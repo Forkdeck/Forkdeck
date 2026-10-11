@@ -521,6 +521,15 @@ impl Config {
                 anyhow::bail!("agents.{}.cmd must not be empty", k.name());
             }
         }
+        // Two stages deploying the same repository to the same environment would each wait on, and
+        // roll back, the other's work.
+        let mut targets = std::collections::HashSet::new();
+        for r in &self.repos {
+            if let Some(d) = &r.deploy {
+                let key = format!("{:?}:{}:{}", r.provider, r.repo, d.environment).to_lowercase();
+                anyhow::ensure!(targets.insert(key), "repos: {} has more than one deploy stage for {:?}", r.repo, d.environment);
+            }
+        }
         for (name, m) in &self.mcp {
             if m.command.is_some() == m.url.is_some() {
                 anyhow::bail!("mcp.{}: set exactly one of command and url", name);
@@ -666,6 +675,10 @@ tool = "rollback"
         assert!(cfg.validate().is_err(), "a pattern that does not compile is rejected");
         let cfg: Config = toml::from_str("[mcp.x]\ncommand = \"a\"\nurl = \"b\"").unwrap();
         assert!(cfg.validate().is_err());
+        let twice = WITH_STAGES.replace("ENV", "");
+        let twice = format!("{}{}", twice, &twice[twice.find("[[repos]]").unwrap()..]);
+        let cfg: Config = toml::from_str(&twice).unwrap();
+        assert!(cfg.validate().unwrap_err().to_string().contains("more than one deploy stage"));
         // A deploy status that cannot say which commit it is about would record commits as deployed that never were.
         let cfg: Config = toml::from_str(&WITH_STAGES.replace("ENV", "").replace("revision = 'rev: ([0-9a-f]+)'", "")).unwrap();
         assert!(cfg.validate().unwrap_err().to_string().contains("revision pattern is required"));

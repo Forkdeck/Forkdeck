@@ -328,7 +328,7 @@ async fn mcp_cmd(hub: &Hub, cmd: McpCmd) -> i32 {
             }
             Ok(a) => match s.call(tool, a).await {
                 Ok(r) => {
-                    say!("{}", r.text);
+                    say!("{}", r.shown);
                     if r.is_error {
                         warn!("the tool reported an error");
                         1

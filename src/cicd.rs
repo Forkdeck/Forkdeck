@@ -11,7 +11,7 @@
 use crate::agents::Slot;
 use crate::config::{CallCfg, Config, DeployCfg, RepoCfg};
 use crate::issues;
-use crate::mcp::{Session, ToolResult};
+use crate::mcp::{self, Session, ToolResult};
 use crate::orchestrator::{run_checks, Hub};
 use crate::state::*;
 use regex::Regex;
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub type Vars = HashMap<String, String>;
@@ -177,7 +177,7 @@ impl<'a> Pool<'a> {
         let args = render(&call.args, vars, &self.captured);
         match self.once(&name, call, &args).await {
             // The server forgot our session. Nothing was executed, so asking again is safe.
-            Err(e) if e.contains("HTTP 404") => self.once(&name, call, &args).await,
+            Err(e) if mcp::is_session_expired(&name, &e) => self.once(&name, call, &args).await,
             other => other,
         }
     }
@@ -192,8 +192,9 @@ impl<'a> Pool<'a> {
 #[derive(Debug)]
 enum Waited {
     Success,
-    /// The answer said so. This is the only outcome that counts as evidence of failure.
-    Failure(String),
+    /// The answer said so. This is the only outcome that counts as evidence of failure. Carries the
+    /// answer as it may be shown, and the values captured from it as it was sent.
+    Failure(String, Vars),
     /// Timed out, or the status could not be read. Nothing is known.
     Unknown(String),
     /// The branch has a newer commit; waiting for this one no longer makes sense.
@@ -228,25 +229,28 @@ async fn wait(pool: &mut Pool<'_>, server: &str, call: &CallCfg, vars: &Vars, wa
         // must not be taken for a failed pipeline or a failed deployment, so it is counted like a
         // call that did not get through.
         let answer = match pool.call(server, call, vars).await {
-            Ok(r) if r.is_error => Err(format!("{} reported an error: {}", call.tool, one_line(&r.text, 160))),
+            Ok(r) if r.is_error => Err(format!("{} reported an error: {}", call.tool, one_line(&r.shown, 160))),
             other => other,
         };
         match answer {
             Ok(r) => {
                 errors = 0;
-                last = r.text.clone();
+                last = r.shown.clone();
+                // Patterns see the answer as it was sent; everything that is shown uses the blanked copy.
                 match read(call, &r.text, want_rev) {
                     Reading::Success => return Waited::Success,
                     Reading::Failure => {
                         let fresh = call.revision.is_some() || saw_running || start.elapsed() >= o.settle;
                         if fresh {
-                            return Waited::Failure(r.text);
+                            let mut got = Vars::new();
+                            capture(call, &r.text, &mut got);
+                            return Waited::Failure(r.shown, got);
                         }
                         tick("failure reported, possibly from an earlier run; waiting to see");
                     }
                     Reading::Pending => {
                         saw_running = true;
-                        tick(&format!("pending · {}", one_line(&r.text, 80)));
+                        tick(&format!("pending · {}", one_line(&r.shown, 80)));
                     }
                 }
             }
@@ -338,15 +342,15 @@ pub async fn ci_wait(hub: &Hub, id: u32, cancel: &Cancel) -> Ci {
         }
         Waited::Cancelled => Ci::Cancelled,
         Waited::Unknown(why) | Waited::Superseded(why) => Ci::Unknown(why),
-        Waited::Failure(status) => {
+        Waited::Failure(status, got) => {
             hub.log("ci", format!("#{} pipeline failed", id));
             // The status answer usually names the failing run; the log call needs that.
-            let got = capture(&ci.status, &status, &mut vars);
-            pool.captured.extend(got);
+            pool.captured.extend(got.keys().cloned());
+            vars.extend(got);
             let log = match &ci.logs {
                 None => status,
                 Some(call) => match pool.call(&ci.server, call, &vars).await {
-                    Ok(l) if !l.is_error && !l.text.trim().is_empty() => l.text,
+                    Ok(l) if !l.is_error && !l.shown.trim().is_empty() => l.shown,
                     Ok(l) => {
                         if l.is_error {
                             hub.log("ci", format!("#{} the log tool reported an error; using the status instead", id));
@@ -378,7 +382,16 @@ pub struct Saved {
     /// A deployment that was started and has not reported back. If forkdeck starts and finds this
     /// set, the previous run was stopped or killed in the middle.
     pub in_progress: Option<String>,
+    /// How many times that deployment has been started. An interrupted one is picked up again, but
+    /// not for ever: something that keeps stopping forkdeck mid-deployment would otherwise trigger
+    /// the same commit again and again.
+    pub tries: u32,
+    /// A rollback that was started and has not reported back.
+    pub rolling_back: Option<String>,
 }
+
+/// How often one commit's deployment is started before a person has to look.
+const MAX_TRIES: u32 = 3;
 
 fn state_dir() -> PathBuf {
     let base = std::env::var("XDG_STATE_HOME").ok().filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(|| {
@@ -392,18 +405,31 @@ fn state_path() -> PathBuf {
 }
 
 /// Only one forkdeck may run deployments from a state directory: two of them (a cron `once` over a
-/// running interface, say) would each wait on, and roll back, the other's work. The lock is held
-/// until the process exits.
-fn have_deploy_lock() -> bool {
-    static LOCK: OnceLock<Option<std::fs::File>> = OnceLock::new();
-    LOCK.get_or_init(|| {
-        use std::os::fd::AsRawFd;
-        std::fs::create_dir_all(state_dir()).ok()?;
-        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(state_dir().join("deploy.lock")).ok()?;
-        // SAFETY: plain syscall on a descriptor we own.
-        (unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0).then_some(f)
-    })
-    .is_some()
+/// running interface, say) would each wait on, and roll back, the other's work. Once taken, the lock
+/// is held until the process exits. `Err` says why it could not be taken; a later call tries again,
+/// so a process that lost to a short-lived one takes over when that one is gone.
+fn deploy_lock() -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    static LOCK: Mutex<Option<std::fs::File>> = Mutex::new(None);
+    let mut held = LOCK.lock().map_err(|_| "lock state poisoned".to_string())?;
+    if held.is_some() {
+        return Ok(());
+    }
+    let path = state_dir().join("deploy.lock");
+    let cannot = |e: std::io::Error| format!("cannot use {} to make sure only one forkdeck deploys ({}); this one will not deploy", path.display(), e);
+    std::fs::create_dir_all(state_dir()).map_err(cannot)?;
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).map_err(cannot)?;
+    // SAFETY: plain syscall on a descriptor we own.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(if e.kind() == std::io::ErrorKind::WouldBlock {
+            format!("another forkdeck is running deployments from {}; this one will not deploy while that one runs", state_dir().display())
+        } else {
+            cannot(e)
+        });
+    }
+    *held = Some(f);
+    Ok(())
 }
 
 /// Read the state file. A file that exists but cannot be understood is an error, not "no state":
@@ -447,19 +473,38 @@ fn note_once(hub: &Hub, msg: String) {
     }
 }
 
+/// What to do about one repository, given what is recorded and where its branch is now.
+#[derive(Debug, PartialEq)]
+pub enum Plan {
+    /// Never seen: note the commit, deploy nothing.
+    Adopt,
+    Nothing,
+    /// Start a deployment; the number is which try this is for that commit.
+    Deploy(u32),
+    /// The same commit was interrupted too often. Stop and say so.
+    GiveUp(u32),
+}
+
+pub fn plan(saved: Option<&Saved>, head: &str) -> Plan {
+    let Some(s) = saved else { return Plan::Adopt };
+    match &s.in_progress {
+        None if s.seen == head => Plan::Nothing,
+        None => Plan::Deploy(1),
+        Some(p) if p == head && s.tries >= MAX_TRIES => Plan::GiveUp(s.tries),
+        Some(p) if p == head => Plan::Deploy(s.tries + 1),
+        // The interrupted one was for an older commit; the head is a fresh start.
+        Some(_) => Plan::Deploy(1),
+    }
+}
+
 /// Look at the base branch of every repository with a deploy stage and start a deployment when it has moved.
 pub async fn deploy_poll(hub: &Hub) {
     if hub.cfg.demo || !hub.cfg.repos.iter().any(|r| r.deploy.is_some()) {
         return;
     }
-    if !have_deploy_lock() {
-        note_once(hub, format!("another forkdeck is running deployments from {}; this one will not deploy", state_dir().display()));
-        return;
+    if let Err(why) = deploy_lock() {
+        return note_once(hub, why);
     }
-    let all = match load_saved() {
-        Ok(a) => a,
-        Err(e) => return note_once(hub, e),
-    };
     for (idx, r) in hub.cfg.repos.iter().enumerate() {
         let Some(d) = &r.deploy else { continue };
         let busy = hub.state.lock().unwrap().jobs.iter().any(|j| !j.status.finished() && matches!(&j.source, Source::Deploy { repo_idx, .. } if *repo_idx == idx));
@@ -477,38 +522,65 @@ pub async fn deploy_poll(hub: &Hub) {
             continue;
         }
         let key = saved_key(r, d);
-        let Some(s) = all.get(&key) else {
-            // First sight of this repository: note where it is, deploy nothing. What is there now is
-            // taken to be what is running, which makes it the rollback target for the next deployment.
-            match update_saved(&key, |s| *s = Saved { seen: head.clone(), last_good: head.clone(), in_progress: None }) {
-                Ok(_) => hub.log("deploy", format!("{}: watching {} from {}; the next commit will be deployed to {}", r.repo, r.base, &head[..10], d.environment)),
-                Err(e) => note_once(hub, format!("{}: {}", r.repo, e)),
-            }
-            continue;
+        // Read the record now, not once for the whole pass: a job for another repository may have
+        // finished and written while this one's branch was being looked up.
+        let saved = match load_saved() {
+            Ok(all) => all.get(&key).cloned(),
+            Err(e) => return note_once(hub, e),
         };
+        if let Some(target) = saved.as_ref().and_then(|s| s.rolling_back.clone()) {
+            hub.log("deploy", format!("{}: a rollback to {} was under way when forkdeck last stopped and was never confirmed. Check {} by hand", r.repo, short(&target), d.environment));
+            record(hub, r, &key, |s| s.rolling_back = None);
+        }
         // The user cancelled this one in this session; do not start it again behind their back.
         if hub.state.lock().unwrap().deploy_cancelled.contains(&(idx, head.clone())) {
             continue;
         }
-        if s.seen == head && s.in_progress.is_none() {
-            continue;
+        match plan(saved.as_ref(), &head) {
+            Plan::Nothing => {}
+            Plan::Adopt => {
+                // What is there now is taken to be what is running, which makes it the rollback target for the next deployment.
+                match update_saved(&key, |s| *s = Saved { seen: head.clone(), last_good: head.clone(), ..Saved::default() }) {
+                    Ok(_) => hub.log("deploy", format!("{}: watching {} from {}; the next commit will be deployed to {}", r.repo, r.base, short(&head), d.environment)),
+                    Err(e) => note_once(hub, format!("{}: {}", r.repo, e)),
+                }
+            }
+            Plan::GiveUp(tries) => {
+                hub.log("deploy", format!("{}: the deployment of {} to {} was interrupted {} times and will not be started again. Its state there is unknown; check it by hand", r.repo, short(&head), d.environment, tries));
+                record(hub, r, &key, |s| {
+                    s.seen = head.clone();
+                    s.in_progress = None;
+                    s.tries = 0;
+                });
+            }
+            Plan::Deploy(n) => {
+                if let Some(p) = saved.as_ref().and_then(|s| s.in_progress.clone()) {
+                    hub.log("deploy", format!("{}: the deployment of {} was started and never finished (was forkdeck stopped?). Its state in {} is unknown; deploying {} now (try {} of {})", r.repo, short(&p), d.environment, short(&head), n, MAX_TRIES));
+                }
+                // Record first: if this cannot be written, a crash would lose track of a running deployment.
+                if let Err(e) = update_saved(&key, |s| {
+                    s.in_progress = Some(head.clone());
+                    s.tries = n;
+                }) {
+                    note_once(hub, format!("{}: {}; not deploying", r.repo, e));
+                    continue;
+                }
+                hub.submit(
+                    format!("{} deploy {} to {}", r.repo, short(&head), d.environment),
+                    String::new(),
+                    Source::Deploy { repo_idx: idx, repo: r.repo.clone(), sha: head },
+                    r.path.clone(),
+                    None,
+                );
+            }
         }
-        if let Some(p) = &s.in_progress {
-            hub.log("deploy", format!("{}: the deployment of {} was started and never finished (was forkdeck stopped?). Its state in {} is unknown; deploying {} now", r.repo, &p[..p.len().min(10)], d.environment, &head[..10]));
-        }
-        // Record first: if this cannot be written, a crash would lose track of a running deployment.
-        if let Err(e) = update_saved(&key, |s| s.in_progress = Some(head.clone())) {
-            note_once(hub, format!("{}: {}; not deploying", r.repo, e));
-            continue;
-        }
-        hub.submit(
-            format!("{} deploy {} to {}", r.repo, &head[..10], d.environment),
-            String::new(),
-            Source::Deploy { repo_idx: idx, repo: r.repo.clone(), sha: head },
-            r.path.clone(),
-            None,
-        );
     }
+}
+
+/// Where the branch points on the remote right now, if that can be found out.
+async fn branch_head(r: &RepoCfg) -> Option<String> {
+    let out = issues::sh("git", &["ls-remote", "origin", &format!("refs/heads/{}", r.base)], Some(&r.path)).await.ok()?;
+    out.split_whitespace().next().filter(|h| h.len() >= 40).map(String::from)
 }
 
 fn step(hub: &Hub, id: u32, slot: Slot, label: &str, state: StageState, line: &str) {
@@ -584,14 +656,21 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
                 s.last_good = sha.clone();
                 s.seen = sha.clone();
                 s.in_progress = None;
+                s.tries = 0;
             });
             (JobStatus::Done, format!("{} is deployed to {}", short(&sha), env))
         }
         End::Superseded(newer) => {
             step(hub, id, Slot::Worker, "deploy", StageState::Skipped, "superseded");
-            // `seen` stays where it was, so the next poll deploys the newer commit.
-            record(hub, &r, &key, |s| s.in_progress = None);
-            (JobStatus::Done, format!("stopped waiting for {}: {} has moved on to {}, which is deployed next. Nothing was rolled back", short(&sha), r.base, short(&newer)))
+            // Forget what was seen, so the next poll deploys wherever the branch is then. That also
+            // covers a branch forced back to a commit that was deployed before: this one was
+            // triggered, so the environment is no longer known to be on the old one.
+            record(hub, &r, &key, |s| {
+                s.seen = String::new();
+                s.in_progress = None;
+                s.tries = 0;
+            });
+            (JobStatus::Done, format!("stopped waiting for {}: {} now points at {}, which is deployed next. Nothing was rolled back", short(&sha), r.base, short(&newer)))
         }
         End::Cancelled(during) => {
             step(hub, id, Slot::Worker, "deploy", StageState::Failed, "cancelled");
@@ -603,6 +682,7 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
             record(hub, &r, &key, |s| {
                 s.seen = sha.clone();
                 s.in_progress = None;
+                s.tries = 0;
             });
             (JobStatus::Failed, format!("{} was not deployed to {}: {}", short(&sha), env, why))
         }
@@ -611,6 +691,7 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
             record(hub, &r, &key, |s| {
                 s.seen = sha.clone();
                 s.in_progress = None;
+                s.tries = 0;
             });
             (JobStatus::Failed, format!("the state of {} in {} is UNKNOWN: {}. Nothing was rolled back; check {} by hand", short(&sha), env, why, env))
         }
@@ -620,14 +701,27 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
             record(hub, &r, &key, |s| {
                 s.seen = sha.clone();
                 s.in_progress = None;
+                s.tries = 0;
             });
+            // The evidence is about this commit. If the branch has moved since, the environment is
+            // on its way to something else, and rolling back now would undo that instead.
+            let moved = branch_head(&r).await.filter(|h| h != &sha);
             let rolled = match &d.rollback {
+                _ if moved.is_some() => {
+                    let to = moved.clone().unwrap_or_default();
+                    record(hub, &r, &key, |s| s.seen = String::new());
+                    format!("Nothing was rolled back, because {} already points at {}, which is deployed next.", r.base, short(&to))
+                }
                 None => "No rollback is configured.".to_string(),
                 Some(_) if saved.last_good.is_empty() || saved.last_good == sha => "No earlier good commit is known, so nothing was rolled back.".to_string(),
                 Some(rb) => {
                     set(hub, id, JobStatus::RollingBack);
                     step(hub, id, Slot::Reviewer, "rollback", StageState::Running, &format!("to {}", short(&saved.last_good)));
+                    // Written down before it starts: if forkdeck dies now, the next start says so.
+                    record(hub, &r, &key, |s| s.rolling_back = Some(saved.last_good.clone()));
                     let back = rollback(&mut pool, &d, rb, &vars, &saved.last_good, cancel, |l| step(hub, id, Slot::Reviewer, "rollback", StageState::Running, l)).await;
+                    // Either way it has reported back; an unconfirmed one is in the outcome below.
+                    record(hub, &r, &key, |s| s.rolling_back = None);
                     match back {
                         Ok(()) => {
                             step(hub, id, Slot::Reviewer, "rollback", StageState::Ok, "healthy again");
@@ -647,7 +741,7 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
         // Text from tools and commands goes out to a chat or a ticket: no stray mentions.
         vars.insert("message".into(), issues::quiet(&outcome));
         match pool.call(&d.server, n, &vars).await {
-            Ok(res) if res.is_error => hub.log("deploy", format!("#{} the notification was refused: {}", id, one_line(&res.text, 160))),
+            Ok(res) if res.is_error => hub.log("deploy", format!("#{} the notification was refused: {}", id, one_line(&res.shown, 160))),
             Ok(_) => {}
             Err(e) => hub.log("deploy", format!("#{} could not send the notification: {}", id, clip(&e, 160))),
         }
@@ -667,7 +761,7 @@ async fn attempt(hub: &Hub, id: u32, pool: &mut Pool<'_>, r: &RepoCfg, d: &Deplo
     if let Some(t) = &d.trigger {
         match pool.call(&d.server, t, vars).await {
             Ok(res) if !res.is_error => step(hub, id, Slot::Worker, "deploy", StageState::Running, &format!("triggered with {}", t.tool)),
-            Ok(res) => return End::Refused(format!("{} refused: {}", t.tool, one_line(&res.text, 200))),
+            Ok(res) => return End::Refused(format!("{} refused: {}", t.tool, one_line(&res.shown, 200))),
             // No answer is not a no: the server may well have started. Keep watching.
             Err(e) => {
                 hub.log("deploy", format!("#{} the trigger call did not return ({}); watching the status anyway", id, clip(&e, 120)));
@@ -686,7 +780,7 @@ async fn attempt(hub: &Hub, id: u32, pool: &mut Pool<'_>, r: &RepoCfg, d: &Deplo
     };
     match wait(pool, &d.server, &d.status, vars, Some(sha), &opts, cancel, |l| step(hub, id, Slot::Worker, "deploy", StageState::Running, l)).await {
         Waited::Success => {}
-        Waited::Failure(t) => return End::Bad(format!("{} reports failure: {}", d.status.tool, one_line(&t, 200))),
+        Waited::Failure(t, _) => return End::Bad(format!("{} reports failure: {}", d.status.tool, one_line(&t, 200))),
         Waited::Unknown(w) => return End::Unknown(w),
         Waited::Superseded(newer) => return End::Superseded(newer),
         Waited::Cancelled => return End::Cancelled("waiting for the deployment"),
@@ -715,7 +809,7 @@ async fn attempt(hub: &Hub, id: u32, pool: &mut Pool<'_>, r: &RepoCfg, d: &Deplo
 async fn rollback(pool: &mut Pool<'_>, d: &DeployCfg, rb: &CallCfg, vars: &Vars, last_good: &str, cancel: &Cancel, tick: impl FnMut(&str)) -> Result<(), String> {
     match pool.call(&d.server, rb, vars).await {
         Ok(res) if !res.is_error => {}
-        Ok(res) => return Err(format!("{} refused: {}", rb.tool, one_line(&res.text, 200))),
+        Ok(res) => return Err(format!("{} refused: {}", rb.tool, one_line(&res.shown, 200))),
         Err(e) => return Err(e),
     }
     // Now the healthy state to wait for is the old commit, not the one that failed.
@@ -724,7 +818,7 @@ async fn rollback(pool: &mut Pool<'_>, d: &DeployCfg, rb: &CallCfg, vars: &Vars,
     let opts = WaitOpts { interval: Duration::from_secs(d.interval_secs.max(1)), limit: Duration::from_secs(d.timeout_mins.max(1) * 60), settle: Duration::ZERO, superseded_by: None };
     match wait(pool, &d.server, &d.status, &back, Some(last_good), &opts, cancel, tick).await {
         Waited::Success => Ok(()),
-        Waited::Failure(t) => Err(format!("it reports failure: {}", one_line(&t, 160))),
+        Waited::Failure(t, _) => Err(format!("it reports failure: {}", one_line(&t, 160))),
         Waited::Unknown(w) | Waited::Superseded(w) => Err(w),
         Waited::Cancelled => Err("forkdeck was stopped before it was confirmed".into()),
     }
@@ -831,6 +925,27 @@ mod tests {
         assert_eq!(j["run"], 9876, "a captured id is sent as a number");
         assert_eq!(j["sha"], "1234567", "a commit made of digits stays text");
         assert_eq!(j["other"], "{missing}");
+    }
+
+    #[test]
+    fn deployment_plan() {
+        let s = |seen: &str, prog: Option<&str>, tries: u32| Saved { seen: seen.into(), last_good: "g".into(), in_progress: prog.map(String::from), tries, rolling_back: None };
+        assert_eq!(plan(None, "a"), Plan::Adopt, "first sight deploys nothing");
+        assert_eq!(plan(Some(&s("a", None, 0)), "a"), Plan::Nothing);
+        assert_eq!(plan(Some(&s("a", None, 0)), "b"), Plan::Deploy(1));
+        assert_eq!(plan(Some(&s("", None, 0)), "a"), Plan::Deploy(1), "after a superseded one, wherever the branch is gets deployed");
+        // Interrupted: picked up again, a bounded number of times.
+        assert_eq!(plan(Some(&s("a", Some("b"), 1)), "b"), Plan::Deploy(2));
+        assert_eq!(plan(Some(&s("a", Some("b"), 2)), "b"), Plan::Deploy(3));
+        assert_eq!(plan(Some(&s("a", Some("b"), 3)), "b"), Plan::GiveUp(3), "not triggered for ever");
+        assert_eq!(plan(Some(&s("a", Some("b"), 3)), "c"), Plan::Deploy(1), "a newer commit starts afresh");
+    }
+
+    #[test]
+    fn old_state_files_still_load() {
+        let old = r#"{"github:o/r:staging":{"seen":"a","last_good":"a","in_progress":null}}"#;
+        let all: HashMap<String, Saved> = serde_json::from_str(old).unwrap();
+        assert_eq!(all["github:o/r:staging"].tries, 0);
     }
 
     #[test]

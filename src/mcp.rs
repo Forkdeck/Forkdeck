@@ -17,8 +17,12 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 const PROTOCOL: &str = "2025-11-25";
 
 pub struct ToolResult {
-    /// All text content, plus any structured content serialised as JSON.
+    /// All text content, plus any structured content serialised as JSON, exactly as the server sent
+    /// it. Only for matching patterns against: a commit id or a run number must not be altered.
     pub text: String,
+    /// The same with every value that came from the environment blanked out. Anything that is
+    /// logged, shown to an agent, posted or passed to another tool uses this.
+    pub shown: String,
     pub is_error: bool,
 }
 
@@ -43,6 +47,14 @@ pub struct Session {
     stderr_tail: Arc<Mutex<String>>,
 }
 
+/// What an error says when the server has dropped the session, so the caller can tell it apart
+/// from an error that merely mentions a 404 and knows the call can be repeated safely.
+pub const SESSION_EXPIRED: &str = "the session expired";
+
+pub fn is_session_expired(server: &str, error: &str) -> bool {
+    error == format!("{}: {}", server, SESSION_EXPIRED)
+}
+
 /// Longest single message accepted from a stdio server.
 const MAX_LINE: usize = 16 * 1024 * 1024;
 
@@ -62,7 +74,8 @@ fn expand_into(s: &str, secrets: &mut Vec<String>) -> Result<String, String> {
         let end = after.find('}').ok_or_else(|| format!("unclosed ${{ in {:?}", s))?;
         let var = &after[..end];
         let val = std::env::var(var).map_err(|_| format!("environment variable {} is not set", var))?;
-        if val.len() >= 4 {
+        // Short values are settings, not secrets, and blanking them would mangle unrelated text.
+        if val.len() >= 6 {
             secrets.push(val.clone());
         }
         out.push_str(&val);
@@ -74,8 +87,14 @@ fn expand_into(s: &str, secrets: &mut Vec<String>) -> Result<String, String> {
 
 /// Blank out every remembered secret. Errors and tool answers end up in logs, prompts and public
 /// comments, and a server is free to echo its own URL, headers or environment.
+///
+/// This catches a value as it was given. It does not catch one that has been encoded (base64,
+/// percent-encoding) on the way.
 pub fn redact(text: &str, secrets: &[String]) -> String {
     let mut out = text.to_string();
+    // Longest first, so a value that begins with another one is not left half showing.
+    let mut secrets: Vec<&String> = secrets.iter().collect();
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
     for s in secrets {
         if out.contains(s.as_str()) {
             out = out.replace(s.as_str(), "***");
@@ -239,7 +258,8 @@ impl Session {
             text.push_str(&sc.to_string());
         }
         // A tool may echo its environment or its URL; its answer goes into prompts and comments.
-        Ok(ToolResult { text: redact(&text, &self.secrets), is_error: r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) })
+        let shown = redact(&text, &self.secrets);
+        Ok(ToolResult { text, shown, is_error: r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) })
     }
 
     pub async fn close(mut self) {
@@ -365,6 +385,10 @@ impl Session {
         }
         let ctype = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
         let body = resp.text().await.map_err(|e| format!("{}: {}", name, e.without_url()))?;
+        if status.as_u16() == 404 && session.is_some() {
+            // The server no longer knows this session. Nothing was executed.
+            return Err(format!("{}: {}", name, SESSION_EXPIRED));
+        }
         if !status.is_success() {
             let short: String = body.chars().take(200).collect();
             return Err(format!("{}: HTTP {} {}", name, status.as_u16(), short.replace('\n', " ")));
@@ -494,10 +518,25 @@ mod tests {
         headers.insert("X-Api-Key".to_string(), "${FORKDECK_TEST_SECRET}".to_string());
         let cfg = McpServerCfg { url: Some(url), headers, ..McpServerCfg::default() };
         let mut s = Session::open("t", &cfg).await.unwrap();
-        assert_eq!(s.call("env", json!({})).await.unwrap().text, "env: TOKEN=***");
+        let r = s.call("env", json!({})).await.unwrap();
+        assert_eq!(r.shown, "env: TOKEN=***", "what is shown has the secret blanked");
+        assert_eq!(r.text, "env: TOKEN=hunter2SECRET", "what patterns are matched against is untouched");
         let e = s.call("env", json!({})).await.err().unwrap();
         assert!(e.contains("500") && e.contains("bad key: ***") && !e.contains("hunter2"), "{}", e);
         server.await.unwrap();
+    }
+
+    #[test]
+    fn redaction_handles_overlapping_values_and_ignores_short_ones() {
+        let secrets = vec!["tokenAB".to_string(), "tokenABCDEF".to_string()];
+        assert_eq!(redact("x tokenABCDEF y tokenAB z", &secrets), "x *** y *** z", "the longer value goes first");
+        // A four-character setting such as a port is not remembered, so it cannot blank part of a commit id.
+        std::env::set_var("FORKDECK_TEST_PORT", "3000");
+        let mut got = Vec::new();
+        assert_eq!(expand_into("${FORKDECK_TEST_PORT}", &mut got).unwrap(), "3000");
+        assert!(got.is_empty());
+        assert!(is_session_expired("ci", "ci: the session expired"));
+        assert!(!is_session_expired("ci", "ci: HTTP 500 upstream said: the session expired"));
     }
 
     #[tokio::test]

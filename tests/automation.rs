@@ -545,7 +545,7 @@ fn a_newer_merge_takes_over_instead_of_triggering_a_rollback() {
     rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &start[..12])]);
     let (ok, out) = rig.once(&[]);
     assert!(ok, "{}", out);
-    assert!(out.contains("has moved on to"), "{}", out);
+    assert!(out.contains("now points at"), "{}", out);
     assert!(!rig.mcp_calls().contains(r#""name":"rollback""#), "a healthy environment must not be rolled back:\n{}", rig.mcp_calls());
 
     // The next pass deploys B.
@@ -626,4 +626,52 @@ fn stopping_while_ci_runs_leaves_the_open_pull_request_alone() {
     assert!(calls.contains("pr create") && calls.contains("--add-label agent:pr-open"), "{}\n{}", calls, out);
     assert!(!calls.contains("agent:needs-human"), "the work did not fail, forkdeck was stopped:\n{}", calls);
     assert!(!calls.contains("could not finish"), "{}", calls);
+}
+
+#[test]
+fn a_branch_forced_back_is_deployed_again_rather_than_assumed() {
+    let rig = Rig::new("forced-back", MCP_SERVER, DEPLOY_STAGE);
+    let start = git(&rig.clone(), &["rev-parse", "HEAD"]);
+    rig.once(&[]);
+    let b = rig.merge_to_main("b.txt");
+    // B is triggered, then main is forced back to where it was.
+    fs::write(rig.root.join("mcp/on_deploy.sh"), format!("git -C {} push -q --force origin {}:refs/heads/main", rig.clone().display(), start)).unwrap();
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Progressing", &b[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(out.contains("now points at"), "{}", out);
+    assert!(!rig.mcp_calls().contains(r#""name":"rollback""#));
+
+    // B was triggered, so the environment is not known to be on the old commit any more: deploy it again.
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &start[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(rig.mcp_calls().contains(&format!(r#""revision":"{}""#, start)), "the commit the branch was forced back to is deployed:\n{}", rig.mcp_calls());
+    assert!(out.contains(&format!("{} is deployed to staging", &start[..10])), "{}", out);
+}
+
+#[test]
+fn a_failed_smoke_test_does_not_roll_back_once_a_newer_commit_is_on_the_branch() {
+    let rig = Rig::new("verify-moved", MCP_SERVER, &DEPLOY_STAGE.replace("test -f README", "test -f smoke-ok"));
+    rig.once(&[]);
+    let a = rig.merge_to_main("a.txt");
+    // A reports healthy; before its smoke test has run, C is merged, and the smoke test then fails.
+    fs::write(
+        rig.root.join("mcp/on_deploy_status.sh"),
+        format!("cd {} && echo c > c.txt && git add . && git commit -qm c && git push -q origin HEAD:main", rig.clone().display()),
+    )
+    .unwrap();
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &a[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok, "{}", out);
+    assert!(out.contains("verification failed") && out.contains("Nothing was rolled back, because main already points at"), "{}", out);
+    assert!(!rig.mcp_calls().contains(r#""name":"rollback""#), "rolling back now would undo the newer commit:\n{}", rig.mcp_calls());
+
+    // The newer commit is deployed on the next pass.
+    let c = git(&rig.clone(), &["rev-parse", "HEAD"]);
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &c[..12])]);
+    fs::write(rig.clone().join("smoke-ok"), "").unwrap();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(rig.mcp_calls().contains(&format!(r#""revision":"{}""#, c)), "{}", rig.mcp_calls());
 }

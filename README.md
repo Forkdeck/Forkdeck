@@ -276,6 +276,7 @@ commit is bad:
 | The trigger tool refuses | no | failed, nothing was deployed |
 | The trigger call gets no answer | not by that alone | the status is watched as usual |
 | A newer commit reaches the branch while waiting | no | this one is dropped, the newer one is deployed next |
+| This commit is bad, but the branch has already moved on | no | failed; the newer commit is deployed next |
 | forkdeck is stopped or the job is cancelled, at any point | no | cancelled, picked up at the next start |
 
 Other things to know:
@@ -289,12 +290,17 @@ Other things to know:
   that commit as what is running, which makes it the first rollback target.
 - **One forkdeck deploys.** The first process to start holds a lock next to the
   state file; any other (a cron `forkdeck once` while the interface is open,
-  for example) still handles issues and reviews but leaves deployments alone.
+  for example) still handles issues and reviews but leaves deployments alone
+  until the first has exited. One repository can have one deploy stage per
+  environment.
 - **State is in `~/.local/state/forkdeck/deploy.json`** (or `$XDG_STATE_HOME`).
   If the file is damaged, forkdeck says so and deploys nothing until it is
   repaired or deleted; it does not start over on its own.
 - **An interrupted deployment is remembered.** If forkdeck is stopped or killed
-  in the middle of one, the next start says so and deploys the branch head.
+  in the middle of one, the next start says so and deploys the branch head,
+  which calls the trigger again. After three starts for the same commit it
+  stops trying and says the state is unknown. An interrupted rollback is
+  reported at the next start and left to you.
 - **A commit is tried once.** After a failed or inconclusive deployment the
   same commit is not tried again; the next commit is.
 - **`verify` runs in your local clone** (`path`), as you, not in a checkout of
@@ -306,9 +312,11 @@ Other things to know:
 
 ### What forkdeck does with MCP servers' answers
 
-- Values taken from the environment (`${NAME}`) are blanked out of every error
-  message and every tool answer before they are logged, shown to an agent or
-  posted, in case a server echoes its own URL or environment.
+- Values taken from the environment (`${NAME}`) that are six characters or
+  longer are blanked out of every error message and every tool answer before
+  they are logged, shown to an agent or posted, in case a server echoes its own
+  URL or environment. Patterns are matched against the answer as it was sent.
+  A value that comes back encoded (base64, percent-encoded) is not caught.
 - HTTP redirects are not followed. Configure the final URL.
 - `capture` and the patterns work on the text of an answer; with several runs
   or resources in one answer they see the first match. `forkdeck mcp call`
