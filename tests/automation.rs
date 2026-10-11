@@ -88,7 +88,9 @@ exit 0
 "#;
 
 /// An MCP server over stdio. Each tool answers with the next line of `$FAKE_MCP/<tool>.txt`
-/// (the last line repeats), and every call is appended to `$FAKE_MCP/calls.log`. In an answer,
+/// (the last line repeats), and every call is appended to `$FAKE_MCP/calls.log`. While
+/// `before.txt` exists and `deploy` has not been called, `deploy_status` answers with that file:
+/// what the system says before anything was started. In an answer,
 /// `@SHA@` becomes the commit the call asked about and `@FIRST@` the first commit ever asked about.
 const MCP: &str = r#"#!/bin/sh
 while IFS= read -r line; do
@@ -102,10 +104,15 @@ while IFS= read -r line; do
       tool=$(printf '%s' "$line" | sed -n 's/.*"name":"\([a-z_]*\)".*/\1/p')
       printf '%s\n' "$line" >> "$FAKE_MCP/calls.log"
       if [ -f "$FAKE_MCP/on_$tool.sh" ]; then mv "$FAKE_MCP/on_$tool.sh" "$FAKE_MCP/ran_$tool.sh"; sh "$FAKE_MCP/ran_$tool.sh" >/dev/null 2>&1; fi
+      [ "$tool" = "deploy" ] && : > "$FAKE_MCP/triggered"
+      if [ "$tool" = "deploy_status" ] && [ -f "$FAKE_MCP/before.txt" ] && [ ! -f "$FAKE_MCP/triggered" ]; then
+        text=$(cat "$FAKE_MCP/before.txt")
+      else
       n=$(cat "$FAKE_MCP/$tool.n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_MCP/$tool.n"
       total=$(wc -l < "$FAKE_MCP/$tool.txt" 2>/dev/null || echo 0)
       [ "$n" -gt "$total" ] && n=$total
       text=$(sed -n "${n}p" "$FAKE_MCP/$tool.txt" 2>/dev/null)
+      fi
       sha=$(printf '%s' "$line" | sed -n 's/.*"sha":"\([0-9a-f]*\)".*/\1/p')
       [ -n "$sha" ] && [ ! -f "$FAKE_MCP/first_sha" ] && printf '%s' "$sha" > "$FAKE_MCP/first_sha"
       first=$(cat "$FAKE_MCP/first_sha" 2>/dev/null)
@@ -280,8 +287,21 @@ impl Rig {
         fs::read_to_string(self.root.join("mcp/calls.log")).unwrap_or_default()
     }
 
-    /// Add a commit to the remote's main branch, as a merge would.
+    /// What the deployment system reports until a deployment is triggered. None: the scripted answers apply from the first call.
+    fn mcp_before(&self, line: Option<&str>) {
+        let _ = fs::remove_file(self.root.join("mcp/triggered"));
+        match line {
+            Some(l) => fs::write(self.root.join("mcp/before.txt"), l).unwrap(),
+            None => {
+                let _ = fs::remove_file(self.root.join("mcp/before.txt"));
+            }
+        }
+    }
+
+    /// Add a commit to the remote's main branch, as a merge would. Until something is triggered,
+    /// the deployment system goes on reporting an older revision, settled.
     fn merge_to_main(&self, file: &str) -> String {
+        self.mcp_before(Some("rev=00000000aaaa Synced"));
         let c = self.clone();
         fs::write(c.join(file), "merged\n").unwrap();
         git(&c, &["add", "."]);
@@ -536,7 +556,8 @@ fn a_merge_is_deployed_to_staging_and_a_bad_one_is_rolled_back() {
     assert!(ok, "{}", out);
     let mcp = rig.mcp_calls();
     assert!(mcp.contains(&format!(r#""revision":"{}""#, a)) && mcp.contains(r#""target":"staging""#), "{}", mcp);
-    assert_eq!(mcp.matches(r#""name":"deploy_status""#).count(), 3, "waited through the old commit and the rollout:\n{}", mcp);
+    assert_eq!(mcp.matches(r#""name":"deploy_status""#).count(), 4, "one look before triggering, then through the old commit and the rollout:\n{}", mcp);
+    assert!(mcp.find(r#""name":"deploy_status""#).unwrap() < mcp.find(r#""name":"deploy","#).or(mcp.find(r#""name":"deploy"}"#)).unwrap(), "the system is asked before anything is started:\n{}", mcp);
     assert!(!mcp.contains(r#""name":"rollback""#));
     assert!(mcp.contains("is deployed to staging"), "the notification carries the result:\n{}", mcp);
 
@@ -601,6 +622,7 @@ fn an_unreadable_status_rolls_nothing_back() {
     let rig = Rig::new("unknown", MCP_SERVER, DEPLOY_STAGE);
     rig.adopt();
     let a = rig.merge_to_main("a.txt");
+    // Readable before the trigger, and never again after it.
     rig.mcp_answers("deploy_status", &["ERR: upstream unavailable"]);
     let (ok, out) = rig.once(&[]);
     assert!(!ok, "not knowing is still a failed run:\n{}", out);
@@ -632,6 +654,7 @@ fn a_newer_merge_takes_over_instead_of_triggering_a_rollback() {
     // The next pass deploys B.
     let b = git(&rig.clone(), &["rev-parse", "HEAD"]);
     assert_ne!(a, b);
+    rig.mcp_before(Some("rev=00000000aaaa Synced"));
     rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &b[..12])]);
     let (ok, out) = rig.once(&[]);
     assert!(ok, "{}", out);
@@ -724,6 +747,7 @@ fn a_branch_forced_back_is_deployed_again_rather_than_assumed() {
     assert!(!rig.mcp_calls().contains(r#""name":"rollback""#));
 
     // B was triggered, so the environment is not known to be on the old commit any more: deploy it again.
+    rig.mcp_before(Some(&format!("rev={} Progressing", &b[..12])));
     rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &start[..12])]);
     let (ok, out) = rig.once(&[]);
     assert!(ok, "{}", out);
@@ -738,7 +762,7 @@ fn a_failed_smoke_test_does_not_roll_back_once_a_newer_commit_is_on_the_branch()
     let a = rig.merge_to_main("a.txt");
     // A reports healthy; before its smoke test has run, C is merged, and the smoke test then fails.
     fs::write(
-        rig.root.join("mcp/on_deploy_status.sh"),
+        rig.root.join("mcp/on_deploy.sh"),
         format!("cd {} && echo c > c.txt && git add . && git commit -qm c && git push -q origin HEAD:main", rig.clone().display()),
     )
     .unwrap();
@@ -750,6 +774,7 @@ fn a_failed_smoke_test_does_not_roll_back_once_a_newer_commit_is_on_the_branch()
 
     // The newer commit is deployed on the next pass.
     let c = git(&rig.clone(), &["rev-parse", "HEAD"]);
+    rig.mcp_before(Some("rev=00000000aaaa Synced"));
     rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &c[..12])]);
     fs::write(rig.clone().join("smoke-ok"), "").unwrap();
     let (ok, out) = rig.once(&[]);
@@ -1346,4 +1371,85 @@ fn a_finished_item_cannot_be_put_back_in_the_queue_by_a_release() {
         assert!(!ok && out.contains("does not carry the label \"review:running\""), "{:?}: {}", extra, out);
     }
     assert!(!rig.calls().contains("label") && !rig.calls().contains("POST"), "{}", rig.calls());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Before a deployment is triggered, the deployment system is asked what is already going on
+
+#[test]
+fn a_commit_that_is_already_rolling_out_is_watched_and_not_triggered_again() {
+    let rig = Rig::new("existing-ours", MCP_SERVER, DEPLOY_STAGE);
+    rig.adopt();
+    let a = rig.merge_to_main("a.txt");
+    // Someone else (a teammate's machine, the system's own automation) has started this commit.
+    rig.mcp_before(None);
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Progressing", &a[..12]), &format!("rev={} Progressing", &a[..12]), &format!("rev={} Healthy", &a[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let mcp = rig.mcp_calls();
+    assert!(!mcp.contains(r#""revision""#), "it must not be triggered a second time:\n{}", mcp);
+    assert!(out.contains("is already rolling out in staging; not triggered again"), "{}", out);
+    assert!(out.contains(&format!("{} is deployed to staging", &a[..10])), "it is still followed to the end and verified:\n{}", out);
+    assert!(fs::read_to_string(rig.state_file()).unwrap().contains(&format!(r#""last_good": "{}""#, a)));
+
+    // The same when it is already there and healthy.
+    let b = rig.merge_to_main("b.txt");
+    rig.mcp_before(None);
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &b[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok && out.contains("is already deployed in staging; not triggered again"), "{}", out);
+    assert!(!rig.mcp_calls().contains(r#""revision""#), "{}", rig.mcp_calls());
+}
+
+#[test]
+fn a_rollout_of_something_else_is_waited_for_before_starting() {
+    let stage = DEPLOY_STAGE.replace("failure = \"Degraded\"", "failure = \"Degraded\"\npending = \"Progressing\"");
+    let rig = Rig::new("existing-other", MCP_SERVER, &stage);
+    let start = rig.adopt();
+    let a = rig.merge_to_main("a.txt");
+    // A rollout of an older revision is still going, then settles.
+    rig.mcp_before(None);
+    rig.mcp_answers(
+        "deploy_status",
+        &["rev=00000000bbbb Progressing", "rev=00000000bbbb Progressing", &format!("rev={} Healthy", &start[..12]), &format!("rev={} Progressing", &a[..12]), &format!("rev={} Healthy", &a[..12])],
+    );
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let mcp = rig.mcp_calls();
+    let trigger = mcp.find(r#""revision""#).expect("it is triggered once the other rollout has settled");
+    assert_eq!(mcp[..trigger].matches(r#""name":"deploy_status""#).count(), 3, "it waited through the other rollout first:\n{}", mcp);
+    assert_eq!(mcp.matches(r#""revision""#).count(), 1);
+    assert!(out.contains(&format!("{} is deployed to staging", &a[..10])), "{}", out);
+}
+
+#[test]
+fn nothing_is_triggered_when_the_system_cannot_be_asked_first() {
+    let rig = Rig::new("existing-unreadable", MCP_SERVER, DEPLOY_STAGE);
+    rig.adopt();
+    let a = rig.merge_to_main("a.txt");
+    rig.mcp_before(Some("ERR: upstream unavailable"));
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &a[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok, "{}", out);
+    assert!(out.contains("was not deployed to staging") && out.contains("so none was started"), "{}", out);
+    let mcp = rig.mcp_calls();
+    assert!(!mcp.contains(r#""revision""#) && !mcp.contains(r#""name":"rollback""#), "{}", mcp);
+}
+
+#[test]
+fn a_deployment_a_teammate_announced_first_is_given_a_moment_before_it_is_started_here() {
+    let rig = Rig::new("existing-peer", &format!("{}\n{}", TEAM, MCP_SERVER), DEPLOY_STAGE);
+    rig.adopt();
+    let a = rig.merge_to_main("a.txt");
+    let mut theirs = claim("b1", "bob", "bobs-box", 1);
+    theirs["machine"] = "ffffffffffffffff".into();
+    rig.seed_claim(&format!("commits_{}", a), 50, "bob", theirs, 10);
+    // Bob's machine never gets round to it: after the pause the system still shows nothing, so it is started here.
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &a[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let mcp = rig.mcp_calls();
+    let trigger = mcp.find(r#""revision""#).expect("it is not left undeployed");
+    assert_eq!(mcp[..trigger].matches(r#""name":"deploy_status""#).count(), 2, "asked, paused, asked again:\n{}", mcp);
+    assert!(out.contains("bob on bobs-box is already on it"), "{}", out);
 }
