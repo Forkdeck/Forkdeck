@@ -23,8 +23,9 @@ esac
 "#;
 
 /// `gh`. Lists come from files, everything else is appended to `calls.log`. `gh api` keeps
-/// comments as files under `$FAKE_GH/c/<path>/<id>.json` (what was posted), `.who` (the author)
-/// and `.at` (when it last changed), which is all the team feature reads and writes.
+/// comments as files under `$FAKE_GH/c/<path>/<id>.json` (what was posted), `.who` (the author),
+/// `.at` (when it last changed) and optionally `.assoc` (how the forge says the author relates to
+/// the repository; a member unless stated), which is all the team feature reads and writes.
 const GH: &str = r#"#!/bin/sh
 [ "$1" = "--version" ] && { echo stand-in; exit 0; }
 if [ "$1" = "api" ]; then
@@ -39,6 +40,10 @@ if [ "$1" = "api" ]; then
     esac
   done
   echo "api $method $path" >> "$FAKE_GH/calls.log"
+  if [ -f "$FAKE_GH/fail_once" ]; then
+    pat=$(cat "$FAKE_GH/fail_once")
+    case "$method $path" in *$pat*) rm "$FAKE_GH/fail_once"; echo "HTTP 502: bad gateway" >&2; exit 1 ;; esac
+  fi
   if [ -n "$FAKE_GH_API_FAIL" ]; then case "$method $path" in *$FAKE_GH_API_FAIL*) echo "HTTP 502: bad gateway" >&2; exit 1 ;; esac; fi
   bare=${path%%\?*}
   key=$(printf '%s' "$bare" | tr '/' '_')
@@ -48,7 +53,7 @@ if [ "$1" = "api" ]; then
     GET\ *)
       d="$FAKE_GH/c/$key"; printf '['; sep=""
       for id in $(ls "$d" 2>/dev/null | sed -n 's/\.json$//p' | sort -n); do
-        printf '%s{"id":%s,"user":{"login":"%s"},"updated_at":"%s",%s' "$sep" "$id" "$(cat "$d/$id.who")" "$(cat "$d/$id.at")" "$(sed 's/^{//' "$d/$id.json")"
+        printf '%s{"id":%s,"user":{"login":"%s"},"author_association":"%s","updated_at":"%s",%s' "$sep" "$id" "$(cat "$d/$id.who")" "$(cat "$d/$id.assoc" 2>/dev/null || echo MEMBER)" "$(cat "$d/$id.at")" "$(sed 's/^{//' "$d/$id.json")"
         sep=","
       done
       printf ']\n' ;;
@@ -69,6 +74,7 @@ if [ "$1" = "api" ]; then
   exit 0
 fi
 case "$1 $2" in
+  "issue view"|"pr view") cat "$FAKE_GH/view-$3.json" 2>/dev/null || echo '{"labels":[]}' ;;
   "issue list") cat "$FAKE_GH/issues.json" ;;
   "pr list") cat "$FAKE_GH/prs.json" ;;
   *)
@@ -928,6 +934,33 @@ impl Rig {
         fs::write(d.join(format!("{}.at", id)), forge_time(ago_secs)).unwrap();
     }
 
+    /// How the forge describes the author of a comment: MEMBER, COLLABORATOR, CONTRIBUTOR, NONE…
+    fn assoc(&self, what: &str, id: u64, assoc: &str) {
+        fs::write(self.comment_dir(what).join(format!("{}.assoc", id)), assoc).unwrap();
+    }
+
+    /// The labels `gh issue view` / `gh pr view` reports for an item.
+    fn labelled(&self, n: u64, label: &str) {
+        fs::write(self.root.join(format!("gh/view-{}.json", n)), format!(r#"{{"labels":[{{"name":"{}"}}]}}"#, label)).unwrap();
+    }
+
+    /// A script the stand-in agent can run mid-job: `$1` posts a release naming the running job's
+    /// claim on issue 7, and the forge describes that account as `$2`.
+    fn release_script(&self) -> String {
+        let d = self.comment_dir("issues_7");
+        let p = self.root.join("bin/post-release");
+        let body = r#"#!/bin/sh
+d=@DIR@
+id=$(sed -n 's/.*\\"id\\":\\"\([0-9a-f-]*\)\\".*/\1/p' "$d/100.json")
+printf '{"body":"<!-- forkdeck:claim {\\"v\\":1,\\"id\\":\\"rel\\",\\"by\\":\\"%s\\",\\"state\\":\\"released\\",\\"ends\\":[\\"%s\\"]} -->\\nreleased"}' "$1" "$id" > "$d/150.json"
+printf '%s' "$1" > "$d/150.who"; printf '%s' "$2" > "$d/150.assoc"; date -u +%Y-%m-%dT%H:%M:%SZ > "$d/150.at"
+"#
+        .replace("@DIR@", &d.display().to_string());
+        fs::write(&p, body).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        p.display().to_string()
+    }
+
     /// The comments on an item, oldest first, as the text that was posted.
     fn comments(&self, what: &str) -> Vec<String> {
         let d = self.comment_dir(what);
@@ -991,6 +1024,9 @@ fn a_claim_that_went_quiet_or_was_forged_does_not_block() {
     // Bob's machine stopped updating two hours ago; Mallory typed a marker naming Carol.
     rig.seed_claim("issues_7", 50, "bob", claim("b1", "bob", "bobs-box", 1), 7200);
     rig.seed_claim("issues_7", 51, "mallory", claim("c1", "carol", "x", 1), 5);
+    // Eve signs her own name, but she only has permission to comment.
+    rig.seed_claim("issues_7", 52, "eve", claim("e1", "eve", "x", 1), 5);
+    rig.assoc("issues_7", 52, "NONE");
     let (ok, out) = rig.once(&[]);
     assert!(ok, "{}", out);
     assert!(rig.calls().contains("pr create"), "{}", rig.calls());
@@ -1053,12 +1089,13 @@ fn nothing_is_claimed_when_the_claims_cannot_be_read() {
 fn a_teammates_release_stops_the_job_before_anything_is_pushed() {
     let rig = Rig::new("team-release", TEAM, "");
     rig.issue();
+    rig.labelled(7, "agent:working");
     // While Alice's agent is working, Bob hands the issue back to the queue from his machine.
     let release = format!("echo change >> by_agent.txt; FAKE_LOGIN=bob {} team release o/r#7 --force > {}/release.out 2>&1", env!("CARGO_BIN_EXE_forkdeck"), rig.root.display());
     let (ok, out) = rig.once(&[("FAKE_WORK", &release)]);
     let said = fs::read_to_string(rig.root.join("release.out")).unwrap_or_default();
     assert!(said.contains("ended the claim of alice") && said.contains("label back to agent:ready"), "{}", said);
-    assert!(!ok && out.contains("bob handed this back to the queue"), "{}", out);
+    assert!(!ok && out.contains("bob has taken this over"), "{}", out);
     let calls = rig.calls();
     assert!(!calls.contains("pr create") && !calls.contains("agent:needs-human") && !calls.contains("issue comment"), "the issue is no longer ours to report on:\n{}", calls);
     assert_eq!(git(&rig.origin(), &["branch", "--list", "forkdeck/*"]), "", "nothing was pushed");
@@ -1070,6 +1107,8 @@ fn a_teammates_release_stops_the_job_before_anything_is_pushed() {
 #[test]
 fn a_fresh_claim_is_only_released_with_force_and_a_stale_one_without() {
     let rig = Rig::new("team-force", TEAM, "");
+    rig.labelled(7, "agent:working");
+    rig.labelled(9, "agent:working");
     rig.seed_claim("issues_7", 50, "bob", claim("b1", "bob", "bobs-box", 1), 60);
     let (ok, out) = rig.run(&["team", "release", "o/r#7"], &[]);
     assert!(!ok && out.contains("bob on bobs-box is already on it") && out.contains("--force"), "{}", out);
@@ -1081,7 +1120,13 @@ fn a_fresh_claim_is_only_released_with_force_and_a_stale_one_without() {
     assert!(rig.calls().contains("issue edit 9 -R o/r --remove-label agent:working --add-label agent:ready"), "{}", rig.calls());
     assert!(rig.comments("issues_9")[1].contains(r#""ends":["b2"]"#));
 
+    // Claimed by hand, or by a forkdeck with sharing off: only moved when that is said.
+    rig.labelled(5, "review:running");
+    let before = rig.calls();
     let (ok, out) = rig.run(&["team", "release", "o/r!5"], &[]);
+    assert!(!ok && out.contains("no forkdeck claim is open") && out.contains("--unclaimed"), "{}", out);
+    assert_eq!(rig.calls().matches("label").count(), before.matches("label").count(), "nothing may change");
+    let (ok, out) = rig.run(&["team", "release", "o/r!5", "--unclaimed"], &[]);
     assert!(ok && out.contains("no forkdeck claim was open") && out.contains("label back to review:ready"), "{}", out);
     let (ok, out) = rig.run(&["team", "release", "other/repo#1"], &[]);
     assert!(!ok && out.contains("not one of the configured"), "{}", out);
@@ -1145,6 +1190,7 @@ fn the_overview_lists_who_holds_what() {
 #[test]
 fn an_issue_with_an_open_pull_request_is_not_handed_back() {
     let rig = Rig::new("team-pr-open", TEAM, "");
+    rig.labelled(7, "agent:working");
     let mut m = claim("b1", "bob", "bobs-box", 1);
     m["pr"] = "https://example.invalid/o/r/pull/12".into();
     m["stage"] = "watching ci".into();
@@ -1163,4 +1209,92 @@ fn with_the_machine_name_hidden_no_claim_is_taken_for_a_leftover() {
     let (ok, out) = rig.once(&[]);
     assert!(ok && out.contains("not started: alice is already on it"), "{}", out);
     assert!(!rig.calls().contains("label"), "{}", rig.calls());
+}
+
+#[test]
+fn a_release_typed_by_someone_without_write_access_is_ignored() {
+    let rig = Rig::new("team-outsider", TEAM, "");
+    rig.issue();
+    let work = format!("echo change >> by_agent.txt; {} eve NONE", rig.release_script());
+    let (ok, out) = rig.once(&[("FAKE_WORK", &work)]);
+    assert!(rig.comments("issues_7").len() == 2, "the forged release was posted: {}", out);
+    assert!(ok, "a passer-by's comment must not stop the job:\n{}", out);
+    assert!(rig.calls().contains("pr create"), "{}", rig.calls());
+    assert!(rig.comments("issues_7")[0].contains(r#""state":"done""#));
+
+    // The very same comment from a teammate does stop it: what differs is what the forge says about the author.
+    let rig = Rig::new("team-insider", TEAM, "");
+    rig.issue();
+    let work = format!("echo change >> by_agent.txt; {} bob COLLABORATOR", rig.release_script());
+    let (ok, out) = rig.once(&[("FAKE_WORK", &work)]);
+    assert!(!ok && out.contains("bob has taken this over"), "{}", out);
+    assert!(!rig.calls().contains("pr create"), "{}", rig.calls());
+}
+
+#[test]
+fn a_claim_that_expired_while_the_agent_ran_publishes_nothing() {
+    // The machine slept: its claim was last refreshed two hours ago when the agent finishes.
+    let rig = Rig::new("team-expired", TEAM, "");
+    rig.issue();
+    let d = rig.comment_dir("issues_7");
+    let work = format!("echo change >> by_agent.txt; echo {} > {}/100.at", forge_time(7200), d.display());
+    let (ok, out) = rig.once(&[("FAKE_WORK", &work)]);
+    assert!(!ok && out.contains("has expired"), "{}", out);
+    let calls = rig.calls();
+    assert!(!calls.contains("pr create") && !calls.contains("agent:needs-human") && !calls.contains("issue comment"), "an expired claim writes nothing:\n{}", calls);
+    assert_eq!(git(&rig.origin(), &["branch", "--list", "forkdeck/*"]), "");
+
+    // Same, and meanwhile the issue was put back by hand and Bob's machine took it without a release.
+    let rig = Rig::new("team-expired-taken", "[team]\nenabled = true\nhost = \"rig\"\n[review]\nmax_fix_rounds = 0", "");
+    rig.issue();
+    let d = rig.comment_dir("issues_7");
+    rig.seed_claim("staging", 150, "bob", claim("b1", "bob", "bobs-box", 1), 30);
+    let staged = rig.comment_dir("staging");
+    let work = format!("echo change >> by_agent.txt; echo {} > {d}/100.at; cp {s}/150.* {d}/", forge_time(7200), d = d.display(), s = staged.display());
+    // The work also fails its review, so the failure path runs: it must stay off Bob's issue too.
+    let (ok, out) = rig.once(&[("FAKE_WORK", &work), ("FAKE_VERDICT", "FAIL")]);
+    assert!(!ok && out.contains("bob has taken this over"), "{}", out);
+    let calls = rig.calls();
+    assert!(!calls.contains("pr create") && !calls.contains("agent:needs-human") && !calls.contains("issue comment"), "the issue is Bob's:\n{}", calls);
+    assert_eq!(git(&rig.origin(), &["branch", "--list", "forkdeck/*"]), "");
+}
+
+#[test]
+fn a_job_that_fails_after_it_was_released_leaves_the_labels_to_the_new_holder() {
+    let rig = Rig::new("team-fail-released", "[team]\nenabled = true\nhost = \"rig\"\n[review]\nmax_fix_rounds = 0", "");
+    rig.issue();
+    rig.labelled(7, "agent:working");
+    let release = format!("echo change >> by_agent.txt; FAKE_LOGIN=bob {} team release o/r#7 --force > {}/release.out 2>&1", env!("CARGO_BIN_EXE_forkdeck"), rig.root.display());
+    let (ok, out) = rig.once(&[("FAKE_WORK", &release), ("FAKE_VERDICT", "FAIL")]);
+    assert!(!ok, "{}", out);
+    assert!(out.contains("not reported on the forge: bob has taken this over"), "{}", out);
+    let calls = rig.calls();
+    assert!(!calls.contains("agent:needs-human") && !calls.contains("issue comment"), "the failure label would overwrite the next holder's:\n{}", calls);
+    assert_eq!(calls.matches("--remove-label").count(), 2, "one label move to claim, one by the release, none after:\n{}", calls);
+}
+
+#[test]
+fn the_final_status_is_written_even_if_the_forge_fails_once() {
+    let rig = Rig::new("team-final", TEAM, "");
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    fs::write(rig.root.join("gh/fail_once"), "PATCH").unwrap();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(!rig.root.join("gh/fail_once").exists(), "an update did fail");
+    assert!(rig.comments("issues_5")[0].contains(r#""state":"done""#), "a comment left active would block teammates: {:?}", rig.comments("issues_5"));
+}
+
+#[test]
+fn a_finished_item_cannot_be_put_back_in_the_queue_by_a_release() {
+    let rig = Rig::new("team-finished", TEAM, "");
+    // Reviewed and passed; no claim is open on it and it does not carry the working label.
+    rig.labelled(5, "review:passed");
+    for extra in [&[][..], &["--unclaimed"][..], &["--force"][..]] {
+        let mut args = vec!["team", "release", "o/r!5"];
+        args.extend_from_slice(extra);
+        let (ok, out) = rig.run(&args, &[]);
+        assert!(!ok && out.contains("does not carry the label \"review:running\""), "{:?}: {}", extra, out);
+    }
+    assert!(!rig.calls().contains("label") && !rig.calls().contains("POST"), "{}", rig.calls());
 }

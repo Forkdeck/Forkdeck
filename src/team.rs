@@ -7,7 +7,11 @@
 //!
 //! The marker is read back from comments anyone may have written, so nothing in it is trusted
 //! beyond what the forge itself vouches for: a marker counts only if the comment's author is the
-//! person it names, and its age is the forge's own "last edited" time, not a clock in the marker.
+//! person it names and the forge says that account may write to the repository, and its age is
+//! the forge's own "last edited" time, not a clock in the marker.
+//!
+//! A claim is a lease, not a flag: everything forkdeck writes to a claimed item first asks
+//! `standing`, and goes ahead only when this process holds the winning claim right now.
 
 use crate::config::RepoCfg;
 use crate::issues;
@@ -40,7 +44,7 @@ pub struct Marker {
     pub pr: String,
     pub started: i64,
     pub beat: i64,
-    /// Claims this comment ends. From a release, any claim; otherwise only the author's own.
+    /// Claims this comment ends: a release, or a new claim replacing ones that had gone quiet.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ends: Vec<String>,
 }
@@ -52,6 +56,10 @@ pub struct Comment {
     pub body: String,
     /// When the forge last saw this comment change, in seconds since the epoch. 0 if it did not say.
     pub updated: i64,
+    /// The forge says the author may write to the repository. Only such comments can claim or release.
+    pub trusted: bool,
+    /// GitLab's numeric user id, which its membership lookup wants. 0 elsewhere.
+    pub author_id: u64,
 }
 
 /// A marker found in a comment, with the time it was last touched.
@@ -149,8 +157,10 @@ pub fn read_claims(comments: &[Comment]) -> Vec<Seen> {
         .iter()
         .filter_map(|c| {
             let m = parse(&c.body)?;
-            // Anyone can type a marker. It only counts when its author is the person it names.
-            if !m.by.eq_ignore_ascii_case(&c.author) {
+            // Anyone who can comment can type a marker. It only counts when its author is the person
+            // it names, and the forge vouches that this account works on the repository: otherwise
+            // a passer-by could hold issues, or end the claims of the people who do the work.
+            if !c.trusted || !m.by.eq_ignore_ascii_case(&c.author) {
                 return None;
             }
             let beat = if c.updated > 0 { c.updated } else { m.beat };
@@ -170,11 +180,9 @@ pub fn ended(all: &[Seen]) -> HashSet<String> {
             if t.comment >= s.comment {
                 continue;
             }
-            // A release is a person's decision and may end anyone's claim. Anything else may only
-            // replace a claim of its own author.
-            if s.m.state == "released" || s.m.by.eq_ignore_ascii_case(&t.m.by) {
-                gone.insert(id.clone());
-            }
+            // Every marker that got this far was written by an account with write access, which
+            // could move the labels by hand anyway. A later one may end an earlier one.
+            gone.insert(id.clone());
         }
     }
     gone
@@ -184,6 +192,50 @@ pub fn ended(all: &[Seen]) -> HashSet<String> {
 pub fn live(all: &[Seen], now: i64, stale_secs: i64) -> Vec<&Seen> {
     let gone = ended(all);
     all.iter().filter(|s| s.m.state == "active" && !gone.contains(&s.m.id) && now - s.beat <= stale_secs).collect()
+}
+
+/// Where a claim stands. Only `Owned` permits writing anything to the item.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Standing {
+    Owned,
+    /// Somebody else holds the item, or ended this claim.
+    Lost(String),
+    /// Not refreshed within the limit. Nobody else holds the item, but anybody may take it.
+    Expired,
+    /// The claim comment is gone, or no longer says it is active.
+    Missing,
+    /// The forge could not be read.
+    Unavailable(String),
+}
+
+impl Standing {
+    pub fn words(&self) -> String {
+        match self {
+            Standing::Owned => "the claim is held".into(),
+            Standing::Lost(who) => format!("{} has taken this over", who),
+            Standing::Expired => "the claim went unrefreshed for too long and has expired".into(),
+            Standing::Missing => "the claim comment is gone".into(),
+            Standing::Unavailable(e) => format!("the claim could not be read ({})", e),
+        }
+    }
+}
+
+/// Does the claim in comment `mine` hold the item right now? The same rule decides a fresh claim
+/// (`confirm`) and every later write, so two machines cannot both come out as the holder.
+pub fn standing(all: &[Seen], mine: u64, now: i64, stale_secs: i64) -> Standing {
+    let Some(me) = all.iter().find(|s| s.comment == mine) else { return Standing::Missing };
+    if ended(all).contains(&me.m.id) {
+        let who = all.iter().rev().find(|s| s.m.ends.contains(&me.m.id)).map(|s| s.m.by.clone()).unwrap_or_else(|| "someone".into());
+        return Standing::Lost(who);
+    }
+    if me.m.state != "active" {
+        return Standing::Missing;
+    }
+    match live(all, now, stale_secs).first() {
+        Some(first) if first.comment == mine => Standing::Owned,
+        Some(first) => Standing::Lost(first.m.by.clone()),
+        None => Standing::Expired,
+    }
 }
 
 pub fn ago(secs: i64) -> String {
@@ -256,7 +308,10 @@ pub fn parse_comments(text: &str) -> Result<Vec<Comment>, String> {
             let s = |p: &str| c.pointer(p).and_then(|x| x.as_str()).unwrap_or("");
             let Some(id) = c.get("id").and_then(|x| x.as_u64()) else { continue };
             let author = if s("/user/login").is_empty() { s("/author/username") } else { s("/user/login") };
-            out.push(Comment { id, author: author.to_string(), body: s("/body").to_string(), updated: stamp(s("/updated_at")) });
+            // GitHub says with every comment how its author relates to the repository.
+            let trusted = matches!(s("/author_association"), "OWNER" | "MEMBER" | "COLLABORATOR");
+            let author_id = c.pointer("/author/id").and_then(|x| x.as_u64()).unwrap_or(0);
+            out.push(Comment { id, author: author.to_string(), body: s("/body").to_string(), updated: stamp(s("/updated_at")), trusted, author_id });
         }
     }
     Ok(out)
@@ -266,7 +321,25 @@ pub async fn comments(r: &RepoCfg, t: &Target) -> Result<Vec<Comment>, String> {
     let path = list_path(r, t).ok_or("this forge has no editable comments there")?;
     let path = format!("{}?per_page=100", path);
     let out = issues::sh(tool(r), &["api", "--paginate", &path], dir(r)).await?;
-    parse_comments(&out)
+    let mut all = parse_comments(&out)?;
+    if r.provider == Provider::Gitlab {
+        // GitLab does not say it with the note, so ask about each account that wrote a marker.
+        // Developer (30) and above can push and label. An answer that cannot be had is a no.
+        let mut known: std::collections::HashMap<u64, bool> = Default::default();
+        for c in all.iter_mut().filter(|c| c.author_id > 0 && parse(&c.body).is_some()) {
+            let ok = match known.get(&c.author_id) {
+                Some(k) => *k,
+                None => {
+                    let res = issues::sh("glab", &["api", &format!("{}/members/all/{}", gitlab_project(r), c.author_id)], dir(r)).await;
+                    let level = res.ok().and_then(|o| serde_json::from_str::<Value>(&o).ok()).and_then(|v| v.get("access_level").and_then(|l| l.as_u64())).unwrap_or(0);
+                    known.insert(c.author_id, level >= 30);
+                    level >= 30
+                }
+            };
+            c.trusted = ok;
+        }
+    }
+    Ok(all)
 }
 
 /// Read the comments, trying a few times: what is decided from them should not hinge on one failed request.
@@ -362,24 +435,33 @@ pub struct Held {
 }
 
 impl Held {
-    pub fn id(&self) -> String {
-        self.marker.lock().unwrap().id.clone()
-    }
-
     /// Change the marker and write the comment, unless the final state is already written.
     async fn write(&self, last: bool, f: impl FnOnce(&mut Marker)) -> Result<(), String> {
         let mut closed = self.closed.lock().await;
         if *closed {
             return Ok(());
         }
-        *closed = last;
         let text = {
             let mut m = self.marker.lock().unwrap();
             f(&mut m);
             m.beat = now();
             render(&m, self.what)
         };
-        edit(&self.repo, &self.target, self.comment, &text).await
+        // The last word matters most: a comment left saying "active" blocks teammates until it
+        // goes stale. Try it a few times, and count the claim as closed only once the forge has it.
+        let waits: &[u64] = if last { &[0, 2, 6, 15] } else { &[0] };
+        let mut res = Ok(());
+        for w in waits {
+            tokio::time::sleep(Duration::from_secs(*w)).await;
+            res = edit(&self.repo, &self.target, self.comment, &text).await;
+            if res.is_ok() {
+                break;
+            }
+        }
+        if last && res.is_ok() {
+            *closed = true;
+        }
+        res
     }
 }
 
@@ -401,7 +483,10 @@ pub async fn claim(hub: &Hub, r: &RepoCfg, target: Target, what: &'static str) -
     let seen = read_claims(&comments_surely(r, &target).await.map_err(|e| format!("team: {}", e))?);
     let t = now();
     let stale = (hub.cfg.team.stale_mins * 60) as i64;
-    let mut ends = Vec::new();
+    // Claims that went quiet are ended by name, so that a machine waking up later finds its claim
+    // gone instead of finding itself the oldest claimant again.
+    let gone = ended(&seen);
+    let mut ends: Vec<String> = seen.iter().filter(|s| s.m.state == "active" && !gone.contains(&s.m.id) && t - s.beat > stale).map(|s| s.m.id.clone()).collect();
     for s in live(&seen, t, stale) {
         // A claim this account left on this machine belongs to a run that has gone, unless that process is still there.
         // Without a machine name there is no telling this machine's claims from the account's other machines'.
@@ -421,15 +506,15 @@ pub async fn claim(hub: &Hub, r: &RepoCfg, target: Target, what: &'static str) -
 pub async fn confirm(hub: &Hub, held: &Arc<Held>) -> Result<Option<String>, String> {
     let seen = read_claims(&comments_surely(&held.repo, &held.target).await.map_err(|e| format!("team: {}", e))?);
     let t = now();
-    let all = live(&seen, t, (hub.cfg.team.stale_mins * 60) as i64);
-    match all.first() {
-        Some(first) if first.comment != held.comment => {
-            let why = describe(first, t);
+    let stale = (hub.cfg.team.stale_mins * 60) as i64;
+    match standing(&seen, held.comment, t, stale) {
+        Standing::Owned => Ok(None),
+        Standing::Lost(who) => {
+            let why = live(&seen, t, stale).first().map(|f| describe(f, t)).unwrap_or_else(|| format!("{} is already on it", who));
             let _ = held.write(true, |m| m.state = "yielded".into()).await;
             Ok(Some(why))
         }
-        Some(_) => Ok(None),
-        None => Err("team: the claim comment is not there any more".into()),
+        other => Err(format!("team: {}", other.words())),
     }
 }
 
@@ -488,11 +573,20 @@ pub fn attach(hub: &Hub, id: u32, held: Arc<Held>) {
             if cur == shown && !due {
                 continue;
             }
-            if due {
-                // A teammate may have taken this over. Stop quietly: the item is theirs now.
-                if let Ok(Some(who)) = lost(&held).await {
+            // Never refresh a claim that is no longer the winning one: that would take the item
+            // back from whoever has it now. Stop quietly instead; it is theirs.
+            match check(&hub, &held).await {
+                Standing::Owned => {}
+                Standing::Unavailable(e) => {
+                    if !complained {
+                        complained = true;
+                        hub.log("team", format!("#{} claim not refreshed: {}", id, e));
+                    }
+                    continue;
+                }
+                gone => {
                     hub.job(id, |j| j.released = true);
-                    hub.log("team", format!("#{} stopped: {} handed it back to the queue", id, who));
+                    hub.log("team", format!("#{} stopped: {}", id, gone.words()));
                     hub.cancel(id);
                     return;
                 }
@@ -512,26 +606,41 @@ pub fn attach(hub: &Hub, id: u32, held: Arc<Held>) {
     });
 }
 
-/// Who ended our claim, if anyone did.
-async fn lost(held: &Arc<Held>) -> Result<Option<String>, String> {
-    let seen = read_claims(&comments_surely(&held.repo, &held.target).await?);
-    let id = held.id();
-    if !ended(&seen).contains(&id) {
-        return Ok(None);
+/// Read the forge and say where a held claim stands.
+async fn check(hub: &Hub, held: &Arc<Held>) -> Standing {
+    match comments_surely(&held.repo, &held.target).await {
+        Ok(c) => standing(&read_claims(&c), held.comment, now(), (hub.cfg.team.stale_mins * 60) as i64),
+        Err(e) => Standing::Unavailable(e),
     }
-    Ok(Some(seen.iter().rev().find(|s| s.m.ends.contains(&id)).map(|s| s.m.by.clone()).unwrap_or_else(|| "someone".into())))
 }
 
-/// Before anything is pushed or posted: is the item still ours? Fails closed when that cannot be read.
-pub async fn still_ours(hub: &Hub, id: u32) -> Result<(), String> {
+/// Before anything is written to the item (a push, a comment, a label): is it still ours?
+/// A job without a claim (sharing off, typed tasks) always may. Anything short of holding the
+/// winning claim right now is a no, including not being able to read the forge.
+pub async fn guard(hub: &Hub, id: u32) -> Result<(), String> {
     let Some(held) = hub.job(id, |j| j.claim.clone()).flatten() else { return Ok(()) };
-    match lost(&held).await {
-        Ok(None) => Ok(()),
-        Ok(Some(who)) => {
+    if held.what == "deployment" {
+        // Announced, not claimed: the deploy stage's own state decides who deploys.
+        return Ok(());
+    }
+    match check(hub, &held).await {
+        Standing::Owned => Ok(()),
+        Standing::Unavailable(e) => Err(format!("team: could not confirm the claim is still ours, so nothing was written: {}", e)),
+        gone => {
             hub.job(id, |j| j.released = true);
-            Err(format!("{} handed this back to the queue while it was running; nothing was published", who))
+            Err(format!("{}; nothing more was written to it", gone.words()))
         }
-        Err(e) => Err(format!("team: could not confirm the claim is still ours, so nothing was published: {}", e)),
+    }
+}
+
+/// As `guard`, for the paths that only report: say why in the log and tell the caller to stay quiet.
+pub async fn may_report(hub: &Hub, id: u32) -> bool {
+    match guard(hub, id).await {
+        Ok(()) => true,
+        Err(e) => {
+            hub.log("team", format!("#{} not reported on the forge: {}", id, e));
+            false
+        }
     }
 }
 
@@ -895,12 +1004,37 @@ pub fn parse_ref(s: &str) -> Option<(String, bool, u64)> {
 
 /// Hand a claimed item back to the queue so that someone (or this machine) can pick it up.
 /// A claim that is still being updated is only ended with `force`.
-pub async fn release(hub: &Hub, what: &str, force: bool) -> Result<String, String> {
+async fn labels(r: &RepoCfg, pr: bool, n: u64) -> Result<Vec<String>, String> {
+    let num = n.to_string();
+    let out = match (r.provider, pr) {
+        (Provider::Github, false) => issues::sh("gh", &["issue", "view", &num, "-R", &r.repo, "--json", "labels"], None).await?,
+        (Provider::Github, true) => issues::sh("gh", &["pr", "view", &num, "-R", &r.repo, "--json", "labels"], None).await?,
+        (Provider::Gitlab, false) => issues::sh("glab", &["issue", "view", &num, "-R", &r.repo, "--output", "json"], dir(r)).await?,
+        (Provider::Gitlab, true) => issues::sh("glab", &["mr", "view", &num, "-R", &r.repo, "--output", "json"], dir(r)).await?,
+    };
+    parse_labels(&out)
+}
+
+/// Label names from `gh ... --json labels` (objects with a name) or `glab ... --output json` (plain strings).
+pub fn parse_labels(json: &str) -> Result<Vec<String>, String> {
+    let v: Value = serde_json::from_str(json).map_err(|e| format!("the item is not JSON: {}", e))?;
+    let arr = v.get("labels").and_then(|l| l.as_array()).ok_or("the item lists no labels")?;
+    Ok(arr.iter().filter_map(|l| l.as_str().or_else(|| l.get("name").and_then(|n| n.as_str())).map(String::from)).collect())
+}
+
+pub async fn release(hub: &Hub, what: &str, force: bool, unclaimed: bool) -> Result<String, String> {
     let (repo, pr, n) = parse_ref(what).ok_or("name the item as owner/repo#12 (an issue) or owner/repo!5 (a pull request)")?;
     let r = hub.cfg.repos.iter().find(|r| r.repo.eq_ignore_ascii_case(&repo)).ok_or_else(|| format!("{} is not one of the configured [[repos]]", repo))?;
     let target = if pr { Target::Pr(n) } else { Target::Issue(n) };
     let by = me(hub, r.provider).await?;
-    let seen = read_claims(&comments(r, &target).await?);
+    let all = comments(r, &target).await?;
+    // Our own word has to count with the others, or the release would be ignored by everyone.
+    if let Some(c) = all.iter().rev().find(|c| c.author.eq_ignore_ascii_case(&by)) {
+        if !c.trusted {
+            return Err(format!("{} does not have write access to {}, so teammates' forkdecks would ignore the release", by, r.repo));
+        }
+    }
+    let seen = read_claims(&all);
     let t = now();
     let stale = (hub.cfg.team.stale_mins * 60) as i64;
     let gone = ended(&seen);
@@ -909,6 +1043,16 @@ pub async fn release(hub: &Hub, what: &str, force: bool) -> Result<String, Strin
         if !force {
             return Err(format!("{}. That is recent, so it was left alone; --force ends it anyway and stops their job", describe(s, t)));
         }
+    }
+    // Only an item that is marked as being worked on can be handed back. Without this, releasing
+    // something already finished would put its request label back and start the work again.
+    let (from, to) = if pr { (&r.pr_working_label, &r.pr_label) } else { (&r.working_label, &r.label) };
+    let labels = labels(r, pr, n).await?;
+    if !labels.iter().any(|l| l == from) {
+        return Err(format!("{}{}{} does not carry the label {:?}, so there is nothing to hand back", r.repo, if pr { "!" } else { "#" }, n, from));
+    }
+    if open.is_empty() && !unclaimed {
+        return Err(format!("no forkdeck claim is open on it. If it was claimed by hand or by a forkdeck with sharing off, --unclaimed moves the label back to {:?} anyway", to));
     }
     if let Some(s) = open.iter().find(|s| !pr && !s.m.pr.is_empty()) {
         return Err(format!("{}'s forkdeck has already opened {} for this issue. Close or take over that pull request; there is nothing to hand back", s.m.by, s.m.pr));
@@ -921,7 +1065,6 @@ pub async fn release(hub: &Hub, what: &str, force: bool) -> Result<String, Strin
         let names: Vec<String> = open.iter().map(|s| s.m.by.clone()).collect();
         format!("ended the claim of {}", names.join(", "))
     };
-    let (from, to) = if pr { (&r.pr_working_label, &r.pr_label) } else { (&r.working_label, &r.label) };
     issues::relabel(r, pr, n, from, to).await?;
     Ok(format!("{}{}{}: {}, label back to {}", r.repo, if pr { "!" } else { "#" }, n, said, to))
 }
@@ -935,7 +1078,7 @@ mod tests {
     }
 
     fn c(id: u64, author: &str, m: &Marker, updated: i64) -> Comment {
-        Comment { id, author: author.into(), body: render(m, "issue"), updated }
+        Comment { id, author: author.into(), body: render(m, "issue"), updated, trusted: true, author_id: 0 }
     }
 
     #[test]
@@ -954,10 +1097,13 @@ mod tests {
     #[test]
     fn only_a_comment_that_starts_with_a_marker_by_its_own_author_counts() {
         let m = marker("a1", "alice", "active");
-        let quoted = Comment { id: 1, author: "bob".into(), body: format!("> {}", render(&m, "issue")), updated: 1000 };
+        let quoted = Comment { id: 1, author: "bob".into(), body: format!("> {}", render(&m, "issue")), updated: 1000, trusted: true, author_id: 0 };
         let forged = c(2, "mallory", &m, 1000);
         let real = c(3, "Alice", &m, 1000);
-        let seen = read_claims(&[quoted, forged, real]);
+        // Her own name on it, but the forge does not say she works on the repository.
+        let mut passer_by = c(4, "eve", &marker("e1", "eve", "active"), 1000);
+        passer_by.trusted = false;
+        let seen = read_claims(&[quoted, forged, real, passer_by]);
         assert_eq!(seen.iter().map(|s| s.comment).collect::<Vec<_>>(), vec![3]);
         assert!(parse("<!-- forkdeck:claim {\"v\":2,\"id\":\"x\",\"by\":\"a\"} -->").is_none(), "an unknown version is not guessed at");
         assert!(parse("<!-- forkdeck:claim not json -->").is_none());
@@ -990,24 +1136,21 @@ mod tests {
     }
 
     #[test]
-    fn a_release_ends_anyones_claim_but_a_new_claim_only_replaces_its_authors_own() {
+    fn a_later_marker_from_someone_with_write_access_ends_a_claim_and_nobody_elses_does() {
         let a = marker("a", "alice", "active");
-        let mut steal = marker("m", "mallory", "active");
-        steal.ends = vec!["a".into()];
-        let seen = read_claims(&[c(1, "alice", &a, 1000), c(2, "mallory", &steal, 1000)]);
-        assert!(ended(&seen).is_empty(), "a claim cannot end somebody else's");
-        assert_eq!(live(&seen, 1001, 600)[0].m.by, "alice");
-
         let mut rel = marker("r", "bob", "released");
         rel.ends = vec!["a".into()];
         let seen = read_claims(&[c(1, "alice", &a, 1000), c(2, "bob", &rel, 1000)]);
         assert!(ended(&seen).contains("a"));
         assert!(live(&seen, 1001, 600).is_empty());
+        assert_eq!(standing(&seen, 1, 1001, 600), Standing::Lost("bob".into()));
 
-        let mut again = marker("a2", "alice", "active");
-        again.ends = vec!["a".into()];
-        let seen = read_claims(&[c(1, "alice", &a, 1000), c(2, "alice", &again, 1000)]);
-        assert_eq!(live(&seen, 1001, 600).iter().map(|s| s.m.id.as_str()).collect::<Vec<_>>(), vec!["a2"]);
+        // The same comment from an account without write access is not a marker at all.
+        let mut outside = c(2, "bob", &rel, 1000);
+        outside.trusted = false;
+        let seen = read_claims(&[c(1, "alice", &a, 1000), outside]);
+        assert!(ended(&seen).is_empty());
+        assert_eq!(standing(&seen, 1, 1001, 600), Standing::Owned);
 
         // A release written before the claim it names does nothing to it.
         let seen = read_claims(&[c(5, "alice", &a, 1000), c(2, "bob", &rel, 1000)]);
@@ -1015,12 +1158,49 @@ mod tests {
     }
 
     #[test]
+    fn only_the_winning_claim_within_its_lease_is_owned() {
+        let a = marker("a", "alice", "active");
+        let b = marker("b", "bob", "active");
+        let both = read_claims(&[c(1, "alice", &a, 1000), c(2, "bob", &b, 1000)]);
+        assert_eq!(standing(&both, 1, 1100, 600), Standing::Owned);
+        assert_eq!(standing(&both, 2, 1100, 600), Standing::Lost("alice".into()));
+        assert_eq!(standing(&both, 3, 1100, 600), Standing::Missing);
+
+        // Alice's machine slept past the limit. Nobody took over: expired, not owned.
+        let alone = read_claims(&[c(1, "alice", &a, 1000)]);
+        assert_eq!(standing(&alone, 1, 5000, 600), Standing::Expired);
+        // Bob took over meanwhile without naming her claim: his is the only live one.
+        let taken = read_claims(&[c(1, "alice", &a, 1000), c(2, "bob", &b, 4900)]);
+        assert_eq!(standing(&taken, 1, 5000, 600), Standing::Lost("bob".into()));
+        // Bob's claim names hers, as forkdeck's does. Even if her comment is refreshed afterwards
+        // she does not become the oldest claimant again.
+        let mut over = marker("b", "bob", "active");
+        over.ends = vec!["a".into()];
+        let woke = read_claims(&[c(1, "alice", &a, 4990), c(2, "bob", &over, 4900)]);
+        assert_eq!(standing(&woke, 1, 5000, 600), Standing::Lost("bob".into()));
+        assert_eq!(standing(&woke, 2, 5000, 600), Standing::Owned);
+        // A claim that says it is finished owns nothing.
+        let done = read_claims(&[c(1, "alice", &marker("a", "alice", "done"), 1000)]);
+        assert_eq!(standing(&done, 1, 1001, 600), Standing::Missing);
+    }
+
+    #[test]
+    fn reads_labels_from_both_clis() {
+        assert_eq!(parse_labels(r#"{"labels":[{"name":"agent:working"},{"name":"bug"}]}"#).unwrap(), vec!["agent:working", "bug"]);
+        assert_eq!(parse_labels(r#"{"iid":3,"labels":["agent:working"]}"#).unwrap(), vec!["agent:working"]);
+        assert!(parse_labels("{}").is_err() && parse_labels("nope").is_err());
+    }
+
+    #[test]
     fn reads_paged_comment_lists_from_both_forges() {
-        let gh = r#"[{"id":1,"body":"hi","user":{"login":"alice"},"updated_at":"2026-01-01T00:00:10Z"}][{"id":2,"body":"x","user":{"login":"bob"},"updated_at":"bad"}]"#;
+        let gh = r#"[{"id":1,"body":"hi","user":{"login":"alice"},"author_association":"MEMBER","updated_at":"2026-01-01T00:00:10Z"}][{"id":2,"body":"x","user":{"login":"bob"},"author_association":"CONTRIBUTOR","updated_at":"bad"}]"#;
         let v = parse_comments(gh).unwrap();
         assert_eq!((v.len(), v[0].author.as_str(), v[0].updated, v[1].updated), (2, "alice", 1_767_225_610, 0));
+        assert!(v[0].trusted && !v[1].trusted, "having contributed before is not write access");
         let gl = r#"[{"id":7,"body":"n","author":{"username":"carol"},"updated_at":"2026-01-01T00:00:10.000+00:00"}]"#;
-        assert_eq!(parse_comments(gl).unwrap()[0].author, "carol");
+        let gl = gl.replace(r#"{"username":"carol"}"#, r#"{"username":"carol","id":42}"#);
+        let v = parse_comments(&gl).unwrap();
+        assert_eq!((v[0].author.as_str(), v[0].author_id, v[0].trusted), ("carol", 42, false), "GitLab notes are vouched for by a membership lookup");
         assert!(parse_comments("<html>").is_err());
         assert!(parse_comments("").unwrap().is_empty());
     }

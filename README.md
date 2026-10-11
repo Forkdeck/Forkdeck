@@ -434,9 +434,21 @@ for scripts. Looking never changes anything, and works with sharing off.
 holds is left alone: no label moves, no comment, and the job ends as "not
 started". If two machines take the same issue in the same second, both see
 both claims when they look again after moving the label, and the older
-comment wins on both. A claim only counts if the comment's author is the
-account it names, so typing a marker into a comment cannot block anyone else's
-work under another name. If the claims cannot be read, nothing is taken.
+comment wins on both. If the claims cannot be read, nothing is taken.
+
+**Who can claim and release.** The comments are read back from threads anyone
+may write in, so a claim or a release only counts when the forge itself says
+its author works on the repository: on GitHub the comment's author is the
+owner, an organisation member or a collaborator; on GitLab a project member
+with the Developer role or above. The comment also has to be written by the
+account it names. Someone who can only comment cannot hold an issue or end a
+teammate's claim by typing a marker.
+
+**A claim is a lease.** Holding the item means holding the oldest claim that
+is still being refreshed, and forkdeck checks exactly that before everything
+it writes: the push, the pull request, the review, labels, and failure
+reports. A job that finds its claim ended, overtaken, expired or unreadable
+writes nothing more to the item and leaves its labels to whoever holds it now.
 
 **When a machine goes away.** A running job refreshes its comment every
 `heartbeat_secs`. A claim that has not been refreshed for `stale_mins` (the
@@ -451,15 +463,26 @@ forkdeck team release acme/payments!57      # a review
 
 That ends the claim with a comment and puts the request label back, and the
 next poll, yours or a teammate's, picks it up. A claim that is still being
-refreshed needs `--force`. The machine that held it notices at its next
-heartbeat, and in any case before it pushes or posts anything, and stops
-without touching the labels. An issue whose pull request is already open is
-not handed back; close or take over the pull request instead.
+refreshed needs `--force`. The machine that held it notices the next time it
+is about to write anything, and stops without touching the labels.
+
+Only an item that carries the working label is handed back, so releasing
+something already finished does not queue it again. An item with that label
+and no forkdeck claim (claimed by hand, or by a forkdeck with sharing off)
+needs `--unclaimed`. An issue whose pull request is already open is not
+handed back; close or take over the pull request instead.
+
+A machine that was suspended, or cut off from the forge, for longer than
+`stale_mins` comes back to an expired claim. It stops there rather than
+publishing work someone else may have redone; hand the issue back and let it
+run again.
 
 Every machine that works a repository should have `[team]` enabled: a forkdeck
 with sharing off neither announces what it takes nor looks at what others
 have. Staleness compares the forge's time with this machine's clock, so a
-clock that is far ahead makes teammates look stale. Deployments are announced
+clock that is far ahead makes teammates look stale. On GitHub, "organisation
+member" is what the forge reports for the comment; a member the organisation
+has given no write access to the repository still counts. Deployments are announced
 but not arbitrated: two machines with a deploy stage for the same environment
 will both deploy, so give that stage to one of them.
 

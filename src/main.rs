@@ -92,6 +92,9 @@ enum TeamCmd {
         /// End a claim that is still being updated, and stop the job behind it
         #[arg(long)]
         force: bool,
+        /// Move the label back although no forkdeck claim is on the item (claimed by hand, or with sharing off)
+        #[arg(long)]
+        unclaimed: bool,
     },
 }
 
@@ -381,8 +384,8 @@ async fn mcp_cmd(hub: &Hub, cmd: McpCmd) -> i32 {
 }
 
 async fn team_cmd(hub: &Hub, all: bool, json: bool, cmd: Option<TeamCmd>) -> i32 {
-    if let Some(TeamCmd::Release { item, force }) = cmd {
-        return match team::release(hub, &item, force).await {
+    if let Some(TeamCmd::Release { item, force, unclaimed }) = cmd {
+        return match team::release(hub, &item, force, unclaimed).await {
             Ok(said) => {
                 say!("{}", said);
                 0

@@ -617,7 +617,7 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
     let d = Some(dir.as_path());
     let msg = commit_message(&title, n);
     // Last look before anything leaves this machine: a teammate may have taken the issue over.
-    team::still_ours(hub, id).await?;
+    team::guard(hub, id).await?;
     if !commit_snapshot(&tree_of(hub, id)?, &msg).await? {
         return Err("the agent finished without changing any file".into());
     }
@@ -687,7 +687,7 @@ pub async fn push_followup(hub: &Hub, id: u32, round: u32, summary: &str) -> Res
     let t = tree_of(hub, id)?;
     let d = Some(t.dir.as_path());
     let msg = format!("Fix CI failure (#{})", n);
-    team::still_ours(hub, id).await?;
+    team::guard(hub, id).await?;
     if !commit_snapshot(&t, &msg).await? {
         return Err("the agent changed nothing".into());
     }
@@ -721,6 +721,9 @@ pub async fn ci_failed(hub: &Hub, id: u32, why: &str) {
         return;
     }
     let Some((r, n, _)) = issue_of(hub, id) else { return };
+    if !team::may_report(hub, id).await {
+        return;
+    }
     let text = quiet(&clip(&format!("forkdeck stopped here: {}", why), 4000));
     if let Some(num) = hub.job(id, |j| j.pr_url.clone()).flatten().as_deref().and_then(pr_number) {
         if let Err(e) = comment(&r, true, num, &text).await {
@@ -815,6 +818,7 @@ pub async fn pr_stale(hub: &Hub, id: u32, reviewed: &str, head: &str, next: &str
         &head[..head.len().min(12)],
         next
     );
+    team::guard(hub, id).await?;
     comment(&r, true, n, &text).await?;
     relabel(&r, true, n, &r.pr_working_label, &r.pr_label).await
 }
@@ -824,6 +828,16 @@ pub async fn pr_withdraw(hub: &Hub, id: u32, reviewed: &str, head: &str, next: &
     let (r, n, _, _) = pr_of(hub, id).ok_or("not a pull request job")?;
     if hub.cfg.demo {
         return Ok(());
+    }
+    if let Err(e) = team::guard(hub, id).await {
+        // The review is a teammate's now. The pass label this job just set must still not stay on a
+        // head nobody reviewed; take that off and leave the rest to them.
+        let num = n.to_string();
+        match r.provider {
+            Provider::Github => sh("gh", &["pr", "edit", &num, "-R", &r.repo, "--remove-label", &r.pr_pass_label], None).await?,
+            Provider::Gitlab => sh("glab", &["mr", "update", &num, "-R", &r.repo, "--unlabel", &r.pr_pass_label], None).await?,
+        };
+        return Err(e);
     }
     // Label first: that is the part something else may be acting on.
     let moved = relabel(&r, true, n, &r.pr_pass_label, &r.pr_label).await;
@@ -905,7 +919,7 @@ pub async fn pr_post(hub: &Hub, id: u32, rep: &Report<'_>) -> Result<(), String>
         tokio::time::sleep(Duration::from_millis(500)).await;
         return Ok(());
     }
-    team::still_ours(hub, id).await?;
+    team::guard(hub, id).await?;
     comment(&r, true, n, &review_comment(rep, &r.checks)).await?;
     // An incomplete review goes back to the request label; the job stays remembered, so it is not retried in a loop.
     let to = match rep.overall {
@@ -926,6 +940,10 @@ pub async fn report_failure(hub: &Hub, id: u32, why: &str) {
     }
     // Nothing was claimed if the label swap in prepare never happened.
     if !hub.job(id, |j| j.branch.is_some()).unwrap_or(false) {
+        return;
+    }
+    // A teammate may hold the item by now: its labels and its thread are theirs.
+    if !team::may_report(hub, id).await {
         return;
     }
     if let Some((r, n, _)) = issue_of(hub, id) {
