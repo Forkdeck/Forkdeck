@@ -219,6 +219,12 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
             _ = tokio::time::sleep(limit) => RunOut { ok: false, text: String::new(), error: format!("timed out after {} min", limit.as_secs() / 60) },
         }
     };
+    // What this run used goes on the job's account, whichever box it was shown in.
+    hub.job(job, |j| {
+        let s = if slot == Slot::Worker { &j.worker } else { &j.reviewer };
+        let add = crate::journal::Usage { runs: 1, tokens_in: s.tokens_in, tokens_out: s.tokens_out, cost: s.cost };
+        j.used[crate::journal::slot(kind)].add(&add);
+    });
     stage(&mut |s| {
         s.elapsed = Some(start.elapsed());
         s.state = if out.ok { StageState::Ok } else { StageState::Failed };

@@ -259,6 +259,12 @@ pub struct Job {
     pub released: bool,
     /// A teammate whose forkdeck announced the same deployment before this one did.
     pub peer: Option<String>,
+    /// What each CLI was used for in this job so far: claude, then codex.
+    pub used: [crate::journal::Usage; 2],
+    /// What checks and reviewers objected to, for the repository's notes.
+    pub findings: Vec<String>,
+    /// Stopped by `limits.job_mins`.
+    pub over_time: bool,
 }
 
 pub struct LogLine {
@@ -284,6 +290,8 @@ pub struct RepoStatus {
     pub last_poll: Option<Instant>,
     pub last_error: Option<String>,
     pub picked: u32,
+    /// Why nothing is being picked up from this repository right now, if a limit says so.
+    pub hold: Option<String>,
 }
 
 /// (repo index, is a pull request, number)
@@ -323,6 +331,8 @@ pub struct State {
     pub have_codex: bool,
     pub next_id: u32,
     pub team: TeamView,
+    /// Used in the last 24 hours, as of the last poll.
+    pub spent: crate::journal::Spent,
 }
 
 /// What teammates are working on, as last read from the forge.

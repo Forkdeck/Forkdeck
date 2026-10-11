@@ -82,6 +82,27 @@ draft = true
 publish_on_failed_review = false
 # worktree_root = "~/.cache/forkdeck/worktrees"
 
+# How much forkdeck may pick up by itself. Counted over the last 24 hours from its
+# journal (~/.local/state/forkdeck/journal.jsonl), so a restart resets nothing.
+# 0 switches a limit off. What a limit holds back stays labelled and untouched.
+[limits]
+jobs_per_day = 0           # issues and reviews picked up, all repositories together
+tokens_per_day = 0         # tokens in and out, both CLIs, typed tasks included
+job_mins = 0               # one issue or review may run this long, then goes to a person
+pause_after_failures = 5   # this many failed in a row on a repository: stop picking up from it
+pause_mins = 60            # ...for this long
+
+# Notes about each repository, given to the worker with every issue. They live in
+# ~/.local/state/forkdeck/notes/, outside the repository. `forkdeck notes` shows them.
+[knowledge]
+enabled = true
+# After work was sent back or a review asked for changes, have a CLI distil up to
+# three general rules from the findings and add them to the notes. Off by default:
+# what is learned is read by every later job, so look at the notes now and then.
+learn = false
+max_learned = 30           # learned rules kept per repository; the oldest make room
+max_chars = 6000           # how much of the notes goes into a prompt
+
 # Sharing with teammates who run forkdeck on the same repositories. The shared
 # state is comments on GitHub or GitLab; only metadata goes into them (who, which
 # machine, agent, stage, times, the pull request link). Typed tasks are never shared.
@@ -103,6 +124,7 @@ deploys = true         # announce deployments on the commit (GitHub only)
 #~ base = "main"
 #~ label = "agent:ready"
 #~ working_label = "agent:working"
+#~ jobs_per_day = 0        # limit for this repository alone; 0 leaves it to [limits]
 #~ done_label = "agent:pr-open"
 #~ failed_label = "agent:needs-human"
 #~ # Only these accounts' issues and pull requests are picked up. Set this on public repositories.

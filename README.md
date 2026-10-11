@@ -511,6 +511,109 @@ Two machines that ask in the same second can still both trigger, so the
 `trigger` tool should be safe to call twice for the same commit, or the deploy
 stage should live on one machine.
 
+## Limits
+
+forkdeck picks work up by itself, so it has brakes. All of them count over the
+last 24 hours from the journal (next section), which means restarting forkdeck
+resets nothing.
+
+```toml
+[limits]
+jobs_per_day = 20          # issues and reviews picked up, all repositories together
+tokens_per_day = 5000000   # in and out, both CLIs, typed tasks included
+job_mins = 90              # one issue or review may run this long
+pause_after_failures = 5   # default
+pause_mins = 60            # default
+```
+
+- **`jobs_per_day`** and a repository's own `jobs_per_day` cap how many issues
+  and reviews are picked up. Deployments and typed tasks are not counted: one
+  follows from a merge and the other from you.
+- **`tokens_per_day`** counts everything both CLIs report having used. When it
+  is reached nothing more is picked up; a job already running finishes.
+- **`job_mins`** stops an issue or review that runs too long, kills its agent,
+  and hands the item to a person with the failure label. Deployments are
+  exempt; they have their own timeouts and stopping one halfway is worse.
+- **`pause_after_failures`** is on by default: after five issues or reviews in
+  a row fail on a repository, nothing more is picked up from it for an hour.
+  Then one is tried; if that fails too, the pause starts again. Cancelled jobs
+  count neither way.
+
+What a limit holds back is not touched at all: the label stays, nothing is
+claimed or commented, and it is picked up on the first poll with room again.
+The queue panel shows what has been used and why a repository is on hold, the
+session log says so once when it starts and once when it ends, and
+`forkdeck doctor` prints the limits in force. Only the failure pause is set out
+of the box; the other three are yours to choose.
+
+## The journal, and `forkdeck stats`
+
+Every finished job is one line in `~/.local/state/forkdeck/journal.jsonl`: what
+it was, which CLIs ran and how often, how long it took, how many times the
+work was sent back, the verdict, tokens and cost as the CLIs reported them,
+the pull request, and the one-line outcome. No prompts and no agent output,
+and for a typed task not even the title. The file stays on your machine.
+
+```
+$ forkdeck stats --days 30
+last 30 day(s): 61 job(s)
+
+issues      34   done   27   failed    6   cancelled   1
+          82% ended with a pull request · 70% of those without being sent back · 11 fix round(s) in all
+          time to a pull request: median 6m 12s, 90% within 19m 40s
+reviews     19   done   18   failed    1   cancelled   0
+          11 passed · 7 asked for changes
+deploys      8   done    7   failed    1   cancelled   0
+          1 rolled back
+
+claude      71 run(s) · 9.8M tokens in · 412.0k out · $31.40 as reported by the CLI
+codex       48 run(s) · 6.1M tokens in · 220.5k out
+```
+
+`--jobs 20` adds the latest jobs one per line, and `--json` prints the summary
+for a dashboard or a script. The journal is also the audit trail: it is
+append-only, each line stands alone, and a damaged line is skipped without
+hiding the rest.
+
+## Notes about a repository
+
+Each job would otherwise start knowing nothing about the project beyond what
+the CLIs read for themselves. forkdeck keeps a notes file per repository and
+puts it in front of the worker with every issue:
+
+```sh
+forkdeck notes acme/payments add "Money is integer cents, never floats."
+forkdeck notes acme/payments          # show the file and where it is
+forkdeck notes                        # every repository and its file
+```
+
+The file is plain Markdown in `~/.local/state/forkdeck/notes/`, outside the
+repository, so an agent working in a worktree cannot edit it. Write in it what
+you like. The worker is told the notes are background: they do not change the
+task and cannot grant access to anything.
+
+**Learning from mistakes.** With `learn = true`, a job whose work was sent
+back by a check or a reviewer, or a review that asked for changes, ends with
+one more short run: a CLI is shown the findings and asked for at most three
+general rules that would have prevented them. Those go under
+`## Learned by forkdeck` in the notes, dated and tagged with the issue they came
+from. The next job on that repository starts with them.
+
+```toml
+[knowledge]
+learn = true
+```
+
+This is off by default, deliberately. A learned rule is read by every later
+job, and the findings it is distilled from come from work that started with
+somebody's issue text. forkdeck narrows what can get in (one line, at most 200
+characters, no links, no mentions, three per job, only the newest
+`max_learned` kept), and it never rewrites what you wrote above the heading,
+but it cannot judge whether a rule is true. Read the notes now and then and
+delete what is wrong; it is your file. A job that went well teaches nothing and
+costs no extra run. Reviewers of labelled pull requests are not given the notes
+yet.
+
 ## Before you leave it unattended
 
 Issue text is input from other people, and an agent that reads it can be
@@ -570,7 +673,8 @@ been run by two real machines against one repository. Expect to adjust
 `agents.codex` arguments for your codex version.
 
 Not there yet: feeding review comments on an open pull request back to the
-worker for another round; a record of jobs that survives a restart.
+worker for another round; resuming a job that was in flight when forkdeck
+stopped (the journal records finished jobs, it does not restart unfinished ones).
 
 ## License
 

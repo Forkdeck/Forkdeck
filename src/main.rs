@@ -3,6 +3,8 @@ mod cicd;
 mod config;
 mod demo;
 mod issues;
+mod journal;
+mod knowledge;
 mod mcp;
 mod orchestrator;
 mod proc;
@@ -71,6 +73,25 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<TeamCmd>,
     },
+    /// What forkdeck has done lately: jobs, pass rates, time to a pull request, tokens
+    Stats {
+        /// How many days back to look
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        /// Also list the latest jobs, newest first
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+        /// Print the summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show or add to the notes the worker is given for a repository
+    Notes {
+        /// owner/repo, as in the config. Without it, list the repositories and their notes files
+        repo: Option<String>,
+        #[command(subcommand)]
+        cmd: Option<NotesCmd>,
+    },
     /// Check the CLIs, the decision endpoint, the MCP servers and the configured repositories
     Doctor,
     /// Write a commented config file
@@ -81,6 +102,12 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum NotesCmd {
+    /// Add a note of your own; it is kept above what forkdeck learns and never rewritten
+    Add { text: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -177,6 +204,7 @@ fn main() -> anyhow::Result<()> {
                 pr_pass_label: "review:passed".into(),
                 pr_fail_label: "review:changes".into(),
                 pr_checks: true,
+                jobs_per_day: 0,
                 ci: None,
                 deploy: None,
             });
@@ -211,6 +239,57 @@ fn main() -> anyhow::Result<()> {
             anyhow::ensure!(hub.cfg.demo || !hub.cfg.repos.is_empty(), "no [[repos]] configured, nothing to look at");
             let code = rt.block_on(team_cmd(&hub, all, json, cmd));
             std::process::exit(code);
+        }
+        Some(Cmd::Stats { days, jobs, json }) => {
+            let days = days.clamp(1, 3650);
+            let entries = journal::read(journal::now() - days as i64 * journal::DAY, None);
+            let summary = journal::summarise(&entries, days);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                for l in journal::text(&summary) {
+                    println!("{}", l);
+                }
+                if jobs > 0 && !entries.is_empty() {
+                    println!();
+                    for l in journal::recent(&entries, jobs) {
+                        println!("{}", l);
+                    }
+                }
+            }
+            Ok(())
+        }
+        Some(Cmd::Notes { repo, cmd }) => {
+            let Some(name) = repo else {
+                anyhow::ensure!(!hub.cfg.repos.is_empty(), "no [[repos]] configured");
+                for r in &hub.cfg.repos {
+                    let p = knowledge::path(r);
+                    let n = knowledge::load(r).lines().filter(|l| l.trim_start().starts_with("- ")).count();
+                    println!("{:<30} {} note(s)   {}", r.repo, n, p.display());
+                }
+                return Ok(());
+            };
+            let r = hub.cfg.repos.iter().find(|r| r.repo.eq_ignore_ascii_case(&name)).ok_or_else(|| anyhow::anyhow!("{} is not one of the configured [[repos]]", name))?;
+            match cmd {
+                Some(NotesCmd::Add { text }) => {
+                    knowledge::add_own(r, &text.join(" ")).map_err(anyhow::Error::msg)?;
+                    println!("added to {}", knowledge::path(r).display());
+                }
+                None => {
+                    let notes = knowledge::load(r);
+                    println!("{}", knowledge::path(r).display());
+                    if notes.trim().is_empty() {
+                        println!("no notes yet. Add one with: forkdeck notes {} add \"...\", or edit the file", r.repo);
+                    } else {
+                        println!();
+                        print!("{}", notes);
+                    }
+                    if !hub.cfg.knowledge.enabled {
+                        println!("\nnote: [knowledge] enabled = false, so these are not given to the worker");
+                    }
+                }
+            }
+            Ok(())
         }
         Some(Cmd::Doctor) => {
             let ok = rt.block_on(doctor(&hub, cfg_path));
@@ -494,6 +573,20 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
     } else if !hub.cfg.repos.is_empty() {
         println!("team      off      work is not shared with teammates ([team] enabled = true)");
     }
+    if !hub.cfg.repos.is_empty() {
+        let l = &hub.cfg.limits;
+        let part = |n: u64, what: &str| if n == 0 { format!("no limit on {}", what) } else { format!("{} {}", n, what) };
+        println!(
+            "limits    {:<8} {} · {} · {} · {}",
+            if l.jobs_per_day == 0 && l.tokens_per_day == 0 { "open" } else { "set" },
+            part(l.jobs_per_day as u64, "jobs a day"),
+            part(l.tokens_per_day, "tokens a day"),
+            if l.job_mins == 0 { "no time limit per job".to_string() } else { format!("{} min per job", l.job_mins) },
+            if l.pause_after_failures == 0 { "no pause on failures".to_string() } else { format!("pause {} min after {} failures in a row", l.pause_mins, l.pause_after_failures) }
+        );
+        let k = &hub.cfg.knowledge;
+        println!("notes     {:<8} {}", if k.enabled { "on" } else { "off" }, if k.learn { "rules are learned from review and check failures" } else { "nothing is learned automatically ([knowledge] learn = true)" });
+    }
     // Every tool a stage names has to exist on its server; a typo would otherwise show up as a stuck pipeline.
     let mut offered: std::collections::HashMap<String, Vec<String>> = Default::default();
     let mut names: Vec<&String> = hub.cfg.mcp.keys().collect();
@@ -550,7 +643,7 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
 }
 
 fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
-    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false }
+    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false, jobs_per_day: hub.cfg.limits.jobs_per_day, tokens_per_day: hub.cfg.limits.tokens_per_day }
 }
 
 fn sync_selection(hub: &Hub, u: &mut ui::Ui) {
