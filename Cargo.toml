@@ -1,0 +1,25 @@
+[package]
+name = "forkdeck"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Justin Holmes"]
+repository = "https://github.com/forkdeck/forkdeck"
+readme = "README.md"
+description = "Terminal agent tree that routes work between the claude and codex CLIs, with a local Jev-compatible decision layer and GitHub/GitLab issue automation"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+
+[profile.release]
+opt-level = 2
+strip = true

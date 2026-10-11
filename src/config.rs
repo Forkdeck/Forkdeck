@@ -1,0 +1,375 @@
+use crate::state::{AgentKind, Provider, Tier};
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+
+pub const EXAMPLE: &str = include_str!("../forkdeck.example.toml");
+
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    pub router: RouterCfg,
+    pub agents: AgentsCfg,
+    pub review: ReviewCfg,
+    pub automation: AutoCfg,
+    pub repos: Vec<RepoCfg>,
+    #[serde(skip)]
+    pub demo: bool,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct RouterCfg {
+    /// "rules" or "jev"
+    pub kind: String,
+    pub default_agent: AgentKind,
+    /// Answers below this confidence are "split": the safer branch is taken.
+    pub threshold: f64,
+    pub jev: JevCfg,
+    pub rules: RulesCfg,
+}
+
+impl Default for RouterCfg {
+    fn default() -> Self {
+        RouterCfg {
+            kind: "rules".into(),
+            default_agent: AgentKind::Claude,
+            threshold: 0.6,
+            jev: JevCfg::default(),
+            rules: RulesCfg::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct JevCfg {
+    pub base_url: String,
+    pub model: String,
+    /// Name of the environment variable holding the bearer key. Empty or unset: no auth header.
+    pub api_key_env: String,
+    pub timeout_ms: u64,
+    pub claude_is_for: String,
+    pub codex_is_for: String,
+}
+
+impl Default for JevCfg {
+    fn default() -> Self {
+        JevCfg {
+            base_url: "http://127.0.0.1:8000".into(),
+            model: "jev-latest".into(),
+            api_key_env: "FORKDECK_JEV_KEY".into(),
+            timeout_ms: 4000,
+            claude_is_for: "Open-ended or ambiguous work: multi-file refactors, design changes, documentation".into(),
+            codex_is_for: "Well-specified work: a bug with a clear reproduction, a contained feature, tests, scripts".into(),
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct RulesCfg {
+    pub claude_keywords: Vec<String>,
+    pub codex_keywords: Vec<String>,
+    pub heavy_keywords: Vec<String>,
+    pub light_keywords: Vec<String>,
+}
+
+fn words(s: &str) -> Vec<String> {
+    s.split_whitespace().map(|w| w.to_string()).collect()
+}
+
+impl Default for RulesCfg {
+    fn default() -> Self {
+        RulesCfg {
+            claude_keywords: words("refactor design architecture document docs readme explain plan restructure"),
+            codex_keywords: words("bug fix test tests script failing crash regression implement endpoint"),
+            heavy_keywords: words("architecture migrate migration concurrency race security rewrite redesign deadlock distributed"),
+            light_keywords: words("typo rename comment bump format lint wording spelling"),
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentsCfg {
+    pub claude: AgentCfg,
+    pub codex: AgentCfg,
+    pub timeout_mins: Option<u64>,
+}
+
+impl AgentsCfg {
+    pub fn get(&self, k: AgentKind) -> AgentCfg {
+        let (cfg, def) = match k {
+            AgentKind::Claude => (&self.claude, AgentCfg::claude()),
+            AgentKind::Codex => (&self.codex, AgentCfg::codex()),
+        };
+        AgentCfg {
+            cmd: cfg.cmd.clone().or(def.cmd),
+            models: cfg.models.clone().or(def.models),
+            efforts: cfg.efforts.clone().or(def.efforts),
+            write_args: cfg.write_args.clone().or(def.write_args),
+            review_args: cfg.review_args.clone().or(def.review_args),
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct Tiers {
+    pub light: String,
+    pub standard: String,
+    pub heavy: String,
+}
+
+impl Tiers {
+    pub fn get(&self, t: Tier) -> &str {
+        match t {
+            Tier::Light => &self.light,
+            Tier::Standard => &self.standard,
+            Tier::Heavy => &self.heavy,
+        }
+    }
+    fn of(l: &str, s: &str, h: &str) -> Option<Tiers> {
+        Some(Tiers { light: l.into(), standard: s.into(), heavy: h.into() })
+    }
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentCfg {
+    pub cmd: Option<String>,
+    /// Model per tier. An empty string leaves the CLI's own default in place.
+    pub models: Option<Tiers>,
+    pub efforts: Option<Tiers>,
+    /// Extra arguments when the agent may edit the working tree.
+    pub write_args: Option<Vec<String>>,
+    /// Extra arguments when the agent only reviews.
+    pub review_args: Option<Vec<String>>,
+}
+
+fn strs(v: &[&str]) -> Option<Vec<String>> {
+    Some(v.iter().map(|s| s.to_string()).collect())
+}
+
+impl AgentCfg {
+    fn claude() -> AgentCfg {
+        AgentCfg {
+            cmd: Some("claude".into()),
+            models: Tiers::of("haiku", "sonnet", "opus"),
+            efforts: Tiers::of("low", "medium", "high"),
+            write_args: strs(&["--permission-mode", "acceptEdits"]),
+            review_args: strs(&["--permission-mode", "plan"]),
+        }
+    }
+    fn codex() -> AgentCfg {
+        AgentCfg {
+            cmd: Some("codex".into()),
+            models: Tiers::of("", "", ""),
+            efforts: Tiers::of("low", "medium", "high"),
+            write_args: strs(&["--sandbox", "workspace-write"]),
+            review_args: strs(&["--sandbox", "read-only"]),
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewCfg {
+    /// "auto" (router decides), "always" or "never"
+    pub mode: String,
+    /// "other" (the CLI that did not do the work) or "same"
+    pub reviewer: String,
+    pub max_fix_rounds: u32,
+    /// Shell commands run after the worker finishes a typed task. Repositories have their own list.
+    pub checks: Vec<String>,
+    pub check_timeout_mins: u64,
+    /// Which CLIs review a labelled pull request. Each one reviews independently.
+    pub pr_reviewers: Vec<AgentKind>,
+}
+
+impl Default for ReviewCfg {
+    fn default() -> Self {
+        ReviewCfg {
+            mode: "auto".into(),
+            reviewer: "other".into(),
+            max_fix_rounds: 1,
+            checks: vec![],
+            check_timeout_mins: 20,
+            pr_reviewers: vec![AgentKind::Claude, AgentKind::Codex],
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoCfg {
+    /// Start with issue polling switched on.
+    pub enabled: bool,
+    pub max_parallel: usize,
+    pub poll_secs: u64,
+    pub worktree_root: Option<PathBuf>,
+    pub draft: bool,
+    /// Open a pull request even when the review did not pass.
+    pub publish_on_failed_review: bool,
+}
+
+impl Default for AutoCfg {
+    fn default() -> Self {
+        AutoCfg {
+            enabled: false,
+            max_parallel: 2,
+            poll_secs: 60,
+            worktree_root: None,
+            draft: true,
+            publish_on_failed_review: false,
+        }
+    }
+}
+
+impl AutoCfg {
+    pub fn root(&self) -> PathBuf {
+        if let Some(p) = &self.worktree_root {
+            return expand(p);
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".cache/forkdeck/worktrees")
+    }
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct RepoCfg {
+    pub provider: Provider,
+    /// "owner/name" on GitHub, "group/project" on GitLab
+    pub repo: String,
+    /// Local clone that worktrees are created from
+    pub path: PathBuf,
+    #[serde(default = "d_base")]
+    pub base: String,
+    #[serde(default = "d_ready")]
+    pub label: String,
+    #[serde(default = "d_working")]
+    pub working_label: String,
+    #[serde(default = "d_review")]
+    pub done_label: String,
+    #[serde(default = "d_failed")]
+    pub failed_label: String,
+    /// Only pick up issues and pull requests opened by these accounts. Empty: anyone.
+    #[serde(default)]
+    pub allowed_authors: Vec<String>,
+    /// Shell commands run in the worktree before review, for example the test suite.
+    #[serde(default)]
+    pub checks: Vec<String>,
+    /// Pull requests carrying this label get reviewed by every CLI in review.pr_reviewers.
+    #[serde(default = "d_pr_ready")]
+    pub pr_label: String,
+    #[serde(default = "d_pr_running")]
+    pub pr_working_label: String,
+    #[serde(default = "d_pr_pass")]
+    pub pr_pass_label: String,
+    #[serde(default = "d_pr_fail")]
+    pub pr_fail_label: String,
+}
+
+fn d_base() -> String {
+    "main".into()
+}
+fn d_ready() -> String {
+    "agent:ready".into()
+}
+fn d_working() -> String {
+    "agent:working".into()
+}
+fn d_review() -> String {
+    "agent:pr-open".into()
+}
+fn d_pr_ready() -> String {
+    "review:ready".into()
+}
+fn d_pr_running() -> String {
+    "review:running".into()
+}
+fn d_pr_pass() -> String {
+    "review:passed".into()
+}
+fn d_pr_fail() -> String {
+    "review:changes".into()
+}
+fn d_failed() -> String {
+    "agent:needs-human".into()
+}
+
+pub fn expand(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    p.to_path_buf()
+}
+
+pub fn user_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".config/forkdeck/config.toml")
+}
+
+pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)> {
+    let candidates: Vec<PathBuf> = match explicit {
+        Some(p) => vec![p.to_path_buf()],
+        None => vec![PathBuf::from("forkdeck.toml"), user_path()],
+    };
+    for c in candidates {
+        if c.exists() {
+            let text = std::fs::read_to_string(&c)?;
+            let mut cfg: Config =
+                toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {}", c.display(), e))?;
+            for r in &mut cfg.repos {
+                r.path = expand(&r.path);
+            }
+            cfg.validate()?;
+            return Ok((cfg, Some(c)));
+        } else if explicit.is_some() {
+            anyhow::bail!("config file {} not found", c.display());
+        }
+    }
+    Ok((Config::default(), None))
+}
+
+impl Config {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !matches!(self.router.kind.as_str(), "rules" | "jev") {
+            anyhow::bail!("router.kind must be \"rules\" or \"jev\", got {:?}", self.router.kind);
+        }
+        if !matches!(self.review.mode.as_str(), "auto" | "always" | "never") {
+            anyhow::bail!("review.mode must be auto, always or never");
+        }
+        if !matches!(self.review.reviewer.as_str(), "other" | "same") {
+            anyhow::bail!("review.reviewer must be other or same");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn example_config_parses() {
+        let cfg: Config = toml::from_str(EXAMPLE).expect("example parses");
+        cfg.validate().unwrap();
+        assert_eq!(cfg.router.kind, "jev");
+        assert_eq!(cfg.repos.len(), 2);
+        assert_eq!(cfg.agents.get(AgentKind::Claude).models.unwrap().heavy, "opus");
+        assert_eq!(cfg.agents.get(AgentKind::Codex).cmd.unwrap(), "codex");
+    }
+
+    #[test]
+    fn empty_config_is_valid() {
+        let cfg: Config = toml::from_str("").unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.router.kind, "rules");
+        assert!(!cfg.automation.enabled);
+    }
+}

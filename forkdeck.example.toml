@@ -1,0 +1,96 @@
+# forkdeck configuration.
+# Looked up as ./forkdeck.toml, then ~/.config/forkdeck/config.toml.
+# Every key is optional; what you leave out keeps its default.
+
+[router]
+# "rules": keyword rules, no network.
+# "jev":   a Jev-compatible decision endpoint (POST /v1/systemone). Falls back to
+#          the rules when the endpoint does not answer.
+kind = "jev"
+default_agent = "claude"
+# Answers under this confidence count as "split" and take the cautious branch:
+# the default agent, the next effort tier up, and a review.
+threshold = 0.6
+
+[router.jev]
+# A local server such as jeff listens here by default. Any server that speaks the
+# same wire format works, including the hosted one.
+base_url = "http://127.0.0.1:8000"
+model = "jev-latest"
+# Name of the environment variable that holds the bearer key. Leave the variable
+# unset when the local server runs without auth.
+api_key_env = "FORKDECK_JEV_KEY"
+timeout_ms = 4000
+# These two descriptions are what the decision model picks between. Tune them to
+# how you actually want work divided.
+claude_is_for = "Open-ended or ambiguous work: multi-file refactors, design changes, documentation"
+codex_is_for = "Well-specified work: a bug with a clear reproduction, a contained feature, tests, scripts"
+
+[router.rules]
+claude_keywords = ["refactor", "design", "architecture", "docs", "readme", "explain", "plan"]
+codex_keywords = ["bug", "fix", "test", "tests", "script", "failing", "crash", "regression"]
+heavy_keywords = ["architecture", "migration", "concurrency", "race", "security", "rewrite"]
+light_keywords = ["typo", "rename", "comment", "bump", "format", "lint"]
+
+[agents]
+timeout_mins = 45
+
+[agents.claude]
+cmd = "claude"
+models = { light = "haiku", standard = "sonnet", heavy = "opus" }
+efforts = { light = "low", standard = "medium", heavy = "high" }
+# acceptEdits lets the agent edit files but not run shell commands unattended.
+# Loosen this only for repositories and issue authors you trust.
+write_args = ["--permission-mode", "acceptEdits"]
+review_args = ["--permission-mode", "plan"]
+
+[agents.codex]
+cmd = "codex"
+# Empty model names keep the codex CLI's own default.
+models = { light = "", standard = "", heavy = "" }
+efforts = { light = "low", standard = "medium", heavy = "high" }
+write_args = ["--sandbox", "workspace-write"]
+review_args = ["--sandbox", "read-only"]
+
+[review]
+mode = "auto"          # auto | always | never
+reviewer = "other"     # other: the CLI that did not do the work | same
+max_fix_rounds = 1
+# Commands run after the worker finishes a task typed into the prompt. A failing
+# command goes back to the worker as a fix round. Repositories list their own below.
+checks = []
+check_timeout_mins = 20
+# Every CLI listed here reviews a labelled pull request independently.
+pr_reviewers = ["claude", "codex"]
+
+[automation]
+enabled = false        # toggle at runtime with Ctrl-A
+max_parallel = 2
+poll_secs = 60
+draft = true
+publish_on_failed_review = false
+# worktree_root = "~/.cache/forkdeck/worktrees"
+
+[[repos]]
+provider = "github"    # uses the gh CLI and its login
+repo = "your-name/your-project"
+path = "~/src/your-project"
+base = "main"
+label = "agent:ready"
+working_label = "agent:working"
+done_label = "agent:pr-open"
+failed_label = "agent:needs-human"
+allowed_authors = ["your-name"]
+# Run in the issue's worktree before any review.
+checks = ["cargo test --quiet"]
+# Pull requests with this label are reviewed and commented on, never approved or merged.
+pr_label = "review:ready"
+pr_working_label = "review:running"
+pr_pass_label = "review:passed"
+pr_fail_label = "review:changes"
+
+[[repos]]
+provider = "gitlab"    # uses the glab CLI and its login
+repo = "your-group/your-project"
+path = "~/src/your-gitlab-project"
+base = "main"
