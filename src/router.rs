@@ -116,11 +116,14 @@ pub fn from_answers(cfg: &Config, v: &Value) -> Result<Decision, String> {
 
     let agent_ans = a.get("agent").ok_or("no answer for \"agent\"")?;
     let choice = agent_ans.get("choice").and_then(|c| c.as_str()).ok_or("agent answer has no choice")?;
-    let conf = agent_ans
-        .get("confidence")
-        .and_then(|c| c.as_f64())
-        .or_else(|| agent_ans.pointer(&format!("/probabilities/{}", choice)).and_then(|c| c.as_f64()))
-        .unwrap_or(0.0);
+    let conf = unit(
+        agent_ans
+            .get("confidence")
+            .and_then(|c| c.as_f64())
+            .or_else(|| agent_ans.pointer(&format!("/probabilities/{}", choice)).and_then(|c| c.as_f64()))
+            .unwrap_or(0.0),
+        "agent confidence",
+    )?;
     let picked = match choice {
         "claude" => AgentKind::Claude,
         "codex" => AgentKind::Codex,
@@ -136,7 +139,11 @@ pub fn from_answers(cfg: &Config, v: &Value) -> Result<Decision, String> {
 
     let eff = a.get("effort").ok_or("no answer for \"effort\"")?;
     let score = eff.get("score").and_then(|s| s.as_f64()).ok_or("effort answer has no score")?;
-    let econf = eff.get("confidence").and_then(|c| c.as_f64()).unwrap_or(1.0);
+    if !(0.0..=2.0).contains(&score) {
+        return Err(format!("effort score is {}, expected 0 to 2", score));
+    }
+    // A missing confidence counts as unsure, which rounds the effort up rather than down.
+    let econf = unit(eff.get("confidence").and_then(|c| c.as_f64()).unwrap_or(0.0), "effort confidence")?;
     let effort_sharp = econf >= th;
     let mut tier = match score.round() as i64 {
         i64::MIN..=0 => Tier::Light,
@@ -148,10 +155,14 @@ pub fn from_answers(cfg: &Config, v: &Value) -> Result<Decision, String> {
         note.push("effort split, one tier up".to_string());
     }
 
-    let rv = a.get("review").and_then(|r| r.get("noul")).and_then(|n| n.as_f64()).ok_or("no noul for \"review\"")?;
+    let rv = unit(
+        a.get("review").and_then(|r| r.get("noul")).and_then(|n| n.as_f64()).ok_or("no noul for \"review\"")?,
+        "review noul",
+    )?;
     // A yes/no probability is sharp when it is far from the middle.
     let review_sharp = (rv - 0.5).abs() >= (th - 0.5).max(0.05);
-    let review = rv >= 0.5 || !review_sharp || !agent_sharp;
+    // Any unsure answer buys a review.
+    let review = rv >= 0.5 || !review_sharp || !agent_sharp || !effort_sharp;
 
     Ok(Decision {
         agent,
@@ -171,6 +182,14 @@ pub fn from_answers(cfg: &Config, v: &Value) -> Result<Decision, String> {
         ms: 0,
         note: note.join("; "),
     })
+}
+
+fn unit(v: f64, what: &str) -> Result<f64, String> {
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("{} is {}, expected a value between 0 and 1", what, v))
+    }
 }
 
 fn hits(text: &str, words: &[String]) -> usize {
@@ -203,13 +222,22 @@ pub fn rules(cfg: &Config, task: &str, is_issue: bool) -> Decision {
     let heavy = hits(&text, &r.heavy_keywords);
     let light = hits(&text, &r.light_keywords);
     let long = text.split_whitespace().count() > 120;
-    let (tier, econf) = if heavy > 0 {
+    let (mut tier, econf) = if heavy > 0 {
         (Tier::Heavy, (0.6 + 0.15 * heavy as f64).min(0.95))
     } else if light > 0 && !long {
         (Tier::Light, (0.6 + 0.15 * light as f64).min(0.95))
     } else {
         (Tier::Standard, 0.65)
     };
+    let effort_sharp = econf >= th;
+    let mut note: Vec<String> = Vec::new();
+    if !agent_sharp {
+        note.push(format!("no clear match, using default {}", agent.name()));
+    }
+    if !effort_sharp {
+        tier = tier.up();
+        note.push("effort split, one tier up".into());
+    }
 
     let rv: f64 = if tier == Tier::Heavy {
         0.9
@@ -220,23 +248,21 @@ pub fn rules(cfg: &Config, task: &str, is_issue: bool) -> Decision {
     } else {
         0.6
     };
+    let review_sharp = (rv - 0.5).abs() >= 0.09;
+    // Same rule as the Jev path: any unsure answer buys a review.
+    let review = rv >= 0.5 || !review_sharp || !agent_sharp || !effort_sharp;
     Decision {
         agent,
         tier,
-        review: rv >= 0.5,
+        review,
         gates: vec![
             Gate { name: "which agent".into(), answer: agent.name().into(), value: conf, sharp: agent_sharp },
-            Gate { name: "effort".into(), answer: tier.name().into(), value: econf, sharp: econf >= th },
-            Gate {
-                name: "needs review".into(),
-                answer: if rv >= 0.5 { "yes".into() } else { "no".into() },
-                value: rv,
-                sharp: (rv - 0.5).abs() >= 0.09,
-            },
+            Gate { name: "effort".into(), answer: tier.name().into(), value: econf, sharp: effort_sharp },
+            Gate { name: "needs review".into(), answer: if review { "yes".into() } else { "no".into() }, value: rv, sharp: review_sharp },
         ],
         source: "rules".into(),
         ms: 0,
-        note: if agent_sharp { String::new() } else { format!("no clear match, using default {}", agent.name()) },
+        note: note.join("; "),
     }
 }
 
@@ -280,6 +306,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_out_of_range_and_treats_missing_confidence_as_unsure() {
+        let cfg = Config::default();
+        let v = json!({"answers": {"agent": {"choice": "codex", "confidence": 3.0},
+            "effort": {"score": 1.0, "confidence": 0.9}, "review": {"noul": 0.9}}});
+        assert!(from_answers(&cfg, &v).is_err());
+        let v = json!({"answers": {"agent": {"choice": "codex", "confidence": 0.9},
+            "effort": {"score": -3.0, "confidence": 0.9}, "review": {"noul": 0.9}}});
+        assert!(from_answers(&cfg, &v).is_err());
+        let v = json!({"answers": {"agent": {"choice": "codex", "confidence": 0.9},
+            "effort": {"score": 0.0}, "review": {"noul": 0.05}}});
+        let d = from_answers(&cfg, &v).unwrap();
+        assert_eq!(d.tier, Tier::Standard, "no effort confidence: one tier up");
+        assert!(d.review, "an unsure effort answer forces a review");
+    }
+
+    #[test]
     fn rejects_unknown_agent() {
         let cfg = Config::default();
         let v = json!({"answers": {"agent": {"choice": "gemini", "confidence": 0.9},
@@ -295,6 +337,10 @@ mod tests {
         let d = rules(&cfg, "Fix typo in heading", false);
         assert_eq!(d.tier, Tier::Light);
         assert!(!d.review);
+        // No keyword for either agent: the choice is unsure, so a review is forced.
+        let d = rules(&cfg, "rename foo", false);
+        assert_eq!(d.tier, Tier::Light);
+        assert!(d.review);
         let d = rules(&cfg, "Redesign the storage migration", true);
         assert_eq!(d.tier, Tier::Heavy);
         assert!(d.review);

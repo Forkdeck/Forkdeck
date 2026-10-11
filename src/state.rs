@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -223,6 +223,10 @@ pub struct Job {
     pub source: Source,
     pub workdir: PathBuf,
     pub branch: Option<String>,
+    /// The commit the work started from. The change under review is everything since this commit.
+    pub base_sha: Option<String>,
+    /// Tree of the agent's work as last staged. Only this tree may be committed.
+    pub staged_tree: Option<String>,
     pub status: JobStatus,
     pub forced: Option<AgentKind>,
     pub decision: Option<Decision>,
@@ -264,21 +268,115 @@ pub struct RepoStatus {
     pub picked: u32,
 }
 
+/// (repo index, is a pull request, number)
+pub type Key = (usize, bool, u64);
+
+pub struct Retry {
+    /// Retries scheduled so far, including the pending one.
+    pub attempts: u32,
+    pub not_before: Instant,
+    /// No more automatic retries; only removing and re-applying the label starts again.
+    pub exhausted: bool,
+}
+
+/// How long to wait before retry number `attempt` (1-based): the base, tripling each time.
+pub fn backoff(base_secs: u64, attempt: u32) -> Duration {
+    Duration::from_secs(base_secs.saturating_mul(3u64.saturating_pow(attempt.saturating_sub(1))).min(24 * 3600))
+}
+
 #[derive(Default)]
 pub struct State {
     pub jobs: Vec<Job>,
     pub log: VecDeque<LogLine>,
     pub router: RouterStats,
     pub repos: Vec<RepoStatus>,
-    /// (repo index, is a pull request, number)
-    pub seen: HashSet<(usize, bool, u64)>,
+    /// Items a job has been started for. An item in here is not taken again unless a retry is due.
+    pub seen: HashSet<Key>,
+    /// Items that came back without a result (review incomplete, head moved, could not run).
+    pub retry: HashMap<Key, Retry>,
     pub automation: bool,
+    /// Set once shutdown has begun: nothing new may start.
+    pub stopping: bool,
     pub have_claude: bool,
     pub have_codex: bool,
     pub next_id: u32,
 }
 
+impl Source {
+    pub fn key(&self) -> Option<Key> {
+        match self {
+            Source::Issue { repo_idx, number, .. } => Some((*repo_idx, false, *number)),
+            Source::Pr { repo_idx, number, .. } => Some((*repo_idx, true, *number)),
+            Source::Manual => None,
+        }
+    }
+}
+
 impl State {
+    fn active(&self, key: Key) -> bool {
+        self.jobs.iter().any(|j| !j.status.finished() && j.source.key() == Some(key))
+    }
+
+    /// A labelled item was listed. Should a job start for it now?
+    pub fn should_take(&mut self, key: Key, now: Instant) -> bool {
+        if self.seen.insert(key) {
+            return true;
+        }
+        if self.active(key) {
+            return false;
+        }
+        match self.retry.get(&key) {
+            Some(r) => !r.exhausted && now >= r.not_before,
+            None => false,
+        }
+    }
+
+    /// The label is gone from everything not in `listed`: forget those items, so that
+    /// putting the label back starts from scratch. This is the manual retry.
+    pub fn forget_unlisted(&mut self, repo_idx: usize, pr: bool, listed: &[u64]) {
+        let gone: Vec<Key> = self
+            .seen
+            .iter()
+            .filter(|k| k.0 == repo_idx && k.1 == pr && !listed.contains(&k.2))
+            .copied()
+            .filter(|k| !self.active(*k))
+            .collect();
+        for k in gone {
+            self.seen.remove(&k);
+            self.retry.remove(&k);
+        }
+    }
+
+    /// What a retry scheduled now would be: Some(delay), or None when the allowance is used up.
+    pub fn retry_preview(&self, key: Key, max: u32, base_secs: u64, immediate: bool) -> Option<Duration> {
+        let next = self.retry.get(&key).map(|r| r.attempts).unwrap_or(0) + 1;
+        (next <= max).then(|| if immediate { Duration::ZERO } else { backoff(base_secs, next) })
+    }
+
+    /// Record that the item needs another go. Returns the delay, or None when no retries are left.
+    pub fn schedule_retry(&mut self, key: Key, max: u32, base_secs: u64, immediate: bool, now: Instant) -> Option<Duration> {
+        let delay = self.retry_preview(key, max, base_secs, immediate);
+        let r = self.retry.entry(key).or_insert(Retry { attempts: 0, not_before: now, exhausted: false });
+        r.attempts += 1;
+        match delay {
+            Some(d) => r.not_before = now + d,
+            None => r.exhausted = true,
+        }
+        delay
+    }
+
+    /// Done with the item: a later label means a new request.
+    pub fn forget(&mut self, key: Key) {
+        self.seen.remove(&key);
+        self.retry.remove(&key);
+    }
+
+    /// Stop retrying without forgetting (a cancelled job must not come straight back).
+    pub fn give_up(&mut self, key: Key, now: Instant) {
+        let r = self.retry.entry(key).or_insert(Retry { attempts: 0, not_before: now, exhausted: true });
+        r.exhausted = true;
+    }
+
     pub fn log(&mut self, who: &str, msg: impl Into<String>) {
         let msg: String = msg.into();
         let msg = msg.replace('\n', " ");
@@ -303,5 +401,52 @@ pub fn clip(s: &str, n: usize) -> String {
         let mut out: String = s.chars().take(n - 1).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_policy_is_bounded_and_reset_by_relabelling() {
+        let mut st = State::default();
+        let k: Key = (0, true, 5);
+        let t0 = Instant::now();
+        assert!(st.should_take(k, t0), "first sighting starts a job");
+        assert!(!st.should_take(k, t0), "and only one");
+
+        // Incomplete: retry 1 after the base delay, not before.
+        assert_eq!(st.schedule_retry(k, 2, 60, false, t0), Some(Duration::from_secs(60)));
+        assert!(!st.should_take(k, t0 + Duration::from_secs(59)));
+        assert!(st.should_take(k, t0 + Duration::from_secs(60)));
+        // Retry 2 backs off further; a third is refused.
+        assert_eq!(st.schedule_retry(k, 2, 60, false, t0), Some(Duration::from_secs(180)));
+        assert_eq!(st.schedule_retry(k, 2, 60, false, t0), None);
+        assert!(!st.should_take(k, t0 + Duration::from_secs(100_000)), "no endless polling");
+
+        // Label removed (not listed any more), then applied again: a fresh start.
+        st.forget_unlisted(0, true, &[]);
+        assert!(st.should_take(k, t0));
+        // A head that moved is retried at once.
+        assert_eq!(st.schedule_retry(k, 2, 60, true, t0), Some(Duration::ZERO));
+        assert!(st.should_take(k, t0));
+        // Other repos and issues with the same number are untouched by forget_unlisted.
+        st.seen.insert((0, false, 5));
+        st.seen.insert((1, true, 5));
+        st.forget_unlisted(0, true, &[]);
+        assert!(st.seen.contains(&(0, false, 5)) && st.seen.contains(&(1, true, 5)));
+    }
+
+    #[test]
+    fn a_cancelled_item_does_not_come_back_until_relabelled() {
+        let mut st = State::default();
+        let k: Key = (0, false, 9);
+        let t0 = Instant::now();
+        assert!(st.should_take(k, t0));
+        st.give_up(k, t0);
+        assert!(!st.should_take(k, t0 + Duration::from_secs(10_000)));
+        st.forget_unlisted(0, false, &[1, 2]);
+        assert!(st.should_take(k, t0));
     }
 }

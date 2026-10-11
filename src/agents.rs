@@ -6,8 +6,8 @@ use serde_json::Value;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::Command;
+use crate::proc;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Slot {
@@ -37,9 +37,13 @@ pub enum Parsed {
     Final { ok: bool, text: String, tokens_in: u64, tokens_out: u64, cost: f64 },
     Usage { tokens_in: u64, tokens_out: u64 },
     Error(String),
+    /// Shown in the output pane but never taken as the agent's answer.
+    Note(String),
     Nothing,
 }
 
+/// The prompt is not part of the command line: it is written to the agent's stdin, so its size
+/// and its first character (a leading `-` would read as an option) do not matter.
 pub fn command_line(hub: &Hub, spec: &RunSpec) -> (String, Vec<String>, String, String) {
     let a = hub.cfg.agents.get(spec.kind);
     let cmd = a.cmd.unwrap_or_else(|| spec.kind.name().to_string());
@@ -49,7 +53,7 @@ pub fn command_line(hub: &Hub, spec: &RunSpec) -> (String, Vec<String>, String, 
     let mut args: Vec<String> = Vec::new();
     match spec.kind {
         AgentKind::Claude => {
-            args.extend(["-p", spec.prompt, "--output-format", "stream-json", "--verbose"].map(String::from));
+            args.extend(["-p", "--output-format", "stream-json", "--verbose"].map(String::from));
             if !model.is_empty() {
                 args.extend(["--model".to_string(), model.clone()]);
             }
@@ -67,7 +71,8 @@ pub fn command_line(hub: &Hub, spec: &RunSpec) -> (String, Vec<String>, String, 
                 args.extend(["-c".to_string(), format!("model_reasoning_effort=\"{}\"", effort)]);
             }
             args.extend(extra);
-            args.push(spec.prompt.to_string());
+            // "-" makes codex read the prompt from stdin.
+            args.push("-".to_string());
         }
     }
     (cmd, args, model, effort)
@@ -161,7 +166,8 @@ pub fn parse_codex(line: &str) -> Vec<Parsed> {
                 }
                 "mcp_tool_call" if !done => Parsed::Tool(format!("mcp {}", s("/item/tool"))),
                 "web_search" if done => Parsed::Tool(format!("search {}", s("/item/query"))),
-                "error" => Parsed::Error(s("/item/message")),
+                // Item-level errors are warnings; only turn.failed and a top-level error end the run.
+                "error" if done => Parsed::Note(format!("warning: {}", s("/item/message"))),
                 _ => Parsed::Nothing,
             }
         }
@@ -205,9 +211,10 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
             _ = cancel.wait() => RunOut { ok: false, text: String::new(), error: "cancelled".into() },
         }
     } else {
-        let limit = Duration::from_secs(hub.cfg.agents.timeout_mins.unwrap_or(45) * 60);
+        let limit = Duration::from_secs(hub.cfg.agents.timeout_mins.unwrap_or(45).clamp(1, 24 * 60) * 60);
+        // Dropping the losing branch drops the process group guard, which kills the agent and its children.
         tokio::select! {
-            o = spawn_and_read(hub, job, slot, kind, &cmd, &args, spec.dir) => o,
+            o = spawn_and_read(hub, job, slot, kind, &cmd, &args, spec.prompt, spec.dir) => o,
             _ = cancel.wait() => RunOut { ok: false, text: String::new(), error: "cancelled".into() },
             _ = tokio::time::sleep(limit) => RunOut { ok: false, text: String::new(), error: format!("timed out after {} min", limit.as_secs() / 60) },
         }
@@ -222,6 +229,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_and_read(
     hub: &Hub,
     job: u32,
@@ -229,49 +237,82 @@ async fn spawn_and_read(
     kind: AgentKind,
     cmd: &str,
     args: &[String],
+    prompt: &str,
     dir: &Path,
 ) -> RunOut {
     let fail = |e: String| RunOut { ok: false, text: String::new(), error: e };
-    let mut child = match Command::new(cmd)
+    let mut child = match proc::command(cmd)
         .args(args)
         .current_dir(dir)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
         .spawn()
     {
         Ok(c) => c,
         Err(e) => return fail(format!("cannot start {}: {}", cmd, e)),
     };
+    let group = proc::Group::of(&child);
+    let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
+    let prompt_bytes = prompt.as_bytes().to_vec();
+    tokio::spawn(async move {
+        let _ = stdin.write_all(&prompt_bytes).await;
+        let _ = stdin.shutdown().await;
+    });
     let err_task = tokio::spawn(async move {
-        let mut buf = String::new();
-        let _ = stderr.read_to_string(&mut buf).await;
-        buf
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf).to_string()
     });
 
-    let mut lines = BufReader::new(stdout).lines();
+    let mut reader = BufReader::new(stdout);
+    let mut raw: Vec<u8> = Vec::new();
     let mut last_text = String::new();
     let mut final_text: Option<String> = None;
     let mut final_ok: Option<bool> = None;
+    let mut finished = false;
     let mut error = String::new();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.trim().is_empty() {
+    let mut status: Option<std::io::Result<std::process::ExitStatus>> = None;
+    loop {
+        // Bytes, not lines(): one invalid UTF-8 sequence must not end the loop while the agent is still writing.
+        // read_until keeps what it has read in `raw` if the other branch wins, so nothing is lost.
+        let n = tokio::select! {
+            r = reader.read_until(b'\n', &mut raw) => r,
+            s = child.wait(), if status.is_none() => {
+                // The agent itself is done. Anything it left running would hold the pipe open
+                // and keep us here until the timeout, so stop it now.
+                status = Some(s);
+                group.kill();
+                continue;
+            }
+        };
+        match n {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                error = format!("reading {} output failed: {}", cmd, e);
+                break;
+            }
+        }
+        let owned = String::from_utf8_lossy(&raw).trim().to_string();
+        raw.clear();
+        let line = owned.as_str();
+        if line.is_empty() {
             continue;
         }
         let parsed = match kind {
-            AgentKind::Claude => parse_claude(&line),
-            AgentKind::Codex => parse_codex(&line),
+            AgentKind::Claude => parse_claude(line),
+            AgentKind::Codex => parse_codex(line),
         };
         for p in parsed {
             hub.job(job, |j| {
                 let s = if slot == Slot::Worker { &mut j.worker } else { &mut j.reviewer };
                 match &p {
-                    Parsed::Text(t) => {
+                    Parsed::Text(t) | Parsed::Note(t) => {
                         for l in t.lines().filter(|l| !l.trim().is_empty()) {
-                            s.push(l.to_string());
+                            s.push(clip(l, 400));
                         }
                     }
                     Parsed::Tool(t) => {
@@ -294,43 +335,55 @@ async fn spawn_and_read(
             match p {
                 Parsed::Text(t) => last_text = t,
                 Parsed::Final { ok, text, .. } => {
+                    finished = true;
                     final_ok = Some(ok);
+                    if !ok && error.is_empty() {
+                        error = first_line(&text);
+                    }
                     final_text = Some(text);
+                }
+                Parsed::Usage { .. } => {
+                    // A turn that completed supersedes an error reported earlier in the stream (a retry that worked).
+                    finished = true;
+                    error.clear();
                 }
                 Parsed::Error(e) => error = e,
                 _ => {}
             }
         }
     }
-    let status = child.wait().await;
+    let status = match status {
+        Some(s) => s,
+        None => child.wait().await,
+    };
     let stderr_text = err_task.await.unwrap_or_default();
     let exit_ok = status.as_ref().map(|s| s.success()).unwrap_or(false);
-    let ok = exit_ok && final_ok.unwrap_or(true) && error.is_empty();
+    // A clean exit is not enough: the stream has to have reached its closing event.
+    let ok = exit_ok && finished && final_ok.unwrap_or(true) && error.is_empty();
     if !ok && error.is_empty() {
         let tail: Vec<&str> = stderr_text.lines().rev().filter(|l| !l.trim().is_empty()).take(3).collect();
         let tail: Vec<&str> = tail.into_iter().rev().collect();
-        error = if tail.is_empty() {
+        error = if !tail.is_empty() {
+            clip(&tail.join(" | "), 400)
+        } else if exit_ok {
+            format!("{} exited before reporting a result", cmd)
+        } else {
             match status {
                 Ok(s) => format!("{} exited with {}", cmd, s),
                 Err(e) => e.to_string(),
             }
-        } else {
-            tail.join(" | ")
         };
     }
     RunOut { ok, text: final_text.filter(|t| !t.is_empty()).unwrap_or(last_text), error }
 }
 
 pub async fn on_path(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+    if cmd.trim().is_empty() {
+        return false;
+    }
+    let mut c = proc::command(cmd);
+    c.arg("--version");
+    matches!(proc::output(c, Duration::from_secs(15)).await, Ok((true, _, _)))
 }
 
 #[cfg(test)]
@@ -360,6 +413,8 @@ mod tests {
         assert_eq!(parse_codex(l), vec![Parsed::Text("Fixed.".into())]);
         let l = r#"{"type":"turn.completed","usage":{"input_tokens":5,"cached_input_tokens":2,"output_tokens":3}}"#;
         assert_eq!(parse_codex(l), vec![Parsed::Usage { tokens_in: 5, tokens_out: 3 }]);
+        let l = r#"{"type":"item.completed","item":{"id":"9","type":"error","message":"slow down"}}"#;
+        assert_eq!(parse_codex(l), vec![Parsed::Note("warning: slow down".into())]);
         let l = r#"{"type":"turn.failed","error":{"message":"quota"}}"#;
         assert_eq!(parse_codex(l), vec![Parsed::Error("quota".into())]);
     }

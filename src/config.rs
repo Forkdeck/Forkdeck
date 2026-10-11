@@ -105,32 +105,38 @@ impl AgentsCfg {
         };
         AgentCfg {
             cmd: cfg.cmd.clone().or(def.cmd),
-            models: cfg.models.clone().or(def.models),
-            efforts: cfg.efforts.clone().or(def.efforts),
+            models: Some(cfg.models.clone().unwrap_or_default().over(def.models)),
+            efforts: Some(cfg.efforts.clone().unwrap_or_default().over(def.efforts)),
             write_args: cfg.write_args.clone().or(def.write_args),
             review_args: cfg.review_args.clone().or(def.review_args),
         }
     }
 }
 
+/// A value per effort tier. A tier left out of the config keeps its built-in value.
 #[derive(Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Tiers {
-    pub light: String,
-    pub standard: String,
-    pub heavy: String,
+    pub light: Option<String>,
+    pub standard: Option<String>,
+    pub heavy: Option<String>,
 }
 
 impl Tiers {
     pub fn get(&self, t: Tier) -> &str {
         match t {
-            Tier::Light => &self.light,
-            Tier::Standard => &self.standard,
-            Tier::Heavy => &self.heavy,
+            Tier::Light => self.light.as_deref(),
+            Tier::Standard => self.standard.as_deref(),
+            Tier::Heavy => self.heavy.as_deref(),
         }
+        .unwrap_or("")
     }
     fn of(l: &str, s: &str, h: &str) -> Option<Tiers> {
-        Some(Tiers { light: l.into(), standard: s.into(), heavy: h.into() })
+        Some(Tiers { light: Some(l.into()), standard: Some(s.into()), heavy: Some(h.into()) })
+    }
+    fn over(self, def: Option<Tiers>) -> Tiers {
+        let d = def.unwrap_or_default();
+        Tiers { light: self.light.or(d.light), standard: self.standard.or(d.standard), heavy: self.heavy.or(d.heavy) }
     }
 }
 
@@ -185,6 +191,11 @@ pub struct ReviewCfg {
     pub check_timeout_mins: u64,
     /// Which CLIs review a labelled pull request. Each one reviews independently.
     pub pr_reviewers: Vec<AgentKind>,
+    /// How often a pull request review that produced no result (a reviewer did not finish, the
+    /// head moved, the review could not run) is retried automatically.
+    pub max_retries: u32,
+    /// Wait before the first such retry; it triples for each later one.
+    pub retry_secs: u64,
 }
 
 impl Default for ReviewCfg {
@@ -196,6 +207,8 @@ impl Default for ReviewCfg {
             checks: vec![],
             check_timeout_mins: 20,
             pr_reviewers: vec![AgentKind::Claude, AgentKind::Codex],
+            max_retries: 3,
+            retry_secs: 120,
         }
     }
 }
@@ -269,6 +282,9 @@ pub struct RepoCfg {
     pub pr_pass_label: String,
     #[serde(default = "d_pr_fail")]
     pub pr_fail_label: String,
+    /// Run `checks` on labelled pull requests too. Off by default: it executes the pull request's code as you.
+    #[serde(default)]
+    pub pr_checks: bool,
 }
 
 fn d_base() -> String {
@@ -301,8 +317,11 @@ fn d_failed() -> String {
 
 pub fn expand(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
+    if let Ok(home) = std::env::var("HOME") {
+        if s == "~" {
+            return PathBuf::from(home);
+        }
+        if let Some(rest) = s.strip_prefix("~/") {
             return PathBuf::from(home).join(rest);
         }
     }
@@ -315,9 +334,10 @@ pub fn user_path() -> PathBuf {
 }
 
 pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)> {
+    // Never read a config from the working directory: agents edit files there, and the config names commands to run.
     let candidates: Vec<PathBuf> = match explicit {
         Some(p) => vec![p.to_path_buf()],
-        None => vec![PathBuf::from("forkdeck.toml"), user_path()],
+        None => vec![user_path()],
     };
     for c in candidates {
         if c.exists() {
@@ -347,6 +367,35 @@ impl Config {
         if !matches!(self.review.reviewer.as_str(), "other" | "same") {
             anyhow::bail!("review.reviewer must be other or same");
         }
+        if !(0.5..=1.0).contains(&self.router.threshold) {
+            anyhow::bail!("router.threshold must be between 0.5 and 1.0, got {}", self.router.threshold);
+        }
+        if self.router.jev.timeout_ms < 100 {
+            anyhow::bail!("router.jev.timeout_ms must be at least 100");
+        }
+        if let Some(m) = self.agents.timeout_mins {
+            if !(1..=24 * 60).contains(&m) {
+                anyhow::bail!("agents.timeout_mins must be between 1 and 1440, got {}", m);
+            }
+        }
+        if !(1..=24 * 60).contains(&self.review.check_timeout_mins) {
+            anyhow::bail!("review.check_timeout_mins must be between 1 and 1440");
+        }
+        for k in [AgentKind::Claude, AgentKind::Codex] {
+            if self.agents.get(k).cmd.unwrap_or_default().trim().is_empty() {
+                anyhow::bail!("agents.{}.cmd must not be empty", k.name());
+            }
+        }
+        for r in &self.repos {
+            if !r.path.is_absolute() {
+                anyhow::bail!("repos: path for {} must be absolute or start with ~/, got {}", r.repo, r.path.display());
+            }
+            for (name, v) in [("repo", &r.repo), ("base", &r.base)] {
+                if v.is_empty() || v.starts_with('-') || v.contains(char::is_whitespace) {
+                    anyhow::bail!("repos: {} {:?} is not a valid name", name, v);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -359,10 +408,41 @@ mod tests {
     fn example_config_parses() {
         let cfg: Config = toml::from_str(EXAMPLE).expect("example parses");
         cfg.validate().unwrap();
-        assert_eq!(cfg.router.kind, "jev");
-        assert_eq!(cfg.repos.len(), 2);
-        assert_eq!(cfg.agents.get(AgentKind::Claude).models.unwrap().heavy, "opus");
+        // What `init` writes has to behave like having no config at all.
+        assert_eq!(cfg.router.kind, "rules");
+        assert!(cfg.repos.is_empty());
+        assert!(!cfg.automation.enabled);
+        assert_eq!(cfg.agents.get(AgentKind::Claude).models.unwrap().get(Tier::Heavy), "opus");
         assert_eq!(cfg.agents.get(AgentKind::Codex).cmd.unwrap(), "codex");
+    }
+
+    #[test]
+    fn commented_examples_parse_once_uncommented() {
+        // The jev and [[repos]] blocks ship commented out; make sure they are still valid.
+        let text: String = EXAMPLE.lines().map(|l| l.strip_prefix("#~ ").unwrap_or(l)).collect::<Vec<_>>().join("\n");
+        let text = text.replace("kind = \"rules\"", "kind = \"jev\"");
+        let mut cfg: Config = toml::from_str(&text).expect("uncommented example parses");
+        for r in &mut cfg.repos {
+            r.path = expand(&r.path);
+        }
+        cfg.validate().unwrap();
+        assert_eq!(cfg.repos.len(), 2);
+    }
+
+    #[test]
+    fn partial_tier_table_keeps_the_other_defaults() {
+        let cfg: Config = toml::from_str("[agents.claude]\nmodels = { heavy = \"big\" }").unwrap();
+        let m = cfg.agents.get(AgentKind::Claude).models.unwrap();
+        assert_eq!((m.get(Tier::Light), m.get(Tier::Heavy)), ("haiku", "big"));
+    }
+
+    #[test]
+    fn rejects_bad_values() {
+        for bad in ["[router]\nthreshold = 7", "[agents]\ntimeout_mins = 0", "[agents.claude]\ncmd = \"\"",
+            "[[repos]]\nprovider = \"github\"\nrepo = \"o/r\"\npath = \"relative\""] {
+            let cfg: Config = toml::from_str(bad).unwrap();
+            assert!(cfg.validate().is_err(), "{}", bad);
+        }
     }
 
     #[test]

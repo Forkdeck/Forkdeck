@@ -3,6 +3,7 @@ mod config;
 mod demo;
 mod issues;
 mod orchestrator;
+mod proc;
 mod router;
 mod state;
 mod ui;
@@ -18,7 +19,7 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(name = "forkdeck", version, about = "Agent tree for the claude and codex CLIs")]
 struct Cli {
-    /// Config file (default: ./forkdeck.toml, then ~/.config/forkdeck/config.toml)
+    /// Config file (default: ~/.config/forkdeck/config.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// Simulated agents, router and issues; nothing is executed
@@ -46,11 +47,13 @@ enum Cmd {
     },
     /// Show what the fork layer would decide for a task
     Route { task: Vec<String> },
+    /// Poll the configured repositories once, work through what is labelled, and exit
+    Once,
     /// Check the CLIs, the decision endpoint and the configured repositories
     Doctor,
     /// Write a commented config file
     Init {
-        /// Where to write it (default: ./forkdeck.toml)
+        /// Where to write it (default: ~/.config/forkdeck/config.toml)
         #[arg(long)]
         path: Option<PathBuf>,
         #[arg(long)]
@@ -66,10 +69,24 @@ fn parse_agent(s: &str) -> anyhow::Result<AgentKind> {
     }
 }
 
+/// Print without panicking when the terminal or pipe has gone away: a panic here would skip the shutdown.
+macro_rules! say {
+    ($($t:tt)*) => {{ let _ = writeln!(std::io::stdout(), $($t)*); }};
+}
+macro_rules! warn {
+    ($($t:tt)*) => {{ let _ = writeln!(std::io::stderr(), $($t)*); }};
+}
+
 fn main() -> anyhow::Result<()> {
+    // Whatever goes wrong, do not leave agents running with nobody watching them.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        proc::kill_all();
+        default_hook(info);
+    }));
     let cli = Cli::parse();
     if let Some(Cmd::Init { path, force }) = &cli.cmd {
-        let p = path.clone().unwrap_or_else(|| PathBuf::from("forkdeck.toml"));
+        let p = path.clone().unwrap_or_else(config::user_path);
         if p.exists() && !force {
             anyhow::bail!("{} already exists (use --force to overwrite)", p.display());
         }
@@ -78,10 +95,17 @@ fn main() -> anyhow::Result<()> {
         }
         std::fs::write(&p, config::EXAMPLE)?;
         println!("wrote {}", p.display());
+        if path.is_some() {
+            println!("pass it with --config; only ~/.config/forkdeck/config.toml is read automatically");
+        }
         return Ok(());
     }
 
     let (mut cfg, cfg_path) = config::load(cli.config.as_deref())?;
+    let stray = cfg_path.is_none() && cli.config.is_none() && !cli.demo && std::path::Path::new("forkdeck.toml").exists();
+    if stray && cli.cmd.is_some() {
+        eprintln!("note: ./forkdeck.toml is not read. Move it to {} or pass --config.", config::user_path().display());
+    }
     cfg.demo = cli.demo;
     if cfg.demo {
         cfg.automation.enabled = true;
@@ -101,6 +125,7 @@ fn main() -> anyhow::Result<()> {
                 pr_working_label: "review:running".into(),
                 pr_pass_label: "review:passed".into(),
                 pr_fail_label: "review:changes".into(),
+                pr_checks: true,
             });
         }
     }
@@ -118,6 +143,12 @@ fn main() -> anyhow::Result<()> {
             }
             println!("{}", serde_json::to_string_pretty(&r.decision)?);
             Ok(())
+        }
+        Some(Cmd::Once) => {
+            anyhow::ensure!(!hub.cfg.repos.is_empty(), "no [[repos]] configured, nothing to poll");
+            rt.block_on(hub.detect_agents());
+            let code = rt.block_on(once(&hub));
+            std::process::exit(code);
         }
         Some(Cmd::Doctor) => {
             let ok = rt.block_on(doctor(&hub, cfg_path));
@@ -142,39 +173,93 @@ fn main() -> anyhow::Result<()> {
                 hub.log("config", format!("loaded {}", p.display()));
             } else if !hub.cfg.demo {
                 hub.log("config", "no config file found, using defaults (forkdeck init writes one)");
+                if stray {
+                    hub.log("config", "ignoring ./forkdeck.toml: move it to ~/.config/forkdeck/config.toml or pass --config");
+                }
             }
-            tui(&hub, cwd)
+            tui(&rt, &hub, cwd)
         }
+    }
+}
+
+/// Resolves on SIGINT, SIGTERM or SIGHUP.
+async fn stop_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("signal handler");
+    let mut int = signal(SignalKind::interrupt()).expect("signal handler");
+    let mut hup = signal(SignalKind::hangup()).expect("signal handler");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+        _ = hup.recv() => {}
     }
 }
 
 async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentKind>) -> i32 {
     let title = state::clip(&task, 80);
     let id = hub.submit(title, task, Source::Manual, cwd, forced);
-    let (mut seen_log, mut seen_w, mut seen_r) = (0usize, 0usize, 0usize);
+    // The agent runs in its own process group, so a signal sent to us has to be passed on by hand.
+    let h = hub.clone();
+    tokio::spawn(async move {
+        stop_signal().await;
+        h.cancel(id);
+    });
     loop {
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let mut st = hub.state.lock().unwrap();
-        // Bounded buffers drop old lines; counting what was drained keeps the cursor right.
-        let drained: Vec<_> = st.log.drain(..).collect();
-        for l in &drained {
-            println!("{} {:<7} {}", l.time, l.who, l.msg);
+        print_progress(hub);
+        let st = hub.state.lock().unwrap();
+        let Some(j) = st.jobs.iter().find(|j| j.id == id) else { return 1 };
+        if j.status.finished() {
+            let code = if j.status == JobStatus::Done { 0 } else { 1 };
+            drop(st);
+            print_progress(hub);
+            return code;
         }
-        seen_log += drained.len();
-        let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return 1 };
+    }
+}
+
+/// Print and drain what has happened since the last call. Only for the modes without an interface.
+fn print_progress(hub: &Hub) {
+    let mut st = hub.state.lock().unwrap();
+    let lines: Vec<_> = st.log.drain(..).collect();
+    for l in &lines {
+        say!("{} {:<7} {}", l.time, l.who, l.msg);
+    }
+    for j in st.jobs.iter_mut() {
+        let id = j.id;
         for l in j.worker.tail.drain(..) {
-            println!("         worker  {}", l);
-            seen_w += 1;
+            say!("         #{:<3} worker  {}", id, l);
         }
         for l in j.reviewer.tail.drain(..) {
-            println!("         review  {}", l);
-            seen_r += 1;
+            say!("         #{:<3} review  {}", id, l);
         }
-        if j.status.finished() {
-            let _ = (seen_log, seen_w, seen_r);
-            let _ = std::io::stdout().flush();
-            return if j.status == JobStatus::Done { 0 } else { 1 };
+    }
+    let _ = std::io::stdout().flush();
+}
+
+/// One pass over the repositories, for cron and for tests: take what is labelled now, finish it, exit.
+/// Exits 1 if any job failed.
+async fn once(hub: &Hub) -> i32 {
+    let h = hub.clone();
+    tokio::spawn(async move {
+        stop_signal().await;
+        h.shutdown(Duration::from_secs(45)).await;
+    });
+    issues::poll_once(hub).await;
+    loop {
+        print_progress(hub);
+        let (open, failed) = {
+            let st = hub.state.lock().unwrap();
+            (
+                st.jobs.iter().filter(|j| !j.status.finished()).count(),
+                st.jobs.iter().filter(|j| matches!(j.status, JobStatus::Failed | JobStatus::Cancelled)).count(),
+            )
+        };
+        if open == 0 {
+            print_progress(hub);
+            return if failed == 0 { 0 } else { 1 };
         }
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 
@@ -269,15 +354,36 @@ fn snapshot(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf, path: &std::p
     Ok(())
 }
 
-fn tui(hub: &Hub, cwd: PathBuf) -> anyhow::Result<()> {
+fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<()> {
     let mut u = new_ui(hub, cwd.clone());
     if hub.cfg.demo {
         hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd.clone(), None);
+    }
+    // A signal (terminal closed, kill, service stop) is handled entirely on the runtime: the main
+    // thread may be stuck reading a terminal that no longer exists.
+    let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let hub = hub.clone();
+        let stopping = stopping.clone();
+        rt.spawn(async move {
+            stop_signal().await;
+            stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = ratatui::try_restore();
+            warn!("stopping jobs and handing claimed issues back…");
+            hub.shutdown(Duration::from_secs(45)).await;
+            proc::kill_all();
+            std::process::exit(1);
+        });
     }
     let mut term = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste);
     let res = (|| -> anyhow::Result<()> {
         loop {
+            if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                // The signal task owns the shutdown and will exit the process; just stay out of its way.
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
             sync_selection(hub, &mut u);
             term.draw(|f| ui::draw(f, &hub.state.lock().unwrap(), &u))?;
             if !event::poll(Duration::from_millis(100))? {
@@ -347,12 +453,16 @@ fn tui(hub: &Hub, cwd: PathBuf) -> anyhow::Result<()> {
         }
     })();
     let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
-    ratatui::restore();
-    // Stop any agent still running so nothing keeps editing after the screen is gone.
-    let ids: Vec<u32> = hub.state.lock().unwrap().jobs.iter().map(|j| j.id).collect();
-    for id in ids {
-        hub.cancel(id);
+    let _ = ratatui::try_restore();
+    // Stop any agent still running, and give claimed issues time to be handed back with a comment.
+    let busy = hub.state.lock().unwrap().jobs.iter().filter(|j| !j.status.finished()).count();
+    if busy > 0 {
+        warn!("stopping {} job(s) and handing claimed issues back…", busy);
     }
-    std::thread::sleep(Duration::from_millis(200));
+    let left = rt.block_on(hub.shutdown(Duration::from_secs(45)));
+    if left > 0 {
+        warn!("{} job(s) did not finish in time; check their issues for a stale working label", left);
+    }
+    proc::kill_all();
     res
 }
