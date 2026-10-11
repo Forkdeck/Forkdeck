@@ -419,21 +419,23 @@ is not derived from anything about the machine.
 **Seeing it.** `Ctrl-T` swaps the agent tree for the team pane, and
 `forkdeck team` prints the same thing:
 
+![the team pane in demo mode](docs/team.png)
+
 ```
 alice on mbp-alice (you)
-  payments#41        working            claude       4m  Retry loop keeps the long backoff after a success
+  payments#41        working       claude      4m  Retry loop keeps the long backoff after a success
 maria on mbp-maria
-  payments#38        watching ci        codex       31m  Webhook signature check rejects rotated keys
-  payments!57        reviewing          claude       5m  Add --since flag to the export command
+  payments#38        watching ci   codex      31m  Webhook signature check rejects rotated keys
+  payments!57        reviewing     claude      5m  Add --since flag to the export command
 tomasz on build-02
-  payments#35        working            claude   2h 33m  Paginate the ledger export
+  payments#35        working       claude  2h 33m  Paginate the ledger export
                      no update for 1h 8m · forkdeck team release acme/payments#35
-  payments@9f3c2ab   deploying                       3m  Merge pull request #52
+  payments@9f3c2ab   deploying                 3m  Merge pull request #52
 ```
 
 `#` is an issue, `!` a pull request, `@` a deployment. It reads the working
 labels of every configured repository, so it also shows items someone claimed
-by hand or with sharing off, as "claimed, no forkdeck status". `--all` adds
+by hand or with sharing off, as "no status". `--all` adds
 issues whose pull request is open and waiting, and `--json` prints the rows
 for scripts. Looking never changes anything, and works with sharing off.
 

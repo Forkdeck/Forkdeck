@@ -865,7 +865,7 @@ pub fn row(repo: &str, kind: &'static str, item: String, title: &str, url: &str,
             r.stage = match (active, s.m.stage.is_empty()) {
                 (true, false) => s.m.stage.clone(),
                 (true, true) => "starting".into(),
-                (false, _) if kind == "issue" && s.m.state == "done" => "pull request open".into(),
+                (false, _) if kind == "issue" && s.m.state == "done" => "pr open".into(),
                 (false, _) => s.m.state.clone(),
             };
             r.running_secs = Some(now - s.m.started);
@@ -896,10 +896,10 @@ pub async fn gather(hub: &Hub, all: bool) -> (Vec<Row>, Vec<String>) {
             continue;
         }
         let who = me(hub, r.provider).await.unwrap_or_default();
-        let mut wanted: Vec<(bool, &str, &str)> = vec![(false, r.working_label.as_str(), "claimed, no forkdeck status"), (true, r.pr_working_label.as_str(), "in review, no forkdeck status")];
+        let mut wanted: Vec<(bool, &str, &str)> = vec![(false, r.working_label.as_str(), "no status"), (true, r.pr_working_label.as_str(), "no status")];
         // An issue whose pull request is open is still being worked on while its CI is watched.
         if all || r.ci.is_some() {
-            wanted.push((false, r.done_label.as_str(), "pull request open"));
+            wanted.push((false, r.done_label.as_str(), "pr open"));
         }
         for (pr, label, fallback) in wanted {
             let items = match listed(r, pr, label).await {
@@ -1009,7 +1009,7 @@ pub fn text(rows: &[Row], width: usize) -> Vec<String> {
         out.push(head);
         for r in rows.iter().filter(|r| r.mine == mine && group(r) == name) {
             let time = r.running_secs.map(ago).unwrap_or_default();
-            let left = format!("  {:<18} {:<18} {:<7} {:>7}  ", clip(&format!("{}{}", short_repo(&r.repo), sep(r)), 18), clip(&r.stage, 18), clip(&r.agent, 7), time);
+            let left = format!("  {:<18} {:<13} {:<6} {:>7}  ", clip(&format!("{}{}", short_repo(&r.repo), sep(r)), 18), clip(&r.stage, 13), clip(&r.agent, 6), time);
             let room = width.saturating_sub(left.chars().count()).max(10);
             out.push(format!("{}{}", left, clip(&r.title, room)));
             if r.stale {
@@ -1283,8 +1283,8 @@ mod tests {
         let r = row("o/r", "issue", "#7".into(), "T", "u", &[], &seen, "bob", 5000, 600, "x");
         assert!(r.stale && !r.mine);
         // No marker: fall back to the assignee and say that nothing is known.
-        let r = row("o/r", "issue", "#7".into(), "T", "u", &["carol".into()], &[], "bob", 5000, 600, "claimed, no forkdeck status");
-        assert_eq!((r.who.as_str(), r.stage.as_str(), r.running_secs), ("carol", "claimed, no forkdeck status", None));
+        let r = row("o/r", "issue", "#7".into(), "T", "u", &["carol".into()], &[], "bob", 5000, 600, "no status");
+        assert_eq!((r.who.as_str(), r.stage.as_str(), r.running_secs), ("carol", "no status", None));
         let lines = text(&[r], 100).join("\n");
         assert!(lines.starts_with("carol\n") && lines.contains("r#7"), "{}", lines);
     }
