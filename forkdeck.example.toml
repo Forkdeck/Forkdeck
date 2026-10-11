@@ -1,15 +1,20 @@
 # forkdeck configuration.
-# Looked up as ./forkdeck.toml, then ~/.config/forkdeck/config.toml.
-# Every key is optional; what you leave out keeps its default.
+# Read from ~/.config/forkdeck/config.toml, or the file given with --config.
+# It is never read from the working directory: agents edit files there, and this
+# file names commands to run.
+#
+# Every key is optional and what you leave out keeps its default. As written,
+# this file behaves the same as having no config. Lines starting with "#~" are
+# examples to uncomment.
 
 [router]
 # "rules": keyword rules, no network.
 # "jev":   a Jev-compatible decision endpoint (POST /v1/systemone). Falls back to
 #          the rules when the endpoint does not answer.
-kind = "jev"
+kind = "rules"
 default_agent = "claude"
 # Answers under this confidence count as "split" and take the cautious branch:
-# the default agent, the next effort tier up, and a review.
+# the default agent, the next effort tier up, and a review. Between 0.5 and 1.
 threshold = 0.6
 
 [router.jev]
@@ -27,10 +32,10 @@ claude_is_for = "Open-ended or ambiguous work: multi-file refactors, design chan
 codex_is_for = "Well-specified work: a bug with a clear reproduction, a contained feature, tests, scripts"
 
 [router.rules]
-claude_keywords = ["refactor", "design", "architecture", "docs", "readme", "explain", "plan"]
-codex_keywords = ["bug", "fix", "test", "tests", "script", "failing", "crash", "regression"]
-heavy_keywords = ["architecture", "migration", "concurrency", "race", "security", "rewrite"]
-light_keywords = ["typo", "rename", "comment", "bump", "format", "lint"]
+claude_keywords = ["refactor", "design", "architecture", "document", "docs", "readme", "explain", "plan", "restructure"]
+codex_keywords = ["bug", "fix", "test", "tests", "script", "failing", "crash", "regression", "implement", "endpoint"]
+heavy_keywords = ["architecture", "migrate", "migration", "concurrency", "race", "security", "rewrite", "redesign", "deadlock", "distributed"]
+light_keywords = ["typo", "rename", "comment", "bump", "format", "lint", "wording", "spelling"]
 
 [agents]
 timeout_mins = 45
@@ -71,26 +76,30 @@ draft = true
 publish_on_failed_review = false
 # worktree_root = "~/.cache/forkdeck/worktrees"
 
-[[repos]]
-provider = "github"    # uses the gh CLI and its login
-repo = "your-name/your-project"
-path = "~/src/your-project"
-base = "main"
-label = "agent:ready"
-working_label = "agent:working"
-done_label = "agent:pr-open"
-failed_label = "agent:needs-human"
-allowed_authors = ["your-name"]
-# Run in the issue's worktree before any review.
-checks = ["cargo test --quiet"]
-# Pull requests with this label are reviewed and commented on, never approved or merged.
-pr_label = "review:ready"
-pr_working_label = "review:running"
-pr_pass_label = "review:passed"
-pr_fail_label = "review:changes"
+#~ [[repos]]
+#~ provider = "github"    # uses the gh CLI and its login
+#~ repo = "your-name/your-project"
+#~ path = "~/src/your-project"
+#~ base = "main"
+#~ label = "agent:ready"
+#~ working_label = "agent:working"
+#~ done_label = "agent:pr-open"
+#~ failed_label = "agent:needs-human"
+#~ # Only these accounts' issues and pull requests are picked up. Set this on public repositories.
+#~ allowed_authors = ["your-name"]
+#~ # Run in the issue's worktree before any review. These run as you, on code an agent just wrote.
+#~ checks = ["cargo test --quiet"]
+#~ # Pull requests with this label are reviewed and commented on, never approved or merged.
+#~ pr_label = "review:ready"
+#~ pr_working_label = "review:running"
+#~ pr_pass_label = "review:passed"
+#~ pr_fail_label = "review:changes"
+#~ # Also run `checks` on labelled pull requests. This executes the pull request's code on your
+#~ # machine, so leave it off unless every author who can get the label applied is trusted.
+#~ pr_checks = false
 
-[[repos]]
-provider = "gitlab"    # uses the glab CLI and its login
-repo = "your-group/your-project"
-path = "~/src/your-gitlab-project"
-base = "main"
+#~ [[repos]]
+#~ provider = "gitlab"    # uses the glab CLI and its login
+#~ repo = "your-group/your-project"
+#~ path = "~/src/your-gitlab-project"
+#~ base = "main"

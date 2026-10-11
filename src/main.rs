@@ -3,6 +3,7 @@ mod config;
 mod demo;
 mod issues;
 mod orchestrator;
+mod proc;
 mod router;
 mod state;
 mod ui;
@@ -18,7 +19,7 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(name = "forkdeck", version, about = "Agent tree for the claude and codex CLIs")]
 struct Cli {
-    /// Config file (default: ./forkdeck.toml, then ~/.config/forkdeck/config.toml)
+    /// Config file (default: ~/.config/forkdeck/config.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// Simulated agents, router and issues; nothing is executed
@@ -50,7 +51,7 @@ enum Cmd {
     Doctor,
     /// Write a commented config file
     Init {
-        /// Where to write it (default: ./forkdeck.toml)
+        /// Where to write it (default: ~/.config/forkdeck/config.toml)
         #[arg(long)]
         path: Option<PathBuf>,
         #[arg(long)]
@@ -69,7 +70,7 @@ fn parse_agent(s: &str) -> anyhow::Result<AgentKind> {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if let Some(Cmd::Init { path, force }) = &cli.cmd {
-        let p = path.clone().unwrap_or_else(|| PathBuf::from("forkdeck.toml"));
+        let p = path.clone().unwrap_or_else(config::user_path);
         if p.exists() && !force {
             anyhow::bail!("{} already exists (use --force to overwrite)", p.display());
         }
@@ -78,6 +79,9 @@ fn main() -> anyhow::Result<()> {
         }
         std::fs::write(&p, config::EXAMPLE)?;
         println!("wrote {}", p.display());
+        if path.is_some() {
+            println!("pass it with --config; only ~/.config/forkdeck/config.toml is read automatically");
+        }
         return Ok(());
     }
 
@@ -101,6 +105,7 @@ fn main() -> anyhow::Result<()> {
                 pr_working_label: "review:running".into(),
                 pr_pass_label: "review:passed".into(),
                 pr_fail_label: "review:changes".into(),
+                pr_checks: true,
             });
         }
     }
@@ -142,15 +147,37 @@ fn main() -> anyhow::Result<()> {
                 hub.log("config", format!("loaded {}", p.display()));
             } else if !hub.cfg.demo {
                 hub.log("config", "no config file found, using defaults (forkdeck init writes one)");
+                if std::path::Path::new("forkdeck.toml").exists() {
+                    hub.log("config", "ignoring ./forkdeck.toml: move it to ~/.config/forkdeck/config.toml or pass --config");
+                }
             }
-            tui(&hub, cwd)
+            tui(&rt, &hub, cwd)
         }
+    }
+}
+
+/// Resolves on SIGINT, SIGTERM or SIGHUP.
+async fn stop_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("signal handler");
+    let mut int = signal(SignalKind::interrupt()).expect("signal handler");
+    let mut hup = signal(SignalKind::hangup()).expect("signal handler");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+        _ = hup.recv() => {}
     }
 }
 
 async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentKind>) -> i32 {
     let title = state::clip(&task, 80);
     let id = hub.submit(title, task, Source::Manual, cwd, forced);
+    // The agent runs in its own process group, so a signal sent to us has to be passed on by hand.
+    let h = hub.clone();
+    tokio::spawn(async move {
+        stop_signal().await;
+        h.cancel(id);
+    });
     let (mut seen_log, mut seen_w, mut seen_r) = (0usize, 0usize, 0usize);
     loop {
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -269,15 +296,26 @@ fn snapshot(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf, path: &std::p
     Ok(())
 }
 
-fn tui(hub: &Hub, cwd: PathBuf) -> anyhow::Result<()> {
+fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<()> {
     let mut u = new_ui(hub, cwd.clone());
     if hub.cfg.demo {
         hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd.clone(), None);
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        rt.spawn(async move {
+            stop_signal().await;
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
     }
     let mut term = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste);
     let res = (|| -> anyhow::Result<()> {
         loop {
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
             sync_selection(hub, &mut u);
             term.draw(|f| ui::draw(f, &hub.state.lock().unwrap(), &u))?;
             if !event::poll(Duration::from_millis(100))? {
@@ -348,11 +386,14 @@ fn tui(hub: &Hub, cwd: PathBuf) -> anyhow::Result<()> {
     })();
     let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
     ratatui::restore();
-    // Stop any agent still running so nothing keeps editing after the screen is gone.
-    let ids: Vec<u32> = hub.state.lock().unwrap().jobs.iter().map(|j| j.id).collect();
-    for id in ids {
-        hub.cancel(id);
+    // Stop any agent still running, and give claimed issues time to be handed back with a comment.
+    let busy = hub.state.lock().unwrap().jobs.iter().filter(|j| !j.status.finished()).count();
+    if busy > 0 {
+        eprintln!("stopping {} job(s) and handing claimed issues back…", busy);
     }
-    std::thread::sleep(Duration::from_millis(200));
+    let left = rt.block_on(hub.shutdown(Duration::from_secs(45)));
+    if left > 0 {
+        eprintln!("{} job(s) did not finish in time; check their issues for a stale working label", left);
+    }
     res
 }
