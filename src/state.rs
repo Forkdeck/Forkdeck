@@ -292,6 +292,8 @@ pub struct RepoStatus {
     pub picked: u32,
     /// Why nothing is being picked up from this repository right now, if a limit says so.
     pub hold: Option<String>,
+    /// Rules waiting to be proposed are not retried before this.
+    pub notes_retry: Option<Instant>,
 }
 
 /// (repo index, is a pull request, number)
@@ -331,6 +333,9 @@ pub struct State {
     pub have_codex: bool,
     pub next_id: u32,
     pub team: TeamView,
+    /// Finished jobs the journal would not take. They are written as soon as it works again, and
+    /// until then nothing more is picked up.
+    pub unrecorded: Vec<crate::journal::Entry>,
     /// Used in the last 24 hours, as of the last poll.
     pub spent: crate::journal::Spent,
 }

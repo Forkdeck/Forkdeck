@@ -4,6 +4,9 @@
 //!
 //! The file never leaves the machine. It holds what a job was and how it went (item, agents,
 //! durations, rounds, tokens, the one-line outcome), not prompts and not agent output.
+//!
+//! Because the limits are counted from it, the journal failing is not a detail: when it cannot be
+//! read or written, nothing more is picked up until it can.
 
 use crate::state::{clip, AgentKind, Job, JobStatus, Source};
 use serde::{Deserialize, Serialize};
@@ -128,28 +131,72 @@ pub fn append(e: &Entry) -> Result<(), String> {
     f.write_all(line.as_bytes()).map_err(|e| format!("{}: {}", p.display(), e))
 }
 
-/// Entries that ended at or after `since`, oldest first. A line that cannot be read is skipped:
-/// one damaged line must not hide the rest. `tail_bytes` bounds how much of a large file is read.
-pub fn read(since: i64, tail_bytes: Option<u64>) -> Vec<Entry> {
-    let Ok(mut f) = std::fs::File::open(path()) else { return Vec::new() };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let mut skip_first = false;
-    if let Some(t) = tail_bytes {
-        if len > t {
-            skip_first = f.seek(SeekFrom::Start(len - t)).is_ok();
-        }
-    }
-    let mut text = String::new();
-    let mut raw = Vec::new();
-    if f.read_to_end(&mut raw).is_ok() {
-        text = String::from_utf8_lossy(&raw).to_string();
-    }
-    parse(&text, since, skip_first)
+/// Entries that ended at or after `since`, oldest first.
+///
+/// A journal that does not exist yet is an empty one. A journal that exists and cannot be read is
+/// an error: the limits are counted from it, and "nothing on record" would mean "nothing used".
+/// A line that cannot be parsed is skipped; one damaged line must not hide the rest.
+pub fn read(since: i64) -> Result<Vec<Entry>, String> {
+    read_file(&path(), since)
 }
 
-pub fn parse(text: &str, since: i64, skip_first: bool) -> Vec<Entry> {
-    // After a seek into the middle of the file the first line is a fragment.
-    text.lines().skip(skip_first as usize).filter_map(|l| serde_json::from_str::<Entry>(l).ok()).filter(|e| e.ts >= since).collect()
+/// Read from the end of the file backwards, a block at a time, and stop once the entries are older
+/// than asked for. However much history there is, only the part that matters is read, and all of
+/// that part is: there is no size after which a busy day gets cut short.
+pub fn read_file(p: &std::path::Path, since: i64) -> Result<Vec<Entry>, String> {
+    const BLOCK: u64 = 256 * 1024;
+    // Entries are appended as jobs end, so they are in time order unless the clock was set back.
+    // Reading goes on a little past the cutoff to allow for that.
+    const SLACK: i64 = 3600;
+    let mut f = match std::fs::File::open(p) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {}", p.display(), e)),
+    };
+    let fail = |e: std::io::Error| format!("{}: {}", p.display(), e);
+    let mut pos = f.metadata().map_err(fail)?.len();
+    let mut out: Vec<Entry> = Vec::new();
+    // The start of the block read last: the tail of a line whose head is in the block before it.
+    let mut carry: Vec<u8> = Vec::new();
+    let mut done = false;
+    while pos > 0 && !done {
+        let take = BLOCK.min(pos);
+        pos -= take;
+        f.seek(SeekFrom::Start(pos)).map_err(fail)?;
+        let mut buf = vec![0u8; take as usize];
+        f.read_exact(&mut buf).map_err(fail)?;
+        buf.extend_from_slice(&carry);
+        // Everything before the first newline may be half a line, unless this is the start of the file.
+        let cut = if pos == 0 { 0 } else { buf.iter().position(|b| *b == b'\n').map(|i| i + 1).unwrap_or(buf.len()) };
+        carry = buf[..cut].to_vec();
+        for line in String::from_utf8_lossy(&buf[cut..]).lines().rev() {
+            let Ok(e) = serde_json::from_str::<Entry>(line) else { continue };
+            if e.ts < since - SLACK {
+                done = true;
+                break;
+            }
+            if e.ts >= since {
+                out.push(e);
+            }
+        }
+    }
+    out.reverse();
+    Ok(out)
+}
+
+/// Can a finished job be recorded right now? Asked before work is picked up: what cannot be
+/// recorded cannot be counted afterwards.
+pub fn writable() -> Result<(), String> {
+    let p = path();
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {}", d.display(), e))?;
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(&p).map(|_| ()).map_err(|e| format!("{}: {}", p.display(), e))
+}
+
+#[cfg(test)]
+fn parse(text: &str, since: i64) -> Vec<Entry> {
+    text.lines().filter_map(|l| serde_json::from_str::<Entry>(l).ok()).filter(|e| e.ts >= since).collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -396,11 +443,67 @@ mod tests {
         let a = serde_json::to_string(&e(10, "issue", "o/r", "done")).unwrap();
         let b = serde_json::to_string(&e(20, "review", "o/r", "failed")).unwrap();
         let text = format!("{}\n{{\"ts\": 15, \"kind\"\n\n{}\n", a, b);
-        assert_eq!(parse(&text, 0, false).len(), 2);
-        assert_eq!(parse(&text, 15, false).len(), 1);
-        // A fragment left by seeking into the file, and fields from a newer version, are both tolerated.
-        let cut = format!("\"status\":\"done\"}}\n{}\n", b.replace("\"ts\":20", "\"ts\":20,\"added_later\":1"));
-        assert_eq!(parse(&cut, 0, true).len(), 1);
+        assert_eq!(parse(&text, 0).len(), 2);
+        assert_eq!(parse(&text, 15).len(), 1);
+        // Fields from a newer version are tolerated.
+        assert_eq!(parse(&b.replace("\"ts\":20", "\"ts\":20,\"added_later\":1"), 0).len(), 1);
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("forkdeck-journal-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_missing_journal_is_empty_but_an_unreadable_one_is_an_error() {
+        let d = scratch("unreadable");
+        assert_eq!(read_file(&d.join("nothing-here.jsonl"), 0), Ok(Vec::new()));
+        // Something is there and it cannot be read as a file.
+        let odd = d.join("journal.jsonl");
+        std::fs::create_dir(&odd).unwrap();
+        assert!(read_file(&odd, 0).is_err(), "nothing on record must not be mistaken for nothing used");
+        // Nor one that cannot even be opened, for any reason other than not being there.
+        std::fs::write(d.join("a-file"), "x").unwrap();
+        assert!(read_file(&d.join("a-file").join("journal.jsonl"), 0).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_busy_day_is_counted_in_full_however_large_the_journal() {
+        let d = scratch("large");
+        let p = d.join("journal.jsonl");
+        let now = 2_000_000_000;
+        let mut text = String::new();
+        // Old history first, then far more than two megabytes from the last day, with a damaged line in it.
+        for i in 0..2000 {
+            let mut old = e(now - 10 * DAY + i, "issue", "o/r", "done");
+            old.claude.tokens_in = 1_000_000;
+            text.push_str(&serde_json::to_string(&old).unwrap());
+            text.push('\n');
+        }
+        let n = 12_000;
+        for i in 0..n {
+            let mut x = e(now - DAY + 60 + i, "issue", "o/r", "done");
+            x.claude.tokens_in = 10;
+            x.outcome = "x".repeat(200);
+            text.push_str(&serde_json::to_string(&x).unwrap());
+            text.push('\n');
+            if i == n / 2 {
+                text.push_str("{\"ts\": 12, \"kind\n");
+            }
+        }
+        assert!(text.len() > 3 * (2 << 20), "the day alone is {} bytes", text.len());
+        std::fs::write(&p, &text).unwrap();
+        let got = read_file(&p, now - DAY).unwrap();
+        assert_eq!(got.len() as i64, n, "every job of the day is there");
+        assert!(got.windows(2).all(|w| w[0].ts <= w[1].ts), "oldest first");
+        assert_eq!(spent(&got, None, now), Spent { jobs: n as u32, tokens: 10 * n as u64 });
+        // And nothing more than was asked for.
+        assert_eq!(read_file(&p, now - 100).unwrap().len(), 0);
+        assert_eq!(read_file(&p, 0).unwrap().len() as i64, n + 2000);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

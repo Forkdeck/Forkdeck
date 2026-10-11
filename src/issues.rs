@@ -311,8 +311,39 @@ fn budget(hub: &Hub) -> Budget {
     if hub.cfg.demo {
         return Budget { stop: None, jobs_left: None, entries: Vec::new(), now };
     }
-    // The journal is the memory here: what was used before a restart still counts.
-    let entries = journal::read(0, Some(2 << 20));
+    // The journal is the memory here: what was used before a restart still counts. Read back as far
+    // as any limit looks: a day for the counts, and the pause window if that is longer.
+    let window = journal::DAY.max((lim.pause_mins * 60) as i64);
+    let counted = lim.jobs_per_day > 0 || lim.tokens_per_day > 0 || lim.pause_after_failures > 0 || hub.cfg.repos.iter().any(|r| r.jobs_per_day > 0);
+    // Jobs that ended while the journal could not be written are owed to it first.
+    let owed: Vec<journal::Entry> = std::mem::take(&mut hub.state.lock().unwrap().unrecorded);
+    let mut broken: Option<String> = None;
+    let mut still_owed = Vec::new();
+    for e in owed {
+        match (&broken, journal::append(&e)) {
+            (None, Ok(())) => {}
+            (None, Err(err)) => {
+                broken = Some(err);
+                still_owed.push(e);
+            }
+            (Some(_), _) => still_owed.push(e),
+        }
+    }
+    hub.state.lock().unwrap().unrecorded.extend(still_owed);
+    if broken.is_none() {
+        broken = journal::writable().err();
+    }
+    let entries = match journal::read(now - window) {
+        Ok(e) => e,
+        Err(e) => {
+            broken.get_or_insert(e);
+            Vec::new()
+        }
+    };
+    // Without the journal there is no telling what has been used. Not knowing is not zero.
+    if let Some(e) = broken.filter(|_| counted) {
+        return Budget { stop: Some(format!("the journal cannot be used, so nothing is picked up: {}", clip(&e, 160))), jobs_left: None, entries, now };
+    }
     let mut spent = journal::spent(&entries, None, now);
     {
         // Jobs still running are not in the journal yet.
@@ -356,6 +387,7 @@ pub async fn poll_once(hub: &Hub) {
     {
         {
             for (idx, r) in hub.cfg.repos.iter().enumerate() {
+                crate::knowledge::retry_pending(hub, idx).await;
                 // What a limit held back in this repository on this poll: the reason, and how many items.
                 let mut repo_hold: Option<(String, u32)> = None;
                 for pr in [false, true] {
@@ -457,8 +489,26 @@ pub async fn poll_once(hub: &Hub) {
     }
 }
 
-fn worktree_dir(hub: &Hub, r: &RepoCfg, kind: &str, n: u64) -> PathBuf {
+/// A directory name for a repository: readable, and different for every repository. Replacing the
+/// separators alone is not enough (`acme/foo_bar` and `acme_foo/bar` would share a name), so a
+/// short hash of the forge and the exact path goes on the end.
+pub fn repo_slug(r: &RepoCfg) -> String {
     let safe: String = r.repo.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect();
+    let forge = match r.provider {
+        Provider::Github => "github",
+        Provider::Gitlab => "gitlab",
+    };
+    // FNV-1a: small, and the same on every machine and in every version, which a path has to be.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in format!("{}:{}", forge, r.repo).bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{}-{:08x}", safe, h as u32)
+}
+
+fn worktree_dir(hub: &Hub, r: &RepoCfg, kind: &str, n: u64) -> PathBuf {
+    let safe = repo_slug(r);
     let host = match r.provider {
         Provider::Github => "github",
         Provider::Gitlab => "gitlab",

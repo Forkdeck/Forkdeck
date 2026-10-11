@@ -242,7 +242,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Stats { days, jobs, json }) => {
             let days = days.clamp(1, 3650);
-            let entries = journal::read(journal::now() - days as i64 * journal::DAY, None);
+            let entries = journal::read(journal::now() - days as i64 * journal::DAY).map_err(|e| anyhow::anyhow!("the journal cannot be read: {}", e))?;
             let summary = journal::summarise(&entries, days);
             if json {
                 println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -284,6 +284,10 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         println!();
                         println!("{}", team.trim_end());
+                    }
+                    let waiting = knowledge::pending(r).len();
+                    if waiting > 0 {
+                        println!("\n{} learned rule(s) are waiting to be proposed (the pull request could not be made yet); no job is given them", waiting);
                     }
                     let notes = knowledge::load(r);
                     println!("\nthis machine's own: {}", knowledge::path(r).display());

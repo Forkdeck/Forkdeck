@@ -295,7 +295,8 @@ pub async fn run_job(hub: Hub, id: u32) {
     if fin.wait.is_none() && !hub.cfg.demo {
         if let Some(e) = hub.job(id, |j| journal::entry(j, fin.status, &fin.outcome, learned)) {
             if let Err(err) = journal::append(&e) {
-                hub.log("journal", format!("#{} not recorded: {}", id, err));
+                hub.log("journal", format!("#{} not recorded: {}. Nothing more is picked up until the journal can be written", id, err));
+                hub.state.lock().unwrap().unrecorded.push(e);
             }
         }
     }

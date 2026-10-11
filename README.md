@@ -535,9 +535,16 @@ pause_mins = 60            # default
   and hands the item to a person with the failure label. Deployments are
   exempt; they have their own timeouts and stopping one halfway is worse.
 - **`pause_after_failures`** is on by default: after five issues or reviews in
-  a row fail on a repository, nothing more is picked up from it for an hour.
+  a row fail on a repository within a day, nothing more is picked up from it for an hour.
   Then one is tried; if that fails too, the pause starts again. Cancelled jobs
   count neither way.
+
+The limits are only as good as the journal they count from. If it cannot be
+read or written (a full disk, wrong permissions), nothing more is picked up
+until it can, and the log says why: not knowing what was used is not treated
+as nothing having been used. A job that ended while it could not be written is
+recorded as soon as it works again. This applies whenever any limit is set,
+which with the default failure pause is always.
 
 What a limit holds back is not touched at all: the label stays, nothing is
 claimed or commented, and it is picked up on the first poll with room again.
@@ -631,10 +638,14 @@ Two things keep the file honest:
 - A labelled pull request that touches `.forkdeck/` gets the same warning on
   its review as one that touches `CLAUDE.md` or `AGENTS.md`.
 
+If the pull request cannot be made (the forge is down, the push is refused),
+the rules wait in a file of their own that no job reads, and are proposed again
+on a later poll. With sharing on, a rule reaches agents through an approved
+pull request or not at all. `forkdeck notes` says how many are waiting.
+
 `share = false` keeps learned rules on this machine instead: they go into its
 own notes file under `## Learned by forkdeck` and take effect at once, for that
-machine only. If a proposal cannot be pushed, the rules are kept the same way
-so they are not lost. `learn` is off by default either way. A job that went
+machine only. `learn` is off by default either way. A job that went
 well teaches nothing and costs no extra run. Reviewers of labelled pull
 requests are not given the notes yet.
 

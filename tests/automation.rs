@@ -78,13 +78,15 @@ if [ "$1" = "api" ]; then
   esac
   exit 0
 fi
+if [ -n "$FAKE_GH_FAIL_CMD" ] && [ "$1 $2" = "$FAKE_GH_FAIL_CMD" ]; then echo "HTTP 503: service unavailable" >&2; exit 1; fi
 case "$1 $2" in
   "issue view"|"pr view") cat "$FAKE_GH/view-$3.json" 2>/dev/null || echo '{"labels":[]}' ;;
   "issue list") cat "$FAKE_GH/issues.json" ;;
   "pr list")
+    # With a label: what is waiting for a review. Without: every open pull request.
     case " $* " in
-      *" --head "*) cat "$FAKE_GH/notes-pr.json" 2>/dev/null || echo "[]" ;;
-      *) cat "$FAKE_GH/prs.json" ;;
+      *" --label "*) cat "$FAKE_GH/prs.json" ;;
+      *) cat "$FAKE_GH/open-prs.json" 2>/dev/null || echo "[]" ;;
     esac ;;
   *)
     printf '%s ' "$@" | tr '\n' ' ' >> "$FAKE_GH/calls.log"
@@ -212,8 +214,21 @@ impl Rig {
         fs::read_to_string(self.root.join("home/.local/state/forkdeck/journal.jsonl")).unwrap_or_default().lines().map(|l| serde_json::from_str(l).expect("a journal line is JSON")).collect()
     }
 
+    /// This machine's own notes for o/r. The file name ends in a hash, so it is looked up.
     fn notes_file(&self) -> PathBuf {
-        self.root.join("home/.local/state/forkdeck/notes/github/o_r.md")
+        self.in_notes("md")
+    }
+
+    fn in_notes(&self, ext: &str) -> PathBuf {
+        let dir = self.root.join("home/.local/state/forkdeck/notes/github");
+        let found = fs::read_dir(&dir).ok().and_then(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == ext) && p.file_name().unwrap().to_string_lossy().starts_with("o_r-")));
+        found.unwrap_or_else(|| dir.join(format!("o_r-missing.{}", ext)))
+    }
+
+    /// The directory the worktrees for o/r are kept in.
+    fn worktrees(&self) -> PathBuf {
+        let dir = self.root.join("wt/github");
+        fs::read_dir(&dir).expect("worktrees exist").filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.file_name().unwrap().to_string_lossy().starts_with("o_r-")).expect("a directory for o/r")
     }
 
     /// Push a branch with one new file and expose it the way GitHub exposes pull request N.
@@ -381,7 +396,7 @@ fn a_failed_attempt_survives_a_retry() {
     assert_eq!(git(&rig.clone(), &["show", "--name-only", "--format=", &second]), "other.txt", "the retry started from the base");
 
     // Work left uncommitted in the worktree (a crash) is kept too.
-    let wt = rig.root.join("wt/github/o_r/issue-7");
+    let wt = rig.worktrees().join("issue-7");
     fs::write(wt.join("half-done.txt"), "wip\n").unwrap();
     rig.once(&[("FAKE_VERDICT", "FAIL")]);
     let kept = git(&rig.clone(), &["log", "--all", "--format=%s", "--", "half-done.txt"]);
@@ -1615,7 +1630,7 @@ fn notes_reach_the_worker_and_rules_are_learned_only_when_asked_for() {
     rig.once(&[("FAKE_PROMPTS", prompts.to_str().unwrap())]);
     assert!(fs::read_to_string(&prompts).unwrap().contains("- Run make fmt before finishing the work."), "the next job starts with what the last one taught");
     let (ok, out) = rig.run(&["notes", "o/r"], &[]);
-    assert!(ok && out.contains("## Learned by forkdeck") && out.contains("o_r.md"), "{}", out);
+    assert!(ok && out.contains("## Learned by forkdeck") && out.contains("/notes/github/o_r-"), "{}", out);
 
     // A job that went well teaches nothing and costs no extra run.
     assert_eq!(rig.journal()[1]["learned"], 0);
@@ -1677,7 +1692,7 @@ fn learned_rules_are_proposed_to_the_team_as_a_pull_request() {
     assert!(!fs::read_to_string(&prompts).unwrap().contains("Run make fmt"), "an unmerged rule steers no job");
 
     // While that pull request is open, more rules are added to it; a rule it already has is not repeated.
-    fs::write(rig.root.join("gh/notes-pr.json"), r#"[{"number":12,"url":"https://example.invalid/o/r/pull/12"}]"#).unwrap();
+    fs::write(rig.root.join("gh/open-prs.json"), format!(r#"[{{"number":12,"url":"https://example.invalid/o/r/pull/12","headRefName":"{}"}}]"#, branch)).unwrap();
     rig.issues(&[9]);
     let more = r"- Run make fmt before finishing the work.\n- Never edit generated files under gen.";
     let (_, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", more)]);
@@ -1701,4 +1716,87 @@ fn an_agent_cannot_change_the_teams_notes_through_an_issue() {
     assert!(ok, "{}", out);
     assert!(out.contains("the agent's changes under .forkdeck/ were left out: .forkdeck/notes.md"), "{}", out);
     assert_eq!(git(&rig.origin(), &["show", "--name-only", "--format=", "forkdeck/issue-7"]), "by_agent.txt");
+}
+
+#[test]
+fn nothing_is_picked_up_while_the_journal_cannot_be_used() {
+    let rig = Rig::new("journal-broken", "[limits]\njobs_per_day = 5", "");
+    let journal = rig.root.join("home/.local/state/forkdeck/journal.jsonl");
+    rig.issue();
+    // While the agent works, the journal stops being a file that can be written.
+    let work = format!("echo change >> by_agent.txt; rm -f {j}; mkdir {j}", j = journal.display());
+    let (_, out) = rig.once(&[("FAKE_WORK", &work)]);
+    assert!(out.contains("not recorded") && out.contains("Nothing more is picked up until the journal can be written"), "{}", out);
+
+    // A new start: there is no telling what was used, so nothing is taken. Not knowing is not zero.
+    rig.issues(&[8]);
+    let before = rig.calls();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(out.contains("o/r: the journal cannot be used, so nothing is picked up"), "{}", out);
+    assert_eq!(rig.calls(), before, "issue 8 is not touched");
+    let (ok, out) = rig.run(&["stats"], &[]);
+    assert!(!ok && out.contains("the journal cannot be read"), "{}", out);
+
+    // Repaired: work goes on.
+    fs::remove_dir(&journal).unwrap();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok && rig.calls().contains("issue edit 8 "), "{}", out);
+
+    // With nothing to count, a broken journal holds nothing up.
+    let rig = Rig::new("journal-unneeded", "[limits]\npause_after_failures = 0", "");
+    fs::create_dir_all(rig.root.join("home/.local/state/forkdeck/journal.jsonl")).unwrap();
+    rig.issue();
+    let (_, out) = rig.once(&[]);
+    assert!(rig.calls().contains("pr create"), "{}", out);
+}
+
+#[test]
+fn rules_that_could_not_be_proposed_wait_where_no_job_reads_them() {
+    let rig = Rig::new("notes-pending", LEARN, "");
+    rig.issue();
+    let lessons = r"- Run make fmt before finishing the work.";
+    // The forge refuses the pull request.
+    let (_, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", lessons), ("FAKE_GH_FAIL_CMD", "pr create")]);
+    assert!(out.contains("1 rule(s) held back until they can be proposed"), "{}", out);
+    assert!(!rig.notes_file().exists(), "with sharing on, a rule nobody approved is not written into the notes");
+    assert!(fs::read_to_string(rig.in_notes("pending")).unwrap().contains("Run make fmt before finishing the work.\t"), "it is kept for later");
+    assert_eq!(rig.notes_branch(), None, "the branch that got no pull request is not left behind");
+    assert_eq!(rig.journal()[0]["learned"], 0);
+
+    // The next job is not given it. (The forge is still down, so it is not proposed either.)
+    rig.issues(&[8]);
+    let prompts = rig.root.join("prompts.txt");
+    let (_, out) = rig.once(&[("FAKE_PROMPTS", prompts.to_str().unwrap()), ("FAKE_GH_FAIL_CMD", "pr create")]);
+    assert!(!fs::read_to_string(&prompts).unwrap().contains("Run make fmt"), "an unapproved rule steers no job");
+    assert!(out.contains("1 rule(s) still waiting to be proposed"), "{}", out);
+    let (_, shown) = rig.run(&["notes", "o/r"], &[]);
+    assert!(shown.contains("1 learned rule(s) are waiting to be proposed"), "{}", shown);
+
+    // The forge is back: the rule is proposed on the next poll, and no longer waits.
+    rig.issues(&[]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok && out.contains("1 rule(s) that were waiting are now proposed: https://example.invalid/o/r/pull/12"), "{}", out);
+    assert!(!rig.in_notes("pending").exists());
+    let branch = rig.notes_branch().expect("a notes branch");
+    assert!(git(&rig.origin(), &["show", &format!("{}:.forkdeck/notes.md", branch)]).contains("Run make fmt before finishing the work. ("));
+    assert!(!rig.notes_file().exists());
+}
+
+#[test]
+fn the_open_notes_pull_request_is_found_among_any_number_of_old_branches() {
+    let rig = Rig::new("notes-many", LEARN, "");
+    // Seven notes branches from earlier rounds; only the oldest still has an open pull request.
+    let c = rig.clone();
+    for n in 1..=7 {
+        git(&c, &["push", "-q", "origin", &format!("HEAD:refs/heads/forkdeck/notes-2026010{}-000000", n)]);
+    }
+    let oldest = "forkdeck/notes-20260101-000000";
+    fs::write(rig.root.join("gh/open-prs.json"), format!(r#"[{{"number":3,"url":"https://example.invalid/o/r/pull/3","headRefName":"feature/x"}},{{"number":40,"url":"https://example.invalid/o/r/pull/40","headRefName":"{}"}}]"#, oldest)).unwrap();
+    rig.issue();
+    let (_, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", r"- Run make fmt before finishing the work.")]);
+    assert!(out.contains("1 rule(s) proposed for the team's notes: https://example.invalid/o/r/pull/40"), "{}", out);
+    assert_eq!(git(&rig.origin(), &["rev-list", "--count", &format!("main..{}", oldest)]), "1", "added to the open one");
+    assert!(!rig.calls().contains("--title Notes for agents"), "no second pull request:\n{}", rig.calls());
+    assert_eq!(git(&rig.origin(), &["for-each-ref", "--format=%(refname:short)", "refs/heads/forkdeck/notes-*"]).lines().count(), 7, "and no new branch");
 }

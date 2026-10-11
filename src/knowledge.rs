@@ -27,8 +27,40 @@ pub fn path(r: &RepoCfg) -> PathBuf {
         Provider::Github => "github",
         Provider::Gitlab => "gitlab",
     };
-    let safe: String = r.repo.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect();
-    crate::cicd::state_dir().join("notes").join(forge).join(format!("{}.md", safe))
+    crate::cicd::state_dir().join("notes").join(forge).join(format!("{}.md", issues::repo_slug(r)))
+}
+
+/// Rules that were learned but could not be proposed yet. They wait here, where no job reads
+/// them, until the pull request can be made: with sharing on, nothing learned takes effect
+/// before a person has seen it, and a forge that is down for a while does not change that.
+pub fn pending_path(r: &RepoCfg) -> PathBuf {
+    path(r).with_extension("pending")
+}
+
+/// Rule and the tag saying where it came from, one pair per line.
+pub fn pending(r: &RepoCfg) -> Vec<(String, String)> {
+    std::fs::read_to_string(pending_path(r)).unwrap_or_default().lines().filter_map(|l| l.split_once('\t')).map(|(a, b)| (a.to_string(), b.to_string())).collect()
+}
+
+fn save_pending(r: &RepoCfg, items: &[(String, String)]) -> Result<(), String> {
+    let p = pending_path(r);
+    if items.is_empty() {
+        let _ = std::fs::remove_file(&p);
+        return Ok(());
+    }
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {}", d.display(), e))?;
+    }
+    let mut seen: Vec<String> = Vec::new();
+    let mut text = String::new();
+    // Bounded like everything else that is learned: the newest are kept.
+    for (rule, tag) in items.iter().rev().take(60).rev() {
+        if !seen.contains(&norm(rule)) {
+            seen.push(norm(rule));
+            text.push_str(&format!("{}\t{}\n", rule.replace(['\t', '\n'], " "), tag.replace(['\t', '\n'], " ")));
+        }
+    }
+    std::fs::write(&p, text).map_err(|e| format!("{}: {}", p.display(), e))
 }
 
 pub fn load(r: &RepoCfg) -> String {
@@ -235,15 +267,30 @@ pub async fn learn(hub: &Hub, id: u32) -> u32 {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let tag = format!("{}, {}", today, tag);
     if hub.cfg.knowledge.share {
-        match propose(hub, idx, &r, &rules, &tag).await {
-            Ok(Some((added, url))) => {
-                hub.log("notes", format!("#{} {} rule(s) proposed for the team's notes: {}", id, added, url));
-                return added;
+        // Whatever is still waiting from earlier goes along.
+        let mut items = pending(&r);
+        items.extend(rules.iter().map(|x| (x.clone(), tag.clone())));
+        return match propose(hub, idx, &r, &items).await {
+            Ok(done) => {
+                let _ = save_pending(&r, &[]);
+                match done {
+                    Some((added, url)) => {
+                        hub.log("notes", format!("#{} {} rule(s) proposed for the team's notes: {}", id, added, url));
+                        added
+                    }
+                    None => 0,
+                }
             }
-            Ok(None) => return 0,
-            // Not lost: kept on this machine, where the next job here still gets them.
-            Err(e) => hub.log("notes", format!("#{} could not propose the rules ({}); keeping them on this machine", id, clip(&e, 200))),
-        }
+            // With sharing on, a rule reaches agents through the pull request or not at all.
+            // It is held where no job reads it and proposed again later.
+            Err(e) => {
+                match save_pending(&r, &items) {
+                    Ok(()) => hub.log("notes", format!("#{} {} rule(s) held back until they can be proposed: {}", id, rules.len(), clip(&e, 200))),
+                    Err(e2) => hub.log("notes", format!("#{} could not propose the rules ({}) nor keep them for later ({})", id, clip(&e, 120), clip(&e2, 120))),
+                }
+                0
+            }
+        };
     }
     let (text, added) = merge(&load(&r), &rules, &tag, hub.cfg.knowledge.max_learned);
     if added == 0 {
@@ -261,36 +308,62 @@ pub async fn learn(hub: &Hub, id: u32) -> u32 {
     }
 }
 
-/// The open pull request whose head is `branch`, if there is one.
-async fn open_pr(r: &RepoCfg, branch: &str) -> Result<Option<String>, String> {
-    let (out, key) = match r.provider {
-        Provider::Github => (issues::sh("gh", &["pr", "list", "-R", &r.repo, "--head", branch, "--state", "open", "--json", "number,url"], None).await?, "url"),
-        Provider::Gitlab => (issues::sh("glab", &["mr", "list", "-R", &r.repo, "--source-branch", branch, "--output", "json"], Some(&r.path)).await?, "web_url"),
+/// Rules are waiting to be proposed for this repository: try again. Called from the poll, not more
+/// often than every ten minutes while it keeps failing.
+pub async fn retry_pending(hub: &Hub, idx: usize) {
+    if hub.cfg.demo || !hub.cfg.knowledge.enabled || !hub.cfg.knowledge.learn || !hub.cfg.knowledge.share {
+        return;
+    }
+    let Some(r) = hub.cfg.repos.get(idx).cloned() else { return };
+    let items = pending(&r);
+    if items.is_empty() {
+        return;
+    }
+    {
+        let mut st = hub.state.lock().unwrap();
+        if st.repos[idx].notes_retry.is_some_and(|t| std::time::Instant::now() < t) {
+            return;
+        }
+        st.repos[idx].notes_retry = Some(std::time::Instant::now() + std::time::Duration::from_secs(600));
+    }
+    match propose(hub, idx, &r, &items).await {
+        Ok(done) => {
+            let _ = save_pending(&r, &[]);
+            if let Some((added, url)) = done {
+                hub.log("notes", format!("{}: {} rule(s) that were waiting are now proposed: {}", r.repo, added, url));
+            }
+        }
+        Err(e) => hub.log("notes", format!("{}: {} rule(s) still waiting to be proposed: {}", r.repo, items.len(), clip(&e, 160))),
+    }
+}
+
+/// The open notes pull request for this repository, if there is one: its branch and its address.
+/// Asked of the forge directly, so it is found however many older notes branches are lying around.
+async fn open_notes_pr(r: &RepoCfg) -> Result<Option<(String, String)>, String> {
+    let (out, head, url) = match r.provider {
+        Provider::Github => (issues::sh("gh", &["pr", "list", "-R", &r.repo, "--state", "open", "--limit", "200", "--json", "number,url,headRefName"], None).await?, "headRefName", "url"),
+        Provider::Gitlab => (issues::sh("glab", &["mr", "list", "-R", &r.repo, "--per-page", "100", "--output", "json"], Some(&r.path)).await?, "source_branch", "web_url"),
     };
     let v: serde_json::Value = serde_json::from_str(&out).map_err(|e| format!("the pull request list is not JSON: {}", e))?;
-    Ok(v.as_array().and_then(|a| a.first()).and_then(|p| p.get(key)).and_then(|u| u.as_str()).filter(|u| !u.is_empty()).map(String::from))
+    let s = |p: &serde_json::Value, k: &str| p.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let mut found: Vec<(String, String)> =
+        v.as_array().ok_or("the pull request list is not an array")?.iter().map(|p| (s(p, head), s(p, url))).filter(|(b, u)| b.starts_with("forkdeck/notes-") && !u.is_empty()).collect();
+    // Should there ever be two, the older one is the one people have been looking at.
+    found.sort();
+    Ok(found.into_iter().next())
 }
 
 /// Put rules in front of the team: a commit that adds them to `.forkdeck/notes.md`, on a branch of
 /// its own, with a pull request. While such a pull request is open, later rules are added to it,
 /// so there is one thing to look at per repository. Nothing is ever force-pushed.
 /// Returns how many rules were new and the pull request, or None when there was nothing to add.
-async fn propose(hub: &Hub, idx: usize, r: &RepoCfg, rules: &[String], tag: &str) -> Result<Option<(u32, String)>, String> {
+async fn propose(hub: &Hub, idx: usize, r: &RepoCfg, items: &[(String, String)]) -> Result<Option<(u32, String)>, String> {
     let lock = hub.git_locks.get(idx).cloned().ok_or("no repository for this job")?;
     let _held = lock.lock().await;
     let repo = Some(r.path.as_path());
     issues::sh("git", &["fetch", "origin", &format!("+refs/heads/{b}:refs/remotes/origin/{b}", b = r.base)], repo).await?;
     // A notes pull request that is still open is added to.
-    let heads = issues::sh("git", &["ls-remote", "--heads", "origin", "refs/heads/forkdeck/notes-*"], repo).await?;
-    let mut branches: Vec<String> = heads.lines().filter_map(|l| l.split_whitespace().nth(1)).filter_map(|n| n.strip_prefix("refs/heads/")).map(String::from).collect();
-    branches.sort();
-    let mut open: Option<(String, String)> = None;
-    for b in branches.iter().rev().take(5) {
-        if let Some(url) = open_pr(r, b).await? {
-            open = Some((b.clone(), url));
-            break;
-        }
-    }
+    let open = open_notes_pr(r).await?;
     let (branch, parent) = match &open {
         Some((b, _)) => {
             issues::sh("git", &["fetch", "origin", &format!("+refs/heads/{}:refs/forkdeck/notes-open", b)], repo).await?;
@@ -303,13 +376,22 @@ async fn propose(hub: &Hub, idx: usize, r: &RepoCfg, rules: &[String], tag: &str
     };
     let current = issues::sh("git", &["show", &format!("{}:{}", parent, SHARED)], repo).await.unwrap_or_default();
     // A rule this machine's own notes already state is not news either.
-    let own: Vec<String> = load(r).lines().map(norm).collect();
-    let fresh: Vec<String> = rules.iter().filter(|x| !own.contains(&norm(&format!("- {}", x))) && !own.contains(&norm(x))).cloned().collect();
-    let start = if current.trim().is_empty() { HEADER.to_string() } else { current };
-    let (text, added) = merge(&start, &fresh, tag, hub.cfg.knowledge.max_learned);
+    let own: Vec<String> = load(r).lines().map(|l| norm(l.trim_start().trim_start_matches("- "))).collect();
+    let mut text = if current.trim().is_empty() { HEADER.to_string() } else { current };
+    let mut fresh: Vec<(String, String)> = Vec::new();
+    for (rule, tag) in items.iter().filter(|(x, _)| !own.contains(&norm(x))) {
+        let (next, added) = merge(&text, std::slice::from_ref(rule), tag, hub.cfg.knowledge.max_learned);
+        if added > 0 {
+            text = next;
+            fresh.push((rule.clone(), tag.clone()));
+        }
+    }
+    let added = fresh.len() as u32;
     if added == 0 {
         return Ok(None);
     }
+    let tag = fresh.iter().map(|(_, t)| t.as_str()).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>().join("; ");
+    let tag = tag.as_str();
     // Built with git's plumbing and an index of its own: no checkout, and the clone's own index and
     // working tree, which a person may be using, are not touched.
     let blob = issues::sh_in("git", &["hash-object", "-w", "--stdin"], repo, &text).await?;
@@ -329,7 +411,7 @@ async fn propose(hub: &Hub, idx: usize, r: &RepoCfg, rules: &[String], tag: &str
     let commit = issues::sh("git", &["commit-tree", &tree, "-p", &parent, "-m", &msg], repo).await?;
     // A plain push: a new branch, or a fast-forward of the open pull request's branch.
     issues::sh("git", &["push", "origin", &format!("{}:refs/heads/{}", commit, branch)], repo).await?;
-    let listed: String = fresh.iter().map(|x| format!("- {}\n", issues::quiet(x))).collect();
+    let listed: String = fresh.iter().map(|(x, _)| format!("- {}\n", issues::quiet(x))).collect();
     if let Some((_, url)) = open {
         if let Some(n) = issues::pr_number(&url) {
             let _ = issues::comment(r, true, n, &format!("forkdeck added {} more rule(s), from {}:\n\n{}", added, tag, listed)).await;
@@ -348,7 +430,16 @@ async fn propose(hub: &Hub, idx: usize, r: &RepoCfg, rules: &[String], tag: &str
         Provider::Github => issues::sh("gh", &["pr", "create", "-R", &r.repo, "--head", &branch, "--base", &r.base, "--title", title, "--body", &body], repo).await,
         Provider::Gitlab => issues::sh("glab", &["mr", "create", "-R", &r.repo, "--source-branch", &branch, "--target-branch", &r.base, "--title", title, "--description", &body, "--yes"], repo).await,
     }
-    .map_err(|e| format!("the branch {} was pushed, but opening the pull request failed: {}", branch, e))?;
+    ;
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            // A branch nobody was told about would only be in the way next time. It was created a
+            // moment ago by this very call, so it is this call's to remove.
+            let _ = issues::sh("git", &["push", "origin", &format!(":refs/heads/{}", branch)], repo).await;
+            return Err(format!("opening the pull request failed: {}", e));
+        }
+    };
     Ok(Some((added, issues::first_url(&out).unwrap_or(out))))
 }
 
@@ -391,6 +482,21 @@ mod tests {
         let learned: Vec<&str> = text.split(LEARNED).nth(1).unwrap().lines().filter(|l| l.starts_with("- ")).collect();
         assert_eq!(learned.len(), 3);
         assert!(learned[0].contains("number 2") && learned[2].contains("number 4"), "{:?}", learned);
+    }
+
+    #[test]
+    fn two_repositories_never_share_a_notes_file() {
+        let repo = |provider: &str, name: &str| -> RepoCfg { toml::from_str(&format!("provider = \"{}\"\nrepo = \"{}\"\npath = \".\"", provider, name)).unwrap() };
+        // Replacing the separators alone would give both of these the same name.
+        let (a, b) = (repo("gitlab", "acme/foo_bar"), repo("gitlab", "acme_foo/bar"));
+        assert_ne!(path(&a), path(&b));
+        assert_ne!(issues::repo_slug(&a), issues::repo_slug(&b));
+        assert!(issues::repo_slug(&a).starts_with("acme_foo_bar-"));
+        // The same name on the two forges is two repositories; the same repository is always the same file.
+        assert_ne!(issues::repo_slug(&repo("github", "o/r")), issues::repo_slug(&repo("gitlab", "o/r")));
+        assert_eq!(path(&a), path(&repo("gitlab", "acme/foo_bar")));
+        assert_eq!(issues::repo_slug(&repo("github", "o/r")), "o_r-f85ac294", "the name must not change between versions");
+        assert_eq!(pending_path(&a).extension().unwrap(), "pending");
     }
 
     #[test]
