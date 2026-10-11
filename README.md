@@ -382,6 +382,87 @@ than what is live. Check each pattern against `forkdeck mcp call` output first.
 A small tool of your own that answers with one line, such as
 `rev=<commit> Healthy`, is sturdier than patterns over a large JSON document.
 
+## Working as a team
+
+When several people run forkdeck against the same repositories, each machine
+needs to know what the others have taken, and people want to see it too. With
+`[team]` enabled, forkdeck keeps that on GitHub or GitLab itself. There is no
+server to run and nothing to sign up for; whoever can see the repository can
+see who is on what.
+
+```toml
+[team]
+enabled = true
+```
+
+**What it does.** Before forkdeck takes a labelled issue or pull request, it
+posts one comment saying so, and assigns the issue to the account `gh` or
+`glab` is logged in as. That comment is edited in place as the job moves
+through routing, working, review, fixing, publishing and watching CI, and once
+more when it ends.
+A deployment is announced the same way on the commit being deployed (GitHub
+only: GitLab commit comments cannot be edited).
+
+**What is shared.** The account name, the machine name, which agent, which
+stage, when it started, when it was last updated, and the pull request link.
+No prompt, no agent output, no logs. Tasks typed into the prompt are never
+shared. The machine name is your hostname unless you set `host`; on a public
+repository you may want `host = ""`.
+
+**Seeing it.** `Ctrl-T` swaps the agent tree for the team pane, and
+`forkdeck team` prints the same thing:
+
+```
+alice on mbp-alice (you)
+  payments#41        working            claude       4m  Retry loop keeps the long backoff after a success
+maria on mbp-maria
+  payments#38        watching ci        codex       31m  Webhook signature check rejects rotated keys
+  payments!57        reviewing          claude       5m  Add --since flag to the export command
+tomasz on build-02
+  payments#35        working            claude   2h 33m  Paginate the ledger export
+                     no update for 1h 8m · forkdeck team release acme/payments#35
+  payments@9f3c2ab   deploying                       3m  Merge pull request #52
+```
+
+`#` is an issue, `!` a pull request, `@` a deployment. It reads the working
+labels of every configured repository, so it also shows items someone claimed
+by hand or with sharing off, as "claimed, no forkdeck status". `--all` adds
+issues whose pull request is open and waiting, and `--json` prints the rows
+for scripts. Looking never changes anything, and works with sharing off.
+
+**Not stepping on each other.** An issue or review that a teammate's forkdeck
+holds is left alone: no label moves, no comment, and the job ends as "not
+started". If two machines take the same issue in the same second, both see
+both claims when they look again after moving the label, and the older
+comment wins on both. A claim only counts if the comment's author is the
+account it names, so typing a marker into a comment cannot block anyone else's
+work under another name. If the claims cannot be read, nothing is taken.
+
+**When a machine goes away.** A running job refreshes its comment every
+`heartbeat_secs`. A claim that has not been refreshed for `stale_mins` (the
+forge's own "last edited" time, not a clock in the comment) is shown as stale
+and no longer blocks anyone. Its label is still on the working one, so hand it
+back:
+
+```sh
+forkdeck team release acme/payments#35      # an issue
+forkdeck team release acme/payments!57      # a review
+```
+
+That ends the claim with a comment and puts the request label back, and the
+next poll, yours or a teammate's, picks it up. A claim that is still being
+refreshed needs `--force`. The machine that held it notices at its next
+heartbeat, and in any case before it pushes or posts anything, and stops
+without touching the labels. An issue whose pull request is already open is
+not handed back; close or take over the pull request instead.
+
+Every machine that works a repository should have `[team]` enabled: a forkdeck
+with sharing off neither announces what it takes nor looks at what others
+have. Staleness compares the forge's time with this machine's clock, so a
+clock that is far ahead makes teammates look stale. Deployments are announced
+but not arbitrated: two machines with a deploy stage for the same environment
+will both deploy, so give that stage to one of them.
+
 ## Before you leave it unattended
 
 Issue text is input from other people, and an agent that reads it can be
@@ -405,7 +486,7 @@ Quitting, closing the terminal or sending SIGTERM stops polling and every
 running agent with the processes it started, then waits up to 45 seconds while
 claimed issues are handed back with a comment. If forkdeck is killed outright
 (SIGKILL, power loss), an issue can be left on `agent:working`; move the label
-back by hand.
+back by hand, or with `forkdeck team release`.
 
 ## Keys
 
@@ -415,6 +496,7 @@ back by hand.
 | `Tab` | force the next task to claude, codex, or back to auto |
 | `↑` `↓` | select a job; `Esc` goes back to following the newest |
 | `Ctrl-A` | issue and pull request polling on/off |
+| `Ctrl-T` | show what teammates are working on, and back |
 | `Ctrl-X` | cancel the selected job |
 | `Ctrl-C` | quit, stopping any running agent |
 
@@ -434,11 +516,14 @@ no stage has been run against a real CI or deployment system yet. The claude
 path has been run against the real CLI. The GitHub flow, the
 codex stream parser and the Jev wire format are tested against stand-ins that
 follow the documented formats, and the `glab` commands have not been run
-against a live GitLab yet. Expect to adjust `agents.codex` arguments for your
-codex version.
+against a live GitLab yet. The team feature is tested against a stand-in for
+`gh api`; its `gh` calls follow the documented REST endpoints and have not
+been run by two real machines against one repository. Expect to adjust
+`agents.codex` arguments for your codex version.
 
 Not there yet: feeding review comments on an open pull request back to the
-worker for another round.
+worker for another round; a record of jobs that survives a restart; arbitrating
+deployments between machines.
 
 ## License
 

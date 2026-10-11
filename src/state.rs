@@ -253,6 +253,10 @@ pub struct Job {
     pub created: Instant,
     pub finished: Option<Instant>,
     pub cancel: Arc<Cancel>,
+    /// The status comment teammates see, while this job holds one.
+    pub claim: Option<Arc<crate::team::Held>>,
+    /// A teammate handed the item back to the queue: stop without touching its labels.
+    pub released: bool,
 }
 
 pub struct LogLine {
@@ -316,6 +320,15 @@ pub struct State {
     pub have_claude: bool,
     pub have_codex: bool,
     pub next_id: u32,
+    pub team: TeamView,
+}
+
+/// What teammates are working on, as last read from the forge.
+#[derive(Default)]
+pub struct TeamView {
+    pub rows: Vec<crate::team::Row>,
+    pub at: Option<Instant>,
+    pub error: Option<String>,
 }
 
 impl Source {
@@ -379,6 +392,12 @@ impl State {
             None => r.exhausted = true,
         }
         delay
+    }
+
+    /// Leave the item alone for a while and then look at it again, without using up a retry.
+    pub fn look_again(&mut self, key: Key, at: Instant) {
+        let r = self.retry.entry(key).or_insert(Retry { attempts: 0, not_before: at, exhausted: false });
+        r.not_before = at;
     }
 
     /// Done with the item: a later label means a new request.

@@ -8,6 +8,7 @@ mod orchestrator;
 mod proc;
 mod router;
 mod state;
+mod team;
 mod ui;
 
 use clap::{Parser, Subcommand};
@@ -34,6 +35,9 @@ struct Cli {
     size: String,
     #[arg(long, hide = true, default_value_t = 6)]
     after: u64,
+    /// With --snapshot: show the team pane
+    #[arg(long, hide = true)]
+    team_pane: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -56,6 +60,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: McpCmd,
     },
+    /// Show what everyone's forkdeck is working on in the configured repositories
+    Team {
+        /// Also list issues whose pull request is open and waiting
+        #[arg(long)]
+        all: bool,
+        /// Print the rows as JSON
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        cmd: Option<TeamCmd>,
+    },
     /// Check the CLIs, the decision endpoint, the MCP servers and the configured repositories
     Doctor,
     /// Write a commented config file
@@ -63,6 +78,18 @@ enum Cmd {
         /// Where to write it (default: ~/.config/forkdeck/config.toml)
         #[arg(long)]
         path: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TeamCmd {
+    /// Hand a claimed issue or review back to the queue, for instance after a machine went away
+    Release {
+        /// owner/repo#12 for an issue, owner/repo!5 for a pull request
+        item: String,
+        /// End a claim that is still being updated, and stop the job behind it
         #[arg(long)]
         force: bool,
     },
@@ -177,6 +204,11 @@ fn main() -> anyhow::Result<()> {
             let code = rt.block_on(mcp_cmd(&hub, cmd));
             std::process::exit(code);
         }
+        Some(Cmd::Team { all, json, cmd }) => {
+            anyhow::ensure!(hub.cfg.demo || !hub.cfg.repos.is_empty(), "no [[repos]] configured, nothing to look at");
+            let code = rt.block_on(team_cmd(&hub, all, json, cmd));
+            std::process::exit(code);
+        }
         Some(Cmd::Doctor) => {
             let ok = rt.block_on(doctor(&hub, cfg_path));
             std::process::exit(if ok { 0 } else { 1 });
@@ -193,8 +225,9 @@ fn main() -> anyhow::Result<()> {
         None => {
             rt.block_on(hub.detect_agents());
             rt.spawn(issues::poll_loop(hub.clone()));
+            rt.spawn(team::watch_loop(hub.clone()));
             if let Some(path) = cli.snapshot {
-                return snapshot(&rt, &hub, cwd, &path, &cli.size, cli.after);
+                return snapshot(&rt, &hub, cwd, &path, &cli.size, cli.after, cli.team_pane);
             }
             if let Some(p) = cfg_path {
                 hub.log("config", format!("loaded {}", p.display()));
@@ -347,6 +380,38 @@ async fn mcp_cmd(hub: &Hub, cmd: McpCmd) -> i32 {
     code
 }
 
+async fn team_cmd(hub: &Hub, all: bool, json: bool, cmd: Option<TeamCmd>) -> i32 {
+    if let Some(TeamCmd::Release { item, force }) = cmd {
+        return match team::release(hub, &item, force).await {
+            Ok(said) => {
+                say!("{}", said);
+                0
+            }
+            Err(e) => {
+                warn!("{}", e);
+                1
+            }
+        };
+    }
+    let (rows, errors) = team::gather(hub, all).await;
+    if json {
+        say!("{}", serde_json::to_string_pretty(&rows).unwrap_or_default());
+    } else {
+        use std::io::IsTerminal;
+        let width = if std::io::stdout().is_terminal() { crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(110).clamp(70, 200) } else { 110 };
+        for l in team::text(&rows, width) {
+            say!("{}", l);
+        }
+        if !hub.cfg.team.enabled && !hub.cfg.demo {
+            say!("\nThis machine does not share its own work: set enabled = true under [team] to claim with a status comment.");
+        }
+    }
+    for e in &errors {
+        warn!("{}", e);
+    }
+    if errors.is_empty() { 0 } else { 1 }
+}
+
 async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
     let mut ok = true;
     match cfg_path {
@@ -402,6 +467,25 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
             if git_ok { "found" } else { "is not a git repository" }
         );
         ok &= tool_ok && git_ok;
+    }
+    if hub.cfg.team.enabled {
+        let mut asked: Vec<Provider> = Vec::new();
+        for r in &hub.cfg.repos {
+            if asked.contains(&r.provider) {
+                continue;
+            }
+            asked.push(r.provider);
+            let forge = if r.provider == Provider::Github { "GitHub" } else { "GitLab" };
+            match team::me(hub, r.provider).await {
+                Ok(name) => println!("team      ok       claims on {} are made as {} from {:?}", forge, name, team::host(hub)),
+                Err(e) => {
+                    ok = false;
+                    println!("team      problem  cannot tell who is logged in on {}: {}", forge, e);
+                }
+            }
+        }
+    } else if !hub.cfg.repos.is_empty() {
+        println!("team      off      work is not shared with teammates ([team] enabled = true)");
     }
     // Every tool a stage names has to exist on its server; a typo would otherwise show up as a stuck pipeline.
     let mut offered: std::collections::HashMap<String, Vec<String>> = Default::default();
@@ -459,7 +543,7 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
 }
 
 fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
-    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo }
+    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false }
 }
 
 fn sync_selection(hub: &Hub, u: &mut ui::Ui) {
@@ -470,10 +554,11 @@ fn sync_selection(hub: &Hub, u: &mut ui::Ui) {
     }
 }
 
-fn snapshot(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf, path: &std::path::Path, size: &str, after: u64) -> anyhow::Result<()> {
+fn snapshot(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf, path: &std::path::Path, size: &str, after: u64, team_pane: bool) -> anyhow::Result<()> {
     let (w, h) = size.split_once('x').ok_or_else(|| anyhow::anyhow!("--size wants WIDTHxHEIGHT"))?;
     let (w, h): (u16, u16) = (w.parse()?, h.parse()?);
     let mut u = new_ui(hub, cwd.clone());
+    u.team = team_pane;
     if hub.cfg.demo {
         hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd, None);
     }
@@ -543,6 +628,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                                 hub.cancel(id);
                             }
                         }
+                        KeyCode::Char('t') if ctrl => u.team = !u.team,
                         KeyCode::Char('u') if ctrl => u.input.clear(),
                         KeyCode::Char(c) if !ctrl => u.input.push(c),
                         KeyCode::Backspace => {
