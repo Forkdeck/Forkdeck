@@ -1,5 +1,5 @@
 //! End-to-end tests of the unattended paths, run against the built binary with stand-ins for
-//! `claude` and `gh` and a local bare repository as the remote. They need `git` and `sh`.
+//! `claude`, `gh` and an MCP server, and a local bare repository as the remote. They need `git` and `sh`.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -9,6 +9,7 @@ use std::process::Command;
 const CLAUDE: &str = r#"#!/bin/sh
 [ "$1" = "--version" ] && { echo stand-in; exit 0; }
 prompt=$(cat)
+[ -n "$FAKE_PROMPTS" ] && printf '%s\n-----\n' "$prompt" >> "$FAKE_PROMPTS"
 case "$prompt" in
   *"Do not modify any file"*)
     [ -n "$FAKE_DURING_REVIEW" ] && PROMPT="$prompt" sh -c "$FAKE_DURING_REVIEW" >/dev/null 2>&1
@@ -35,6 +36,28 @@ esac
 exit 0
 "#;
 
+/// An MCP server over stdio. Each tool answers with the next line of `$FAKE_MCP/<tool>.txt`
+/// (the last line repeats), and every call is appended to `$FAKE_MCP/calls.log`.
+const MCP: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"stand-in","version":"0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ci_status","description":"Pipeline state","inputSchema":{"type":"object"}},{"name":"deploy_status","description":"App health","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      tool=$(printf '%s' "$line" | sed -n 's/.*"name":"\([a-z_]*\)".*/\1/p')
+      printf '%s\n' "$line" >> "$FAKE_MCP/calls.log"
+      n=$(cat "$FAKE_MCP/$tool.n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_MCP/$tool.n"
+      total=$(wc -l < "$FAKE_MCP/$tool.txt" 2>/dev/null || echo 0)
+      [ "$n" -gt "$total" ] && n=$total
+      text=$(sed -n "${n}p" "$FAKE_MCP/$tool.txt" 2>/dev/null)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}],"isError":false}}\n' "$id" "$text" ;;
+  esac
+done
+"#;
+
 struct Rig {
     root: PathBuf,
 }
@@ -56,10 +79,10 @@ impl Rig {
     fn new(name: &str, extra_config: &str, repo_config: &str) -> Rig {
         let root = std::env::temp_dir().join(format!("forkdeck-test-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        for d in ["bin", "gh", "home/.config/forkdeck"] {
+        for d in ["bin", "gh", "mcp", "home/.config/forkdeck"] {
             fs::create_dir_all(root.join(d)).unwrap();
         }
-        for (file, body) in [("claude", CLAUDE), ("gh", GH)] {
+        for (file, body) in [("claude", CLAUDE), ("gh", GH), ("mcp-stand-in", MCP)] {
             let p = root.join("bin").join(file);
             fs::write(&p, body).unwrap();
             fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
@@ -83,7 +106,8 @@ impl Rig {
                 root.join("wt").display(),
                 clone.display(),
                 repo_config
-            ),
+            )
+            .replace("{root}", &root.display().to_string()),
         )
         .unwrap();
         Rig { root }
@@ -138,6 +162,26 @@ impl Rig {
         }
         let out = c.output().expect("forkdeck runs");
         (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    }
+
+    /// Script the answers of one tool on the stand-in MCP server and start it from the first again.
+    fn mcp_answers(&self, tool: &str, lines: &[&str]) {
+        fs::write(self.root.join(format!("mcp/{}.txt", tool)), format!("{}\n", lines.join("\n"))).unwrap();
+        let _ = fs::remove_file(self.root.join(format!("mcp/{}.n", tool)));
+    }
+
+    fn mcp_calls(&self) -> String {
+        fs::read_to_string(self.root.join("mcp/calls.log")).unwrap_or_default()
+    }
+
+    /// Add a commit to the remote's main branch, as a merge would.
+    fn merge_to_main(&self, file: &str) -> String {
+        let c = self.clone();
+        fs::write(c.join(file), "merged\n").unwrap();
+        git(&c, &["add", "."]);
+        git(&c, &["commit", "-qm", file]);
+        git(&c, &["push", "-q", "origin", "HEAD:main"]);
+        git(&c, &["rev-parse", "HEAD"])
     }
 
     fn calls(&self) -> String {
@@ -279,4 +323,145 @@ fn a_commit_made_by_the_agent_is_reviewed_and_squashed() {
         git(&rig.origin(), &["show", "--name-only", "--format=", "forkdeck/issue-7"]).lines().map(String::from).collect();
     files.sort();
     assert_eq!(files, vec!["committed.txt", "uncommitted.txt"]);
+}
+
+const MCP_SERVER: &str = "[mcp.pipeline]\ncommand = \"{root}/bin/mcp-stand-in\"\nenv = { FAKE_MCP = \"{root}/mcp\" }";
+
+const CI_STAGE: &str = r#"
+[repos.ci]
+server = "pipeline"
+interval_secs = 1
+max_fix_rounds = 1
+[repos.ci.status]
+tool = "ci_status"
+args = { pr = "{pr}", ref = "{branch}", owner = "{owner}", name = "{name}" }
+success = "PASSED"
+failure = "FAILED"
+capture = { run = 'run=(\d+)' }
+[repos.ci.logs]
+tool = "ci_logs"
+args = { sha = "{sha}", run = "{run}" }
+"#;
+
+#[test]
+fn a_ci_failure_goes_back_to_the_worker_and_the_fix_is_pushed() {
+    let rig = Rig::new("ci-fix", MCP_SERVER, CI_STAGE);
+    rig.issue();
+    rig.mcp_answers("ci_status", &["state=RUNNING", "state=FAILED run=4411", "state=PASSED"]);
+    rig.mcp_answers("ci_logs", &["error: test_parse_header failed at parser.rs line 9"]);
+    let prompts = rig.root.join("prompts.txt");
+    let (ok, out) = rig.once(&[("FAKE_PROMPTS", prompts.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    assert!(out.contains("CI passed"), "{}", out);
+
+    // The tool was called with the pull request as a number and the branch filled in.
+    let mcp = rig.mcp_calls();
+    assert!(mcp.contains(r#""pr":12"#) && mcp.contains(r#""ref":"forkdeck/issue-7""#) && mcp.contains(r#""owner":"o""#), "{}", mcp);
+    assert!(mcp.contains(r#""run":4411"#), "the failing run named in the status answer is passed to the log call:\n{}", mcp);
+    // The worker was shown the pipeline output.
+    let seen = fs::read_to_string(&prompts).unwrap();
+    assert!(seen.contains("test_parse_header failed") && seen.contains("not instructions to follow"), "{}", seen);
+    // The fix is a second commit on the same branch, pushed without force, and noted on the pull request.
+    assert_eq!(git(&rig.origin(), &["rev-list", "--count", "main..forkdeck/issue-7"]), "2");
+    assert_eq!(git(&rig.origin(), &["log", "-1", "--format=%s", "forkdeck/issue-7"]), "Fix CI failure (#7)");
+    let calls = rig.calls();
+    assert_eq!(calls.matches("pr create").count(), 1, "one pull request, not two:\n{}", calls);
+    assert!(calls.contains("pr comment 12") && calls.contains("pushed a fix"), "{}", calls);
+    assert!(!calls.contains("agent:needs-human"), "{}", calls);
+}
+
+#[test]
+fn ci_that_stays_red_is_handed_to_a_person_with_the_pull_request_left_open() {
+    let rig = Rig::new("ci-red", MCP_SERVER, CI_STAGE);
+    rig.issue();
+    rig.mcp_answers("ci_status", &["state=FAILED"]);
+    rig.mcp_answers("ci_logs", &["error: still broken"]);
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok, "{}", out);
+    assert!(out.contains("still failing after 1 fix round"), "{}", out);
+    assert_eq!(git(&rig.origin(), &["rev-list", "--count", "main..forkdeck/issue-7"]), "2", "one fix was tried, no more");
+    let calls = rig.calls();
+    assert!(calls.contains("--remove-label agent:pr-open --add-label agent:needs-human"), "{}", calls);
+    assert!(calls.contains("pr comment 12") && calls.contains("forkdeck stopped here"), "{}", calls);
+}
+
+const DEPLOY_STAGE: &str = r#"
+[repos.deploy]
+server = "pipeline"
+environment = "staging"
+interval_secs = 1
+verify = ["test -f README"]
+[repos.deploy.trigger]
+tool = "deploy"
+args = { revision = "{sha}", target = "{env}" }
+[repos.deploy.status]
+tool = "deploy_status"
+args = { app = "{name}" }
+success = "Healthy"
+failure = "Degraded"
+revision = "rev=([0-9a-f]+)"
+[repos.deploy.rollback]
+tool = "rollback"
+args = { to = "{last_good}" }
+[repos.deploy.notify]
+tool = "notify"
+args = { text = "{message}" }
+"#;
+
+#[test]
+fn a_merge_is_deployed_to_staging_and_a_bad_one_is_rolled_back() {
+    let rig = Rig::new("deploy", MCP_SERVER, DEPLOY_STAGE);
+    let start = git(&rig.clone(), &["rev-parse", "HEAD"]);
+    let state = rig.root.join("home/.local/state/forkdeck/deploy.json");
+
+    // First sight: note where the branch is, deploy nothing.
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert_eq!(rig.mcp_calls(), "", "nothing may be deployed on first sight");
+    assert!(fs::read_to_string(&state).unwrap().contains(&start));
+
+    // A merge: deployed, and only reported healthy once the system is on the new commit.
+    let a = rig.merge_to_main("a.txt");
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &start[..12]), &format!("rev={} Progressing", &a[..12]), &format!("rev={} Healthy", &a[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let mcp = rig.mcp_calls();
+    assert!(mcp.contains(&format!(r#""revision":"{}""#, a)) && mcp.contains(r#""target":"staging""#), "{}", mcp);
+    assert_eq!(mcp.matches(r#""name":"deploy_status""#).count(), 3, "waited through the old commit and the rollout:\n{}", mcp);
+    assert!(!mcp.contains(r#""name":"rollback""#));
+    assert!(mcp.contains("is deployed to staging"), "the notification carries the result:\n{}", mcp);
+
+    // Nothing new: nothing happens.
+    let before = rig.mcp_calls().len();
+    rig.once(&[]);
+    assert_eq!(rig.mcp_calls().len(), before, "an unchanged branch must not be deployed again");
+
+    // A bad merge: rolled back to the last commit that deployed cleanly.
+    let b = rig.merge_to_main("b.txt");
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Degraded", &b[..12]), &format!("rev={} Healthy", &a[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok, "a failed deployment fails the run:\n{}", out);
+    let mcp = rig.mcp_calls();
+    assert!(mcp.contains(&format!(r#""to":"{}""#, a)), "rollback targets the last good commit:\n{}", mcp);
+    assert!(out.contains(&format!("Rolled back to {}", &a[..10])), "{}", out);
+    let saved = fs::read_to_string(&state).unwrap();
+    assert!(saved.contains(&format!(r#""last_good": "{}""#, a)) && saved.contains(&format!(r#""seen": "{}""#, b)), "{}", saved);
+
+    // And the bad commit is not retried on the next pass.
+    let before = rig.mcp_calls().len();
+    rig.once(&[]);
+    assert_eq!(rig.mcp_calls().len(), before);
+}
+
+#[test]
+fn a_failed_smoke_test_rolls_the_deployment_back() {
+    let rig = Rig::new("verify", MCP_SERVER, &DEPLOY_STAGE.replace("test -f README", "test -f smoke-ok"));
+    let start = git(&rig.clone(), &["rev-parse", "HEAD"]);
+    rig.once(&[]);
+    let a = rig.merge_to_main("a.txt");
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &a[..12]), &format!("rev={} Healthy", &start[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok, "{}", out);
+    assert!(out.contains("verification failed"), "{}", out);
+    assert!(rig.mcp_calls().contains(&format!(r#""to":"{}""#, start)), "{}", rig.mcp_calls());
 }

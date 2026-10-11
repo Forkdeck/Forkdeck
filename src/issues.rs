@@ -242,8 +242,10 @@ pub async fn poll_loop(hub: Hub) {
     }
 }
 
-/// Look at every configured repository once and start a job for each labelled item that is due.
+/// Look at every configured repository once and start a job for each labelled item that is due,
+/// and a deployment for each base branch that has moved.
 pub async fn poll_once(hub: &Hub) {
+    crate::cicd::deploy_poll(hub).await;
     {
         {
             for (idx, r) in hub.cfg.repos.iter().enumerate() {
@@ -327,7 +329,7 @@ fn worktree_dir(hub: &Hub, r: &RepoCfg, kind: &str, n: u64) -> PathBuf {
 
 fn repo_index(hub: &Hub, id: u32) -> Option<usize> {
     hub.job(id, |j| match &j.source {
-        Source::Issue { repo_idx, .. } | Source::Pr { repo_idx, .. } => Some(*repo_idx),
+        Source::Issue { repo_idx, .. } | Source::Pr { repo_idx, .. } | Source::Deploy { repo_idx, .. } => Some(*repo_idx),
         Source::Manual => None,
     })
     .flatten()
@@ -558,6 +560,9 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
     }
     // No --force: prepare() refused to start if this branch already existed on the remote.
     sh("git", &["push", "-u", "origin", &format!("HEAD:refs/heads/{}", branch)], d).await?;
+    // Later work on this job (a CI fix) starts from what is now on the remote.
+    let pushed = sh("git", &["rev-parse", "HEAD"], d).await?;
+    hub.job(id, |j| j.base_sha = Some(pushed.clone()));
 
     let checks = match o.checks_ok {
         None => "No checks configured.".to_string(),
@@ -608,6 +613,60 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
         hub.log("issues", e);
     }
     Ok(format!("{}pull request opened: {}", if draft { "draft " } else { "" }, url))
+}
+
+/// Commit a fix made after the pull request was opened and push it as a further commit on the same branch.
+pub async fn push_followup(hub: &Hub, id: u32, round: u32, summary: &str) -> Result<(), String> {
+    if hub.cfg.demo {
+        return Ok(());
+    }
+    let (r, n, _) = issue_of(hub, id).ok_or("not an issue job")?;
+    let t = tree_of(hub, id)?;
+    let d = Some(t.dir.as_path());
+    let msg = format!("Fix CI failure (#{})", n);
+    if !commit_snapshot(&t, &msg).await? {
+        return Err("the agent changed nothing".into());
+    }
+    // A plain push: it only succeeds as a fast-forward, so nobody else's commits are overwritten.
+    sh("git", &["push", "origin", &format!("HEAD:refs/heads/{}", t.branch)], d).await?;
+    let pushed = sh("git", &["rev-parse", "HEAD"], d).await?;
+    let pr = hub.job(id, |j| {
+        j.base_sha = Some(pushed.clone());
+        j.pr_url.clone()
+    });
+    if let Some(num) = pr.flatten().as_deref().and_then(pr_number) {
+        let text = format!("CI failed, so forkdeck pushed a fix (round {}): `{}`.\n\n{}", round, &pushed[..pushed.len().min(12)], clip(&quiet(summary), 4000));
+        if let Err(e) = comment(&r, true, num, &text).await {
+            hub.log("issues", e);
+        }
+    }
+    Ok(())
+}
+
+/// The number at the end of a pull or merge request URL.
+pub fn pr_number(url: &str) -> Option<u64> {
+    url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
+}
+
+/// CI is red and forkdeck has stopped trying: note it on the pull request and hand the issue to a person.
+pub async fn ci_failed(hub: &Hub, id: u32, why: &str) {
+    if hub.cfg.demo {
+        return;
+    }
+    let Some((r, n, _)) = issue_of(hub, id) else { return };
+    let text = quiet(&clip(&format!("forkdeck stopped here: {}", why), 4000));
+    if let Some(num) = hub.job(id, |j| j.pr_url.clone()).flatten().as_deref().and_then(pr_number) {
+        if let Err(e) = comment(&r, true, num, &text).await {
+            hub.log("issues", e);
+        }
+    }
+    if let Err(e) = comment(&r, false, n, &text).await {
+        hub.log("issues", e);
+    }
+    // publish() already moved the issue to the done label.
+    if let Err(e) = relabel(&r, false, n, &r.done_label, &r.failed_label).await {
+        hub.log("issues", e);
+    }
 }
 
 /// Claim a labelled pull request and check its head out, detached, in a worktree. Returns the commit that will be reviewed.

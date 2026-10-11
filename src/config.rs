@@ -1,5 +1,6 @@
 use crate::state::{AgentKind, Provider, Tier};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub const EXAMPLE: &str = include_str!("../forkdeck.example.toml");
@@ -11,6 +12,8 @@ pub struct Config {
     pub agents: AgentsCfg,
     pub review: ReviewCfg,
     pub automation: AutoCfg,
+    /// MCP servers by name. CI and deployment stages call tools on these.
+    pub mcp: HashMap<String, McpServerCfg>,
     pub repos: Vec<RepoCfg>,
     #[serde(skip)]
     pub demo: bool,
@@ -249,6 +252,127 @@ impl AutoCfg {
     }
 }
 
+/// How to reach one MCP server: a command to run (stdio) or a URL (Streamable HTTP).
+/// `${NAME}` in args, env values, the url and header values is replaced from the environment.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerCfg {
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub url: Option<String>,
+    pub headers: HashMap<String, String>,
+    /// Longest wait for one answer.
+    pub timeout_secs: u64,
+}
+
+impl Default for McpServerCfg {
+    fn default() -> Self {
+        McpServerCfg { command: None, args: vec![], env: HashMap::new(), url: None, headers: HashMap::new(), timeout_secs: 60 }
+    }
+}
+
+/// One tool call and how to read its answer.
+///
+/// `args` may contain placeholders such as `{owner}`, `{name}`, `{repo}`, `{branch}`, `{base}`,
+/// `{sha}`, `{pr}`, `{issue}`, `{env}`, `{last_good}` and `{message}`. A value that is nothing but
+/// a numeric placeholder (`"{pr}"`) is sent as a number.
+///
+/// The answer is read as text. `failure`, `pending` and `success` are regular expressions tried in
+/// that order; an answer none of them matches counts as pending. A tool error is a failure.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct CallCfg {
+    /// Defaults to the stage's server.
+    #[serde(default)]
+    pub server: Option<String>,
+    pub tool: String,
+    #[serde(default = "empty_table")]
+    pub args: toml::Value,
+    #[serde(default)]
+    pub success: Option<String>,
+    #[serde(default)]
+    pub failure: Option<String>,
+    #[serde(default)]
+    pub pending: Option<String>,
+    /// Optional: a regular expression whose first group is the revision the answer describes.
+    /// Success then also requires that revision to be the commit being waited for.
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// Optional: values to take from the answer for later calls in the same stage, such as the id of
+    /// the failing run for the log call. Name = regular expression; the first group is the value,
+    /// usable as `{name}`.
+    #[serde(default)]
+    pub capture: HashMap<String, String>,
+}
+
+fn empty_table() -> toml::Value {
+    toml::Value::Table(Default::default())
+}
+
+/// Watch CI on a pull request forkdeck opened, and send failures back to the worker.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct CiCfg {
+    pub server: String,
+    #[serde(default = "d_30")]
+    pub interval_secs: u64,
+    #[serde(default = "d_30")]
+    pub timeout_mins: u64,
+    /// How many times a CI failure is sent back to the worker before a person is asked.
+    #[serde(default = "d_1")]
+    pub max_fix_rounds: u32,
+    pub status: CallCfg,
+    /// Optional: fetch the failing output to show the worker. Without it the status answer is used.
+    #[serde(default)]
+    pub logs: Option<CallCfg>,
+}
+
+/// Deploy the base branch when it moves, watch the result, and roll back if it goes wrong.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct DeployCfg {
+    pub server: String,
+    #[serde(default = "d_staging")]
+    pub environment: String,
+    #[serde(default = "d_15")]
+    pub interval_secs: u64,
+    #[serde(default = "d_15")]
+    pub timeout_mins: u64,
+    /// Optional: start the deployment. Leave out when merging already deploys (GitOps auto-sync).
+    #[serde(default)]
+    pub trigger: Option<CallCfg>,
+    pub status: CallCfg,
+    /// Shell commands run after the deployment reports healthy, such as a smoke test.
+    #[serde(default)]
+    pub verify: Vec<String>,
+    /// Optional: undo a failed deployment. `{last_good}` is the last commit that deployed cleanly.
+    #[serde(default)]
+    pub rollback: Option<CallCfg>,
+    /// Optional: tell someone how it went. `{message}` is a one-line result.
+    #[serde(default)]
+    pub notify: Option<CallCfg>,
+}
+
+fn d_30() -> u64 {
+    30
+}
+fn d_15() -> u64 {
+    15
+}
+fn d_1() -> u32 {
+    1
+}
+fn d_staging() -> String {
+    "staging".into()
+}
+
+impl CallCfg {
+    pub fn patterns(&self) -> [(&'static str, &Option<String>); 4] {
+        [("success", &self.success), ("failure", &self.failure), ("pending", &self.pending), ("revision", &self.revision)]
+    }
+}
+
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct RepoCfg {
@@ -285,6 +409,10 @@ pub struct RepoCfg {
     /// Run `checks` on labelled pull requests too. Off by default: it executes the pull request's code as you.
     #[serde(default)]
     pub pr_checks: bool,
+    #[serde(default)]
+    pub ci: Option<CiCfg>,
+    #[serde(default)]
+    pub deploy: Option<DeployCfg>,
 }
 
 fn d_base() -> String {
@@ -386,7 +514,49 @@ impl Config {
                 anyhow::bail!("agents.{}.cmd must not be empty", k.name());
             }
         }
+        for (name, m) in &self.mcp {
+            if m.command.is_some() == m.url.is_some() {
+                anyhow::bail!("mcp.{}: set exactly one of command and url", name);
+            }
+        }
         for r in &self.repos {
+            let mut calls: Vec<(String, &str, &CallCfg)> = Vec::new();
+            if let Some(ci) = &r.ci {
+                anyhow::ensure!(ci.interval_secs >= 1 && ci.timeout_mins >= 1, "repos.ci for {}: interval_secs and timeout_mins must be at least 1", r.repo);
+                calls.push(("ci.status".into(), &ci.server, &ci.status));
+                calls.extend(ci.logs.iter().map(|c| ("ci.logs".to_string(), ci.server.as_str(), c)));
+                anyhow::ensure!(ci.status.success.is_some(), "repos.ci.status for {}: a success pattern is required", r.repo);
+            }
+            if let Some(d) = &r.deploy {
+                anyhow::ensure!(d.interval_secs >= 1 && d.timeout_mins >= 1, "repos.deploy for {}: interval_secs and timeout_mins must be at least 1", r.repo);
+                // A name is all there is to go on, so this is a guard against accidents, not a control.
+                if d.environment.to_lowercase().contains("prod") {
+                    anyhow::bail!("repos.deploy for {}: environment {:?} looks like production. Unattended production deployments are not supported.", r.repo, d.environment);
+                }
+                calls.push(("deploy.status".into(), &d.server, &d.status));
+                anyhow::ensure!(d.status.success.is_some(), "repos.deploy.status for {}: a success pattern is required", r.repo);
+                for (n, c) in [("deploy.trigger", &d.trigger), ("deploy.rollback", &d.rollback), ("deploy.notify", &d.notify)] {
+                    calls.extend(c.iter().map(|c| (n.to_string(), d.server.as_str(), c)));
+                }
+            }
+            for (what, stage_server, c) in calls {
+                let server = c.server.as_deref().unwrap_or(stage_server);
+                anyhow::ensure!(self.mcp.contains_key(server), "repos.{} for {}: no [mcp.{}] server is configured", what, r.repo, server);
+                anyhow::ensure!(!c.tool.trim().is_empty(), "repos.{} for {}: tool must not be empty", what, r.repo);
+                anyhow::ensure!(c.args.is_table(), "repos.{} for {}: args must be a table", what, r.repo);
+                for (pname, p) in c.patterns() {
+                    if let Some(p) = p {
+                        regex::Regex::new(p).map_err(|e| anyhow::anyhow!("repos.{}.{} for {}: {}", what, pname, r.repo, e))?;
+                    }
+                }
+                for (cname, p) in &c.capture {
+                    let re = regex::Regex::new(p).map_err(|e| anyhow::anyhow!("repos.{}.capture.{} for {}: {}", what, cname, r.repo, e))?;
+                    anyhow::ensure!(re.captures_len() >= 2, "repos.{}.capture.{} for {}: the pattern needs a group for the value", what, cname, r.repo);
+                }
+                if let Some(p) = &c.revision {
+                    anyhow::ensure!(regex::Regex::new(p).map(|re| re.captures_len() >= 2).unwrap_or(false), "repos.{}.revision for {}: the pattern needs a group for the commit", what, r.repo);
+                }
+            }
             if !r.path.is_absolute() {
                 anyhow::bail!("repos: path for {} must be absolute or start with ~/, got {}", r.repo, r.path.display());
             }
@@ -434,6 +604,54 @@ mod tests {
         let cfg: Config = toml::from_str("[agents.claude]\nmodels = { heavy = \"big\" }").unwrap();
         let m = cfg.agents.get(AgentKind::Claude).models.unwrap();
         assert_eq!((m.get(Tier::Light), m.get(Tier::Heavy)), ("haiku", "big"));
+    }
+
+    const WITH_STAGES: &str = r#"
+[mcp.ci]
+command = "ci-mcp"
+[mcp.cd]
+url = "http://127.0.0.1:3000/mcp"
+headers = { Authorization = "Bearer ${TOKEN}" }
+[[repos]]
+provider = "github"
+repo = "o/r"
+path = "/src/r"
+[repos.ci]
+server = "ci"
+[repos.ci.status]
+tool = "status"
+args = { owner = "{owner}", pr = "{pr}", nested = { ref = "{branch}" } }
+success = "ok"
+failure = "bad"
+[repos.deploy]
+server = "cd"
+ENV
+[repos.deploy.status]
+tool = "get_application"
+success = "Healthy"
+revision = 'rev: ([0-9a-f]+)'
+[repos.deploy.rollback]
+server = "ci"
+tool = "rollback"
+"#;
+
+    #[test]
+    fn stages_parse_and_production_is_refused() {
+        let cfg: Config = toml::from_str(&WITH_STAGES.replace("ENV", "")).unwrap();
+        cfg.validate().unwrap();
+        let r = &cfg.repos[0];
+        assert_eq!(r.ci.as_ref().unwrap().max_fix_rounds, 1);
+        assert_eq!(r.deploy.as_ref().unwrap().environment, "staging");
+        for env in ["production", "Prod-EU"] {
+            let cfg: Config = toml::from_str(&WITH_STAGES.replace("ENV", &format!("environment = \"{}\"", env))).unwrap();
+            assert!(cfg.validate().unwrap_err().to_string().contains("production"), "{}", env);
+        }
+        let cfg: Config = toml::from_str(&WITH_STAGES.replace("ENV", "").replace("server = \"cd\"", "server = \"nope\"")).unwrap();
+        assert!(cfg.validate().unwrap_err().to_string().contains("[mcp.nope]"));
+        let cfg: Config = toml::from_str(&WITH_STAGES.replace("ENV", "").replace("success = \"ok\"", "success = \"(\"")).unwrap();
+        assert!(cfg.validate().is_err(), "a pattern that does not compile is rejected");
+        let cfg: Config = toml::from_str("[mcp.x]\ncommand = \"a\"\nurl = \"b\"").unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

@@ -166,6 +166,110 @@ This works on any pull request, including the ones forkdeck opened, which gets
 you a second look by both models on the pushed commit rather than the working
 tree.
 
+## CI and deployment, through MCP
+
+forkdeck plugs into the CI/CD you already run by calling tools on
+[MCP](https://modelcontextprotocol.io) servers. It has no code for any
+particular system. For each stage the config names a server, a tool, its
+arguments, and regular expressions that say what the answer means. Anything
+with an MCP server works the same way: GitHub Actions, GitLab CI, Argo CD,
+Flux, Tekton, Woodpecker, Crow CI, Jenkins, CircleCI, or your own.
+
+```toml
+[mcp.github]                       # a command to start (stdio) ...
+command = "docker"
+args = ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"]
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}" }
+
+[mcp.pipelines]                    # ... or a URL (Streamable HTTP)
+url = "http://127.0.0.1:3000/mcp"
+headers = { Authorization = "Bearer ${PIPELINES_TOKEN}" }
+```
+
+`${NAME}` is filled from the environment, so tokens stay out of the file. To
+find out what a server offers and what its answers look like:
+
+```
+forkdeck mcp tools github
+forkdeck mcp call github pull_request_read '{"owner":"o","repo":"r","pullNumber":12,"method":"get_check_runs"}'
+```
+
+`forkdeck doctor` starts every configured server and checks that each tool a
+stage names exists on it.
+
+### CI feedback
+
+With `[repos.ci]` set, a job does not end when its pull request opens. forkdeck
+polls the status tool until the pipeline passes or fails. A failure goes back
+to the worker together with the log; the fix goes through the same local checks
+and review as the first attempt and is pushed as a further commit on the same
+branch (a plain push, never forced). After `max_fix_rounds` failures, or if CI
+gives no result within `timeout_mins`, the pull request is left open with a
+comment and the issue goes to `agent:needs-human`.
+
+```toml
+[repos.ci]
+server = "github"
+[repos.ci.status]
+tool = "pull_request_read"
+args = { owner = "{owner}", repo = "{name}", pullNumber = "{pr}", method = "get_check_runs" }
+failure = '"conclusion":\s*"(failure|timed_out|cancelled)"'
+pending = '"status":\s*"(queued|in_progress)"'
+success = '"conclusion":\s*"success"'
+```
+
+The patterns are tried in the order failure, pending, success, and an answer
+that matches none of them counts as pending. A tool error is a failure.
+
+Placeholders in `args`: `{repo}`, `{owner}`, `{name}`, `{base}`, `{branch}`,
+`{sha}`, `{pr}`, `{issue}`, `{env}`, `{last_good}`, `{message}`. A value that is
+only `"{pr}"` or `"{issue}"` is sent as a number. `capture` takes values out of
+an answer for later calls in the stage, for example the id of the failing run
+for the log call; the example config shows it.
+
+Make sure the status call is about the commit forkdeck just pushed. A tool
+that reports "the latest run on the branch" will still show the old failure
+for a moment after a fix is pushed and use up a fix round. Either call a tool
+that is keyed by the pull request's head, or set `revision` (below).
+
+### Deploying to staging, and rolling back
+
+With `[repos.deploy]` set, forkdeck watches the base branch. When it moves, it:
+
+1. calls the `trigger` tool, if there is one (leave it out when merging already
+   deploys, as with GitOps auto-sync),
+2. polls the `status` tool until that commit is healthy,
+3. runs the `verify` commands, such as a smoke test,
+4. on any failure calls the `rollback` tool with `{last_good}`, the last commit
+   that deployed and verified cleanly, and waits for that to be healthy again,
+5. calls the `notify` tool, if there is one, with a one-line result.
+
+`revision` is a pattern whose first group is the commit an answer describes.
+Set it for anything that deploys asynchronously: until the system reports the
+commit being deployed, its answer is about the previous one and is treated as
+pending, whether that one is healthy or degraded.
+
+Things to know:
+
+- **Staging only.** A deploy stage whose `environment` contains "prod" does not
+  load. That is a guard on the name; forkdeck cannot see what a tool really
+  deploys to, so do not point this stage at production.
+- **It runs unattended.** Every commit that reaches the base branch is deployed
+  without asking. Branch protection and review are what keep that safe.
+- **First start deploys nothing.** forkdeck notes where the branch is and takes
+  that commit as what is running, which makes it the first rollback target.
+- **State is in `~/.local/state/forkdeck/deploy.json`** (or `$XDG_STATE_HOME`).
+  Delete an entry to make forkdeck forget a repository.
+- **A commit is tried once.** A failed deployment is not retried when the
+  branch has not moved.
+- **Rollback is whatever your tool does.** If the rollback fails too, the job
+  says so in capitals and stops; nothing else is attempted.
+- **Only the newest commit is deployed** when several land between polls.
+
+The example config has a worked Argo CD stage. Its tool names come from the
+Argo CD MCP server's documentation; its argument names are a guess to check
+with `forkdeck mcp tools argocd`.
+
 ## Before you leave it unattended
 
 Issue text is input from other people, and an agent that reads it can be
@@ -212,7 +316,10 @@ or a cron entry.
 
 ## Status
 
-Early. The claude path has been run against the real CLI. The GitHub flow, the
+Early. The MCP client has been run against the reference MCP server over both
+transports, and the CI and deploy stages are tested against a stand-in server;
+no stage has been run against a real CI or deployment system yet. The claude
+path has been run against the real CLI. The GitHub flow, the
 codex stream parser and the Jev wire format are tested against stand-ins that
 follow the documented formats, and the `glab` commands have not been run
 against a live GitLab yet. Expect to adjust `agents.codex` arguments for your

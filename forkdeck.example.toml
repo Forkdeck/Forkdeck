@@ -104,8 +104,82 @@ publish_on_failed_review = false
 #~ # machine, so leave it off unless every author who can get the label applied is trusted.
 #~ pr_checks = false
 
+#~ # Watch the project's CI on the pull requests forkdeck opens. A failure goes back to the worker
+#~ # with the log, and the fix is pushed as a further commit, max_fix_rounds times.
+#~ [repos.ci]
+#~ server = "github"
+#~ interval_secs = 30
+#~ timeout_mins = 30
+#~ max_fix_rounds = 1
+#~ [repos.ci.status]
+#~ tool = "pull_request_read"
+#~ args = { owner = "{owner}", repo = "{name}", pullNumber = "{pr}", method = "get_check_runs" }
+#~ # Tried in the order failure, pending, success. An answer that matches none is pending.
+#~ failure = '"conclusion":\s*"(failure|timed_out|cancelled|action_required)"'
+#~ pending = '"status":\s*"(queued|in_progress|pending|waiting|requested)"'
+#~ success = '"conclusion":\s*"success"'
+#~ # Taken from the failing answer for the log call below.
+#~ capture = { run_id = '/actions/runs/(\d+)', job_id = '/job/(\d+)' }
+#~ [repos.ci.logs]
+#~ tool = "get_job_logs"
+#~ args = { owner = "{owner}", repo = "{name}", run_id = "{run_id}", job_id = "{job_id}", failed_only = true, return_content = true, tail_lines = 200 }
+
+#~ # When the base branch moves, deploy that commit to staging, check it, and roll back if it is bad.
+#~ # Production is refused: an environment whose name contains "prod" does not load.
+#~ [repos.deploy]
+#~ server = "argocd"
+#~ environment = "staging"
+#~ interval_secs = 15
+#~ timeout_mins = 15
+#~ # Commands run once the deployment is healthy. A failure triggers the rollback.
+#~ verify = ["curl -fsS https://staging.example.com/healthz"]
+#~ # Leave the trigger out when merging already deploys (auto-sync).
+#~ [repos.deploy.trigger]
+#~ tool = "sync_application"
+#~ args = { applicationName = "your-app-staging" }
+#~ [repos.deploy.status]
+#~ tool = "get_application"
+#~ args = { applicationName = "your-app-staging" }
+#~ failure = '"status":\s*"(Degraded|Missing)"|"phase":\s*"(Failed|Error)"'
+#~ pending = '"status":\s*"(Progressing|OutOfSync)"|"phase":\s*"Running"'
+#~ success = '"status":\s*"Healthy"'
+#~ # First group: the commit the answer is about. Until it is the commit being deployed, the answer is pending.
+#~ revision = '"revision":\s*"([0-9a-f]{7,40})"'
+#~ # {last_good} is the last commit that deployed and verified cleanly.
+#~ [repos.deploy.rollback]
+#~ tool = "sync_application"
+#~ args = { applicationName = "your-app-staging", revision = "{last_good}" }
+#~ # Any tool on any server; {message} is a one-line result.
+#~ # [repos.deploy.notify]
+#~ # server = "chat"
+#~ # tool = "post_message"
+#~ # args = { channel = "deploys", text = "{message}" }
+
 #~ [[repos]]
 #~ provider = "gitlab"    # uses the glab CLI and its login
 #~ repo = "your-group/your-project"
 #~ path = "~/src/your-gitlab-project"
 #~ base = "main"
+
+# MCP servers the CI and deploy stages call. Any server works: forkdeck only needs the name of a
+# tool, its arguments and how to read the answer. List what a server offers with
+#     forkdeck mcp tools <name>
+# and try a call with
+#     forkdeck mcp call <name> <tool> '{"json":"arguments"}'
+# ${NAME} is replaced from the environment, so tokens stay out of this file.
+
+#~ [mcp.github]
+#~ command = "docker"
+#~ args = ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"]
+#~ env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}" }
+
+#~ [mcp.argocd]
+#~ command = "npx"
+#~ args = ["argocd-mcp@latest", "stdio"]
+#~ env = { ARGOCD_BASE_URL = "https://argocd.example.com", ARGOCD_API_TOKEN = "${ARGOCD_TOKEN}" }
+
+# A server reached over HTTP instead of started as a command:
+# [mcp.pipelines]
+# url = "http://127.0.0.1:3000/mcp"
+# headers = { Authorization = "Bearer ${PIPELINES_TOKEN}" }
+# timeout_secs = 60

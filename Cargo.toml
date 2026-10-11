@@ -12,6 +12,7 @@ description = "Terminal agent tree that routes work between the claude and codex
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
+regex = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 ratatui = "0.29"

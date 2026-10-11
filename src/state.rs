@@ -59,6 +59,10 @@ pub enum JobStatus {
     Reviewing,
     Fixing,
     Publishing,
+    /// Waiting for the project's CI on the pull request.
+    Ci,
+    Deploying,
+    RollingBack,
     Done,
     Failed,
     Cancelled,
@@ -73,6 +77,9 @@ impl JobStatus {
             JobStatus::Reviewing => "reviewing",
             JobStatus::Fixing => "fixing",
             JobStatus::Publishing => "publishing",
+            JobStatus::Ci => "watching ci",
+            JobStatus::Deploying => "deploying",
+            JobStatus::RollingBack => "rolling back",
             JobStatus::Done => "done",
             JobStatus::Failed => "failed",
             JobStatus::Cancelled => "cancelled",
@@ -95,6 +102,8 @@ pub enum StageState {
 #[derive(Clone, Debug)]
 pub struct Stage {
     pub agent: Option<AgentKind>,
+    /// What the box shows when no agent runs in it (a deployment step).
+    pub label: String,
     pub model: String,
     pub effort: String,
     pub state: StageState,
@@ -112,6 +121,7 @@ impl Default for Stage {
     fn default() -> Self {
         Stage {
             agent: None,
+            label: String::new(),
             model: String::new(),
             effort: String::new(),
             state: StageState::Idle,
@@ -176,6 +186,8 @@ pub enum Provider {
 pub enum Source {
     Manual,
     Issue { repo_idx: usize, repo: String, number: u64, url: String },
+    /// The base branch moved: deploy that commit.
+    Deploy { repo_idx: usize, repo: String, sha: String },
     /// An existing pull or merge request that was labelled for review.
     Pr { repo_idx: usize, repo: String, number: u64, url: String, head: String, base: String },
 }
@@ -307,7 +319,7 @@ impl Source {
         match self {
             Source::Issue { repo_idx, number, .. } => Some((*repo_idx, false, *number)),
             Source::Pr { repo_idx, number, .. } => Some((*repo_idx, true, *number)),
-            Source::Manual => None,
+            Source::Manual | Source::Deploy { .. } => None,
         }
     }
 }
