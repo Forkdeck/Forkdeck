@@ -37,7 +37,8 @@ exit 0
 "#;
 
 /// An MCP server over stdio. Each tool answers with the next line of `$FAKE_MCP/<tool>.txt`
-/// (the last line repeats), and every call is appended to `$FAKE_MCP/calls.log`.
+/// (the last line repeats), and every call is appended to `$FAKE_MCP/calls.log`. In an answer,
+/// `@SHA@` becomes the commit the call asked about and `@FIRST@` the first commit ever asked about.
 const MCP: &str = r#"#!/bin/sh
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -54,6 +55,10 @@ while IFS= read -r line; do
       total=$(wc -l < "$FAKE_MCP/$tool.txt" 2>/dev/null || echo 0)
       [ "$n" -gt "$total" ] && n=$total
       text=$(sed -n "${n}p" "$FAKE_MCP/$tool.txt" 2>/dev/null)
+      sha=$(printf '%s' "$line" | sed -n 's/.*"sha":"\([0-9a-f]*\)".*/\1/p')
+      [ -n "$sha" ] && [ ! -f "$FAKE_MCP/first_sha" ] && printf '%s' "$sha" > "$FAKE_MCP/first_sha"
+      first=$(cat "$FAKE_MCP/first_sha" 2>/dev/null)
+      text=$(printf '%s' "$text" | sed "s/@SHA@/$sha/g; s/@FIRST@/$first/g")
       err=false; case "$text" in ERR:*) err=true ;; esac
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}],"isError":%s}}\n' "$id" "$text" "$err" ;;
   esac
@@ -195,6 +200,17 @@ impl Rig {
     fn mcp_answers(&self, tool: &str, lines: &[&str]) {
         fs::write(self.root.join(format!("mcp/{}.txt", tool)), format!("{}\n", lines.join("\n"))).unwrap();
         let _ = fs::remove_file(self.root.join(format!("mcp/{}.n", tool)));
+    }
+
+    /// First start with a deploy stage: the deployment system reports the branch head as running and
+    /// healthy, so forkdeck takes it as the commit to roll back to. Returns that commit.
+    fn adopt(&self) -> String {
+        let head = git(&self.clone(), &["rev-parse", "HEAD"]);
+        self.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &head[..12])]);
+        let (ok, out) = self.once(&[]);
+        assert!(ok && out.contains("reports healthy"), "{}", out);
+        let _ = fs::remove_file(self.root.join("mcp/calls.log"));
+        head
     }
 
     fn mcp_calls(&self) -> String {
@@ -362,7 +378,7 @@ max_fix_rounds = 1
 settle_secs = 0
 [repos.ci.status]
 tool = "ci_status"
-args = { pr = "{pr}", ref = "{branch}", owner = "{owner}", name = "{name}" }
+args = { pr = "{pr}", ref = "{branch}", owner = "{owner}", name = "{name}", sha = "{sha}" }
 success = "PASSED"
 failure = "FAILED"
 capture = { run = 'run=(\d+)' }
@@ -442,11 +458,13 @@ fn a_merge_is_deployed_to_staging_and_a_bad_one_is_rolled_back() {
     let start = git(&rig.clone(), &["rev-parse", "HEAD"]);
     let state = rig.root.join("home/.local/state/forkdeck/deploy.json");
 
-    // First sight: note where the branch is, deploy nothing.
+    // First sight: note where the branch is, ask what is running, deploy nothing.
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &start[..12])]);
     let (ok, out) = rig.once(&[]);
     assert!(ok, "{}", out);
-    assert_eq!(rig.mcp_calls(), "", "nothing may be deployed on first sight");
-    assert!(fs::read_to_string(&state).unwrap().contains(&start));
+    assert!(!rig.mcp_calls().contains(r#""name":"deploy""#), "nothing may be deployed on first sight:\n{}", rig.mcp_calls());
+    assert!(fs::read_to_string(&state).unwrap().contains(&format!(r#""last_good": "{}""#, start)), "confirmed healthy, so it is a rollback target");
+    fs::remove_file(rig.root.join("mcp/calls.log")).unwrap();
 
     // A merge: deployed, and only reported healthy once the system is on the new commit.
     let a = rig.merge_to_main("a.txt");
@@ -485,7 +503,7 @@ fn a_merge_is_deployed_to_staging_and_a_bad_one_is_rolled_back() {
 fn a_failed_smoke_test_rolls_the_deployment_back() {
     let rig = Rig::new("verify", MCP_SERVER, &DEPLOY_STAGE.replace("test -f README", "test -f smoke-ok"));
     let start = git(&rig.clone(), &["rev-parse", "HEAD"]);
-    rig.once(&[]);
+    rig.adopt();
     let a = rig.merge_to_main("a.txt");
     rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &a[..12]), &format!("rev={} Healthy", &start[..12])]);
     let (ok, out) = rig.once(&[]);
@@ -498,7 +516,7 @@ fn a_failed_smoke_test_rolls_the_deployment_back() {
 fn one_tool_error_is_not_a_failed_deployment_or_a_red_pipeline() {
     // Deploy: a rate limit in the middle of a rollout must not roll anything back.
     let rig = Rig::new("flaky-deploy", MCP_SERVER, DEPLOY_STAGE);
-    rig.once(&[]);
+    rig.adopt();
     let a = rig.merge_to_main("a.txt");
     rig.mcp_answers("deploy_status", &[&format!("rev={} Progressing", &a[..12]), "ERR: rate limited, try later", &format!("rev={} Healthy", &a[..12])]);
     let (ok, out) = rig.once(&[]);
@@ -518,7 +536,7 @@ fn one_tool_error_is_not_a_failed_deployment_or_a_red_pipeline() {
 #[test]
 fn an_unreadable_status_rolls_nothing_back() {
     let rig = Rig::new("unknown", MCP_SERVER, DEPLOY_STAGE);
-    rig.once(&[]);
+    rig.adopt();
     let a = rig.merge_to_main("a.txt");
     rig.mcp_answers("deploy_status", &["ERR: upstream unavailable"]);
     let (ok, out) = rig.once(&[]);
@@ -533,7 +551,7 @@ fn an_unreadable_status_rolls_nothing_back() {
 fn a_newer_merge_takes_over_instead_of_triggering_a_rollback() {
     let rig = Rig::new("superseded", MCP_SERVER, DEPLOY_STAGE);
     let start = git(&rig.clone(), &["rev-parse", "HEAD"]);
-    rig.once(&[]);
+    rig.adopt();
     let a = rig.merge_to_main("a.txt");
     // While A is rolling out, B is merged, and from then on the system only ever reports B.
     let c = rig.clone();
@@ -561,7 +579,7 @@ fn a_newer_merge_takes_over_instead_of_triggering_a_rollback() {
 #[test]
 fn stopping_during_verification_rolls_nothing_back_and_the_next_start_picks_it_up() {
     let rig = Rig::new("stop-verify", MCP_SERVER, &DEPLOY_STAGE.replace("test -f README", "test -f {root}/fast || sleep 60"));
-    rig.once(&[]);
+    rig.adopt();
     let a = rig.merge_to_main("a.txt");
     rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &a[..12])]);
     let out = rig.once_then_stop(
@@ -594,7 +612,7 @@ fn stopping_during_verification_rolls_nothing_back_and_the_next_start_picks_it_u
 #[test]
 fn a_damaged_state_file_stops_deployments_instead_of_resetting_them() {
     let rig = Rig::new("damaged", MCP_SERVER, DEPLOY_STAGE);
-    rig.once(&[]);
+    rig.adopt();
     rig.merge_to_main("a.txt");
     fs::write(rig.state_file(), "{ \"github:o/r:staging\": { \"seen\": ").unwrap();
     let (_, out) = rig.once(&[]);
@@ -632,7 +650,7 @@ fn stopping_while_ci_runs_leaves_the_open_pull_request_alone() {
 fn a_branch_forced_back_is_deployed_again_rather_than_assumed() {
     let rig = Rig::new("forced-back", MCP_SERVER, DEPLOY_STAGE);
     let start = git(&rig.clone(), &["rev-parse", "HEAD"]);
-    rig.once(&[]);
+    rig.adopt();
     let b = rig.merge_to_main("b.txt");
     // B is triggered, then main is forced back to where it was.
     fs::write(rig.root.join("mcp/on_deploy.sh"), format!("git -C {} push -q --force origin {}:refs/heads/main", rig.clone().display(), start)).unwrap();
@@ -653,7 +671,7 @@ fn a_branch_forced_back_is_deployed_again_rather_than_assumed() {
 #[test]
 fn a_failed_smoke_test_does_not_roll_back_once_a_newer_commit_is_on_the_branch() {
     let rig = Rig::new("verify-moved", MCP_SERVER, &DEPLOY_STAGE.replace("test -f README", "test -f smoke-ok"));
-    rig.once(&[]);
+    rig.adopt();
     let a = rig.merge_to_main("a.txt");
     // A reports healthy; before its smoke test has run, C is merged, and the smoke test then fails.
     fs::write(
@@ -687,7 +705,7 @@ fn progressive_stage() -> String {
 #[test]
 fn a_canary_rollout_is_followed_through_its_steps() {
     let rig = Rig::new("canary", MCP_SERVER, &progressive_stage());
-    rig.once(&[]);
+    rig.adopt();
     let a = rig.merge_to_main("a.txt");
     let r = &a[..12];
     rig.mcp_answers(
@@ -714,7 +732,7 @@ fn a_canary_rollout_is_followed_through_its_steps() {
 fn a_rollout_the_system_aborts_is_a_failure_without_a_second_rollback() {
     let rig = Rig::new("aborted", MCP_SERVER, &progressive_stage());
     let start = git(&rig.clone(), &["rev-parse", "HEAD"]);
-    rig.once(&[]);
+    rig.adopt();
     let a = rig.merge_to_main("a.txt");
     // The canary fails its analysis; the system puts the old version back and reports that.
     rig.mcp_answers("deploy_status", &[&format!("rev={} step=canary-20% Progressing", &a[..12]), &format!("rev={} Aborted", &start[..12])]);
@@ -732,10 +750,99 @@ fn a_rollout_the_system_aborts_is_a_failure_without_a_second_rollback() {
 fn an_abort_left_over_from_an_earlier_rollout_is_not_taken_for_this_one() {
     let rig = Rig::new("stale-abort", MCP_SERVER, &progressive_stage());
     let start = git(&rig.clone(), &["rev-parse", "HEAD"]);
-    rig.once(&[]);
+    rig.adopt();
     let a = rig.merge_to_main("a.txt");
     rig.mcp_answers("deploy_status", &[&format!("rev={} Aborted", &start[..12]), &format!("rev={} step=canary-20% Progressing", &a[..12]), &format!("rev={} Healthy", &a[..12])]);
     let (ok, out) = rig.once(&[]);
     assert!(ok, "{}", out);
     assert!(out.contains(&format!("{} is deployed to staging", &a[..10])), "{}", out);
+}
+
+#[test]
+fn nothing_is_rolled_back_when_the_branch_cannot_be_read() {
+    // The deployment is bad for certain (the smoke test says no), but at that moment the remote is
+    // unreachable, so forkdeck cannot rule out that a newer commit is already rolling out.
+    let rig = Rig::new("blind", MCP_SERVER, &DEPLOY_STAGE.replace("test -f README", "mv {root}/origin.git {root}/origin.gone; exit 1"));
+    rig.adopt();
+    let a = rig.merge_to_main("a.txt");
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &a[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok, "{}", out);
+    assert!(out.contains("verification failed") && out.contains("could not be read to make sure no newer commit is on its way"), "{}", out);
+    assert!(!rig.mcp_calls().contains(r#""name":"rollback""#), "a rollback is not something to do on a guess:\n{}", rig.mcp_calls());
+}
+
+#[test]
+fn a_smoke_test_that_gives_no_answer_is_not_a_failed_deployment() {
+    // The check is killed before it can say anything. That is a broken check, not a bad deployment.
+    let rig = Rig::new("verify-killed", MCP_SERVER, &DEPLOY_STAGE.replace("test -f README", "kill -9 $$"));
+    rig.adopt();
+    let a = rig.merge_to_main("a.txt");
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &a[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok, "{}", out);
+    assert!(out.contains("UNKNOWN") && out.contains("verification gave no result") && out.contains("Nothing was rolled back"), "{}", out);
+    assert!(!rig.mcp_calls().contains(r#""name":"rollback""#), "{}", rig.mcp_calls());
+    let saved = fs::read_to_string(rig.state_file()).unwrap();
+    assert!(!saved.contains(&format!(r#""last_good": "{}""#, a)), "an unverified commit is not a rollback target:\n{}", saved);
+}
+
+#[test]
+fn a_baseline_that_is_not_confirmed_healthy_is_never_rolled_back_to() {
+    let rig = Rig::new("baseline", MCP_SERVER, &DEPLOY_STAGE.replace("test -f README", "test -f smoke-ok"));
+    let start = git(&rig.clone(), &["rev-parse", "HEAD"]);
+    // On first start the environment turns out to be running some other commit.
+    rig.mcp_answers("deploy_status", &["rev=0123456789ab Healthy"]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(out.contains("it is running a different commit") && out.contains("nothing to roll back to"), "{}", out);
+    let saved = fs::read_to_string(rig.state_file()).unwrap();
+    assert!(saved.contains(r#""last_good": """#) && !saved.contains(&format!(r#""last_good": "{}""#, start)), "{}", saved);
+
+    // The next deployment fails its smoke test. There is no known-good commit, so no rollback.
+    let a = rig.merge_to_main("a.txt");
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &a[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok, "{}", out);
+    assert!(out.contains("No earlier good commit is known"), "{}", out);
+    assert!(!rig.mcp_calls().contains(r#""name":"rollback""#), "{}", rig.mcp_calls());
+
+    // Once a deployment has succeeded, that commit is the target.
+    fs::write(rig.clone().join("smoke-ok"), "").unwrap();
+    let b = rig.merge_to_main("b.txt");
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &b[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(fs::read_to_string(rig.state_file()).unwrap().contains(&format!(r#""last_good": "{}""#, b)));
+}
+
+#[test]
+fn a_deployment_that_cannot_be_recorded_is_not_reported_as_a_clean_success() {
+    let rig = Rig::new("unrecorded", MCP_SERVER, DEPLOY_STAGE);
+    let start = rig.adopt();
+    let a = rig.merge_to_main("a.txt");
+    // While the deployment runs, the state file becomes unwritable (here: replaced by a directory).
+    let state = rig.state_file();
+    fs::write(rig.root.join("mcp/on_deploy.sh"), format!("rm -f {p} && mkdir {p}", p = state.display())).unwrap();
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &a[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok, "the run must not exit clean when its record is wrong:\n{}", out);
+    assert!(out.contains(&format!("{} is deployed to staging", &a[..10])) && out.contains("COULD NOT BE RECORDED"), "{}", out);
+    assert!(rig.mcp_calls().contains("COULD NOT BE RECORDED"), "the notification says so too:\n{}", rig.mcp_calls());
+    let _ = start;
+}
+
+#[test]
+fn a_ci_pass_that_belongs_to_the_previous_push_is_not_taken_for_the_fix() {
+    let stage = CI_STAGE.replace("failure = \"FAILED\"", "failure = \"FAILED\"\nrevision = 'rev=([0-9a-f]+)'");
+    let rig = Rig::new("stale-pass", MCP_SERVER, &stage);
+    rig.issue();
+    // First push fails. After the fix is pushed, the tool still answers about the first push for a
+    // while, and what it says about it is "passed" (a re-run, say). Only then does it get to the fix.
+    rig.mcp_answers("ci_status", &["rev=@SHA@ FAILED run=1", "rev=@FIRST@ PASSED", "rev=@FIRST@ PASSED", "rev=@SHA@ RUNNING", "rev=@SHA@ PASSED"]);
+    rig.mcp_answers("ci_logs", &["error: broken"]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert_eq!(git(&rig.origin(), &["rev-list", "--count", "main..forkdeck/issue-7"]), "2");
+    assert_eq!(rig.mcp_calls().matches(r#""name":"ci_status""#).count(), 5, "it kept waiting for the fix's own result:\n{}", rig.mcp_calls());
 }

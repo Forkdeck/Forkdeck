@@ -351,8 +351,26 @@ async fn decide(hub: &Hub, id: u32, prompt: &str, is_issue: bool, forced: Option
     Ok(d)
 }
 
+/// How a set of commands ended.
+pub enum Checked {
+    Passed,
+    /// A command ran to its end and exited with a non-zero status. It said no.
+    Failed(String),
+    /// A command gave no verdict: it could not be started, ran out of time, was killed by a signal
+    /// or was cancelled. This says nothing about what it was checking.
+    Errored(String),
+}
+
 /// Run the configured check commands in order. Returns None when there are none.
 pub async fn run_checks(hub: &Hub, id: u32, cmds: &[String], dir: &Path, cancel: &Cancel) -> Option<(bool, String)> {
+    // For the project's own checks either way the work goes back to the worker with the output.
+    match run_checks_detailed(hub, id, cmds, dir, cancel).await? {
+        Checked::Passed => Some((true, String::new())),
+        Checked::Failed(out) | Checked::Errored(out) => Some((false, out)),
+    }
+}
+
+pub async fn run_checks_detailed(hub: &Hub, id: u32, cmds: &[String], dir: &Path, cancel: &Cancel) -> Option<Checked> {
     if cmds.is_empty() {
         return None;
     }
@@ -360,7 +378,7 @@ pub async fn run_checks(hub: &Hub, id: u32, cmds: &[String], dir: &Path, cancel:
         tokio::time::sleep(Duration::from_millis(600)).await;
         hub.log("checks", format!("#{} {} passed", id, cmds.join(", ")));
         hub.job(id, |j| j.checks = Some(true));
-        return Some((true, String::new()));
+        return Some(Checked::Passed);
     }
     let limit = Duration::from_secs(hub.cfg.review.check_timeout_mins.clamp(1, 24 * 60) * 60);
     for c in cmds {
@@ -368,24 +386,29 @@ pub async fn run_checks(hub: &Hub, id: u32, cmds: &[String], dir: &Path, cancel:
         cmd.args(["-c", c]).current_dir(dir);
         // Losing the select drops the command's process group guard, which stops the whole check.
         let res = tokio::select! {
-            r = proc::output(cmd, limit) => r,
+            r = proc::output_code(cmd, limit) => r,
             _ = cancel.wait() => Err("cancelled".to_string()),
         };
-        let (ok, text) = match res {
-            Err(e) => (false, e),
-            Ok((ok, out, err)) => (ok, format!("{}{}", out, err)),
-        };
-        if !ok {
+        let tail = |text: &str| {
             let lines: Vec<&str> = text.lines().collect();
             let tail: Vec<String> = lines[lines.len().saturating_sub(60)..].iter().map(|l| clip(l, 500)).collect();
-            hub.log("checks", format!("#{} `{}` failed", id, c));
+            format!("$ {}\n{}", c, tail.join("\n"))
+        };
+        let ended = match res {
+            Ok((Some(0), _, _)) => None,
+            Ok((Some(_), out, err)) => Some(Checked::Failed(tail(&format!("{}{}", out, err)))),
+            Ok((None, out, err)) => Some(Checked::Errored(tail(&format!("{}{}\nended by a signal", out, err)))),
+            Err(e) => Some(Checked::Errored(tail(&e))),
+        };
+        if let Some(bad) = ended {
+            hub.log("checks", format!("#{} `{}` {}", id, c, if matches!(bad, Checked::Failed(_)) { "failed" } else { "gave no result" }));
             hub.job(id, |j| j.checks = Some(false));
-            return Some((false, format!("$ {}\n{}", c, tail.join("\n"))));
+            return Some(bad);
         }
         hub.log("checks", format!("#{} `{}` passed", id, c));
     }
     hub.job(id, |j| j.checks = Some(true));
-    Some((true, String::new()))
+    Some(Checked::Passed)
 }
 
 /// What a round of checks and review needs to know.

@@ -570,6 +570,13 @@ impl Config {
                 calls.push(("ci.status".into(), &ci.server, &ci.status));
                 calls.extend(ci.logs.iter().map(|c| ("ci.logs".to_string(), ci.server.as_str(), c)));
                 anyhow::ensure!(ci.status.success.is_some(), "repos.ci.status for {}: a success pattern is required", r.repo);
+                // "Passed" has to mean this commit passed. Either the answer says which commit it is
+                // about, or the question names the commit. A result for the previous push must not count.
+                anyhow::ensure!(
+                    ci.status.revision.is_some() || ci.status.args.to_string().contains("{sha}"),
+                    "repos.ci.status for {}: set a revision pattern, or pass {{sha}} in args so the tool is asked about the exact commit. Otherwise a result from the previous push could be taken for the new one",
+                    r.repo
+                );
             }
             if let Some(d) = &r.deploy {
                 anyhow::ensure!(d.interval_secs >= 1 && d.timeout_mins >= 1, "repos.deploy for {}: interval_secs and timeout_mins must be at least 1", r.repo);
@@ -674,7 +681,7 @@ path = "/src/r"
 server = "ci"
 [repos.ci.status]
 tool = "status"
-args = { owner = "{owner}", pr = "{pr}", nested = { ref = "{branch}" } }
+args = { owner = "{owner}", pr = "{pr}", nested = { ref = "{branch}", commit = "{sha}" } }
 success = "ok"
 failure = "bad"
 [repos.deploy]
@@ -706,6 +713,11 @@ tool = "rollback"
         assert!(cfg.validate().is_err(), "a pattern that does not compile is rejected");
         let cfg: Config = toml::from_str("[mcp.x]\ncommand = \"a\"\nurl = \"b\"").unwrap();
         assert!(cfg.validate().is_err());
+        // A CI status that neither says nor is asked which commit it is about could pass on an old result.
+        let cfg: Config = toml::from_str(&WITH_STAGES.replace("ENV", "").replace(", commit = \"{sha}\"", "")).unwrap();
+        assert!(cfg.validate().unwrap_err().to_string().contains("previous push"));
+        let cfg: Config = toml::from_str(&WITH_STAGES.replace("ENV", "").replace(", commit = \"{sha}\"", "").replace("failure = \"bad\"", "failure = \"bad\"\nrevision = 'sha=([0-9a-f]+)'")).unwrap();
+        cfg.validate().unwrap();
         let twice = WITH_STAGES.replace("ENV", "");
         let twice = format!("{}{}", twice, &twice[twice.find("[[repos]]").unwrap()..]);
         let cfg: Config = toml::from_str(&twice).unwrap();

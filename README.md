@@ -234,13 +234,18 @@ only `"{pr}"` or `"{issue}"` is sent as a number. `capture` takes values out of
 an answer for later calls in the stage, for example the id of the failing run
 for the log call; the example config shows it.
 
-Right after a fix is pushed, most systems still show the previous run's
-failure for a moment. Two things keep that from being read as the fix failing.
-If `status.revision` is set (a pattern whose first group is the commit the
-answer is about), only answers about the pushed commit count. Without it, a
-failure that shows up within `settle_secs` (60), before the pipeline was seen
-running, is not believed until that time has passed. Set `revision` where the
-tool's answer includes the commit; it is the exact one.
+"Passed" has to mean that this commit passed, so the status call must be tied
+to a commit. The config does not load unless one of these holds:
+
+- `status.revision` is set: a pattern whose first group is the commit the
+  answer is about. Only answers about the commit forkdeck pushed are believed.
+  A result left over from the previous push, pass or fail, is treated as
+  pending.
+- or `args` pass `{sha}`, so the tool is asked about the exact commit.
+
+With the second form and no `revision`, a failure that shows up within
+`settle_secs` (60), before the pipeline was seen running, is not believed until
+that time has passed.
 
 When forkdeck is stopped while it waits for CI, the pull request is simply left
 open as it is. Nothing is posted and no label changes.
@@ -310,7 +315,9 @@ commit is bad:
 | The status tool says this commit failed | yes | failed |
 | The deployment system reverted the rollout itself (`reverted`) | no, it already did | failed |
 | The rollout waits for a person longer than `pause_timeout_mins` | no | failed, state reported as UNKNOWN |
-| A `verify` command fails | yes | failed |
+| A `verify` command runs and exits non-zero | yes | failed |
+| A `verify` command gives no answer (hangs past its time limit, cannot start, is killed) | no | failed, state reported as UNKNOWN |
+| The branch cannot be read just before a rollback, so a newer commit cannot be ruled out | no | failed, needs attention |
 | The status never arrives, or cannot be read five times running | no | failed, state reported as UNKNOWN |
 | The trigger tool refuses | no | failed, nothing was deployed |
 | The trigger call gets no answer | not by that alone | the status is watched as usual |
@@ -325,8 +332,11 @@ Other things to know:
   see what a tool really deploys to. Do not point this stage at production.
 - **It runs unattended.** Every commit that reaches the base branch is deployed
   without asking. Branch protection and review are what keep that safe.
-- **First start deploys nothing.** forkdeck notes where the branch is and takes
-  that commit as what is running, which makes it the first rollback target.
+- **First start deploys nothing.** forkdeck notes where the branch is and asks
+  the status tool once. Only if the deployment system reports that very commit
+  as healthy does it become a rollback target. Otherwise there is nothing to
+  roll back to until a deployment has succeeded, and a failure before then is
+  reported without a rollback.
 - **One forkdeck deploys.** The first process to start holds a lock next to the
   state file; any other (a cron `forkdeck once` while the interface is open,
   for example) still handles issues and reviews but leaves deployments alone
@@ -334,7 +344,9 @@ Other things to know:
   environment.
 - **State is in `~/.local/state/forkdeck/deploy.json`** (or `$XDG_STATE_HOME`).
   If the file is damaged, forkdeck says so and deploys nothing until it is
-  repaired or deleted; it does not start over on its own.
+  repaired or deleted; it does not start over on its own. If a result cannot
+  be written, the job fails and says so even when the deployment itself went
+  through, because forkdeck's record no longer matches the environment.
 - **An interrupted deployment is remembered.** If forkdeck is stopped or killed
   in the middle of one, the next start says so and deploys the branch head,
   which calls the trigger again. After three starts for the same commit it

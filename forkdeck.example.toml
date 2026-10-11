@@ -111,7 +111,8 @@ publish_on_failed_review = false
 #~ interval_secs = 30
 #~ timeout_mins = 30
 #~ max_fix_rounds = 1
-#~ # A failure seen this soon, before the pipeline was seen running, may be the previous run's.
+#~ # Only for a status that is asked by {sha} and has no revision pattern: a failure seen this soon,
+#~ # before the pipeline was seen running, is not believed yet.
 #~ settle_secs = 60
 #~ [repos.ci.status]
 #~ tool = "pull_request_read"
@@ -121,9 +122,10 @@ publish_on_failed_review = false
 #~ failure = '"conclusion":\s*"(failure|timed_out|cancelled|action_required)"'
 #~ pending = '"status":\s*"(queued|in_progress|pending|waiting|requested)"'
 #~ success = '"conclusion":\s*"success"'
-#~ # If the answer names the commit it is about, say where: only answers about the commit forkdeck
-#~ # pushed are then believed, which is exact where settle_secs is a guess.
-#~ # revision = '"head_sha":\s*"([0-9a-f]{40})"'
+#~ # Required, unless args pass {sha} so the tool is asked about the exact commit: where the answer
+#~ # names the commit it is about. Only answers about the commit forkdeck pushed are believed, so a
+#~ # result left over from the previous push, pass or fail, is never taken for the new one.
+#~ revision = '"head_sha":\s*"([0-9a-f]{40})"'
 #~ # Taken from the failing answer for the log call below.
 #~ capture = { run_id = '/actions/runs/(\d+)', job_id = '/job/(\d+)' }
 #~ [repos.ci.logs]

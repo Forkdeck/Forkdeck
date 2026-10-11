@@ -12,7 +12,7 @@ use crate::agents::Slot;
 use crate::config::{CallCfg, Config, DeployCfg, RepoCfg};
 use crate::issues;
 use crate::mcp::{self, Session, ToolResult};
-use crate::orchestrator::{run_checks, Hub};
+use crate::orchestrator::{run_checks_detailed, Checked, Hub};
 use crate::state::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -595,9 +595,26 @@ pub async fn deploy_poll(hub: &Hub) {
         match plan(saved.as_ref(), &head) {
             Plan::Nothing => {}
             Plan::Adopt => {
-                // What is there now is taken to be what is running, which makes it the rollback target for the next deployment.
-                match update_saved(&key, |s| *s = Saved { seen: head.clone(), last_good: head.clone(), ..Saved::default() }) {
-                    Ok(_) => hub.log("deploy", format!("{}: watching {} from {}; the next commit will be deployed to {}", r.repo, r.base, short(&head), d.environment)),
+                // Nothing is deployed on first sight. Whether there is something to roll back to is a
+                // separate question: the branch head is only a rollback target if the deployment
+                // system itself says that commit is what is running, and healthy.
+                let baseline = running_and_healthy(hub, r, d, &head).await;
+                let last_good = if baseline.is_ok() { head.clone() } else { String::new() };
+                match update_saved(&key, |s| *s = Saved { seen: head.clone(), last_good, ..Saved::default() }) {
+                    Ok(_) => match baseline {
+                        Ok(()) => hub.log("deploy", format!("{}: watching {} from {}, which {} reports healthy; the next commit will be deployed there", r.repo, r.base, short(&head), d.environment)),
+                        Err(why) => hub.log(
+                            "deploy",
+                            format!(
+                                "{}: watching {} from {}. {} could not be confirmed to be running that commit healthily ({}), so there is nothing to roll back to until a deployment succeeds",
+                                r.repo,
+                                r.base,
+                                short(&head),
+                                d.environment,
+                                why
+                            ),
+                        ),
+                    },
                     Err(e) => note_once(hub, format!("{}: {}", r.repo, e)),
                 }
             }
@@ -630,6 +647,27 @@ pub async fn deploy_poll(hub: &Hub) {
                 );
             }
         }
+    }
+}
+
+/// Ask the deployment system, once, whether `sha` is what is running and healthy.
+async fn running_and_healthy(hub: &Hub, r: &RepoCfg, d: &DeployCfg, sha: &str) -> Result<(), String> {
+    let mut vars = repo_vars(r);
+    vars.insert("sha".into(), sha.to_string());
+    vars.insert("env".into(), d.environment.clone());
+    vars.insert("last_good".into(), String::new());
+    vars.insert("message".into(), String::new());
+    let mut pool = Pool::new(&hub.cfg);
+    let answer = pool.call(&d.server, &d.status, &vars).await;
+    pool.close().await;
+    match answer {
+        Err(e) => Err(format!("the status could not be read: {}", clip(&e, 160))),
+        Ok(res) if res.is_error => Err(format!("{} reported an error", d.status.tool)),
+        Ok(res) => match read(&d.status, &res.text, Some(sha), false) {
+            Reading::Success => Ok(()),
+            _ if !about(&d.status, &res.text, Some(sha)) => Err("it is running a different commit".to_string()),
+            other => Err(format!("its status reads {:?}", other).to_lowercase()),
+        },
     }
 }
 
@@ -703,6 +741,8 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
     hub.job(id, |j| j.reviewer.label = "verify".into());
 
     let mut pool = Pool::new(&hub.cfg);
+    // State that could not be written. The deployment still happened; forkdeck's record of it did not.
+    let mut unrecorded: Vec<String> = Vec::new();
     set(hub, id, JobStatus::Deploying);
     step(hub, id, Slot::Worker, "deploy", StageState::Running, &format!("{} → {}", short(&sha), env));
     let end = attempt(hub, id, &mut pool, &r, &d, &vars, &sha, cancel).await;
@@ -710,7 +750,7 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
     let (status, outcome) = match end {
         End::Good => {
             step(hub, id, Slot::Worker, "deploy", StageState::Ok, "healthy");
-            record(hub, &r, &key, |s| {
+            record_into(&mut unrecorded, hub, &r, &key, |s| {
                 s.last_good = sha.clone();
                 s.seen = sha.clone();
                 s.in_progress = None;
@@ -723,7 +763,7 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
             // Forget what was seen, so the next poll deploys wherever the branch is then. That also
             // covers a branch forced back to a commit that was deployed before: this one was
             // triggered, so the environment is no longer known to be on the old one.
-            record(hub, &r, &key, |s| {
+            record_into(&mut unrecorded, hub, &r, &key, |s| {
                 s.seen = String::new();
                 s.in_progress = None;
                 s.tries = 0;
@@ -737,7 +777,7 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
         }
         End::Refused(why) => {
             step(hub, id, Slot::Worker, "deploy", StageState::Failed, &why);
-            record(hub, &r, &key, |s| {
+            record_into(&mut unrecorded, hub, &r, &key, |s| {
                 s.seen = sha.clone();
                 s.in_progress = None;
                 s.tries = 0;
@@ -748,7 +788,7 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
             // The system that runs the rollout decided, and has already acted. Calling a rollback on
             // top of its own would be two hands on the same wheel.
             step(hub, id, Slot::Worker, "deploy", StageState::Failed, "stopped and reverted by the deployment system");
-            record(hub, &r, &key, |s| {
+            record_into(&mut unrecorded, hub, &r, &key, |s| {
                 s.seen = sha.clone();
                 s.in_progress = None;
                 s.tries = 0;
@@ -760,7 +800,7 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
         }
         End::Unknown(why) => {
             step(hub, id, Slot::Worker, "deploy", StageState::Failed, &why);
-            record(hub, &r, &key, |s| {
+            record_into(&mut unrecorded, hub, &r, &key, |s| {
                 s.seen = sha.clone();
                 s.in_progress = None;
                 s.tries = 0;
@@ -770,30 +810,36 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
         End::Bad(why) => {
             step(hub, id, Slot::Worker, "deploy", StageState::Failed, &why);
             hub.log("deploy", format!("#{} {}", id, why));
-            record(hub, &r, &key, |s| {
+            record_into(&mut unrecorded, hub, &r, &key, |s| {
                 s.seen = sha.clone();
                 s.in_progress = None;
                 s.tries = 0;
             });
             // The evidence is about this commit. If the branch has moved since, the environment is
             // on its way to something else, and rolling back now would undo that instead.
-            let moved = branch_head(&r).await.filter(|h| h != &sha);
-            let rolled = match &d.rollback {
-                _ if moved.is_some() => {
-                    let to = moved.clone().unwrap_or_default();
-                    record(hub, &r, &key, |s| s.seen = String::new());
-                    format!("Nothing was rolled back, because {} already points at {}, which is deployed next.", r.base, short(&to))
+            // That has to be known, not assumed: if the branch cannot be read, a newer commit may be
+            // rolling out right now, and a rollback is not something to do on a guess.
+            let head_now = if d.rollback.is_some() { branch_head(&r).await } else { Some(sha.clone()) };
+            let rolled = match (&d.rollback, &head_now) {
+                (Some(_), None) => format!(
+                    "Nothing was rolled back, because {} could not be read to make sure no newer commit is on its way. {} is left as it is and needs attention.",
+                    r.base, env
+                ),
+                (Some(_), Some(to)) if to != &sha => {
+                    record_into(&mut unrecorded, hub, &r, &key, |s| s.seen = String::new());
+                    format!("Nothing was rolled back, because {} already points at {}, which is deployed next.", r.base, short(to))
                 }
+                _ => match &d.rollback {
                 None => "No rollback is configured.".to_string(),
                 Some(_) if saved.last_good.is_empty() || saved.last_good == sha => "No earlier good commit is known, so nothing was rolled back.".to_string(),
                 Some(rb) => {
                     set(hub, id, JobStatus::RollingBack);
                     step(hub, id, Slot::Reviewer, "rollback", StageState::Running, &format!("to {}", short(&saved.last_good)));
                     // Written down before it starts: if forkdeck dies now, the next start says so.
-                    record(hub, &r, &key, |s| s.rolling_back = Some(saved.last_good.clone()));
+                    record_into(&mut unrecorded, hub, &r, &key, |s| s.rolling_back = Some(saved.last_good.clone()));
                     let back = rollback(&mut pool, &d, rb, &vars, &saved.last_good, cancel, |l| step(hub, id, Slot::Reviewer, "rollback", StageState::Running, l)).await;
                     // Either way it has reported back; an unconfirmed one is in the outcome below.
-                    record(hub, &r, &key, |s| s.rolling_back = None);
+                    record_into(&mut unrecorded, hub, &r, &key, |s| s.rolling_back = None);
                     match back {
                         Ok(()) => {
                             step(hub, id, Slot::Reviewer, "rollback", StageState::Ok, "healthy again");
@@ -805,9 +851,24 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
                         }
                     }
                 }
+                },
             };
             (JobStatus::Failed, format!("deploying {} to {} failed: {} {}", short(&sha), env, why, rolled))
         }
+    };
+    // What happened out there and what forkdeck has on record must not silently part ways.
+    let (status, outcome) = match unrecorded.first() {
+        None => (status, outcome),
+        Some(e) => (
+            if status == JobStatus::Done { JobStatus::Failed } else { status },
+            format!(
+                "{}. THIS COULD NOT BE RECORDED ({}): forkdeck's record of {} is out of date, so its next decision there cannot be trusted. Repair {} and check it before the next deployment",
+                outcome,
+                e,
+                env,
+                state_path().display()
+            ),
+        ),
     };
     if let Some(n) = d.notify.as_ref().filter(|_| status != JobStatus::Cancelled) {
         // Text from tools and commands goes out to a chat or a ticket: no stray mentions.
@@ -820,6 +881,14 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
     }
     pool.close().await;
     (status, outcome)
+}
+
+/// As `record`, and keeps the reason when the state could not be written.
+fn record_into(failed: &mut Vec<String>, hub: &Hub, r: &RepoCfg, key: &str, change: impl FnOnce(&mut Saved)) {
+    if let Err(e) = update_saved(key, change) {
+        hub.log("deploy", format!("{}: cannot record the deployment: {}", r.repo, e));
+        failed.push(e);
+    }
 }
 
 fn record(hub: &Hub, r: &RepoCfg, key: &str, change: impl FnOnce(&mut Saved)) {
@@ -861,7 +930,7 @@ async fn attempt(hub: &Hub, id: u32, pool: &mut Pool<'_>, r: &RepoCfg, d: &Deplo
     }
     if !d.verify.is_empty() {
         step(hub, id, Slot::Reviewer, "verify", StageState::Running, &d.verify.join(" ; "));
-        let res = run_checks(hub, id, &d.verify, &r.path, cancel).await;
+        let res = run_checks_detailed(hub, id, &d.verify, &r.path, cancel).await;
         // These are not the project's checks; do not show them as such.
         hub.job(id, |j| j.checks = None);
         // A verify command that was stopped has not failed. Rolling back on a quit would undo a good deployment.
@@ -869,11 +938,19 @@ async fn attempt(hub: &Hub, id: u32, pool: &mut Pool<'_>, r: &RepoCfg, d: &Deplo
             step(hub, id, Slot::Reviewer, "verify", StageState::Failed, "cancelled");
             return End::Cancelled("verifying the deployment");
         }
+        let last_line = |out: &str| clip(out.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(""), 200);
         match res {
-            Some((true, _)) | None => step(hub, id, Slot::Reviewer, "verify", StageState::Ok, "passed"),
-            Some((false, out)) => {
+            Some(Checked::Passed) | None => step(hub, id, Slot::Reviewer, "verify", StageState::Ok, "passed"),
+            // The command ran and said no: that is evidence about the deployment.
+            Some(Checked::Failed(out)) => {
                 step(hub, id, Slot::Reviewer, "verify", StageState::Failed, "failed");
-                return End::Bad(format!("verification failed: {}", clip(out.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(""), 200)));
+                return End::Bad(format!("verification failed: {}", last_line(&out)));
+            }
+            // The command never gave an answer (it hung, could not start, was killed). That is a
+            // problem with the check, and says nothing about what was deployed.
+            Some(Checked::Errored(out)) => {
+                step(hub, id, Slot::Reviewer, "verify", StageState::Failed, "gave no result");
+                return End::Unknown(format!("it reported healthy, but verification gave no result: {}", last_line(&out)));
             }
         }
     }
