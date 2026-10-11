@@ -264,6 +264,43 @@ answer is about the previous one and is treated as pending, whether that one is
 healthy or degraded. Without this, "healthy" from a system that had not started
 yet would be recorded as a successful deployment.
 
+**Canary, percentage and regional rollouts.** How a commit is rolled out is the
+deployment system's decision, not forkdeck's. forkdeck asks for a commit to be
+deployed and then watches; it sends no strategy, no percentages and no regions.
+Whatever your MCP server's tool does when called (an Argo Rollouts canary, a
+Flagger analysis, a region-by-region pipeline) is what happens. Three optional
+patterns on `status` let forkdeck follow such a rollout properly:
+
+```toml
+[repos.deploy.status]
+tool = "get_rollout"
+args = { name = "{name}" }
+revision = 'rev=([0-9a-f]+)'
+success = "Healthy"
+failure = "Degraded"
+pending = "Progressing"
+paused = "Paused"                 # waiting for a person to promote it
+reverted = "Aborted"              # the system stopped and restored the old version itself
+progress = 'step=(\S+)'           # shown while waiting, for example "canary-20%"
+```
+
+- `progress` is display only: its first group is shown next to "pending" in
+  the interface and the log, so you can see "canary 20%" or the region.
+- `paused` means the rollout is waiting for a manual promotion or an approval.
+  That time is not charged to `timeout_mins`; it has its own limit,
+  `pause_timeout_mins` (a day). forkdeck does not promote anything.
+- `reverted` means the system judged the rollout bad and put the old version
+  back on its own. The job fails, and forkdeck's `rollback` tool is **not**
+  called: two rollbacks would fight each other. With a system that reverts
+  itself you can leave `rollback` out altogether. After an abort such systems
+  go back to reporting the old commit, so this answer is believed even though
+  it is no longer about the new one, but only once the new one was seen
+  rolling out; before that it is left over from an earlier deployment.
+
+A long rollout needs a long `timeout_mins`: the default of 15 is for a plain
+deployment. `verify` runs once, after the whole rollout reports success;
+checking each step is the deployment system's analysis, not forkdeck's.
+
 **What counts as evidence, and what does not.** A rollback changes a running
 environment, so forkdeck only does it when something positively says the new
 commit is bad:
@@ -271,6 +308,8 @@ commit is bad:
 | What happened | Rolled back? | Result |
 |---|---|---|
 | The status tool says this commit failed | yes | failed |
+| The deployment system reverted the rollout itself (`reverted`) | no, it already did | failed |
+| The rollout waits for a person longer than `pause_timeout_mins` | no | failed, state reported as UNKNOWN |
 | A `verify` command fails | yes | failed |
 | The status never arrives, or cannot be read five times running | no | failed, state reported as UNKNOWN |
 | The trigger tool refuses | no | failed, nothing was deployed |

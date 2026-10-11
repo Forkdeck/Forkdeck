@@ -140,7 +140,8 @@ publish_on_failed_review = false
 #~ server = "argocd"
 #~ environment = "staging"
 #~ interval_secs = 15
-#~ timeout_mins = 15
+#~ timeout_mins = 15            # raise this for a staged rollout
+#~ pause_timeout_mins = 1440    # how long it may wait for a manual promotion
 #~ # Commands run once the deployment is healthy. A failure triggers the rollback.
 #~ verify = ["curl -fsS https://staging.example.com/healthz"]
 #~ # Leave the trigger out when merging already deploys (auto-sync).
@@ -153,6 +154,11 @@ publish_on_failed_review = false
 #~ failure = '"status":\s*"(Degraded|Missing)"|"phase":\s*"(Failed|Error)"'
 #~ pending = '"status":\s*"(Progressing|OutOfSync)"|"phase":\s*"Running"'
 #~ success = '"status":\s*"Healthy"'
+#~ # For a canary, percentage or region-by-region rollout. The strategy is the deployment system's;
+#~ # these only let forkdeck follow it. All three are optional.
+#~ # paused = '"phase":\s*"Paused"'          # waiting for a person; not charged to timeout_mins
+#~ # reverted = '"phase":\s*"(Aborted)"'     # the system restored the old version itself: no rollback call
+#~ # progress = '"message":\s*"([^"]+)"'     # first group is shown while waiting
 #~ # Required. First group: the commit the answer is about. Until it is the commit being deployed, the answer is pending.
 #~ revision = '"revision":\s*"([0-9a-f]{7,40})"'
 #~ # {last_good} is the last commit that deployed and verified cleanly.

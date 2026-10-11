@@ -299,6 +299,19 @@ pub struct CallCfg {
     /// Success then also requires that revision to be the commit being waited for.
     #[serde(default)]
     pub revision: Option<String>,
+    /// Optional, for a deployment status: the deployment system has stopped the rollout and put the
+    /// old version back by itself (an aborted canary, a failed analysis). The deployment has failed,
+    /// and forkdeck's own rollback tool is not called on top of it.
+    #[serde(default)]
+    pub reverted: Option<String>,
+    /// Optional, for a deployment status: the rollout is waiting for a person (a manual promotion
+    /// or an approval gate). Time spent like this does not count against `timeout_mins`.
+    #[serde(default)]
+    pub paused: Option<String>,
+    /// Optional: a regular expression whose first group says how far a rollout has got, such as
+    /// "canary 20%" or a region. Shown while waiting; it decides nothing.
+    #[serde(default)]
+    pub progress: Option<String>,
     /// Optional: values to take from the answer for later calls in the same stage, such as the id of
     /// the failing run for the log call. Name = regular expression; the first group is the value,
     /// usable as `{name}`.
@@ -347,6 +360,10 @@ pub struct DeployCfg {
     #[serde(default)]
     pub trigger: Option<CallCfg>,
     pub status: CallCfg,
+    /// How long a rollout may sit waiting for a person (see `status.paused`) before forkdeck stops
+    /// watching it. Nothing is rolled back when it does.
+    #[serde(default = "d_day")]
+    pub pause_timeout_mins: u64,
     /// Shell commands run after the deployment reports healthy, such as a smoke test.
     #[serde(default)]
     pub verify: Vec<String>,
@@ -360,6 +377,9 @@ pub struct DeployCfg {
 
 fn d_30() -> u64 {
     30
+}
+fn d_day() -> u64 {
+    24 * 60
 }
 fn d_60() -> u64 {
     60
@@ -375,8 +395,16 @@ fn d_staging() -> String {
 }
 
 impl CallCfg {
-    pub fn patterns(&self) -> [(&'static str, &Option<String>); 4] {
-        [("success", &self.success), ("failure", &self.failure), ("pending", &self.pending), ("revision", &self.revision)]
+    pub fn patterns(&self) -> [(&'static str, &Option<String>); 7] {
+        [
+            ("success", &self.success),
+            ("failure", &self.failure),
+            ("pending", &self.pending),
+            ("revision", &self.revision),
+            ("reverted", &self.reverted),
+            ("paused", &self.paused),
+            ("progress", &self.progress),
+        ]
     }
 }
 
@@ -575,6 +603,9 @@ impl Config {
                 for (cname, p) in &c.capture {
                     let re = regex::Regex::new(p).map_err(|e| anyhow::anyhow!("repos.{}.capture.{} for {}: {}", what, cname, r.repo, e))?;
                     anyhow::ensure!(re.captures_len() >= 2, "repos.{}.capture.{} for {}: the pattern needs a group for the value", what, cname, r.repo);
+                }
+                if let Some(p) = &c.progress {
+                    anyhow::ensure!(regex::Regex::new(p).map(|re| re.captures_len() >= 2).unwrap_or(false), "repos.{}.progress for {}: the pattern needs a group for what to show", what, r.repo);
                 }
                 if let Some(p) = &c.revision {
                     anyhow::ensure!(regex::Regex::new(p).map(|re| re.captures_len() >= 2).unwrap_or(false), "repos.{}.revision for {}: the pattern needs a group for the commit", what, r.repo);

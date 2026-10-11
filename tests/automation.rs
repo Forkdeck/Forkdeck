@@ -675,3 +675,67 @@ fn a_failed_smoke_test_does_not_roll_back_once_a_newer_commit_is_on_the_branch()
     assert!(ok, "{}", out);
     assert!(rig.mcp_calls().contains(&format!(r#""revision":"{}""#, c)), "{}", rig.mcp_calls());
 }
+
+/// A deployment system that rolls out in steps and decides for itself whether to go on.
+fn progressive_stage() -> String {
+    DEPLOY_STAGE.replace(
+        "failure = \"Degraded\"",
+        "failure = \"Degraded\"\nreverted = \"Aborted\"\npaused = \"Paused\"\nprogress = 'step=(\\S+)'",
+    )
+}
+
+#[test]
+fn a_canary_rollout_is_followed_through_its_steps() {
+    let rig = Rig::new("canary", MCP_SERVER, &progressive_stage());
+    rig.once(&[]);
+    let a = rig.merge_to_main("a.txt");
+    let r = &a[..12];
+    rig.mcp_answers(
+        "deploy_status",
+        &[
+            &format!("rev={} step=canary-20% Progressing", r),
+            &format!("rev={} step=canary-50% Paused", r),
+            &format!("rev={} step=eu-west-then-us-east Progressing", r),
+            &format!("rev={} step=all-regions Healthy", r),
+        ],
+    );
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    // forkdeck shows where the system says it is; it sent nothing about strategy.
+    assert!(out.contains("pending · canary-20%") && out.contains("paused, waiting for a person · canary-50%") && out.contains("eu-west-then-us-east"), "{}", out);
+    let mcp = rig.mcp_calls();
+    assert_eq!(mcp.matches(r#""name":"deploy""#).count(), 1, "one trigger, however many steps:\n{}", mcp);
+    assert!(!mcp.contains("canary") && !mcp.contains("percent"), "the strategy is not forkdeck's to send:\n{}", mcp);
+    assert!(!mcp.contains(r#""name":"rollback""#));
+    assert!(fs::read_to_string(rig.state_file()).unwrap().contains(&format!(r#""last_good": "{}""#, a)));
+}
+
+#[test]
+fn a_rollout_the_system_aborts_is_a_failure_without_a_second_rollback() {
+    let rig = Rig::new("aborted", MCP_SERVER, &progressive_stage());
+    let start = git(&rig.clone(), &["rev-parse", "HEAD"]);
+    rig.once(&[]);
+    let a = rig.merge_to_main("a.txt");
+    // The canary fails its analysis; the system puts the old version back and reports that.
+    rig.mcp_answers("deploy_status", &[&format!("rev={} step=canary-20% Progressing", &a[..12]), &format!("rev={} Aborted", &start[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok, "{}", out);
+    assert!(out.contains("restored the previous version itself") && out.contains("forkdeck called no rollback"), "{}", out);
+    let mcp = rig.mcp_calls();
+    assert!(!mcp.contains(r#""name":"rollback""#), "the system already reverted; a rollback on top would fight it:\n{}", mcp);
+    assert!(mcp.contains(r#""name":"notify""#) && mcp.contains("restored the previous version"), "{}", mcp);
+    let saved = fs::read_to_string(rig.state_file()).unwrap();
+    assert!(saved.contains(&format!(r#""last_good": "{}""#, start)) && saved.contains(&format!(r#""seen": "{}""#, a)), "{}", saved);
+}
+
+#[test]
+fn an_abort_left_over_from_an_earlier_rollout_is_not_taken_for_this_one() {
+    let rig = Rig::new("stale-abort", MCP_SERVER, &progressive_stage());
+    let start = git(&rig.clone(), &["rev-parse", "HEAD"]);
+    rig.once(&[]);
+    let a = rig.merge_to_main("a.txt");
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Aborted", &start[..12]), &format!("rev={} step=canary-20% Progressing", &a[..12]), &format!("rev={} Healthy", &a[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(out.contains(&format!("{} is deployed to staging", &a[..10])), "{}", out);
+}

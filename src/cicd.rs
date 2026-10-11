@@ -83,6 +83,10 @@ pub enum Reading {
     Success,
     Failure,
     Pending,
+    /// The deployment system gave up on the rollout and restored the old version by itself.
+    Reverted,
+    /// The rollout is waiting for a person.
+    Paused,
 }
 
 fn matches(pattern: &Option<String>, text: &str) -> bool {
@@ -95,20 +99,37 @@ fn same_revision(a: &str, b: &str) -> bool {
     a.len() >= 7 && b.len() >= 7 && (a.starts_with(&b) || b.starts_with(&a))
 }
 
+/// Is this answer about the commit being waited for? True when the stage has no way to tell.
+pub fn about(call: &CallCfg, text: &str, want_rev: Option<&str>) -> bool {
+    match (&call.revision, want_rev) {
+        (Some(p), Some(want)) => {
+            let got = Regex::new(p).ok().and_then(|re| re.captures(text).and_then(|c| c.get(1).map(|m| m.as_str().to_string())));
+            matches!(got, Some(g) if same_revision(&g, want))
+        }
+        _ => true,
+    }
+}
+
 /// Decide what a tool's answer means. A tool error is not an answer; callers deal with that.
 ///
 /// With a `revision` pattern, an answer about any other commit is "pending": a system that has
 /// not picked up the new commit yet is still describing the old one, healthy or not.
-pub fn read(call: &CallCfg, text: &str, want_rev: Option<&str>) -> Reading {
-    if let (Some(p), Some(want)) = (&call.revision, want_rev) {
-        let got = Regex::new(p).ok().and_then(|re| re.captures(text).and_then(|c| c.get(1).map(|m| m.as_str().to_string())));
-        match got {
-            Some(g) if same_revision(&g, want) => {}
-            _ => return Reading::Pending,
-        }
+///
+/// The one exception is `reverted`. A system that aborts a rollout goes back to reporting the old
+/// commit, so that answer is no longer about ours. It is believed once ours has been seen rolling
+/// out (`seen_ours`); before that, it is left over from some earlier deployment.
+pub fn read(call: &CallCfg, text: &str, want_rev: Option<&str>, seen_ours: bool) -> Reading {
+    let ours = about(call, text, want_rev);
+    if matches(&call.reverted, text) && (ours || seen_ours) {
+        return Reading::Reverted;
+    }
+    if !ours {
+        return Reading::Pending;
     }
     if matches(&call.failure, text) {
         Reading::Failure
+    } else if matches(&call.paused, text) {
+        Reading::Paused
     } else if matches(&call.pending, text) {
         Reading::Pending
     } else if matches(&call.success, text) {
@@ -116,6 +137,12 @@ pub fn read(call: &CallCfg, text: &str, want_rev: Option<&str>) -> Reading {
     } else {
         Reading::Pending
     }
+}
+
+/// How far the rollout says it has got, if the stage says where to look.
+pub fn progress(call: &CallCfg, text: &str) -> Option<String> {
+    let re = Regex::new(call.progress.as_deref()?).ok()?;
+    re.captures(text)?.get(1).map(|m| one_line(m.as_str(), 60)).filter(|s| !s.is_empty())
 }
 
 /// Pull values out of an answer for later calls to use as placeholders: each `capture` entry is
@@ -199,6 +226,8 @@ enum Waited {
     Unknown(String),
     /// The branch has a newer commit; waiting for this one no longer makes sense.
     Superseded(String),
+    /// The deployment system stopped the rollout and restored the old version itself.
+    Reverted(String),
     Cancelled,
 }
 
@@ -210,6 +239,8 @@ struct WaitOpts<'a> {
     settle: Duration,
     /// (local clone, branch, commit): stop when the branch no longer points at the commit.
     superseded_by: Option<(&'a Path, &'a str, &'a str)>,
+    /// How long the rollout may wait for a person. That time is not charged to `limit`.
+    pause_limit: Duration,
 }
 
 /// How many times in a row the status may be unreadable before giving up.
@@ -221,6 +252,10 @@ async fn wait(pool: &mut Pool<'_>, server: &str, call: &CallCfg, vars: &Vars, wa
     let mut errors = 0;
     let mut last = String::new();
     let mut saw_running = false;
+    let mut seen_ours = false;
+    // Time the rollout has spent waiting for a person, and when the current wait began.
+    let mut paused_total = Duration::ZERO;
+    let mut paused_since: Option<Instant> = None;
     loop {
         if cancel.is_set() {
             return Waited::Cancelled;
@@ -237,8 +272,26 @@ async fn wait(pool: &mut Pool<'_>, server: &str, call: &CallCfg, vars: &Vars, wa
                 errors = 0;
                 last = r.shown.clone();
                 // Patterns see the answer as it was sent; everything that is shown uses the blanked copy.
-                match read(call, &r.text, want_rev) {
+                let reading = read(call, &r.text, want_rev, seen_ours);
+                seen_ours |= call.revision.is_some() && about(call, &r.text, want_rev);
+                if reading != Reading::Paused {
+                    if let Some(t) = paused_since.take() {
+                        paused_total += t.elapsed();
+                    }
+                }
+                // What the system says about how far it has got, or failing that the answer itself.
+                let where_at = progress(call, &r.text).unwrap_or_else(|| one_line(&r.shown, 80));
+                match reading {
                     Reading::Success => return Waited::Success,
+                    Reading::Reverted => return Waited::Reverted(r.shown),
+                    Reading::Paused => {
+                        saw_running = true;
+                        let since = *paused_since.get_or_insert_with(Instant::now);
+                        if paused_total + since.elapsed() >= o.pause_limit {
+                            return Waited::Unknown(format!("it has been waiting for someone to promote it for {} min; last answer: {}", o.pause_limit.as_secs() / 60, one_line(&last, 200)));
+                        }
+                        tick(&format!("paused, waiting for a person · {}", where_at));
+                    }
                     Reading::Failure => {
                         let fresh = call.revision.is_some() || saw_running || start.elapsed() >= o.settle;
                         if fresh {
@@ -250,7 +303,7 @@ async fn wait(pool: &mut Pool<'_>, server: &str, call: &CallCfg, vars: &Vars, wa
                     }
                     Reading::Pending => {
                         saw_running = true;
-                        tick(&format!("pending · {}", one_line(&r.shown, 80)));
+                        tick(&format!("pending · {}", where_at));
                     }
                 }
             }
@@ -270,7 +323,8 @@ async fn wait(pool: &mut Pool<'_>, server: &str, call: &CallCfg, vars: &Vars, wa
                 }
             }
         }
-        if start.elapsed() >= o.limit {
+        let paused_now = paused_total + paused_since.map(|t| t.elapsed()).unwrap_or_default();
+        if start.elapsed().saturating_sub(paused_now) >= o.limit {
             return Waited::Unknown(format!("no result after {} min; last answer: {}", o.limit.as_secs() / 60, one_line(&last, 200)));
         }
         tokio::select! {
@@ -333,6 +387,7 @@ pub async fn ci_wait(hub: &Hub, id: u32, cancel: &Cancel) -> Ci {
         limit: Duration::from_secs(ci.timeout_mins.max(1) * 60),
         settle: Duration::from_secs(ci.settle_secs),
         superseded_by: None,
+        pause_limit: Duration::from_secs(ci.timeout_mins.max(1) * 60),
     };
     let waited = wait(&mut pool, &ci.server, &ci.status, &vars, Some(&sha), &opts, cancel, |_| {}).await;
     let out = match waited {
@@ -342,6 +397,7 @@ pub async fn ci_wait(hub: &Hub, id: u32, cancel: &Cancel) -> Ci {
         }
         Waited::Cancelled => Ci::Cancelled,
         Waited::Unknown(why) | Waited::Superseded(why) => Ci::Unknown(why),
+        Waited::Reverted(status) => Ci::Failed(status),
         Waited::Failure(status, got) => {
             hub.log("ci", format!("#{} pipeline failed", id));
             // The status answer usually names the failing run; the log call needs that.
@@ -617,6 +673,8 @@ enum End {
     Refused(String),
     /// No evidence either way.
     Unknown(String),
+    /// The deployment system judged the rollout bad and restored the old version itself.
+    Reverted(String),
     Superseded(String),
     Cancelled(&'static str),
 }
@@ -685,6 +743,20 @@ pub async fn deploy_run(hub: &Hub, id: u32, cancel: &Cancel) -> (JobStatus, Stri
                 s.tries = 0;
             });
             (JobStatus::Failed, format!("{} was not deployed to {}: {}", short(&sha), env, why))
+        }
+        End::Reverted(said) => {
+            // The system that runs the rollout decided, and has already acted. Calling a rollback on
+            // top of its own would be two hands on the same wheel.
+            step(hub, id, Slot::Worker, "deploy", StageState::Failed, "stopped and reverted by the deployment system");
+            record(hub, &r, &key, |s| {
+                s.seen = sha.clone();
+                s.in_progress = None;
+                s.tries = 0;
+            });
+            (
+                JobStatus::Failed,
+                format!("deploying {} to {} failed: the deployment system stopped the rollout and restored the previous version itself ({}). forkdeck called no rollback", short(&sha), env, said),
+            )
         }
         End::Unknown(why) => {
             step(hub, id, Slot::Worker, "deploy", StageState::Failed, &why);
@@ -777,11 +849,13 @@ async fn attempt(hub: &Hub, id: u32, pool: &mut Pool<'_>, r: &RepoCfg, d: &Deplo
         limit: Duration::from_secs(d.timeout_mins.max(1) * 60),
         settle: Duration::ZERO,
         superseded_by: Some((r.path.as_path(), r.base.as_str(), sha)),
+        pause_limit: Duration::from_secs(d.pause_timeout_mins.max(1) * 60),
     };
     match wait(pool, &d.server, &d.status, vars, Some(sha), &opts, cancel, |l| step(hub, id, Slot::Worker, "deploy", StageState::Running, l)).await {
         Waited::Success => {}
         Waited::Failure(t, _) => return End::Bad(format!("{} reports failure: {}", d.status.tool, one_line(&t, 200))),
         Waited::Unknown(w) => return End::Unknown(w),
+        Waited::Reverted(t) => return End::Reverted(one_line(&t, 200)),
         Waited::Superseded(newer) => return End::Superseded(newer),
         Waited::Cancelled => return End::Cancelled("waiting for the deployment"),
     }
@@ -815,11 +889,13 @@ async fn rollback(pool: &mut Pool<'_>, d: &DeployCfg, rb: &CallCfg, vars: &Vars,
     // Now the healthy state to wait for is the old commit, not the one that failed.
     let mut back = vars.clone();
     back.insert("sha".into(), last_good.to_string());
-    let opts = WaitOpts { interval: Duration::from_secs(d.interval_secs.max(1)), limit: Duration::from_secs(d.timeout_mins.max(1) * 60), settle: Duration::ZERO, superseded_by: None };
+    let limit = Duration::from_secs(d.timeout_mins.max(1) * 60);
+    let opts = WaitOpts { interval: Duration::from_secs(d.interval_secs.max(1)), limit, settle: Duration::ZERO, superseded_by: None, pause_limit: limit };
     match wait(pool, &d.server, &d.status, &back, Some(last_good), &opts, cancel, tick).await {
         Waited::Success => Ok(()),
         Waited::Failure(t, _) => Err(format!("it reports failure: {}", one_line(&t, 160))),
         Waited::Unknown(w) | Waited::Superseded(w) => Err(w),
+        Waited::Reverted(t) => Err(format!("the deployment system reports it reverted: {}", one_line(&t, 160))),
         Waited::Cancelled => Err("forkdeck was stopped before it was confirmed".into()),
     }
 }
@@ -842,6 +918,9 @@ mod tests {
             failure: opt(failure),
             pending: opt(pending),
             revision: revision.map(String::from),
+            reverted: None,
+            paused: None,
+            progress: None,
             capture: Default::default(),
         }
     }
@@ -891,11 +970,11 @@ mod tests {
     fn reads_check_run_style_answers() {
         // Patterns of the kind used for a list of check runs.
         let c = call(r#""conclusion":\s*"success""#, r#""conclusion":\s*"(failure|timed_out|cancelled)""#, r#""status":\s*"(queued|in_progress)""#, None);
-        assert_eq!(read(&c, r#"{"total_count":0,"check_runs":[]}"#, None), Reading::Pending, "CI has not started yet");
-        assert_eq!(read(&c, r#"[{"status":"in_progress","conclusion":null}]"#, None), Reading::Pending);
-        assert_eq!(read(&c, r#"[{"status":"completed","conclusion":"success"}]"#, None), Reading::Success);
-        assert_eq!(read(&c, r#"[{"status":"completed","conclusion":"success"},{"status":"queued"}]"#, None), Reading::Pending, "not done until all are");
-        assert_eq!(read(&c, r#"[{"conclusion":"failure"},{"status":"in_progress"}]"#, None), Reading::Failure, "one failure is enough");
+        assert_eq!(read(&c, r#"{"total_count":0,"check_runs":[]}"#, None, false), Reading::Pending, "CI has not started yet");
+        assert_eq!(read(&c, r#"[{"status":"in_progress","conclusion":null}]"#, None, false), Reading::Pending);
+        assert_eq!(read(&c, r#"[{"status":"completed","conclusion":"success"}]"#, None, false), Reading::Success);
+        assert_eq!(read(&c, r#"[{"status":"completed","conclusion":"success"},{"status":"queued"}]"#, None, false), Reading::Pending, "not done until all are");
+        assert_eq!(read(&c, r#"[{"conclusion":"failure"},{"status":"in_progress"}]"#, None, false), Reading::Failure, "one failure is enough");
     }
 
     #[test]
@@ -903,13 +982,36 @@ mod tests {
         let c = call("Healthy", "Degraded", "Progressing", Some(r"revision: ([0-9a-f]+)"));
         let new = "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         // Still on the old commit: neither its health nor its failure says anything about ours.
-        assert_eq!(read(&c, "revision: 0000000bbb health: Healthy", Some(new)), Reading::Pending);
-        assert_eq!(read(&c, "revision: 0000000bbb health: Degraded", Some(new)), Reading::Pending);
-        assert_eq!(read(&c, "health: Healthy", Some(new)), Reading::Pending, "no revision in the answer");
-        assert_eq!(read(&c, "revision: 1111111 health: Progressing", Some(new)), Reading::Pending);
-        assert_eq!(read(&c, "revision: 1111111 health: Healthy", Some(new)), Reading::Success, "abbreviated commits match");
-        assert_eq!(read(&c, &format!("revision: {} health: Degraded", new), Some(new)), Reading::Failure);
-        assert_eq!(read(&c, "revision: 111 health: Healthy", Some(new)), Reading::Pending, "too short to be sure");
+        assert_eq!(read(&c, "revision: 0000000bbb health: Healthy", Some(new), false), Reading::Pending);
+        assert_eq!(read(&c, "revision: 0000000bbb health: Degraded", Some(new), false), Reading::Pending);
+        assert_eq!(read(&c, "health: Healthy", Some(new), false), Reading::Pending, "no revision in the answer");
+        assert_eq!(read(&c, "revision: 1111111 health: Progressing", Some(new), false), Reading::Pending);
+        assert_eq!(read(&c, "revision: 1111111 health: Healthy", Some(new), false), Reading::Success, "abbreviated commits match");
+        assert_eq!(read(&c, &format!("revision: {} health: Degraded", new), Some(new), false), Reading::Failure);
+        assert_eq!(read(&c, "revision: 111 health: Healthy", Some(new), false), Reading::Pending, "too short to be sure");
+    }
+
+    #[test]
+    fn a_progressive_rollout_is_read_step_by_step() {
+        let mut c = call("phase=Healthy", "phase=Degraded", "phase=Progressing", Some(r"rev=([0-9a-f]+)"));
+        c.reverted = Some("phase=Aborted".into());
+        c.paused = Some("phase=Paused".into());
+        c.progress = Some(r"step=(.+?)(?: phase|$)".into());
+        let new = "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        // The strategy is the system's: forkdeck only reads how far it says it has got.
+        assert_eq!(read(&c, "rev=1111111 step=canary 20% phase=Progressing", Some(new), false), Reading::Pending);
+        assert_eq!(progress(&c, "rev=1111111 step=canary 20% phase=Progressing").as_deref(), Some("canary 20%"));
+        assert_eq!(progress(&c, "rev=1111111 step=eu-west 2 of 5 regions phase=Paused").as_deref(), Some("eu-west 2 of 5 regions"));
+        assert_eq!(progress(&c, "rev=1111111 phase=Progressing"), None);
+        assert_eq!(read(&c, "rev=1111111 step=canary 50% phase=Paused", Some(new), true), Reading::Paused);
+        assert_eq!(read(&c, "rev=1111111 phase=Healthy", Some(new), true), Reading::Success);
+
+        // Aborted: the system is back on the old commit and says so.
+        assert_eq!(read(&c, "rev=0000000 phase=Aborted", Some(new), true), Reading::Reverted, "believed once ours was seen rolling out");
+        assert_eq!(read(&c, "rev=0000000 phase=Aborted", Some(new), false), Reading::Pending, "before that it is left over from an earlier deployment");
+        assert_eq!(read(&c, "rev=1111111 phase=Aborted", Some(new), false), Reading::Reverted, "an abort that still names ours is ours");
+        // A paused rollout of some other commit says nothing about ours.
+        assert_eq!(read(&c, "rev=0000000 phase=Paused", Some(new), true), Reading::Pending);
     }
 
     #[test]
