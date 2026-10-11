@@ -897,9 +897,112 @@ fn record(hub: &Hub, r: &RepoCfg, key: &str, change: impl FnOnce(&mut Saved)) {
     }
 }
 
+/// What the deployment system says before anything is started.
+enum Existing {
+    /// This commit is already there or on its way: watch it, do not start it again.
+    Ours(&'static str),
+    /// Nothing is in the way.
+    Clear,
+    Stop(End),
+}
+
+/// The revision an answer is about, for messages.
+fn revision_in(call: &CallCfg, text: &str) -> String {
+    let got = call.revision.as_deref().and_then(|p| Regex::new(p).ok()).and_then(|re| re.captures(text).and_then(|c| c.get(1).map(|m| m.as_str().to_string())));
+    got.map(|g| short(&g).to_string()).unwrap_or_else(|| "another revision".into())
+}
+
+/// Ask the deployment system what is going on before triggering anything. It is the one place
+/// that knows: another machine, a person or the system's own automation may have started this
+/// commit already, or be in the middle of rolling out a different one.
+///
+/// - This commit is deployed or rolling out: it is not triggered a second time, only watched.
+/// - A different rollout is in progress: wait for it to settle, then go ahead.
+/// - The status cannot be read: nothing is started.
+#[allow(clippy::too_many_arguments)]
+async fn existing(hub: &Hub, id: u32, pool: &mut Pool<'_>, r: &RepoCfg, d: &DeployCfg, vars: &Vars, sha: &str, cancel: &Cancel) -> Existing {
+    let start = Instant::now();
+    let interval = Duration::from_secs(d.interval_secs.max(1));
+    let limit = Duration::from_secs(d.timeout_mins.max(1) * 60);
+    // A teammate's forkdeck announced this deployment before ours did. Give it a moment to start it.
+    let mut peer = hub.job(id, |j| j.peer.clone()).flatten();
+    let mut errors = 0;
+    loop {
+        if cancel.is_set() {
+            return Existing::Stop(End::Cancelled("checking for a deployment already under way"));
+        }
+        let answer = match pool.call(&d.server, &d.status, vars).await {
+            Ok(res) if res.is_error => Err(format!("{} reported an error: {}", d.status.tool, one_line(&res.shown, 160))),
+            other => other,
+        };
+        let mut pause = interval;
+        match answer {
+            Err(e) => {
+                errors += 1;
+                step(hub, id, Slot::Worker, "deploy", StageState::Running, &format!("status unreadable ({} of {}): {}", errors, MAX_ERRORS, clip(&e, 80)));
+                if errors >= MAX_ERRORS {
+                    return Existing::Stop(End::Refused(format!(
+                        "{} could not be read to see whether a deployment is already under way, so none was started: {}",
+                        d.status.tool,
+                        clip(&e, 160)
+                    )));
+                }
+            }
+            Ok(res) => {
+                errors = 0;
+                if about(&d.status, &res.text, Some(sha)) {
+                    return match read(&d.status, &res.text, Some(sha), false) {
+                        Reading::Success => Existing::Ours("deployed"),
+                        Reading::Pending | Reading::Paused => Existing::Ours("rolling out"),
+                        // An earlier try at this commit went wrong. Starting it again is what a retry is for.
+                        Reading::Failure | Reading::Reverted => Existing::Clear,
+                    };
+                }
+                let busy = matches(&d.status.pending, &res.text) || matches(&d.status.paused, &res.text);
+                if busy {
+                    step(hub, id, Slot::Worker, "deploy", StageState::Running, &format!("a rollout of {} is under way; waiting for it before starting", revision_in(&d.status, &res.text)));
+                    if start.elapsed() >= limit {
+                        return Existing::Stop(End::Refused(format!(
+                            "a rollout of {} was still under way after {} min, so this one was not started. Last answer: {}",
+                            revision_in(&d.status, &res.text),
+                            limit.as_secs() / 60,
+                            one_line(&res.shown, 160)
+                        )));
+                    }
+                } else if let Some(who) = peer.take() {
+                    step(hub, id, Slot::Worker, "deploy", StageState::Running, &format!("{} announced this deployment first; giving it a moment", who));
+                    pause = (interval * 2).clamp(Duration::from_secs(5), Duration::from_secs(60));
+                } else {
+                    return Existing::Clear;
+                }
+            }
+        }
+        // While waiting, the branch may move on; then this commit is no longer the one to deploy.
+        if let Some(head) = branch_head(r).await {
+            if head != sha {
+                return Existing::Stop(End::Superseded(head));
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(pause) => {}
+            _ = cancel.wait() => return Existing::Stop(End::Cancelled("checking for a deployment already under way")),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn attempt(hub: &Hub, id: u32, pool: &mut Pool<'_>, r: &RepoCfg, d: &DeployCfg, vars: &Vars, sha: &str, cancel: &Cancel) -> End {
-    if let Some(t) = &d.trigger {
+    let found = if d.trigger.is_some() { existing(hub, id, pool, r, d, vars, sha, cancel).await } else { Existing::Clear };
+    let start_it = match found {
+        Existing::Stop(end) => return end,
+        Existing::Ours(how) => {
+            hub.log("deploy", format!("#{} {} is already {} in {}; not triggered again", id, short(sha), how, d.environment));
+            step(hub, id, Slot::Worker, "deploy", StageState::Running, &format!("already {}, watching", how));
+            false
+        }
+        Existing::Clear => true,
+    };
+    if let Some(t) = d.trigger.as_ref().filter(|_| start_it) {
         match pool.call(&d.server, t, vars).await {
             Ok(res) if !res.is_error => step(hub, id, Slot::Worker, "deploy", StageState::Running, &format!("triggered with {}", t.tool)),
             Ok(res) => return End::Refused(format!("{} refused: {}", t.tool, one_line(&res.shown, 200))),

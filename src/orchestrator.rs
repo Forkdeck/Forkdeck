@@ -120,6 +120,7 @@ impl Hub {
                 cancel: Cancel::new(),
                 claim: None,
                 released: false,
+                peer: None,
             });
             if stopping {
                 // Shutting down: the job exists so the caller has an id, but it never starts and claims nothing.

@@ -254,14 +254,26 @@ open as it is. Nothing is posted and no label changes.
 
 With `[repos.deploy]` set, forkdeck watches the base branch. When it moves, it:
 
-1. calls the `trigger` tool, if there is one (leave it out when merging already
-   deploys, as with GitOps auto-sync),
+1. asks the `status` tool what is going on already, and then calls the
+   `trigger` tool, if there is one (leave it out when merging already deploys,
+   as with GitOps auto-sync),
 2. polls the `status` tool until that commit is healthy,
 3. runs the `verify` commands, such as a smoke test,
 4. calls the `rollback` tool with `{last_good}`, the last commit that deployed
    and verified cleanly, **if and only if there is evidence the new commit is
    bad**, then waits for the old one to be healthy again,
 5. calls the `notify` tool, if there is one, with a one-line result.
+
+**Not starting what is already running.** Before triggering, forkdeck asks the
+deployment system, because it is the one place that knows. If the commit is
+already deployed or rolling out (a teammate's machine started it, or the
+system's own automation did), it is not triggered again: forkdeck watches it to
+the end, verifies it and records it as usual. If a rollout of a different
+revision is in progress (the answer matches `pending` or `paused`), forkdeck
+waits for it to settle before starting, up to `timeout_mins`, and starts
+nothing if it never does. If the status cannot be read, nothing is started.
+Set `status.pending` to whatever your system says mid-rollout; without it
+forkdeck cannot tell a rollout of something else from a settled environment.
 
 `status.revision` is required: a pattern whose first group is the commit the
 answer describes. Until the system reports the commit being deployed, its
@@ -491,9 +503,13 @@ with sharing off neither announces what it takes nor looks at what others
 have. Staleness compares the forge's time with this machine's clock, so a
 clock that is far ahead makes teammates look stale. On GitHub, "organisation
 member" is what the forge reports for the comment; a member the organisation
-has given no write access to the repository still counts. Deployments are announced
-but not arbitrated: two machines with a deploy stage for the same environment
-will both deploy, so give that stage to one of them.
+has given no write access to the repository still counts. Deployments are announced on the forge
+but decided by the deployment system: each machine asks it before triggering
+and does not start a commit that is already deployed or rolling out. A machine
+that sees a teammate's announcement first also waits a moment before starting.
+Two machines that ask in the same second can still both trigger, so the
+`trigger` tool should be safe to call twice for the same commit, or the deploy
+stage should live on one machine.
 
 ## Before you leave it unattended
 
@@ -554,8 +570,7 @@ been run by two real machines against one repository. Expect to adjust
 `agents.codex` arguments for your codex version.
 
 Not there yet: feeding review comments on an open pull request back to the
-worker for another round; a record of jobs that survives a restart; arbitrating
-deployments between machines.
+worker for another round; a record of jobs that survives a restart.
 
 ## License
 

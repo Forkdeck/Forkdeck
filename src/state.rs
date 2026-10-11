@@ -257,6 +257,8 @@ pub struct Job {
     pub claim: Option<Arc<crate::team::Held>>,
     /// A teammate handed the item back to the queue: stop without touching its labels.
     pub released: bool,
+    /// A teammate whose forkdeck announced the same deployment before this one did.
+    pub peer: Option<String>,
 }
 
 pub struct LogLine {
