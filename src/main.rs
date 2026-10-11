@@ -276,10 +276,19 @@ fn main() -> anyhow::Result<()> {
                     println!("added to {}", knowledge::path(r).display());
                 }
                 None => {
+                    let _ = rt.block_on(issues::sh("git", &["fetch", "-q", "origin", &format!("+refs/heads/{b}:refs/remotes/origin/{b}", b = r.base)], Some(&r.path)));
+                    let team = rt.block_on(knowledge::shared(r));
+                    println!("the team's notes: {} on {}", knowledge::SHARED, r.base);
+                    if team.trim().is_empty() {
+                        println!("  none yet. Add the file through a pull request, or let forkdeck propose rules ([knowledge] learn = true)");
+                    } else {
+                        println!();
+                        println!("{}", team.trim_end());
+                    }
                     let notes = knowledge::load(r);
-                    println!("{}", knowledge::path(r).display());
+                    println!("\nthis machine's own: {}", knowledge::path(r).display());
                     if notes.trim().is_empty() {
-                        println!("no notes yet. Add one with: forkdeck notes {} add \"...\", or edit the file", r.repo);
+                        println!("  none yet. Add one with: forkdeck notes {} add \"...\", or edit the file", r.repo);
                     } else {
                         println!();
                         print!("{}", notes);

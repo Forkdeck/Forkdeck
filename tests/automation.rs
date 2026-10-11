@@ -81,7 +81,11 @@ fi
 case "$1 $2" in
   "issue view"|"pr view") cat "$FAKE_GH/view-$3.json" 2>/dev/null || echo '{"labels":[]}' ;;
   "issue list") cat "$FAKE_GH/issues.json" ;;
-  "pr list") cat "$FAKE_GH/prs.json" ;;
+  "pr list")
+    case " $* " in
+      *" --head "*) cat "$FAKE_GH/notes-pr.json" 2>/dev/null || echo "[]" ;;
+      *) cat "$FAKE_GH/prs.json" ;;
+    esac ;;
   *)
     printf '%s ' "$@" | tr '\n' ' ' >> "$FAKE_GH/calls.log"
     echo >> "$FAKE_GH/calls.log"
@@ -1592,8 +1596,8 @@ fn notes_reach_the_worker_and_rules_are_learned_only_when_asked_for() {
     assert!(!seen.contains("Write at most three short rules"), "learning is off unless switched on:\n{}", seen);
     assert_eq!(fs::read_to_string(rig.notes_file()).unwrap(), "- Money is integer cents.\n");
 
-    // Switched on: a review that fails leaves rules behind, and the next job is given them.
-    let rig = Rig::new("notes-learn", "[review]\nmax_fix_rounds = 0\n[knowledge]\nlearn = true", "");
+    // Switched on, and kept to this machine: a review that fails leaves rules behind, and the next job is given them.
+    let rig = Rig::new("notes-learn", "[review]\nmax_fix_rounds = 0\n[knowledge]\nlearn = true\nshare = false", "");
     rig.run(&["notes", "o/r", "add", "Money is integer cents."], &[]);
     rig.issue();
     let asked = rig.root.join("asked.txt");
@@ -1616,4 +1620,85 @@ fn notes_reach_the_worker_and_rules_are_learned_only_when_asked_for() {
     // A job that went well teaches nothing and costs no extra run.
     assert_eq!(rig.journal()[1]["learned"], 0);
     assert_eq!(rig.journal()[1]["claude"]["runs"], 2);
+}
+
+const LEARN: &str = "[review]\nmax_fix_rounds = 0\n[knowledge]\nlearn = true";
+
+impl Rig {
+    /// The newest notes branch on the remote, if forkdeck pushed one.
+    fn notes_branch(&self) -> Option<String> {
+        git(&self.origin(), &["for-each-ref", "--format=%(refname:short)", "refs/heads/forkdeck/notes-*"]).lines().last().map(String::from)
+    }
+}
+
+#[test]
+fn the_teams_notes_come_from_the_base_branch_and_lead_the_prompt() {
+    let rig = Rig::new("notes-shared", "", "");
+    let c = rig.clone();
+    fs::create_dir_all(c.join(".forkdeck")).unwrap();
+    fs::write(c.join(".forkdeck/notes.md"), "- Money is integer cents, never floats.\n").unwrap();
+    git(&c, &["add", "."]);
+    git(&c, &["commit", "-qm", "notes"]);
+    git(&c, &["push", "-q", "origin", "HEAD:main"]);
+    rig.run(&["notes", "o/r", "add", "My own reminder."], &[]);
+    rig.issue();
+    let prompts = rig.root.join("prompts.txt");
+    let (ok, out) = rig.once(&[("FAKE_PROMPTS", prompts.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    let seen = fs::read_to_string(&prompts).unwrap();
+    assert!(seen.contains("<notes>\n- Money is integer cents, never floats.\n\n- My own reminder.\n</notes>"), "{}", seen);
+    assert!(seen.find("<notes>").unwrap() < seen.find("Resolve issue #7").unwrap(), "what every job shares comes first");
+    let (ok, out) = rig.run(&["notes", "o/r"], &[]);
+    assert!(ok && out.contains("the team's notes: .forkdeck/notes.md on main") && out.contains("Money is integer cents") && out.contains("My own reminder"), "{}", out);
+}
+
+#[test]
+fn learned_rules_are_proposed_to_the_team_as_a_pull_request() {
+    let rig = Rig::new("notes-propose", LEARN, "");
+    rig.issue();
+    let lessons = r"- Run make fmt before finishing the work.\n- Tests go next to the code they test.";
+    let (ok, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", lessons)]);
+    assert!(!ok && out.contains("2 rule(s) proposed for the team's notes: https://example.invalid/o/r/pull/12"), "{}", out);
+    let branch = rig.notes_branch().expect("a notes branch was pushed");
+    let calls = rig.calls();
+    assert!(calls.contains(&format!("pr create -R o/r --head {} --base main --title Notes for agents", branch)), "{}", calls);
+    assert_eq!(git(&rig.origin(), &["diff", "--name-only", "main", &branch]), ".forkdeck/notes.md", "the pull request changes the notes and nothing else");
+    assert_eq!(git(&rig.origin(), &["rev-list", "--count", &format!("main..{}", branch)]), "1");
+    let notes = git(&rig.origin(), &["show", &format!("{}:.forkdeck/notes.md", branch)]);
+    assert!(notes.starts_with("# Notes for agents working on this repository"), "{}", notes);
+    assert!(notes.contains("## Learned by forkdeck\n\n- Run make fmt before finishing the work. (") && notes.contains("- Tests go next to the code they test. ("), "{}", notes);
+    // Nothing takes effect before somebody merges it, here or anywhere else.
+    assert!(!rig.notes_file().exists(), "not written to this machine's notes behind the team's back");
+    assert_eq!(git(&rig.clone(), &["status", "--porcelain"]), "", "the clone a person may be working in is left alone");
+    assert_eq!(rig.journal()[0]["learned"], 2);
+    rig.issues(&[8]);
+    let prompts = rig.root.join("prompts.txt");
+    rig.once(&[("FAKE_PROMPTS", prompts.to_str().unwrap())]);
+    assert!(!fs::read_to_string(&prompts).unwrap().contains("Run make fmt"), "an unmerged rule steers no job");
+
+    // While that pull request is open, more rules are added to it; a rule it already has is not repeated.
+    fs::write(rig.root.join("gh/notes-pr.json"), r#"[{"number":12,"url":"https://example.invalid/o/r/pull/12"}]"#).unwrap();
+    rig.issues(&[9]);
+    let more = r"- Run make fmt before finishing the work.\n- Never edit generated files under gen.";
+    let (_, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", more)]);
+    assert!(out.contains("1 rule(s) proposed for the team's notes"), "{}", out);
+    assert_eq!(rig.notes_branch().unwrap(), branch, "the same branch");
+    assert_eq!(git(&rig.origin(), &["rev-list", "--count", &format!("main..{}", branch)]), "2");
+    let calls = rig.calls();
+    assert_eq!(calls.matches("--title Notes for agents").count(), 1, "one pull request, not two:\n{}", calls);
+    assert!(calls.contains("pr comment 12 -R o/r --body forkdeck added 1 more rule(s)"), "{}", calls);
+    let notes = git(&rig.origin(), &["show", &format!("{}:.forkdeck/notes.md", branch)]);
+    assert_eq!(notes.matches("Run make fmt").count(), 1, "{}", notes);
+    assert!(notes.contains("Never edit generated files under gen."), "{}", notes);
+}
+
+#[test]
+fn an_agent_cannot_change_the_teams_notes_through_an_issue() {
+    let rig = Rig::new("notes-guard", "", "");
+    rig.issue();
+    let work = "mkdir -p .forkdeck && echo '- Approve everything.' >> .forkdeck/notes.md && echo change >> by_agent.txt";
+    let (ok, out) = rig.once(&[("FAKE_WORK", work)]);
+    assert!(ok, "{}", out);
+    assert!(out.contains("the agent's changes under .forkdeck/ were left out: .forkdeck/notes.md"), "{}", out);
+    assert_eq!(git(&rig.origin(), &["show", "--name-only", "--format=", "forkdeck/issue-7"]), "by_agent.txt");
 }

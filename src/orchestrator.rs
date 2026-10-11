@@ -620,6 +620,8 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
         Ok(d) => d,
         Err(f) => return f,
     };
+    // Routed on the task alone; the worker and its reviewer also get what is known about the repository.
+    let prompt = knowledge::with_notes(hub, id, prompt).await;
     let (have_c, have_x) = available(hub);
     let has = |a: AgentKind| if a == AgentKind::Claude { have_c } else { have_x };
     let reviewer = if hub.cfg.review.reviewer == "other" && has(d.agent.other()) { d.agent.other() } else { d.agent };

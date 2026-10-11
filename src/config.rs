@@ -303,6 +303,9 @@ pub struct KnowledgeCfg {
     /// After work was sent back or a review asked for changes, have a CLI distil rules from the
     /// findings and add them to the notes. Off by default: what is learned is read by every later job.
     pub learn: bool,
+    /// Propose learned rules to the team as a pull request against `.forkdeck/notes.md`. Off: they
+    /// are written to this machine's own notes instead and take effect at once, for this machine only.
+    pub share: bool,
     /// Learned rules kept per repository; the oldest make room.
     pub max_learned: usize,
     /// How much of the notes is put into a prompt.
@@ -311,7 +314,7 @@ pub struct KnowledgeCfg {
 
 impl Default for KnowledgeCfg {
     fn default() -> Self {
-        KnowledgeCfg { enabled: true, learn: false, max_learned: 30, max_chars: 6000 }
+        KnowledgeCfg { enabled: true, learn: false, share: true, max_learned: 30, max_chars: 6000 }
     }
 }
 
