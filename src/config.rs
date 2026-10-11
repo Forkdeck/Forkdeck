@@ -322,6 +322,10 @@ pub struct CiCfg {
     /// How many times a CI failure is sent back to the worker before a person is asked.
     #[serde(default = "d_1")]
     pub max_fix_rounds: u32,
+    /// A failure reported within this many seconds, before the pipeline was seen running, may be
+    /// the previous run's and is not believed yet. Not used when `status.revision` is set.
+    #[serde(default = "d_60")]
+    pub settle_secs: u64,
     pub status: CallCfg,
     /// Optional: fetch the failing output to show the worker. Without it the status answer is used.
     #[serde(default)]
@@ -356,6 +360,9 @@ pub struct DeployCfg {
 
 fn d_30() -> u64 {
     30
+}
+fn d_60() -> u64 {
+    60
 }
 fn d_15() -> u64 {
     15
@@ -535,6 +542,13 @@ impl Config {
                 }
                 calls.push(("deploy.status".into(), &d.server, &d.status));
                 anyhow::ensure!(d.status.success.is_some(), "repos.deploy.status for {}: a success pattern is required", r.repo);
+                // Without it, "healthy" from a system still running the previous commit would be recorded
+                // as this commit deployed, and would become the target of the next rollback.
+                anyhow::ensure!(
+                    d.status.revision.is_some(),
+                    "repos.deploy.status for {}: a revision pattern is required, so that an answer about the previous commit is not taken for this one",
+                    r.repo
+                );
                 for (n, c) in [("deploy.trigger", &d.trigger), ("deploy.rollback", &d.rollback), ("deploy.notify", &d.notify)] {
                     calls.extend(c.iter().map(|c| (n.to_string(), d.server.as_str(), c)));
                 }
@@ -652,6 +666,9 @@ tool = "rollback"
         assert!(cfg.validate().is_err(), "a pattern that does not compile is rejected");
         let cfg: Config = toml::from_str("[mcp.x]\ncommand = \"a\"\nurl = \"b\"").unwrap();
         assert!(cfg.validate().is_err());
+        // A deploy status that cannot say which commit it is about would record commits as deployed that never were.
+        let cfg: Config = toml::from_str(&WITH_STAGES.replace("ENV", "").replace("revision = 'rev: ([0-9a-f]+)'", "")).unwrap();
+        assert!(cfg.validate().unwrap_err().to_string().contains("revision pattern is required"));
     }
 
     #[test]

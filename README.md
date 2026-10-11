@@ -219,7 +219,14 @@ success = '"conclusion":\s*"success"'
 ```
 
 The patterns are tried in the order failure, pending, success, and an answer
-that matches none of them counts as pending. A tool error is a failure.
+that matches none of them counts as pending.
+
+A tool that reports an error has not answered the question, so an error is
+never read as a red pipeline or a failed deployment. It is retried on the next
+poll, and after five in a row the stage stops with "no result". The same goes
+for a status that never arrives before `timeout_mins`. In that case no code is
+changed and nothing is rolled back; the job fails and says what it could not
+find out.
 
 Placeholders in `args`: `{repo}`, `{owner}`, `{name}`, `{base}`, `{branch}`,
 `{sha}`, `{pr}`, `{issue}`, `{env}`, `{last_good}`, `{message}`. A value that is
@@ -227,10 +234,16 @@ only `"{pr}"` or `"{issue}"` is sent as a number. `capture` takes values out of
 an answer for later calls in the stage, for example the id of the failing run
 for the log call; the example config shows it.
 
-Make sure the status call is about the commit forkdeck just pushed. A tool
-that reports "the latest run on the branch" will still show the old failure
-for a moment after a fix is pushed and use up a fix round. Either call a tool
-that is keyed by the pull request's head, or set `revision` (below).
+Right after a fix is pushed, most systems still show the previous run's
+failure for a moment. Two things keep that from being read as the fix failing.
+If `status.revision` is set (a pattern whose first group is the commit the
+answer is about), only answers about the pushed commit count. Without it, a
+failure that shows up within `settle_secs` (60), before the pipeline was seen
+running, is not believed until that time has passed. Set `revision` where the
+tool's answer includes the commit; it is the exact one.
+
+When forkdeck is stopped while it waits for CI, the pull request is simply left
+open as it is. Nothing is posted and no label changes.
 
 ### Deploying to staging, and rolling back
 
@@ -240,35 +253,75 @@ With `[repos.deploy]` set, forkdeck watches the base branch. When it moves, it:
    deploys, as with GitOps auto-sync),
 2. polls the `status` tool until that commit is healthy,
 3. runs the `verify` commands, such as a smoke test,
-4. on any failure calls the `rollback` tool with `{last_good}`, the last commit
-   that deployed and verified cleanly, and waits for that to be healthy again,
+4. calls the `rollback` tool with `{last_good}`, the last commit that deployed
+   and verified cleanly, **if and only if there is evidence the new commit is
+   bad**, then waits for the old one to be healthy again,
 5. calls the `notify` tool, if there is one, with a one-line result.
 
-`revision` is a pattern whose first group is the commit an answer describes.
-Set it for anything that deploys asynchronously: until the system reports the
-commit being deployed, its answer is about the previous one and is treated as
-pending, whether that one is healthy or degraded.
+`status.revision` is required: a pattern whose first group is the commit the
+answer describes. Until the system reports the commit being deployed, its
+answer is about the previous one and is treated as pending, whether that one is
+healthy or degraded. Without this, "healthy" from a system that had not started
+yet would be recorded as a successful deployment.
 
-Things to know:
+**What counts as evidence, and what does not.** A rollback changes a running
+environment, so forkdeck only does it when something positively says the new
+commit is bad:
+
+| What happened | Rolled back? | Result |
+|---|---|---|
+| The status tool says this commit failed | yes | failed |
+| A `verify` command fails | yes | failed |
+| The status never arrives, or cannot be read five times running | no | failed, state reported as UNKNOWN |
+| The trigger tool refuses | no | failed, nothing was deployed |
+| The trigger call gets no answer | not by that alone | the status is watched as usual |
+| A newer commit reaches the branch while waiting | no | this one is dropped, the newer one is deployed next |
+| forkdeck is stopped or the job is cancelled, at any point | no | cancelled, picked up at the next start |
+
+Other things to know:
 
 - **Staging only.** A deploy stage whose `environment` contains "prod" does not
-  load. That is a guard on the name; forkdeck cannot see what a tool really
-  deploys to, so do not point this stage at production.
+  load. That is a check on a name you typed and nothing more; forkdeck cannot
+  see what a tool really deploys to. Do not point this stage at production.
 - **It runs unattended.** Every commit that reaches the base branch is deployed
   without asking. Branch protection and review are what keep that safe.
 - **First start deploys nothing.** forkdeck notes where the branch is and takes
   that commit as what is running, which makes it the first rollback target.
+- **One forkdeck deploys.** The first process to start holds a lock next to the
+  state file; any other (a cron `forkdeck once` while the interface is open,
+  for example) still handles issues and reviews but leaves deployments alone.
 - **State is in `~/.local/state/forkdeck/deploy.json`** (or `$XDG_STATE_HOME`).
-  Delete an entry to make forkdeck forget a repository.
-- **A commit is tried once.** A failed deployment is not retried when the
-  branch has not moved.
-- **Rollback is whatever your tool does.** If the rollback fails too, the job
+  If the file is damaged, forkdeck says so and deploys nothing until it is
+  repaired or deleted; it does not start over on its own.
+- **An interrupted deployment is remembered.** If forkdeck is stopped or killed
+  in the middle of one, the next start says so and deploys the branch head.
+- **A commit is tried once.** After a failed or inconclusive deployment the
+  same commit is not tried again; the next commit is.
+- **`verify` runs in your local clone** (`path`), as you, not in a checkout of
+  the deployed commit. Use it for commands that talk to the environment, such
+  as `curl`, not for scripts that must match the deployed version.
+- **Rollback is whatever your tool does.** If it cannot be confirmed, the job
   says so in capitals and stops; nothing else is attempted.
 - **Only the newest commit is deployed** when several land between polls.
 
-The example config has a worked Argo CD stage. Its tool names come from the
-Argo CD MCP server's documentation; its argument names are a guess to check
-with `forkdeck mcp tools argocd`.
+### What forkdeck does with MCP servers' answers
+
+- Values taken from the environment (`${NAME}`) are blanked out of every error
+  message and every tool answer before they are logged, shown to an agent or
+  posted, in case a server echoes its own URL or environment.
+- HTTP redirects are not followed. Configure the final URL.
+- `capture` and the patterns work on the text of an answer; with several runs
+  or resources in one answer they see the first match. `forkdeck mcp call`
+  shows exactly what they will be matched against.
+
+The example config has an Argo CD stage as a starting point. Its tool names
+come from the Argo CD MCP server's documentation. Its argument names and its
+patterns have not been run against a live Argo CD: an application's answer
+carries a sync status and a health status, for the application and for each
+resource, and after a rollback its reported revision may be the branch's rather
+than what is live. Check each pattern against `forkdeck mcp call` output first.
+A small tool of your own that answers with one line, such as
+`rev=<commit> Healthy`, is sturdier than patterns over a large JSON document.
 
 ## Before you leave it unattended
 

@@ -49,11 +49,13 @@ while IFS= read -r line; do
     *'"method":"tools/call"'*)
       tool=$(printf '%s' "$line" | sed -n 's/.*"name":"\([a-z_]*\)".*/\1/p')
       printf '%s\n' "$line" >> "$FAKE_MCP/calls.log"
+      if [ -f "$FAKE_MCP/on_$tool.sh" ]; then mv "$FAKE_MCP/on_$tool.sh" "$FAKE_MCP/ran_$tool.sh"; sh "$FAKE_MCP/ran_$tool.sh" >/dev/null 2>&1; fi
       n=$(cat "$FAKE_MCP/$tool.n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_MCP/$tool.n"
       total=$(wc -l < "$FAKE_MCP/$tool.txt" 2>/dev/null || echo 0)
       [ "$n" -gt "$total" ] && n=$total
       text=$(sed -n "${n}p" "$FAKE_MCP/$tool.txt" 2>/dev/null)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}],"isError":false}}\n' "$id" "$text" ;;
+      err=false; case "$text" in ERR:*) err=true ;; esac
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}],"isError":%s}}\n' "$id" "$text" "$err" ;;
   esac
 done
 "#;
@@ -147,8 +149,7 @@ impl Rig {
         fs::write(self.root.join("gh/prs.json"), j).unwrap();
     }
 
-    /// Run `forkdeck once` and return (exit ok, output).
-    fn once(&self, env: &[(&str, &str)]) -> (bool, String) {
+    fn command(&self, env: &[(&str, &str)]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_forkdeck"));
         c.arg("once")
             .current_dir(self.clone())
@@ -160,8 +161,34 @@ impl Rig {
         for (k, v) in env {
             c.env(k, v);
         }
-        let out = c.output().expect("forkdeck runs");
+        c
+    }
+
+    /// Run `forkdeck once` and return (exit ok, output).
+    fn once(&self, env: &[(&str, &str)]) -> (bool, String) {
+        let out = self.command(env).output().expect("forkdeck runs");
         (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    }
+
+    /// Start `forkdeck once`, wait until `ready` holds (or ten seconds), send it SIGTERM as a
+    /// service manager or a closing terminal would, and return its output.
+    fn once_then_stop(&self, ready: impl Fn(&Rig) -> bool, while_running: impl FnOnce(&Rig)) -> String {
+        let child = self.command(&[]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("forkdeck starts");
+        for _ in 0..100 {
+            if ready(self) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(ready(self), "forkdeck never reached the point the test stops it at");
+        while_running(self);
+        Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+        let out = child.wait_with_output().unwrap();
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    }
+
+    fn state_file(&self) -> PathBuf {
+        self.root.join("home/.local/state/forkdeck/deploy.json")
     }
 
     /// Script the answers of one tool on the stand-in MCP server and start it from the first again.
@@ -332,6 +359,7 @@ const CI_STAGE: &str = r#"
 server = "pipeline"
 interval_secs = 1
 max_fix_rounds = 1
+settle_secs = 0
 [repos.ci.status]
 tool = "ci_status"
 args = { pr = "{pr}", ref = "{branch}", owner = "{owner}", name = "{name}" }
@@ -464,4 +492,138 @@ fn a_failed_smoke_test_rolls_the_deployment_back() {
     assert!(!ok, "{}", out);
     assert!(out.contains("verification failed"), "{}", out);
     assert!(rig.mcp_calls().contains(&format!(r#""to":"{}""#, start)), "{}", rig.mcp_calls());
+}
+
+#[test]
+fn one_tool_error_is_not_a_failed_deployment_or_a_red_pipeline() {
+    // Deploy: a rate limit in the middle of a rollout must not roll anything back.
+    let rig = Rig::new("flaky-deploy", MCP_SERVER, DEPLOY_STAGE);
+    rig.once(&[]);
+    let a = rig.merge_to_main("a.txt");
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Progressing", &a[..12]), "ERR: rate limited, try later", &format!("rev={} Healthy", &a[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(!rig.mcp_calls().contains(r#""name":"rollback""#), "{}", rig.mcp_calls());
+    assert!(fs::read_to_string(rig.state_file()).unwrap().contains(&format!(r#""last_good": "{}""#, a)));
+
+    // CI: a bad gateway on the status call must not send the worker off to "fix" anything.
+    let rig = Rig::new("flaky-ci", MCP_SERVER, CI_STAGE);
+    rig.issue();
+    rig.mcp_answers("ci_status", &["ERR: 502 Bad Gateway", "state=PASSED"]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert_eq!(git(&rig.origin(), &["rev-list", "--count", "main..forkdeck/issue-7"]), "1", "no fix commit for a pipeline that never failed");
+}
+
+#[test]
+fn an_unreadable_status_rolls_nothing_back() {
+    let rig = Rig::new("unknown", MCP_SERVER, DEPLOY_STAGE);
+    rig.once(&[]);
+    let a = rig.merge_to_main("a.txt");
+    rig.mcp_answers("deploy_status", &["ERR: upstream unavailable"]);
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok, "not knowing is still a failed run:\n{}", out);
+    assert!(out.contains("UNKNOWN") && out.contains("Nothing was rolled back"), "{}", out);
+    assert!(!rig.mcp_calls().contains(r#""name":"rollback""#), "no evidence of failure, no rollback:\n{}", rig.mcp_calls());
+    let saved = fs::read_to_string(rig.state_file()).unwrap();
+    assert!(!saved.contains(&format!(r#""last_good": "{}""#, a)), "an unverified commit never becomes a rollback target:\n{}", saved);
+}
+
+#[test]
+fn a_newer_merge_takes_over_instead_of_triggering_a_rollback() {
+    let rig = Rig::new("superseded", MCP_SERVER, DEPLOY_STAGE);
+    let start = git(&rig.clone(), &["rev-parse", "HEAD"]);
+    rig.once(&[]);
+    let a = rig.merge_to_main("a.txt");
+    // While A is rolling out, B is merged, and from then on the system only ever reports B.
+    let c = rig.clone();
+    fs::write(
+        rig.root.join("mcp/on_deploy.sh"),
+        format!("cd {} && echo b > b.txt && git add . && git commit -qm b && git push -q origin HEAD:main", c.display()),
+    )
+    .unwrap();
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &start[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(out.contains("has moved on to"), "{}", out);
+    assert!(!rig.mcp_calls().contains(r#""name":"rollback""#), "a healthy environment must not be rolled back:\n{}", rig.mcp_calls());
+
+    // The next pass deploys B.
+    let b = git(&rig.clone(), &["rev-parse", "HEAD"]);
+    assert_ne!(a, b);
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &b[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(rig.mcp_calls().contains(&format!(r#""revision":"{}""#, b)), "{}", rig.mcp_calls());
+    assert!(fs::read_to_string(rig.state_file()).unwrap().contains(&format!(r#""last_good": "{}""#, b)));
+}
+
+#[test]
+fn stopping_during_verification_rolls_nothing_back_and_the_next_start_picks_it_up() {
+    let rig = Rig::new("stop-verify", MCP_SERVER, &DEPLOY_STAGE.replace("test -f README", "test -f {root}/fast || sleep 60"));
+    rig.once(&[]);
+    let a = rig.merge_to_main("a.txt");
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &a[..12])]);
+    let out = rig.once_then_stop(
+        |r| r.mcp_calls().contains(r#""name":"deploy_status""#),
+        |r| {
+            // A second forkdeck started meanwhile must stay out of deployments altogether.
+            let before = r.mcp_calls().len();
+            let (_, other) = r.once(&[]);
+            assert!(other.contains("another forkdeck is running deployments"), "{}", other);
+            assert_eq!(r.mcp_calls().len(), before, "the second process made tool calls");
+        },
+    );
+    assert!(out.contains("cancelled while verifying"), "{}", out);
+    assert!(out.contains("nothing was rolled back"), "{}", out);
+    let mcp = rig.mcp_calls();
+    assert!(!mcp.contains(r#""name":"rollback""#), "quitting is not a failed smoke test:\n{}", mcp);
+    assert!(!mcp.contains(r#""name":"notify""#), "{}", mcp);
+    let saved = fs::read_to_string(rig.state_file()).unwrap();
+    assert!(saved.contains(&format!(r#""in_progress": "{}""#, a)), "the interrupted deployment is remembered:\n{}", saved);
+
+    // Started again: it says what happened and finishes the job.
+    fs::write(rig.root.join("fast"), "").unwrap();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(out.contains("was started and never finished"), "{}", out);
+    let saved = fs::read_to_string(rig.state_file()).unwrap();
+    assert!(saved.contains(&format!(r#""last_good": "{}""#, a)) && saved.contains(r#""in_progress": null"#), "{}", saved);
+}
+
+#[test]
+fn a_damaged_state_file_stops_deployments_instead_of_resetting_them() {
+    let rig = Rig::new("damaged", MCP_SERVER, DEPLOY_STAGE);
+    rig.once(&[]);
+    rig.merge_to_main("a.txt");
+    fs::write(rig.state_file(), "{ \"github:o/r:staging\": { \"seen\": ").unwrap();
+    let (_, out) = rig.once(&[]);
+    assert!(out.contains("is damaged"), "{}", out);
+    assert_eq!(rig.mcp_calls(), "", "nothing may be deployed from a state that cannot be read");
+    assert!(fs::read_to_string(rig.state_file()).unwrap().starts_with("{ \"github:o/r:staging\": { \"seen\": "), "the file is left for a person to repair");
+}
+
+#[test]
+fn a_failure_left_over_from_the_previous_run_does_not_use_up_a_fix_round() {
+    // After the fix is pushed, the status tool still shows the old failure for one more poll.
+    let rig = Rig::new("stale-ci", MCP_SERVER, &CI_STAGE.replace("settle_secs = 0", "settle_secs = 4"));
+    rig.issue();
+    rig.mcp_answers("ci_status", &["state=RUNNING", "state=FAILED run=1", "state=FAILED run=1", "state=PASSED"]);
+    rig.mcp_answers("ci_logs", &["error: flaky"]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "the stale failure was believed:\n{}", out);
+    assert_eq!(git(&rig.origin(), &["rev-list", "--count", "main..forkdeck/issue-7"]), "2", "exactly one fix");
+    assert!(!rig.calls().contains("agent:needs-human"));
+}
+
+#[test]
+fn stopping_while_ci_runs_leaves_the_open_pull_request_alone() {
+    let rig = Rig::new("stop-ci", MCP_SERVER, CI_STAGE);
+    rig.issue();
+    rig.mcp_answers("ci_status", &["state=RUNNING"]);
+    let out = rig.once_then_stop(|r| r.mcp_calls().contains(r#""name":"ci_status""#), |_| {});
+    let calls = rig.calls();
+    assert!(calls.contains("pr create") && calls.contains("--add-label agent:pr-open"), "{}\n{}", calls, out);
+    assert!(!calls.contains("agent:needs-human"), "the work did not fail, forkdeck was stopped:\n{}", calls);
+    assert!(!calls.contains("could not finish"), "{}", calls);
 }

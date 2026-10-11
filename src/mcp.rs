@@ -9,6 +9,7 @@ use crate::proc;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -36,10 +37,23 @@ pub struct Session {
     transport: Transport,
     next_id: u64,
     limit: Duration,
+    /// Values taken from the environment for this server. Never shown.
+    secrets: Vec<String>,
+    /// The last of what a stdio server wrote to stderr, for when it dies without an answer.
+    stderr_tail: Arc<Mutex<String>>,
 }
 
+/// Longest single message accepted from a stdio server.
+const MAX_LINE: usize = 16 * 1024 * 1024;
+
 /// Replace `${NAME}` with the environment variable. Secrets belong in the environment, not in the config.
+#[cfg(test)]
 pub fn expand_env(s: &str) -> Result<String, String> {
+    expand_into(s, &mut Vec::new())
+}
+
+/// As `expand_env`, and remembers every value it put in so it can be kept out of messages later.
+fn expand_into(s: &str, secrets: &mut Vec<String>) -> Result<String, String> {
     let mut out = String::new();
     let mut rest = s;
     while let Some(i) = rest.find("${") {
@@ -48,11 +62,26 @@ pub fn expand_env(s: &str) -> Result<String, String> {
         let end = after.find('}').ok_or_else(|| format!("unclosed ${{ in {:?}", s))?;
         let var = &after[..end];
         let val = std::env::var(var).map_err(|_| format!("environment variable {} is not set", var))?;
+        if val.len() >= 4 {
+            secrets.push(val.clone());
+        }
         out.push_str(&val);
         rest = &after[end + 1..];
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// Blank out every remembered secret. Errors and tool answers end up in logs, prompts and public
+/// comments, and a server is free to echo its own URL, headers or environment.
+pub fn redact(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for s in secrets {
+        if out.contains(s.as_str()) {
+            out = out.replace(s.as_str(), "***");
+        }
+    }
+    out
 }
 
 /// Pull the JSON-RPC messages out of a server-sent event stream body.
@@ -88,35 +117,61 @@ fn result_of(name: &str, method: &str, msg: &Value) -> Result<Value, String> {
 
 impl Session {
     pub async fn open(name: &str, cfg: &McpServerCfg) -> Result<Session, String> {
+        let mut secrets = Vec::new();
+        let opened = Session::start(name, cfg, &mut secrets).await;
+        // Whatever went wrong, the message must not carry a token.
+        opened.map_err(|e| redact(&e, &secrets))
+    }
+
+    async fn start(name: &str, cfg: &McpServerCfg, secrets: &mut Vec<String>) -> Result<Session, String> {
         let limit = Duration::from_secs(cfg.timeout_secs.clamp(1, 3600));
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
         let transport = match (&cfg.command, &cfg.url) {
             (Some(cmd), None) => {
                 let mut c = proc::command(cmd);
-                c.args(cfg.args.iter().map(|a| expand_env(a)).collect::<Result<Vec<_>, _>>()?);
+                let mut args = Vec::new();
+                for a in &cfg.args {
+                    args.push(expand_into(a, secrets)?);
+                }
+                c.args(args);
                 for (k, v) in &cfg.env {
-                    c.env(k, expand_env(v)?);
+                    c.env(k, expand_into(v, secrets)?);
                 }
                 c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
                 let mut child = c.spawn().map_err(|e| format!("{}: cannot start {}: {}", name, cmd, e))?;
                 let group = proc::Group::of(&child);
                 let stdin = child.stdin.take().expect("piped stdin");
                 let out = BufReader::new(child.stdout.take().expect("piped stdout"));
-                // Servers log to stderr; it must be drained or a chatty one blocks.
+                // Servers log to stderr; it must be drained or a chatty one blocks. Only the end is kept.
                 let mut err = child.stderr.take().expect("piped stderr");
+                let tail = stderr_tail.clone();
                 tokio::spawn(async move {
-                    let mut sink = Vec::new();
-                    let _ = err.read_to_end(&mut sink).await;
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = err.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        if let Ok(mut t) = tail.lock() {
+                            t.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            if t.len() > 2000 {
+                                let cut = t.char_indices().map(|(i, _)| i).find(|i| t.len() - i <= 1500).unwrap_or(0);
+                                *t = t[cut..].to_string();
+                            }
+                        }
+                    }
                 });
                 Transport::Stdio { child, stdin, out, _group: group }
             }
             (None, Some(url)) => {
                 let mut headers = HashMap::new();
                 for (k, v) in &cfg.headers {
-                    headers.insert(k.clone(), expand_env(v)?);
+                    headers.insert(k.clone(), expand_into(v, secrets)?);
                 }
-                let url = expand_env(url)?;
+                let url = expand_into(url, secrets)?;
+                // No redirects: only some credential headers are dropped when one crosses to another
+                // host, and a token in a custom header would be sent along.
+                let mut b = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
                 // A server on this machine must not be reached through HTTP_PROXY: that would hand the proxy its credentials.
-                let mut b = reqwest::Client::builder();
                 if crate::orchestrator::is_loopback(&url) {
                     b = b.no_proxy();
                 }
@@ -124,7 +179,7 @@ impl Session {
             }
             _ => return Err(format!("mcp.{}: set exactly one of command and url", name)),
         };
-        let mut s = Session { name: name.to_string(), transport, next_id: 1, limit };
+        let mut s = Session { name: name.to_string(), transport, next_id: 1, limit, secrets: secrets.clone(), stderr_tail };
         let init = s
             .request(
                 "initialize",
@@ -183,7 +238,8 @@ impl Session {
             }
             text.push_str(&sc.to_string());
         }
-        Ok(ToolResult { text, is_error: r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) })
+        // A tool may echo its environment or its URL; its answer goes into prompts and comments.
+        Ok(ToolResult { text: redact(&text, &self.secrets), is_error: r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) })
     }
 
     pub async fn close(mut self) {
@@ -209,16 +265,25 @@ impl Session {
         let name = self.name.clone();
         match &mut self.transport {
             Transport::Stdio { stdin, .. } => write_line(stdin, &msg).await.map_err(|e| format!("{}: {}", name, e)),
-            Transport::Http { .. } => self.post(&msg, None).await.map(|_| ()),
+            Transport::Http { .. } => {
+                let r = self.post(&msg, None).await.map(|_| ());
+                r.map_err(|e| redact(&e, &self.secrets))
+            }
         }
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let res = self.request_raw(method, params).await;
+        res.map_err(|e| redact(&e, &self.secrets))
+    }
+
+    async fn request_raw(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let name = self.name.clone();
         let limit = self.limit;
+        let tail = self.stderr_tail.clone();
         let answer = match &mut self.transport {
             Transport::Stdio { stdin, out, .. } => {
                 let exchange = async {
@@ -226,9 +291,15 @@ impl Session {
                     let mut raw = Vec::new();
                     loop {
                         raw.clear();
-                        let n = out.read_until(b'\n', &mut raw).await.map_err(|e| e.to_string())?;
+                        // Bounded: a server that never ends its line must not be read into memory without limit.
+                        let n = (&mut *out).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut raw).await.map_err(|e| e.to_string())?;
                         if n == 0 {
-                            return Err("the server closed the connection".to_string());
+                            let said = tail.lock().map(|t| t.trim().to_string()).unwrap_or_default();
+                            let last = said.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
+                            return Err(if last.is_empty() { "the server closed the connection".to_string() } else { format!("the server closed the connection: {}", last) });
+                        }
+                        if raw.len() > MAX_LINE {
+                            return Err(format!("the server sent a message over {} MB", MAX_LINE / (1024 * 1024)));
                         }
                         let Ok(v) = serde_json::from_slice::<Value>(&raw) else { continue };
                         if v.get("id").and_then(|i| i.as_u64()) == Some(id) && v.get("method").is_none() {
@@ -274,13 +345,26 @@ impl Session {
         for (k, v) in headers.iter() {
             req = req.header(k, v);
         }
-        let resp = req.send().await.map_err(|e| format!("{}: {}", name, if e.is_timeout() { format!("no answer within {} s", limit.as_secs()) } else { e.to_string() }))?;
+        // reqwest puts the full URL in its messages, and a URL may carry a token.
+        let resp = req.send().await.map_err(|e| {
+            let why = if e.is_timeout() {
+                format!("no answer within {} s", limit.as_secs())
+            } else if e.is_connect() {
+                "cannot connect to the server".to_string()
+            } else {
+                e.without_url().to_string()
+            };
+            format!("{}: {}", name, why)
+        })?;
         let status = resp.status();
+        if status.is_redirection() {
+            return Err(format!("{}: the server answered with a redirect (HTTP {}), which is not followed; configure the final URL", name, status.as_u16()));
+        }
         if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
             *session = Some(sid.to_string());
         }
         let ctype = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
-        let body = resp.text().await.map_err(|e| format!("{}: {}", name, e))?;
+        let body = resp.text().await.map_err(|e| format!("{}: {}", name, e.without_url()))?;
         if !status.is_success() {
             let short: String = body.chars().take(200).collect();
             return Err(format!("{}: HTTP {} {}", name, status.as_u16(), short.replace('\n', " ")));
@@ -380,6 +464,51 @@ mod tests {
         let r = s.call("status", json!({ "app": "web" })).await.unwrap();
         assert_eq!(r.text, "Healthy\n{\"rev\":\"abc\"}");
         assert!(!r.is_error);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn secrets_never_appear_in_errors_or_answers() {
+        std::env::set_var("FORKDECK_TEST_SECRET", "hunter2SECRET");
+        // Unreachable server, token in the URL.
+        let cfg = McpServerCfg { url: Some("http://127.0.0.1:9/mcp?token=${FORKDECK_TEST_SECRET}".into()), timeout_secs: 3, ..McpServerCfg::default() };
+        let e = Session::open("t", &cfg).await.err().unwrap();
+        assert!(!e.contains("hunter2SECRET") && !e.contains("token="), "{}", e);
+
+        // A server that echoes the token back, in an error body and in a tool answer.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(serve(listener, 4, |i, _, _| match i {
+            0 => {
+                let b = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{}}}"#;
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", b.len(), b)
+            }
+            1 => "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            2 => {
+                let b = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"env: TOKEN=hunter2SECRET"}]}}"#;
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", b.len(), b)
+            }
+            _ => "HTTP/1.1 500 Oops\r\nContent-Length: 26\r\nConnection: close\r\n\r\nbad key: hunter2SECRET !!!".to_string(),
+        }));
+        let mut headers = HashMap::new();
+        headers.insert("X-Api-Key".to_string(), "${FORKDECK_TEST_SECRET}".to_string());
+        let cfg = McpServerCfg { url: Some(url), headers, ..McpServerCfg::default() };
+        let mut s = Session::open("t", &cfg).await.unwrap();
+        assert_eq!(s.call("env", json!({})).await.unwrap().text, "env: TOKEN=***");
+        let e = s.call("env", json!({})).await.err().unwrap();
+        assert!(e.contains("500") && e.contains("bad key: ***") && !e.contains("hunter2"), "{}", e);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        // Exactly one request is served: following the redirect would hang the test on a second one.
+        let server = tokio::spawn(serve(listener, 1, |_, _, _| "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()));
+        let cfg = McpServerCfg { url: Some(url), ..McpServerCfg::default() };
+        let e = Session::open("t", &cfg).await.err().unwrap();
+        assert!(e.contains("redirect") && e.contains("307"), "{}", e);
         server.await.unwrap();
     }
 

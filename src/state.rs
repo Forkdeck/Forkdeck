@@ -309,6 +309,10 @@ pub struct State {
     pub automation: bool,
     /// Set once shutdown has begun: nothing new may start.
     pub stopping: bool,
+    /// The last thing said about deployments, so it is said once and not on every poll.
+    pub deploy_note: Option<String>,
+    /// Deployments cancelled in this session (repo index, commit). They are not started again until forkdeck restarts.
+    pub deploy_cancelled: HashSet<(usize, String)>,
     pub have_claude: bool,
     pub have_codex: bool,
     pub next_id: u32,
