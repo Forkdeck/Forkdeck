@@ -81,7 +81,7 @@ const BODY_LIMIT: usize = 60_000;
 
 /// Text from an agent or a log, made safe to post: no notifications to people it happens to mention.
 /// Also breaks `#123` references, so text an agent wrote cannot close or link other issues.
-fn quiet(s: &str) -> String {
+pub fn quiet(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 16);
     let mut it = s.chars().peekable();
     while let Some(c) = it.next() {
@@ -242,8 +242,10 @@ pub async fn poll_loop(hub: Hub) {
     }
 }
 
-/// Look at every configured repository once and start a job for each labelled item that is due.
+/// Look at every configured repository once and start a job for each labelled item that is due,
+/// and a deployment for each base branch that has moved.
 pub async fn poll_once(hub: &Hub) {
+    crate::cicd::deploy_poll(hub).await;
     {
         {
             for (idx, r) in hub.cfg.repos.iter().enumerate() {
@@ -327,7 +329,7 @@ fn worktree_dir(hub: &Hub, r: &RepoCfg, kind: &str, n: u64) -> PathBuf {
 
 fn repo_index(hub: &Hub, id: u32) -> Option<usize> {
     hub.job(id, |j| match &j.source {
-        Source::Issue { repo_idx, .. } | Source::Pr { repo_idx, .. } => Some(*repo_idx),
+        Source::Issue { repo_idx, .. } | Source::Pr { repo_idx, .. } | Source::Deploy { repo_idx, .. } => Some(*repo_idx),
         Source::Manual => None,
     })
     .flatten()
@@ -558,6 +560,9 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
     }
     // No --force: prepare() refused to start if this branch already existed on the remote.
     sh("git", &["push", "-u", "origin", &format!("HEAD:refs/heads/{}", branch)], d).await?;
+    // Later work on this job (a CI fix) starts from what is now on the remote.
+    let pushed = sh("git", &["rev-parse", "HEAD"], d).await?;
+    hub.job(id, |j| j.base_sha = Some(pushed.clone()));
 
     let checks = match o.checks_ok {
         None => "No checks configured.".to_string(),
@@ -608,6 +613,63 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
         hub.log("issues", e);
     }
     Ok(format!("{}pull request opened: {}", if draft { "draft " } else { "" }, url))
+}
+
+/// Commit a fix made after the pull request was opened and push it as a further commit on the same branch.
+pub async fn push_followup(hub: &Hub, id: u32, round: u32, summary: &str) -> Result<(), String> {
+    if hub.cfg.demo {
+        return Ok(());
+    }
+    let (r, n, _) = issue_of(hub, id).ok_or("not an issue job")?;
+    let t = tree_of(hub, id)?;
+    let d = Some(t.dir.as_path());
+    let msg = format!("Fix CI failure (#{})", n);
+    if !commit_snapshot(&t, &msg).await? {
+        return Err("the agent changed nothing".into());
+    }
+    // A plain push: it only succeeds as a fast-forward, so nobody else's commits are overwritten.
+    sh("git", &["push", "origin", &format!("HEAD:refs/heads/{}", t.branch)], d).await?;
+    let pushed = sh("git", &["rev-parse", "HEAD"], d).await?;
+    let pr = hub.job(id, |j| {
+        j.base_sha = Some(pushed.clone());
+        j.pr_url.clone()
+    });
+    if let Some(num) = pr.flatten().as_deref().and_then(pr_number) {
+        let text = format!("CI failed, so forkdeck pushed a fix (round {}): `{}`.\n\n{}", round, &pushed[..pushed.len().min(12)], clip(&quiet(summary), 4000));
+        if let Err(e) = comment(&r, true, num, &text).await {
+            hub.log("issues", e);
+        }
+    }
+    Ok(())
+}
+
+/// The pull or merge request number in what the CLI printed: the last all-digit path segment of the
+/// first URL, ignoring any query, fragment or trailing punctuation.
+pub fn pr_number(text: &str) -> Option<u64> {
+    let url = first_url(text)?;
+    let path = url.split(['?', '#']).next()?;
+    path.trim_end_matches(|c: char| !c.is_ascii_alphanumeric()).rsplit('/').find_map(|seg| seg.parse().ok())
+}
+
+/// CI is red and forkdeck has stopped trying: note it on the pull request and hand the issue to a person.
+pub async fn ci_failed(hub: &Hub, id: u32, why: &str) {
+    if hub.cfg.demo {
+        return;
+    }
+    let Some((r, n, _)) = issue_of(hub, id) else { return };
+    let text = quiet(&clip(&format!("forkdeck stopped here: {}", why), 4000));
+    if let Some(num) = hub.job(id, |j| j.pr_url.clone()).flatten().as_deref().and_then(pr_number) {
+        if let Err(e) = comment(&r, true, num, &text).await {
+            hub.log("issues", e);
+        }
+    }
+    if let Err(e) = comment(&r, false, n, &text).await {
+        hub.log("issues", e);
+    }
+    // publish() already moved the issue to the done label.
+    if let Err(e) = relabel(&r, false, n, &r.done_label, &r.failed_label).await {
+        hub.log("issues", e);
+    }
 }
 
 /// Claim a labelled pull request and check its head out, detached, in a worktree. Returns the commit that will be reviewed.
@@ -897,6 +959,23 @@ mod tests {
     fn spots_agent_instruction_files() {
         let names = "src/main.rs\nCLAUDE.md\ndocs/AGENTS.md\n.claude/settings.json\nsub/.codex/config.toml\nREADME.md\nclaude_notes.txt";
         assert_eq!(steering_files(names), vec!["CLAUDE.md", "docs/AGENTS.md", ".claude/settings.json", "sub/.codex/config.toml"]);
+    }
+
+    #[test]
+    fn finds_the_pull_request_number() {
+        for (text, n) in [
+            ("https://github.com/o/r/pull/12", Some(12)),
+            ("https://github.com/o/r/pull/12/", Some(12)),
+            ("https://github.com/o/r/pull/12#issuecomment-99", Some(12)),
+            ("https://github.com/o/r/pull/12?expand=1", Some(12)),
+            ("Created https://gitlab.com/g/p/-/merge_requests/4.", Some(4)),
+            ("!4 title\n https://gitlab.com/g/sub/p/-/merge_requests/4\n", Some(4)),
+            ("pull request created", None),
+            ("https://github.com/o/r/pulls", None),
+            ("12", None),
+        ] {
+            assert_eq!(pr_number(text), n, "{:?}", text);
+        }
     }
 
     #[test]

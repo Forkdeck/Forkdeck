@@ -69,7 +69,13 @@ pub fn command(cmd: &str) -> Command {
 }
 
 /// Run to completion with a time limit, returning (success, stdout, stderr).
-pub async fn output(mut c: Command, limit: Duration) -> Result<(bool, String, String), String> {
+pub async fn output(c: Command, limit: Duration) -> Result<(bool, String, String), String> {
+    output_code(c, limit).await.map(|(code, out, err)| (code == Some(0), out, err))
+}
+
+/// As `output`, but with the exit code: `None` means the process was ended by a signal rather than
+/// finishing by itself. An `Err` means it never gave a result at all (could not start, timed out).
+pub async fn output_code(mut c: Command, limit: Duration) -> Result<(Option<i32>, String, String), String> {
     c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn().map_err(|e| format!("could not start: {}", e))?;
     let group = Group::of(&child);
@@ -95,5 +101,5 @@ pub async fn output(mut c: Command, limit: Duration) -> Result<(bool, String, St
     group.kill();
     let out = out_task.await.unwrap_or_default();
     let err = err_task.await.unwrap_or_default();
-    Ok((status.success(), String::from_utf8_lossy(&out).to_string(), String::from_utf8_lossy(&err).to_string()))
+    Ok((status.code(), String::from_utf8_lossy(&out).to_string(), String::from_utf8_lossy(&err).to_string()))
 }

@@ -1,7 +1,9 @@
 mod agents;
+mod cicd;
 mod config;
 mod demo;
 mod issues;
+mod mcp;
 mod orchestrator;
 mod proc;
 mod router;
@@ -49,7 +51,12 @@ enum Cmd {
     Route { task: Vec<String> },
     /// Poll the configured repositories once, work through what is labelled, and exit
     Once,
-    /// Check the CLIs, the decision endpoint and the configured repositories
+    /// Look at a configured MCP server: list its tools, or call one by hand
+    Mcp {
+        #[command(subcommand)]
+        cmd: McpCmd,
+    },
+    /// Check the CLIs, the decision endpoint, the MCP servers and the configured repositories
     Doctor,
     /// Write a commented config file
     Init {
@@ -58,6 +65,20 @@ enum Cmd {
         path: Option<PathBuf>,
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    /// List the tools a server offers, to find the names for the config
+    Tools { server: String },
+    /// Call a tool and print its answer as forkdeck would read it
+    Call {
+        server: String,
+        tool: String,
+        /// Arguments as a JSON object
+        #[arg(default_value = "{}")]
+        args: String,
     },
 }
 
@@ -126,6 +147,8 @@ fn main() -> anyhow::Result<()> {
                 pr_pass_label: "review:passed".into(),
                 pr_fail_label: "review:changes".into(),
                 pr_checks: true,
+                ci: None,
+                deploy: None,
             });
         }
     }
@@ -148,6 +171,10 @@ fn main() -> anyhow::Result<()> {
             anyhow::ensure!(!hub.cfg.repos.is_empty(), "no [[repos]] configured, nothing to poll");
             rt.block_on(hub.detect_agents());
             let code = rt.block_on(once(&hub));
+            std::process::exit(code);
+        }
+        Some(Cmd::Mcp { cmd }) => {
+            let code = rt.block_on(mcp_cmd(&hub, cmd));
             std::process::exit(code);
         }
         Some(Cmd::Doctor) => {
@@ -263,6 +290,63 @@ async fn once(hub: &Hub) -> i32 {
     }
 }
 
+async fn mcp_cmd(hub: &Hub, cmd: McpCmd) -> i32 {
+    let (server, run): (&str, _) = match &cmd {
+        McpCmd::Tools { server } => (server, None),
+        McpCmd::Call { server, tool, args } => (server, Some((tool, args))),
+    };
+    let Some(sc) = hub.cfg.mcp.get(server) else {
+        let known: Vec<&str> = hub.cfg.mcp.keys().map(|k| k.as_str()).collect();
+        warn!("no [mcp.{}] in the config. Configured servers: {}", server, if known.is_empty() { "none".to_string() } else { known.join(", ") });
+        return 2;
+    };
+    let mut s = match mcp::Session::open(server, sc).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("{}", e);
+            return 1;
+        }
+    };
+    let code = match run {
+        None => match s.tools().await {
+            Ok(tools) => {
+                for t in &tools {
+                    say!("{:<34} {}", t.name, state::clip(&t.description.replace('\n', " "), 100));
+                }
+                say!("{} tool(s)", tools.len());
+                0
+            }
+            Err(e) => {
+                warn!("{}", e);
+                1
+            }
+        },
+        Some((tool, args)) => match serde_json::from_str::<serde_json::Value>(args) {
+            Err(e) => {
+                warn!("the arguments are not JSON: {}", e);
+                2
+            }
+            Ok(a) => match s.call(tool, a).await {
+                Ok(r) => {
+                    say!("{}", r.shown);
+                    if r.is_error {
+                        warn!("the tool reported an error");
+                        1
+                    } else {
+                        0
+                    }
+                }
+                Err(e) => {
+                    warn!("{}", e);
+                    1
+                }
+            },
+        },
+    };
+    s.close().await;
+    code
+}
+
 async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
     let mut ok = true;
     match cfg_path {
@@ -318,6 +402,55 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
             if git_ok { "found" } else { "is not a git repository" }
         );
         ok &= tool_ok && git_ok;
+    }
+    // Every tool a stage names has to exist on its server; a typo would otherwise show up as a stuck pipeline.
+    let mut offered: std::collections::HashMap<String, Vec<String>> = Default::default();
+    let mut names: Vec<&String> = hub.cfg.mcp.keys().collect();
+    names.sort();
+    for name in names {
+        let listed = match mcp::Session::open(name, &hub.cfg.mcp[name]).await {
+            Ok(mut s) => {
+                let t = s.tools().await;
+                s.close().await;
+                t
+            }
+            Err(e) => Err(e),
+        };
+        match listed {
+            Ok(tools) => {
+                println!("mcp       ok       {} offers {} tool(s)", name, tools.len());
+                offered.insert(name.clone(), tools.into_iter().map(|t| t.name).collect());
+            }
+            Err(e) => {
+                ok = false;
+                println!("mcp       problem  {}", e);
+            }
+        }
+    }
+    for r in &hub.cfg.repos {
+        let mut calls: Vec<(&str, &str, &config::CallCfg)> = Vec::new();
+        if let Some(ci) = &r.ci {
+            calls.push(("ci.status", &ci.server, &ci.status));
+            calls.extend(ci.logs.iter().map(|c| ("ci.logs", ci.server.as_str(), c)));
+        }
+        if let Some(d) = &r.deploy {
+            calls.push(("deploy.status", &d.server, &d.status));
+            for (n, c) in [("deploy.trigger", &d.trigger), ("deploy.rollback", &d.rollback), ("deploy.notify", &d.notify)] {
+                calls.extend(c.iter().map(|c| (n, d.server.as_str(), c)));
+            }
+            if d.rollback.is_none() {
+                println!("stage     note     {} deploys to {} with no rollback configured", r.repo, d.environment);
+            }
+        }
+        for (what, stage_server, c) in calls {
+            let server = c.server.as_deref().unwrap_or(stage_server);
+            if let Some(tools) = offered.get(server) {
+                if !tools.contains(&c.tool) {
+                    ok = false;
+                    println!("stage     problem  {} {}: {} has no tool named {:?} (forkdeck mcp tools {})", r.repo, what, server, c.tool, server);
+                }
+            }
+        }
     }
     if hub.cfg.repos.is_empty() {
         println!("repos     none     add [[repos]] entries to pick up labelled issues");

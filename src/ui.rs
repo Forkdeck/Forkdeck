@@ -288,6 +288,7 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
         Source::Issue { repo, number, url, .. } => {
             if url.is_empty() { format!("issue {}#{}", repo, number) } else { url.clone() }
         }
+        Source::Deploy { repo, sha, .. } => format!("{} at {}", repo, &sha[..sha.len().min(10)]),
         Source::Pr { repo, number, url, .. } => {
             if url.is_empty() { format!("pull request {}!{}", repo, number) } else { url.clone() }
         }
@@ -311,7 +312,15 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
     let mut lines: Vec<Line> = Vec::new();
     match &j.decision {
         None => {
-            let msg = if j.status == JobStatus::Queued { "waiting for a free slot".to_string() } else { format!("{} asking", spinner()) };
+            let msg = if matches!(j.source, Source::Deploy { .. }) {
+                "not used: a deployment runs no agent".to_string()
+            } else if j.status == JobStatus::Queued {
+                "waiting for a free slot".to_string()
+            } else if j.status.finished() {
+                "never reached".to_string()
+            } else {
+                format!("{} asking", spinner())
+            };
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(msg, fg(DIM))).alignment(Alignment::Center));
         }
@@ -341,9 +350,13 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
     // Worker and reviewer
     let pair = Rect { y: rows[4].y, height: rows[4].height, ..centered(inner, 84) };
     let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).spacing(2).split(pair);
-    let is_pr = matches!(j.source, Source::Pr { .. });
-    stage_box(f, halves[0], if is_pr { "first review" } else { "worker" }, &j.worker);
-    stage_box(f, halves[1], if is_pr { "second review" } else { "reviewer" }, &j.reviewer);
+    let (left, right) = match j.source {
+        Source::Pr { .. } => ("first review", "second review"),
+        Source::Deploy { .. } => ("deploy", if j.reviewer.label.is_empty() { "verify" } else { j.reviewer.label.as_str() }),
+        _ => ("worker", "reviewer"),
+    };
+    stage_box(f, halves[0], left, &j.worker);
+    stage_box(f, halves[1], right, &j.reviewer);
     connector(f, rows[5], DIM);
 
     // Outcome
@@ -398,6 +411,7 @@ fn stage_box(f: &mut Frame, area: Rect, role: &str, s: &Stage) {
         (StageState::Failed, _) => RED,
         (StageState::Idle, _) | (StageState::Skipped, _) => DIM,
         (_, Some(a)) => agent_color(a),
+        _ if !s.label.is_empty() => PURPLE,
         _ => DIM,
     };
     let w = area.width.saturating_sub(4) as usize;
@@ -414,6 +428,7 @@ fn stage_box(f: &mut Frame, area: Rect, role: &str, s: &Stage) {
             }
             lines.push(Line::from(Span::styled(clip(&bits.join(" · "), w), fg(agent_color(a)))));
         }
+        None if !s.label.is_empty() => lines.push(Line::from(Span::styled("via MCP", fg(PURPLE)))),
         None => lines.push(Line::from(Span::styled(if s.state == StageState::Skipped { "not needed" } else { "waiting" }, fg(DIM)))),
     }
     let st = match s.state {
@@ -424,6 +439,9 @@ fn stage_box(f: &mut Frame, area: Rect, role: &str, s: &Stage) {
         StageState::Failed => format!("[✗ failed {}]", mmss(s.secs())),
     };
     lines.push(Line::from(Span::styled(st, fg(color))));
+    if s.agent.is_none() && !s.label.is_empty() {
+        lines.push(Line::from(Span::styled(clip(&s.last, w), fg(DIM))));
+    }
     if s.agent.is_some() {
         let mut usage = format!("{} tools · {} in · {} out", s.tools, kilo(s.tokens_in), kilo(s.tokens_out));
         if s.cost > 0.0 {
