@@ -12,6 +12,7 @@ pub struct Config {
     pub agents: AgentsCfg,
     pub review: ReviewCfg,
     pub automation: AutoCfg,
+    pub team: TeamCfg,
     /// MCP servers by name. CI and deployment stages call tools on these.
     pub mcp: HashMap<String, McpServerCfg>,
     pub repos: Vec<RepoCfg>,
@@ -239,6 +240,33 @@ impl Default for AutoCfg {
             draft: true,
             publish_on_failed_review: false,
         }
+    }
+}
+
+/// Sharing what this machine is working on with teammates, through comments on the forge.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct TeamCfg {
+    /// Claim issues and reviews with a status comment, and refuse what a teammate already holds.
+    pub enabled: bool,
+    /// A claim not updated for this long is shown as stale and no longer blocks anyone.
+    pub stale_mins: u64,
+    /// How often a running job refreshes its status comment.
+    pub heartbeat_secs: u64,
+    /// How often the team pane re-reads the forge.
+    pub refresh_secs: u64,
+    /// Machine name shown to teammates. Defaults to the hostname on private repositories and to
+    /// nothing on public ones. A name set here is used everywhere; "" shows none anywhere.
+    pub host: Option<String>,
+    /// Assign a claimed issue to the logged-in account.
+    pub assign: bool,
+    /// Announce deployments with a comment on the commit (GitHub only).
+    pub deploys: bool,
+}
+
+impl Default for TeamCfg {
+    fn default() -> Self {
+        TeamCfg { enabled: false, stale_mins: 30, heartbeat_secs: 300, refresh_secs: 120, host: None, assign: true, deploys: true }
     }
 }
 
@@ -540,6 +568,15 @@ impl Config {
             if !(1..=24 * 60).contains(&m) {
                 anyhow::bail!("agents.timeout_mins must be between 1 and 1440, got {}", m);
             }
+        }
+        if !(30..=3600).contains(&self.team.heartbeat_secs) {
+            anyhow::bail!("team.heartbeat_secs must be between 30 and 3600, got {}", self.team.heartbeat_secs);
+        }
+        if self.team.stale_mins * 60 < self.team.heartbeat_secs * 3 || self.team.stale_mins > 7 * 24 * 60 {
+            anyhow::bail!("team.stale_mins must cover at least three heartbeats and at most a week, got {}", self.team.stale_mins);
+        }
+        if self.team.refresh_secs < 30 {
+            anyhow::bail!("team.refresh_secs must be at least 30");
         }
         if !(1..=24 * 60).contains(&self.review.check_timeout_mins) {
             anyhow::bail!("review.check_timeout_mins must be between 1 and 1440");

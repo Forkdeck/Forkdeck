@@ -7,6 +7,7 @@ use crate::issues;
 use crate::proc;
 use crate::router;
 use crate::state::*;
+use crate::team;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,6 +24,10 @@ pub struct Hub {
     pub rt: tokio::runtime::Handle,
     /// One per configured repository: fetches and worktree changes in a shared clone must not interleave.
     pub git_locks: Arc<Vec<Arc<tokio::sync::Mutex<()>>>>,
+    /// The account each forge CLI is logged in as (GitHub, GitLab), once asked.
+    pub team_me: Arc<Mutex<[Option<String>; 2]>>,
+    /// Whether each repository is readable by anyone, once the forge has said.
+    pub team_public: Arc<Mutex<std::collections::HashMap<String, bool>>>,
 }
 
 pub fn is_loopback(url: &str) -> bool {
@@ -64,6 +69,8 @@ impl Hub {
             http: http.build().unwrap_or_default(),
             rt,
             git_locks: Arc::new(git_locks),
+            team_me: Arc::new(Mutex::new([None, None])),
+            team_public: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -111,6 +118,8 @@ impl Hub {
                 created: Instant::now(),
                 finished: None,
                 cancel: Cancel::new(),
+                claim: None,
+                released: false,
             });
             if stopping {
                 // Shutting down: the job exists so the caller has an id, but it never starts and claims nothing.
@@ -181,18 +190,25 @@ struct Finish {
     retry: Option<bool>,
     /// The failure has already been written up where it belongs; do not post the generic notice as well.
     reported: bool,
+    /// A teammate holds the item: look at it again after this long, without counting it as a retry.
+    wait: Option<Duration>,
 }
 
 fn done(m: impl Into<String>) -> Finish {
-    Finish { status: JobStatus::Done, outcome: m.into(), retry: None, reported: false }
+    Finish { status: JobStatus::Done, outcome: m.into(), retry: None, reported: false, wait: None }
 }
 
 fn failed(m: impl Into<String>) -> Finish {
-    Finish { status: JobStatus::Failed, outcome: m.into(), retry: None, reported: false }
+    Finish { status: JobStatus::Failed, outcome: m.into(), retry: None, reported: false, wait: None }
+}
+
+/// A teammate's forkdeck holds the item. Nothing was started and nothing on the forge was changed.
+fn taken(hub: &Hub, why: &str) -> Finish {
+    Finish { status: JobStatus::Done, outcome: format!("not started: {}", why), retry: None, reported: true, wait: Some(Duration::from_secs(hub.cfg.team.heartbeat_secs.max(30))) }
 }
 
 fn cancelled() -> Finish {
-    Finish { status: JobStatus::Cancelled, outcome: "cancelled".into(), retry: None, reported: false }
+    Finish { status: JobStatus::Cancelled, outcome: "cancelled".into(), retry: None, reported: false, wait: None }
 }
 
 pub async fn run_job(hub: Hub, id: u32) {
@@ -213,8 +229,9 @@ pub async fn run_job(hub: Hub, id: u32) {
                 if cancel.is_set() {
                     cancelled()
                 } else if is_deploy {
+                    team::announce(&hub, id).await;
                     let (status, outcome) = cicd::deploy_run(&hub, id, &cancel).await;
-                    Finish { status, outcome, retry: None, reported: true }
+                    Finish { status, outcome, retry: None, reported: true, wait: None }
                 } else if is_pr {
                     pr_pipeline(&hub, id, &cancel).await
                 } else {
@@ -233,9 +250,13 @@ pub async fn run_job(hub: Hub, id: u32) {
     } else {
         fin
     };
-    if !manual && fin.status != JobStatus::Done && !fin.reported {
+    // Handed back to the queue by a teammate: the item and its labels are theirs to move now.
+    let released = hub.job(id, |j| j.released).unwrap_or(false);
+    if !manual && fin.status != JobStatus::Done && !fin.reported && !released {
         issues::report_failure(&hub, id, &fin.outcome).await;
     }
+    // Before the job counts as finished, so that a shutdown waits for the last word to teammates.
+    team::finish(&hub, id, fin.status).await;
     hub.job(id, |j| {
         j.status = fin.status;
         j.outcome = fin.outcome.clone();
@@ -258,7 +279,9 @@ pub async fn run_job(hub: Hub, id: u32) {
         let (max, base) = (hub.cfg.review.max_retries, hub.cfg.review.retry_secs);
         let mut st = hub.state.lock().unwrap();
         let found = st.jobs.iter().find(|j| j.id == id).and_then(|j| j.source.key().map(|k| (k, j.branch.is_some())));
-        if let Some((key, claimed)) = found {
+        if let (Some((key, _)), Some(w)) = (found, fin.wait) {
+            st.look_again(key, now + w);
+        } else if let Some((key, claimed)) = found {
             match (fin.status, fin.retry, is_pr, claimed) {
                 // The user stopped it: do not bring it back until the label is applied afresh.
                 (JobStatus::Cancelled, ..) => st.give_up(key, now),
@@ -531,7 +554,10 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
     // Issues get claimed and a private worktree before anything else.
     if is_issue {
         if let Err(e) = issues::prepare(hub, id).await {
-            return failed(format!("could not prepare issue: {}", e));
+            return match e.strip_prefix(team::TAKEN) {
+                Some(why) => taken(hub, why),
+                None => failed(format!("could not prepare issue: {}", e)),
+            };
         }
     }
     let Some((prompt, dir, forced, checks, ci)) = hub.job(id, |j| {
@@ -667,14 +693,19 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
 /// CI did not come good: say so on the pull request and hand the issue to a person. The pull request stays open.
 async fn ci_gave_up(hub: &Hub, id: u32, why: String) -> Finish {
     issues::ci_failed(hub, id, &why).await;
-    Finish { status: JobStatus::Failed, outcome: why, retry: None, reported: true }
+    Finish { status: JobStatus::Failed, outcome: why, retry: None, reported: true, wait: None }
 }
 
 /// A labelled pull request: every configured CLI reviews it independently and the findings are posted as one comment.
 async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     let sha = match issues::pr_prepare(hub, id).await {
         Ok(s) => s,
-        Err(e) => return failed(format!("could not prepare pull request: {}", e)),
+        Err(e) => {
+            return match e.strip_prefix(team::TAKEN) {
+                Some(why) => taken(hub, why),
+                None => failed(format!("could not prepare pull request: {}", e)),
+            }
+        }
     };
     let Some((dir, title, body, number, base, checks)) = hub.job(id, |j| match &j.source {
         Source::Pr { repo_idx, number, base, .. } => {
@@ -765,6 +796,7 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
                 outcome: format!("stale: the head moved from {} to {} during the review; no verdict posted", short(&sha), short(&head)),
                 retry: Some(true),
                 reported: false,
+                wait: None,
             },
             Err(e) => failed(format!("the head moved during the review and reporting that failed: {}", e)),
         };
@@ -791,6 +823,7 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
                     outcome: format!("pass withdrawn: the head moved from {} to {} as the review was posted", short(&sha), short(&now_head)),
                     retry: Some(true),
                     reported: false,
+                    wait: None,
                 };
             }
         }
@@ -805,6 +838,7 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
         // An incomplete review puts the request label back; it is retried with a delay, a bounded number of times.
         retry: incomplete.then_some(false),
         reported: false,
+        wait: None,
     }
 }
 

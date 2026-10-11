@@ -22,9 +22,60 @@ case "$prompt" in
 esac
 "#;
 
+/// `gh`. Lists come from files, everything else is appended to `calls.log`. `gh api` keeps
+/// comments as files under `$FAKE_GH/c/<path>/<id>.json` (what was posted), `.who` (the author),
+/// `.at` (when it last changed) and optionally `.assoc` (how the forge says the author relates to
+/// the repository; a member unless stated), which is all the team feature reads and writes.
 const GH: &str = r#"#!/bin/sh
 [ "$1" = "--version" ] && { echo stand-in; exit 0; }
+if [ "$1" = "api" ]; then
+  shift; method=GET; path=""; input=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -X) method=$2; shift 2 ;;
+      --input) input=$(cat); shift 2 ;;
+      --jq) shift 2 ;;
+      --paginate) shift ;;
+      *) path=$1; shift ;;
+    esac
+  done
+  echo "api $method $path" >> "$FAKE_GH/calls.log"
+  if [ -f "$FAKE_GH/fail_once" ]; then
+    pat=$(cat "$FAKE_GH/fail_once")
+    case "$method $path" in *$pat*) rm "$FAKE_GH/fail_once"; echo "HTTP 502: bad gateway" >&2; exit 1 ;; esac
+  fi
+  if [ -n "$FAKE_GH_API_FAIL" ]; then case "$method $path" in *$FAKE_GH_API_FAIL*) echo "HTTP 502: bad gateway" >&2; exit 1 ;; esac; fi
+  bare=${path%%\?*}
+  key=$(printf '%s' "$bare" | tr '/' '_')
+  case "$method $path" in
+    "GET user") echo "${FAKE_LOGIN:-alice}" ;;
+    "GET repos/o/r") cat "$FAKE_GH/visibility" 2>/dev/null || echo private ;;
+    GET\ repos/*/commits\?*) cat "$FAKE_GH/commits.json" 2>/dev/null || echo "[]" ;;
+    GET\ *)
+      d="$FAKE_GH/c/$key"; printf '['; sep=""
+      for id in $(ls "$d" 2>/dev/null | sed -n 's/\.json$//p' | sort -n); do
+        printf '%s{"id":%s,"user":{"login":"%s"},"author_association":"%s","updated_at":"%s",%s' "$sep" "$id" "$(cat "$d/$id.who")" "$(cat "$d/$id.assoc" 2>/dev/null || echo MEMBER)" "$(cat "$d/$id.at")" "$(sed 's/^{//' "$d/$id.json")"
+        sep=","
+      done
+      printf ']\n' ;;
+    POST\ *)
+      if [ -f "$FAKE_GH/on_post.sh" ]; then mv "$FAKE_GH/on_post.sh" "$FAKE_GH/ran_post.sh"; sh "$FAKE_GH/ran_post.sh" >/dev/null 2>&1; fi
+      d="$FAKE_GH/c/$key"; mkdir -p "$d"
+      n=$(cat "$FAKE_GH/next_id" 2>/dev/null || echo 100); echo $((n + 1)) > "$FAKE_GH/next_id"
+      printf '%s' "$input" > "$d/$n.json"; printf '%s' "${FAKE_LOGIN:-alice}" > "$d/$n.who"; date -u +%Y-%m-%dT%H:%M:%SZ > "$d/$n.at"
+      echo "{\"id\":$n}" ;;
+    PATCH\ *)
+      id=${bare##*/}
+      for f in "$FAKE_GH"/c/*/"$id.json"; do
+        [ -f "$f" ] || { echo "HTTP 404" >&2; exit 1; }
+        printf '%s' "$input" > "$f"; date -u +%Y-%m-%dT%H:%M:%SZ > "${f%.json}.at"
+      done
+      echo "{\"id\":$id}" ;;
+  esac
+  exit 0
+fi
 case "$1 $2" in
+  "issue view"|"pr view") cat "$FAKE_GH/view-$3.json" 2>/dev/null || echo '{"labels":[]}' ;;
   "issue list") cat "$FAKE_GH/issues.json" ;;
   "pr list") cat "$FAKE_GH/prs.json" ;;
   *)
@@ -86,9 +137,10 @@ impl Rig {
     fn new(name: &str, extra_config: &str, repo_config: &str) -> Rig {
         let root = std::env::temp_dir().join(format!("forkdeck-test-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        for d in ["bin", "gh", "mcp", "home/.config/forkdeck"] {
+        for d in ["bin", "gh", "mcp", "home/.config/forkdeck", "home/.local/state/forkdeck"] {
             fs::create_dir_all(root.join(d)).unwrap();
         }
+        fs::write(root.join("home/.local/state/forkdeck/machine-id"), "0123456789abcdef\n").unwrap();
         for (file, body) in [("claude", CLAUDE), ("gh", GH), ("mcp-stand-in", MCP)] {
             let p = root.join("bin").join(file);
             fs::write(&p, body).unwrap();
@@ -155,9 +207,20 @@ impl Rig {
     }
 
     fn command(&self, env: &[(&str, &str)]) -> Command {
+        let mut c = self.bare(env);
+        c.arg("once");
+        c
+    }
+
+    /// Run forkdeck with other arguments and return (exit ok, output).
+    fn run(&self, args: &[&str], env: &[(&str, &str)]) -> (bool, String) {
+        let out = self.bare(env).args(args).output().expect("forkdeck runs");
+        (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    }
+
+    fn bare(&self, env: &[(&str, &str)]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_forkdeck"));
-        c.arg("once")
-            .current_dir(self.clone())
+        c.current_dir(self.clone())
             .env_clear()
             .env("PATH", format!("{}:/usr/local/bin:/usr/bin:/bin", self.root.join("bin").display()))
             .env("HOME", self.root.join("home"))
@@ -845,4 +908,442 @@ fn a_ci_pass_that_belongs_to_the_previous_push_is_not_taken_for_the_fix() {
     assert!(ok, "{}", out);
     assert_eq!(git(&rig.origin(), &["rev-list", "--count", "main..forkdeck/issue-7"]), "2");
     assert_eq!(rig.mcp_calls().matches(r#""name":"ci_status""#).count(), 5, "it kept waiting for the fix's own result:\n{}", rig.mcp_calls());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Team: claims and status comments on the forge
+
+const TEAM: &str = "[team]\nenabled = true";
+/// The made-up machine id every rig starts with.
+const MACHINE: &str = "0123456789abcdef";
+
+/// Seconds since the epoch as the forge would print them.
+fn forge_time(ago_secs: i64) -> String {
+    let out = Command::new("date").args(["-u", "-d", &format!("@{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - ago_secs), "+%Y-%m-%dT%H:%M:%SZ"]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+impl Rig {
+    fn comment_dir(&self, what: &str) -> PathBuf {
+        self.root.join("gh/c").join(format!("repos_o_r_{}_comments", what))
+    }
+
+    /// Put a claim comment on the forge as somebody's forkdeck would have left it.
+    fn seed_claim(&self, what: &str, id: u64, author: &str, marker: serde_json::Value, ago_secs: i64) {
+        let d = self.comment_dir(what);
+        fs::create_dir_all(&d).unwrap();
+        let body = format!("<!-- forkdeck:claim {} -->\n**forkdeck** · somebody is on this", marker);
+        fs::write(d.join(format!("{}.json", id)), serde_json::json!({ "body": body }).to_string()).unwrap();
+        fs::write(d.join(format!("{}.who", id)), author).unwrap();
+        fs::write(d.join(format!("{}.at", id)), forge_time(ago_secs)).unwrap();
+    }
+
+    /// How the forge describes the author of a comment: MEMBER, COLLABORATOR, CONTRIBUTOR, NONE…
+    fn assoc(&self, what: &str, id: u64, assoc: &str) {
+        fs::write(self.comment_dir(what).join(format!("{}.assoc", id)), assoc).unwrap();
+    }
+
+    /// The labels `gh issue view` / `gh pr view` reports for an item.
+    fn labelled(&self, n: u64, label: &str) {
+        fs::write(self.root.join(format!("gh/view-{}.json", n)), format!(r#"{{"labels":[{{"name":"{}"}}]}}"#, label)).unwrap();
+    }
+
+    /// A script the stand-in agent can run mid-job: `$1` posts a release naming the running job's
+    /// claim on issue 7, and the forge describes that account as `$2`.
+    fn release_script(&self) -> String {
+        let d = self.comment_dir("issues_7");
+        let p = self.root.join("bin/post-release");
+        let body = r#"#!/bin/sh
+d=@DIR@
+id=$(sed -n 's/.*\\"id\\":\\"\([0-9a-f-]*\)\\".*/\1/p' "$d/100.json")
+printf '{"body":"<!-- forkdeck:claim {\\"v\\":1,\\"id\\":\\"rel\\",\\"by\\":\\"%s\\",\\"state\\":\\"released\\",\\"ends\\":[\\"%s\\"]} -->\\nreleased"}' "$1" "$id" > "$d/150.json"
+printf '%s' "$1" > "$d/150.who"; printf '%s' "$2" > "$d/150.assoc"; date -u +%Y-%m-%dT%H:%M:%SZ > "$d/150.at"
+"#
+        .replace("@DIR@", &d.display().to_string());
+        fs::write(&p, body).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        p.display().to_string()
+    }
+
+    /// The comments on an item, oldest first, as the text that was posted.
+    fn comments(&self, what: &str) -> Vec<String> {
+        let d = self.comment_dir(what);
+        let mut ids: Vec<u64> = fs::read_dir(&d).map(|r| r.filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".json")?.parse().ok()).collect()).unwrap_or_default();
+        ids.sort();
+        ids.iter().map(|i| serde_json::from_str::<serde_json::Value>(&fs::read_to_string(d.join(format!("{}.json", i))).unwrap()).unwrap()["body"].as_str().unwrap().to_string()).collect()
+    }
+}
+
+fn claim(id: &str, by: &str, host: &str, pid: u32) -> serde_json::Value {
+    serde_json::json!({ "v": 1, "id": id, "by": by, "host": host, "pid": pid, "agent": "claude", "state": "active", "stage": "working", "started": 1, "beat": 1 })
+}
+
+#[test]
+fn a_claimed_issue_carries_one_status_comment_and_only_metadata() {
+    let rig = Rig::new("team-claim", TEAM, "");
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let comments = rig.comments("issues_7");
+    assert_eq!(comments.len(), 1, "one comment, edited in place: {:?}", comments);
+    let c = &comments[0];
+    assert!(c.contains(r#""by":"alice""#) && c.contains(&format!(r#""machine":"{}""#, MACHINE)) && c.contains(r#""state":"done""#), "{}", c);
+    assert!(c.contains("https://example.invalid/o/r/pull/12"), "the pull request is linked: {}", c);
+    assert!(!c.contains("Did the work") && !c.contains("Please add it") && !c.contains("Looked at it"), "no prompt and no agent output may be shared: {}", c);
+    let calls = rig.calls();
+    let said = calls.find("api POST repos/o/r/issues/7/comments").expect("the claim is posted");
+    let labelled = calls.find("--add-label agent:working").expect("the label moves");
+    assert!(said < labelled, "the claim is on the forge before the label moves:\n{}", calls);
+    assert!(calls.contains("issue edit 7 -R o/r --add-assignee @me"), "{}", calls);
+    assert!(calls.contains("pr create"), "{}", calls);
+}
+
+#[test]
+fn sharing_is_off_unless_asked_for() {
+    let rig = Rig::new("team-off", "", "");
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(!rig.calls().contains("api "), "nothing extra is said on the forge:\n{}", rig.calls());
+    assert!(!rig.calls().contains("--add-assignee"));
+}
+
+#[test]
+fn an_issue_a_teammate_holds_is_left_alone() {
+    let rig = Rig::new("team-held", TEAM, "");
+    rig.issue();
+    rig.seed_claim("issues_7", 50, "bob", claim("b1", "bob", "bobs-box", 1), 60);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "leaving a teammate's issue alone is not a failure:\n{}", out);
+    assert!(out.contains("not started: bob on bobs-box is already on it"), "{}", out);
+    let calls = rig.calls();
+    assert!(!calls.contains("label") && !calls.contains("pr create") && !calls.contains("POST") && !calls.contains("issue comment"), "nothing on the forge may change:\n{}", calls);
+    assert_eq!(git(&rig.origin(), &["branch", "--list", "forkdeck/*"]), "");
+}
+
+#[test]
+fn a_claim_that_went_quiet_or_was_forged_does_not_block() {
+    let rig = Rig::new("team-stale", TEAM, "");
+    rig.issue();
+    // Bob's machine stopped updating two hours ago; Mallory typed a marker naming Carol.
+    rig.seed_claim("issues_7", 50, "bob", claim("b1", "bob", "bobs-box", 1), 7200);
+    rig.seed_claim("issues_7", 51, "mallory", claim("c1", "carol", "x", 1), 5);
+    // Eve signs her own name, but she only has permission to comment.
+    rig.seed_claim("issues_7", 52, "eve", claim("e1", "eve", "x", 1), 5);
+    rig.assoc("issues_7", 52, "NONE");
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(rig.calls().contains("pr create"), "{}", rig.calls());
+}
+
+#[test]
+fn when_two_machines_claim_at_once_the_older_comment_wins() {
+    let rig = Rig::new("team-race", TEAM, "");
+    rig.issue();
+    // Bob's claim lands after we looked and before ours is stored: neither saw the other.
+    let d = rig.comment_dir("issues_7");
+    let body = serde_json::json!({ "body": format!("<!-- forkdeck:claim {} -->\nx", claim("b1", "bob", "bobs-box", 1)) }).to_string();
+    fs::write(
+        rig.root.join("gh/on_post.sh"),
+        format!("mkdir -p {d}; cat > {d}/50.json <<'EOF'\n{body}\nEOF\nprintf bob > {d}/50.who; date -u +%Y-%m-%dT%H:%M:%SZ > {d}/50.at\n", d = d.display(), body = body),
+    )
+    .unwrap();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(out.contains("not started: bob on bobs-box is already on it"), "{}", out);
+    let comments = rig.comments("issues_7");
+    assert!(comments[1].contains(r#""state":"yielded""#), "our claim steps back: {:?}", comments);
+    let calls = rig.calls();
+    assert!(!calls.contains("pr create") && !calls.contains("agent:needs-human") && !calls.contains("issue comment") && !calls.contains("--add-assignee"), "the issue is Bob's; nothing more is done to it:\n{}", calls);
+    assert_eq!(git(&rig.origin(), &["branch", "--list", "forkdeck/*"]), "");
+}
+
+#[test]
+fn a_claim_left_by_a_run_that_died_on_this_machine_is_replaced() {
+    let rig = Rig::new("team-own", TEAM, "");
+    rig.issue();
+    // Same account, same machine, and no such process any more.
+    let mut left = claim("old", "alice", "", 4_000_000);
+    left["machine"] = MACHINE.into();
+    rig.seed_claim("issues_7", 50, "alice", left, 30);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let comments = rig.comments("issues_7");
+    assert!(comments[1].contains(r#""ends":["old"]"#) && comments[1].contains(r#""state":"done""#), "{:?}", comments);
+    assert!(rig.calls().contains("pr create"));
+
+    // From another machine the same account is somebody else.
+    let rig = Rig::new("team-other-host", TEAM, "");
+    rig.issue();
+    let mut other = claim("old", "alice", "laptop", 4_000_000);
+    other["machine"] = "ffffffffffffffff".into();
+    rig.seed_claim("issues_7", 50, "alice", other, 30);
+    let (_, out) = rig.once(&[]);
+    assert!(out.contains("not started: alice on laptop is already on it"), "{}", out);
+}
+
+#[test]
+fn nothing_is_claimed_when_the_claims_cannot_be_read() {
+    let rig = Rig::new("team-unreadable", TEAM, "");
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_GH_API_FAIL", "GET repos/o/r/issues/7/comments")]);
+    assert!(!ok, "{}", out);
+    assert!(out.contains("could not prepare issue: team:"), "{}", out);
+    let calls = rig.calls();
+    assert!(!calls.contains("label") && !calls.contains("POST"), "a teammate may hold it; it must stay untouched:\n{}", calls);
+}
+
+#[test]
+fn a_teammates_release_stops_the_job_before_anything_is_pushed() {
+    let rig = Rig::new("team-release", TEAM, "");
+    rig.issue();
+    rig.labelled(7, "agent:working");
+    // While Alice's agent is working, Bob hands the issue back to the queue from his machine.
+    let release = format!("echo change >> by_agent.txt; FAKE_LOGIN=bob {} team release o/r#7 --force > {}/release.out 2>&1", env!("CARGO_BIN_EXE_forkdeck"), rig.root.display());
+    let (ok, out) = rig.once(&[("FAKE_WORK", &release)]);
+    let said = fs::read_to_string(rig.root.join("release.out")).unwrap_or_default();
+    assert!(said.contains("ended the claim of alice") && said.contains("label back to agent:ready"), "{}", said);
+    assert!(!ok && out.contains("bob has taken this over"), "{}", out);
+    let calls = rig.calls();
+    assert!(!calls.contains("pr create") && !calls.contains("agent:needs-human") && !calls.contains("issue comment"), "the issue is no longer ours to report on:\n{}", calls);
+    assert_eq!(git(&rig.origin(), &["branch", "--list", "forkdeck/*"]), "", "nothing was pushed");
+    let comments = rig.comments("issues_7");
+    assert!(comments[0].contains(r#""state":"released""#) && comments[0].contains(r#""by":"alice""#), "{:?}", comments);
+    assert!(comments[1].contains(r#""by":"bob""#) && comments[1].contains(r#""ends":["#), "{:?}", comments);
+}
+
+#[test]
+fn a_fresh_claim_is_only_released_with_force_and_a_stale_one_without() {
+    let rig = Rig::new("team-force", TEAM, "");
+    rig.labelled(7, "agent:working");
+    rig.labelled(9, "agent:working");
+    rig.seed_claim("issues_7", 50, "bob", claim("b1", "bob", "bobs-box", 1), 60);
+    let (ok, out) = rig.run(&["team", "release", "o/r#7"], &[]);
+    assert!(!ok && out.contains("bob on bobs-box is already on it") && out.contains("--force"), "{}", out);
+    assert!(!rig.calls().contains("label") && !rig.calls().contains("POST"), "{}", rig.calls());
+
+    rig.seed_claim("issues_9", 60, "bob", claim("b2", "bob", "bobs-box", 1), 7200);
+    let (ok, out) = rig.run(&["team", "release", "o/r#9"], &[]);
+    assert!(ok && out.contains("ended the claim of bob"), "{}", out);
+    assert!(rig.calls().contains("issue edit 9 -R o/r --remove-label agent:working --add-label agent:ready"), "{}", rig.calls());
+    assert!(rig.comments("issues_9")[1].contains(r#""ends":["b2"]"#));
+
+    // Claimed by hand, or by a forkdeck with sharing off: only moved when that is said.
+    rig.labelled(5, "review:running");
+    let before = rig.calls();
+    let (ok, out) = rig.run(&["team", "release", "o/r!5"], &[]);
+    assert!(!ok && out.contains("no forkdeck claim is open") && out.contains("--unclaimed"), "{}", out);
+    assert_eq!(rig.calls().matches("label").count(), before.matches("label").count(), "nothing may change");
+    let (ok, out) = rig.run(&["team", "release", "o/r!5", "--unclaimed"], &[]);
+    assert!(ok && out.contains("no forkdeck claim was open") && out.contains("label back to review:ready"), "{}", out);
+    let (ok, out) = rig.run(&["team", "release", "other/repo#1"], &[]);
+    assert!(!ok && out.contains("not one of the configured"), "{}", out);
+}
+
+#[test]
+fn a_reviewed_pull_request_carries_a_status_comment_too() {
+    let rig = Rig::new("team-pr", TEAM, "");
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let comments = rig.comments("issues_5");
+    assert_eq!(comments.len(), 1, "{:?}", comments);
+    assert!(comments[0].contains(r#""state":"done""#) && comments[0].contains("reviewing this pull request"), "{:?}", comments);
+    assert!(rig.calls().contains("--add-label review:passed"));
+    assert!(!rig.calls().contains("--add-assignee"), "reviewing is not owning");
+
+    // A teammate is already reviewing: leave it.
+    let rig = Rig::new("team-pr-held", TEAM, "");
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    rig.seed_claim("issues_5", 50, "bob", claim("b1", "bob", "bobs-box", 1), 60);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok && out.contains("not started: bob"), "{}", out);
+    assert!(!rig.calls().contains("label") && !rig.calls().contains("pr comment"), "{}", rig.calls());
+}
+
+#[test]
+fn a_deployment_is_announced_on_its_commit() {
+    let rig = Rig::new("team-deploy", &format!("{}\n{}", TEAM, MCP_SERVER), DEPLOY_STAGE);
+    rig.adopt();
+    let a = rig.merge_to_main("a.txt");
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &a[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let comments = rig.comments(&format!("commits_{}", a));
+    assert_eq!(comments.len(), 1, "{:?}\n{}", comments, out);
+    assert!(comments[0].contains(r#""state":"done""#) && comments[0].contains("deploying this commit"), "{:?}", comments);
+}
+
+#[test]
+fn the_overview_lists_who_holds_what() {
+    let rig = Rig::new("team-list", TEAM, "");
+    rig.issue();
+    rig.seed_claim("issues_7", 50, "bob", claim("b1", "bob", "bobs-box", 1), 7200);
+    let (ok, out) = rig.run(&["team"], &[]);
+    assert!(ok, "{}", out);
+    assert!(out.contains("bob on bobs-box") && out.contains("r#7") && out.contains("working") && out.contains("Add a change file"), "{}", out);
+    assert!(out.contains("no update for 2h 0m · forkdeck team release o/r#7"), "{}", out);
+    assert!(!rig.calls().contains("POST") && !rig.calls().contains("label"), "looking changes nothing:\n{}", rig.calls());
+
+    let (ok, out) = rig.run(&["team", "--json"], &[("FAKE_LOGIN", "bob")]);
+    assert!(ok, "{}", out);
+    let rows: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(rows[0]["who"], "bob");
+    assert_eq!(rows[0]["mine"], true);
+    assert_eq!(rows[0]["stale"], true);
+}
+
+#[test]
+fn an_issue_with_an_open_pull_request_is_not_handed_back() {
+    let rig = Rig::new("team-pr-open", TEAM, "");
+    rig.labelled(7, "agent:working");
+    let mut m = claim("b1", "bob", "bobs-box", 1);
+    m["pr"] = "https://example.invalid/o/r/pull/12".into();
+    m["stage"] = "watching ci".into();
+    rig.seed_claim("issues_7", 50, "bob", m, 7200);
+    let (ok, out) = rig.run(&["team", "release", "o/r#7", "--force"], &[]);
+    assert!(!ok && out.contains("already opened https://example.invalid/o/r/pull/12"), "{}", out);
+    assert!(!rig.calls().contains("label") && !rig.calls().contains("POST"), "{}", rig.calls());
+}
+
+fn this_host() -> String {
+    String::from_utf8_lossy(&Command::new("hostname").output().expect("hostname runs").stdout).trim().to_string()
+}
+
+#[test]
+fn no_hostname_is_posted_on_a_public_repository() {
+    let host = this_host();
+    assert!(!host.is_empty());
+    let named = format!(r#""host":"{}""#, host);
+
+    // Private: teammates see which machine it is.
+    let rig = Rig::new("team-private", TEAM, "");
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(rig.comments("issues_7")[0].contains(&named), "{:?}", rig.comments("issues_7"));
+
+    // Public, and a forge that gives no usable answer: nothing about the machine but its made-up id.
+    for (name, visibility) in [("team-public", "public"), ("team-unknown", "{\"message\":\"Not Found\"}")] {
+        let rig = Rig::new(name, TEAM, "");
+        fs::write(rig.root.join("gh/visibility"), visibility).unwrap();
+        rig.issue();
+        // A claim an earlier run on this machine left behind is still recognised, by the id alone.
+        let mut left = claim("old", "alice", "", 4_000_000);
+        left["machine"] = MACHINE.into();
+        rig.seed_claim("issues_7", 50, "alice", left, 30);
+        let (ok, out) = rig.once(&[]);
+        assert!(ok, "{}: {}", name, out);
+        let c = rig.comments("issues_7")[1].clone();
+        assert!(c.contains(r#""host":"""#) && !c.contains(&host), "{}: the hostname must not be posted: {}", name, c);
+        assert!(c.contains(r#""ends":["old"]"#) && c.contains("`alice` finished"), "{}: {}", name, c);
+        assert!(!out.contains(&format!("on {}", host)), "{}", out);
+    }
+
+    // A name somebody chose for the purpose is a label, not a hostname, and is used as written.
+    let rig = Rig::new("team-public-named", "[team]\nenabled = true\nhost = \"runner-a\"", "");
+    fs::write(rig.root.join("gh/visibility"), "public").unwrap();
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(rig.comments("issues_7")[0].contains(r#""host":"runner-a""#));
+
+    // And the release comment a person posts follows the same rule.
+    let rig = Rig::new("team-public-release", TEAM, "");
+    fs::write(rig.root.join("gh/visibility"), "public").unwrap();
+    rig.labelled(7, "agent:working");
+    rig.seed_claim("issues_7", 50, "bob", claim("b1", "bob", "", 1), 7200);
+    let (ok, out) = rig.run(&["team", "release", "o/r#7"], &[]);
+    assert!(ok, "{}", out);
+    assert!(!rig.comments("issues_7")[1].contains(&host), "{:?}", rig.comments("issues_7"));
+}
+
+#[test]
+fn a_release_typed_by_someone_without_write_access_is_ignored() {
+    let rig = Rig::new("team-outsider", TEAM, "");
+    rig.issue();
+    let work = format!("echo change >> by_agent.txt; {} eve NONE", rig.release_script());
+    let (ok, out) = rig.once(&[("FAKE_WORK", &work)]);
+    assert!(rig.comments("issues_7").len() == 2, "the forged release was posted: {}", out);
+    assert!(ok, "a passer-by's comment must not stop the job:\n{}", out);
+    assert!(rig.calls().contains("pr create"), "{}", rig.calls());
+    assert!(rig.comments("issues_7")[0].contains(r#""state":"done""#));
+
+    // The very same comment from a teammate does stop it: what differs is what the forge says about the author.
+    let rig = Rig::new("team-insider", TEAM, "");
+    rig.issue();
+    let work = format!("echo change >> by_agent.txt; {} bob COLLABORATOR", rig.release_script());
+    let (ok, out) = rig.once(&[("FAKE_WORK", &work)]);
+    assert!(!ok && out.contains("bob has taken this over"), "{}", out);
+    assert!(!rig.calls().contains("pr create"), "{}", rig.calls());
+}
+
+#[test]
+fn a_claim_that_expired_while_the_agent_ran_publishes_nothing() {
+    // The machine slept: its claim was last refreshed two hours ago when the agent finishes.
+    let rig = Rig::new("team-expired", TEAM, "");
+    rig.issue();
+    let d = rig.comment_dir("issues_7");
+    let work = format!("echo change >> by_agent.txt; echo {} > {}/100.at", forge_time(7200), d.display());
+    let (ok, out) = rig.once(&[("FAKE_WORK", &work)]);
+    assert!(!ok && out.contains("has expired"), "{}", out);
+    let calls = rig.calls();
+    assert!(!calls.contains("pr create") && !calls.contains("agent:needs-human") && !calls.contains("issue comment"), "an expired claim writes nothing:\n{}", calls);
+    assert_eq!(git(&rig.origin(), &["branch", "--list", "forkdeck/*"]), "");
+
+    // Same, and meanwhile the issue was put back by hand and Bob's machine took it without a release.
+    let rig = Rig::new("team-expired-taken", "[team]\nenabled = true\n[review]\nmax_fix_rounds = 0", "");
+    rig.issue();
+    let d = rig.comment_dir("issues_7");
+    rig.seed_claim("staging", 150, "bob", claim("b1", "bob", "bobs-box", 1), 30);
+    let staged = rig.comment_dir("staging");
+    let work = format!("echo change >> by_agent.txt; echo {} > {d}/100.at; cp {s}/150.* {d}/", forge_time(7200), d = d.display(), s = staged.display());
+    // The work also fails its review, so the failure path runs: it must stay off Bob's issue too.
+    let (ok, out) = rig.once(&[("FAKE_WORK", &work), ("FAKE_VERDICT", "FAIL")]);
+    assert!(!ok && out.contains("bob has taken this over"), "{}", out);
+    let calls = rig.calls();
+    assert!(!calls.contains("pr create") && !calls.contains("agent:needs-human") && !calls.contains("issue comment"), "the issue is Bob's:\n{}", calls);
+    assert_eq!(git(&rig.origin(), &["branch", "--list", "forkdeck/*"]), "");
+}
+
+#[test]
+fn a_job_that_fails_after_it_was_released_leaves_the_labels_to_the_new_holder() {
+    let rig = Rig::new("team-fail-released", "[team]\nenabled = true\n[review]\nmax_fix_rounds = 0", "");
+    rig.issue();
+    rig.labelled(7, "agent:working");
+    let release = format!("echo change >> by_agent.txt; FAKE_LOGIN=bob {} team release o/r#7 --force > {}/release.out 2>&1", env!("CARGO_BIN_EXE_forkdeck"), rig.root.display());
+    let (ok, out) = rig.once(&[("FAKE_WORK", &release), ("FAKE_VERDICT", "FAIL")]);
+    assert!(!ok, "{}", out);
+    assert!(out.contains("not reported on the forge: bob has taken this over"), "{}", out);
+    let calls = rig.calls();
+    assert!(!calls.contains("agent:needs-human") && !calls.contains("issue comment"), "the failure label would overwrite the next holder's:\n{}", calls);
+    assert_eq!(calls.matches("--remove-label").count(), 2, "one label move to claim, one by the release, none after:\n{}", calls);
+}
+
+#[test]
+fn the_final_status_is_written_even_if_the_forge_fails_once() {
+    let rig = Rig::new("team-final", TEAM, "");
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    fs::write(rig.root.join("gh/fail_once"), "PATCH").unwrap();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(!rig.root.join("gh/fail_once").exists(), "an update did fail");
+    assert!(rig.comments("issues_5")[0].contains(r#""state":"done""#), "a comment left active would block teammates: {:?}", rig.comments("issues_5"));
+}
+
+#[test]
+fn a_finished_item_cannot_be_put_back_in_the_queue_by_a_release() {
+    let rig = Rig::new("team-finished", TEAM, "");
+    // Reviewed and passed; no claim is open on it and it does not carry the working label.
+    rig.labelled(5, "review:passed");
+    for extra in [&[][..], &["--unclaimed"][..], &["--force"][..]] {
+        let mut args = vec!["team", "release", "o/r!5"];
+        args.extend_from_slice(extra);
+        let (ok, out) = rig.run(&args, &[]);
+        assert!(!ok && out.contains("does not carry the label \"review:running\""), "{:?}: {}", extra, out);
+    }
+    assert!(!rig.calls().contains("label") && !rig.calls().contains("POST"), "{}", rig.calls());
 }

@@ -4,6 +4,7 @@
 use crate::config::RepoCfg;
 use crate::orchestrator::{strip_verdict, Hub};
 use crate::state::{clip, AgentKind, Provider, Source};
+use crate::team::{self, Claimed, Target};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use crate::proc;
@@ -117,6 +118,24 @@ pub async fn sh(cmd: &str, args: &[&str], dir: Option<&Path>) -> Result<String, 
     }
 }
 
+/// As `sh`, with text given to the command on its standard input.
+pub async fn sh_in(cmd: &str, args: &[&str], dir: Option<&Path>, input: &str) -> Result<String, String> {
+    let mut c = proc::command(cmd);
+    c.args(args);
+    if let Some(d) = dir {
+        c.current_dir(d);
+    }
+    let what = format!("{} {}", cmd, args.first().copied().unwrap_or(""));
+    match proc::output_input(c, Duration::from_secs(300), Some(input.to_string())).await {
+        Err(e) => Err(format!("{}: {}", what, e)),
+        Ok((Some(0), out, _)) => Ok(out.trim().to_string()),
+        Ok((_, out, err)) => {
+            let shown = if err.trim().is_empty() { out } else { err };
+            Err(format!("{}: {}", what, clip(&shown.trim().replace('\n', " "), 300)))
+        }
+    }
+}
+
 pub fn parse_list(provider: Provider, json: &str) -> Result<Vec<Issue>, String> {
     let v: Value = serde_json::from_str(json).map_err(|e| format!("issue list is not JSON: {}", e))?;
     let arr = v.as_array().ok_or("issue list is not an array")?;
@@ -171,7 +190,7 @@ async fn list_prs(r: &RepoCfg) -> Result<Vec<Issue>, String> {
 }
 
 /// `pr` selects the pull/merge request commands instead of the issue ones.
-async fn relabel(r: &RepoCfg, pr: bool, n: u64, from: &str, to: &str) -> Result<(), String> {
+pub async fn relabel(r: &RepoCfg, pr: bool, n: u64, from: &str, to: &str) -> Result<(), String> {
     let n = n.to_string();
     match (r.provider, pr) {
         (Provider::Github, false) => sh("gh", &["issue", "edit", &n, "-R", &r.repo, "--remove-label", from, "--add-label", to], None).await,
@@ -350,6 +369,35 @@ async fn fresh_worktree(repo: &Path, dir: &Path, add_args: &[&str]) -> Result<()
     sh("git", &args, Some(repo)).await.map(|_| ())
 }
 
+/// With team sharing on: say on the forge that this machine is taking the item, unless a teammate holds it.
+async fn claim_first(hub: &Hub, r: &RepoCfg, target: Target, what: &'static str) -> Result<Option<std::sync::Arc<team::Held>>, String> {
+    if !team::on(hub) {
+        return Ok(None);
+    }
+    match team::claim(hub, r, target, what).await? {
+        Claimed::Ours(h) => Ok(Some(h)),
+        Claimed::Taken(why) => Err(format!("{}{}", team::TAKEN, why)),
+    }
+}
+
+/// After the label moved: check that nobody claimed at the same moment, then keep the status comment current.
+async fn settle_claim(hub: &Hub, id: u32, held: Option<std::sync::Arc<team::Held>>) -> Result<(), String> {
+    let Some(h) = held else { return Ok(()) };
+    match team::confirm(hub, &h).await {
+        Ok(None) => {
+            team::attach(hub, id, h);
+            Ok(())
+        }
+        Ok(Some(why)) => Err(format!("{}{}", team::TAKEN, why)),
+        Err(e) => {
+            // The label is already ours and it cannot be told whether a teammate holds the item too.
+            // Stop, and let the claim be closed as failed with everything else.
+            team::attach(hub, id, h);
+            Err(e)
+        }
+    }
+}
+
 /// Claim the issue and give the job a clean worktree on its own branch.
 pub async fn prepare(hub: &Hub, id: u32) -> Result<(), String> {
     let (r, n, _) = issue_of(hub, id).ok_or("not an issue job")?;
@@ -360,11 +408,24 @@ pub async fn prepare(hub: &Hub, id: u32) -> Result<(), String> {
         hub.job(id, |j| j.branch = Some(branch.clone()));
         return Ok(());
     }
-    relabel(&r, false, n, &r.label, &r.working_label)
-        .await
-        .map_err(|e| format!("{} (do the labels {:?} and {:?} exist?)", e, r.label, r.working_label))?;
+    let held = claim_first(hub, &r, Target::Issue(n), "issue").await?;
+    if let Err(e) = relabel(&r, false, n, &r.label, &r.working_label).await {
+        if let Some(h) = &held {
+            team::abandon(h, "failed").await;
+        }
+        return Err(format!("{} (do the labels {:?} and {:?} exist?)", e, r.label, r.working_label));
+    }
+    let settled = settle_claim(hub, id, held).await;
+    if let Err(e) = &settled {
+        if e.starts_with(team::TAKEN) {
+            // A teammate claimed it a moment earlier. The label is where they want it; leave everything be.
+            return settled;
+        }
+    }
     // From here on the issue is ours: a failure must be reported back to it.
     hub.job(id, |j| j.branch = Some(branch.clone()));
+    settled?;
+    team::assign_if_on(hub, &r, n).await;
     let lock = repo_index(hub, id).and_then(|i| hub.git_locks.get(i).cloned()).ok_or("no repository for this job")?;
     let _held = lock.lock().await;
     let repo = r.path.as_path();
@@ -555,6 +616,8 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
     }
     let d = Some(dir.as_path());
     let msg = commit_message(&title, n);
+    // Last look before anything leaves this machine: a teammate may have taken the issue over.
+    team::guard(hub, id).await?;
     if !commit_snapshot(&tree_of(hub, id)?, &msg).await? {
         return Err("the agent finished without changing any file".into());
     }
@@ -624,6 +687,7 @@ pub async fn push_followup(hub: &Hub, id: u32, round: u32, summary: &str) -> Res
     let t = tree_of(hub, id)?;
     let d = Some(t.dir.as_path());
     let msg = format!("Fix CI failure (#{})", n);
+    team::guard(hub, id).await?;
     if !commit_snapshot(&t, &msg).await? {
         return Err("the agent changed nothing".into());
     }
@@ -657,6 +721,9 @@ pub async fn ci_failed(hub: &Hub, id: u32, why: &str) {
         return;
     }
     let Some((r, n, _)) = issue_of(hub, id) else { return };
+    if !team::may_report(hub, id).await {
+        return;
+    }
     let text = quiet(&clip(&format!("forkdeck stopped here: {}", why), 4000));
     if let Some(num) = hub.job(id, |j| j.pr_url.clone()).flatten().as_deref().and_then(pr_number) {
         if let Err(e) = comment(&r, true, num, &text).await {
@@ -683,10 +750,21 @@ pub async fn pr_prepare(hub: &Hub, id: u32) -> Result<String, String> {
     if base.is_empty() || base.starts_with('-') || base.contains(char::is_whitespace) {
         return Err(format!("unusable base branch name {:?}", base));
     }
-    relabel(&r, true, n, &r.pr_label, &r.pr_working_label)
-        .await
-        .map_err(|e| format!("{} (do the labels {:?} and {:?} exist?)", e, r.pr_label, r.pr_working_label))?;
+    let held = claim_first(hub, &r, Target::Pr(n), "pull request").await?;
+    if let Err(e) = relabel(&r, true, n, &r.pr_label, &r.pr_working_label).await {
+        if let Some(h) = &held {
+            team::abandon(h, "failed").await;
+        }
+        return Err(format!("{} (do the labels {:?} and {:?} exist?)", e, r.pr_label, r.pr_working_label));
+    }
+    let settled = settle_claim(hub, id, held).await;
+    if let Err(e) = &settled {
+        if e.starts_with(team::TAKEN) {
+            return Err(e.clone());
+        }
+    }
     hub.job(id, |j| j.branch = Some(head.clone()));
+    settled?;
     let lock = repo_index(hub, id).and_then(|i| hub.git_locks.get(i).cloned()).ok_or("no repository for this job")?;
     let _held = lock.lock().await;
     let repo = r.path.as_path();
@@ -740,6 +818,7 @@ pub async fn pr_stale(hub: &Hub, id: u32, reviewed: &str, head: &str, next: &str
         &head[..head.len().min(12)],
         next
     );
+    team::guard(hub, id).await?;
     comment(&r, true, n, &text).await?;
     relabel(&r, true, n, &r.pr_working_label, &r.pr_label).await
 }
@@ -749,6 +828,16 @@ pub async fn pr_withdraw(hub: &Hub, id: u32, reviewed: &str, head: &str, next: &
     let (r, n, _, _) = pr_of(hub, id).ok_or("not a pull request job")?;
     if hub.cfg.demo {
         return Ok(());
+    }
+    if let Err(e) = team::guard(hub, id).await {
+        // The review is a teammate's now. The pass label this job just set must still not stay on a
+        // head nobody reviewed; take that off and leave the rest to them.
+        let num = n.to_string();
+        match r.provider {
+            Provider::Github => sh("gh", &["pr", "edit", &num, "-R", &r.repo, "--remove-label", &r.pr_pass_label], None).await?,
+            Provider::Gitlab => sh("glab", &["mr", "update", &num, "-R", &r.repo, "--unlabel", &r.pr_pass_label], None).await?,
+        };
+        return Err(e);
     }
     // Label first: that is the part something else may be acting on.
     let moved = relabel(&r, true, n, &r.pr_pass_label, &r.pr_label).await;
@@ -830,6 +919,7 @@ pub async fn pr_post(hub: &Hub, id: u32, rep: &Report<'_>) -> Result<(), String>
         tokio::time::sleep(Duration::from_millis(500)).await;
         return Ok(());
     }
+    team::guard(hub, id).await?;
     comment(&r, true, n, &review_comment(rep, &r.checks)).await?;
     // An incomplete review goes back to the request label; the job stays remembered, so it is not retried in a loop.
     let to = match rep.overall {
@@ -850,6 +940,10 @@ pub async fn report_failure(hub: &Hub, id: u32, why: &str) {
     }
     // Nothing was claimed if the label swap in prepare never happened.
     if !hub.job(id, |j| j.branch.is_some()).unwrap_or(false) {
+        return;
+    }
+    // A teammate may hold the item by now: its labels and its thread are theirs.
+    if !team::may_report(hub, id).await {
         return;
     }
     if let Some((r, n, _)) = issue_of(hub, id) {

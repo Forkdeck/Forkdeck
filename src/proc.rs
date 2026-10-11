@@ -75,10 +75,23 @@ pub async fn output(c: Command, limit: Duration) -> Result<(bool, String, String
 
 /// As `output`, but with the exit code: `None` means the process was ended by a signal rather than
 /// finishing by itself. An `Err` means it never gave a result at all (could not start, timed out).
-pub async fn output_code(mut c: Command, limit: Duration) -> Result<(Option<i32>, String, String), String> {
-    c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+pub async fn output_code(c: Command, limit: Duration) -> Result<(Option<i32>, String, String), String> {
+    output_input(c, limit, None).await
+}
+
+/// As `output_code`, optionally writing `input` to the process's standard input first.
+pub async fn output_input(mut c: Command, limit: Duration, input: Option<String>) -> Result<(Option<i32>, String, String), String> {
+    c.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn().map_err(|e| format!("could not start: {}", e))?;
     let group = Group::of(&child);
+    if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
+        // Written from its own task: a process that never reads must still run into the time limit.
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(text.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        });
+    }
     let mut out = child.stdout.take().expect("piped stdout");
     let mut err = child.stderr.take().expect("piped stderr");
     let out_task = tokio::spawn(async move {

@@ -38,6 +38,8 @@ pub struct Ui {
     pub forced: Option<AgentKind>,
     pub cwd: PathBuf,
     pub demo: bool,
+    /// Show what teammates are working on in place of the agent tree.
+    pub team: bool,
 }
 
 fn fg(c: Color) -> Style {
@@ -114,6 +116,7 @@ pub fn draw(f: &mut Frame, st: &State, ui: &Ui) {
     left_panel(f, cols[0], st, ui);
     let job = ui.selected.and_then(|id| st.jobs.iter().find(|j| j.id == id));
     match job {
+        _ if ui.team => team_panel(f, cols[1], st),
         Some(j) => tree(f, cols[1], j),
         None => empty_tree(f, cols[1]),
     }
@@ -245,6 +248,41 @@ fn left_panel(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
         }
     }
     f.render_widget(Paragraph::new(lines).block(boxed("queue", PURPLE)), area);
+}
+
+fn team_panel(f: &mut Frame, area: Rect, st: &State) {
+    let w = area.width.saturating_sub(4) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    let age = match st.team.at {
+        Some(t) => format!("read from the forge {}s ago", t.elapsed().as_secs()),
+        None => "reading the forge…".to_string(),
+    };
+    lines.push(Line::from(Span::styled(clip(&age, w), fg(DIM))));
+    if let Some(e) = &st.team.error {
+        lines.push(Line::from(Span::styled(clip(e, w), fg(RED))));
+    }
+    lines.push(Line::default());
+    if st.team.at.is_some() {
+        for l in crate::team::text(&st.team.rows, w) {
+            let style = if !l.starts_with(' ') {
+                bold(if l.ends_with("(you)") { GREEN } else { PURPLE })
+            } else if l.trim_start().starts_with("no update for") {
+                fg(RED)
+            } else if l.trim_start().starts_with("http") {
+                fg(DIM)
+            } else {
+                fg(TEXT)
+            };
+            lines.push(Line::from(Span::styled(clip(&l, w), style)));
+        }
+    }
+    let room = area.height.saturating_sub(2) as usize;
+    if lines.len() > room && room > 1 {
+        let more = lines.len() - (room - 1);
+        lines.truncate(room - 1);
+        lines.push(Line::from(Span::styled(format!("… {} more line(s): forkdeck team", more), fg(DIM))));
+    }
+    f.render_widget(Paragraph::new(lines).block(boxed("team", GREEN).padding(Padding::horizontal(1))), area);
 }
 
 fn empty_tree(f: &mut Frame, area: Rect) {
@@ -506,7 +544,7 @@ fn status(f: &mut Frame, area: Rect, st: &State) {
         Span::styled(if st.automation { "[on]" } else { "[off]" }, fg(if st.automation { GREEN } else { DIM })),
     ]);
     f.render_widget(Paragraph::new(left), area);
-    let keys = "Enter run · Tab agent · ↑↓ job · ^A issues · ^X cancel · ^C quit ";
+    let keys = "⏎ run · Tab agent · ↑↓ job · ^A issues · ^T team · ^X stop · ^C quit ";
     f.render_widget(Paragraph::new(Span::styled(keys, fg(DIM))).alignment(Alignment::Right), area);
 }
 

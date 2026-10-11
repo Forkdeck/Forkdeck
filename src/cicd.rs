@@ -449,7 +449,7 @@ pub struct Saved {
 /// How often one commit's deployment is started before a person has to look.
 const MAX_TRIES: u32 = 3;
 
-fn state_dir() -> PathBuf {
+pub fn state_dir() -> PathBuf {
     let base = std::env::var("XDG_STATE_HOME").ok().filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(|| {
         PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/state")
     });

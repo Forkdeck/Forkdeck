@@ -82,6 +82,20 @@ draft = true
 publish_on_failed_review = false
 # worktree_root = "~/.cache/forkdeck/worktrees"
 
+# Sharing with teammates who run forkdeck on the same repositories. The shared
+# state is comments on GitHub or GitLab; only metadata goes into them (who, which
+# machine, agent, stage, times, the pull request link). Typed tasks are never shared.
+[team]
+enabled = false        # claim with a status comment, and leave alone what a teammate holds
+stale_mins = 30        # a claim not refreshed for this long stops blocking others
+heartbeat_secs = 300   # how often a running job refreshes its comment
+refresh_secs = 120     # how often the team pane (Ctrl-T) re-reads the forge
+assign = true          # assign a claimed issue to the logged-in account
+deploys = true         # announce deployments on the commit (GitHub only)
+# Machine name shown to teammates. Default: the hostname on private repositories,
+# nothing on public ones. A name set here is posted everywhere; "" posts none.
+# host = "build-02"
+
 #~ [[repos]]
 #~ provider = "github"    # uses the gh CLI and its login
 #~ repo = "your-name/your-project"
