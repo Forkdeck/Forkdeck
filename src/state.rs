@@ -273,6 +273,8 @@ pub struct State {
     /// (repo index, is a pull request, number)
     pub seen: HashSet<(usize, bool, u64)>,
     pub automation: bool,
+    /// Set once shutdown has begun: nothing new may start.
+    pub stopping: bool,
     pub have_claude: bool,
     pub have_codex: bool,
     pub next_id: u32,

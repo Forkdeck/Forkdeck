@@ -69,8 +69,17 @@ pub struct Report<'a> {
 const BODY_LIMIT: usize = 60_000;
 
 /// Text from an agent or a log, made safe to post: no notifications to people it happens to mention.
+/// Also breaks `#123` references, so text an agent wrote cannot close or link other issues.
 fn quiet(s: &str) -> String {
-    s.replace('@', "@\u{200b}")
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        out.push(c);
+        if c == '@' || (c == '#' && it.peek().is_some_and(|n| n.is_ascii_digit())) {
+            out.push('\u{200b}');
+        }
+    }
+    out
 }
 
 /// Log text for a fenced block: it must not be able to close the fence.
@@ -357,6 +366,17 @@ pub async fn stage(hub: &Hub, id: u32) -> Result<(), String> {
     sh("git", &["add", "-A"], Some(&dir)).await.map(|_| ())
 }
 
+/// Throw away everything that is not staged: files the checks created or rewrote. The agent's
+/// work is in the index, so nothing of it is lost, and ignored files (build output) are left alone.
+pub async fn drop_unstaged(hub: &Hub, id: u32) -> Result<(), String> {
+    if hub.cfg.demo {
+        return Ok(());
+    }
+    let dir = hub.job(id, |j| j.workdir.clone()).ok_or("job vanished")?;
+    sh("git", &["checkout-index", "--all", "--force"], Some(&dir)).await?;
+    sh("git", &["clean", "-fd", "--quiet"], Some(&dir)).await.map(|_| ())
+}
+
 /// Commit what is staged. Returns whether the branch now has commits the base does not.
 async fn commit_staged(r: &RepoCfg, dir: &Path, msg: &str) -> Result<bool, String> {
     let d = Some(dir);
@@ -426,14 +446,14 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
         (_, false, _, _) => "Not reviewed before opening.".to_string(),
         (_, true, Some(true), Some(rv)) => format!("Reviewed by {} before opening: pass.", rv),
         (_, true, Some(false), Some(rv)) => {
-            format!("Reviewed by {} before opening: **did not pass**.\n\n{}", rv, quiet(&clip(&strip_verdict(o.reasons), 20_000)))
+            format!("Reviewed by {} before opening: **did not pass**.\n\n{}", rv, clip(&quiet(&strip_verdict(o.reasons)), 20_000))
         }
         _ => "The review produced no verdict.".to_string(),
     };
     let body = format!(
         "Closes #{}\n\n{}\n\n---\nOpened by forkdeck. Work by {}. {} {}",
         n,
-        quiet(&clip(o.summary, 30_000)),
+        clip(&quiet(o.summary), 30_000),
         worker,
         checks,
         verdict
@@ -509,8 +529,11 @@ pub async fn agent_files_changed(hub: &Hub, dir: &Path, base: &str) -> Vec<Strin
     if hub.cfg.demo {
         return vec![];
     }
-    let out = sh("git", &["diff", "--name-only", &format!("origin/{}...HEAD", base)], Some(dir)).await.unwrap_or_default();
-    steering_files(&out)
+    match sh("git", &["diff", "--name-only", &format!("origin/{}...HEAD", base)], Some(dir)).await {
+        Ok(out) => steering_files(&out),
+        // Not knowing is reported as a warning too, rather than as "nothing to worry about".
+        Err(_) => vec!["the list of changed files could not be read".to_string()],
+    }
 }
 
 pub fn steering_files(names: &str) -> Vec<String> {
@@ -537,7 +560,7 @@ pub fn review_comment(rep: &Report, check_cmds: &[String]) -> String {
     if !rep.steering.is_empty() {
         out.push_str(&format!(
             "**Read these reviews with care.** This pull request changes files that the reviewing agents load as instructions (`{}`), so it may have influenced what they concluded.\n\n",
-            rep.steering.join("`, `")
+            rep.steering.iter().take(10).map(|f| clip(f, 120).replace('`', "'")).collect::<Vec<_>>().join("`, `")
         ));
     }
     match rep.checks {
@@ -547,10 +570,10 @@ pub fn review_comment(rep: &Report, check_cmds: &[String]) -> String {
     }
     let each = (BODY_LIMIT - 5000) / rep.reviews.len().max(1);
     for r in rep.reviews {
-        out.push_str(&format!("#### {}: {}\n\n{}\n\n", r.by.name(), word(r.verdict), quiet(&clip(strip_verdict(&r.text).trim(), each))));
+        out.push_str(&format!("#### {}: {}\n\n{}\n\n", r.by.name(), word(r.verdict), clip(&quiet(strip_verdict(&r.text).trim()), each)));
     }
-    out.push_str("---\nEach reviewer worked independently from the diff. This comment is advisory: nothing was approved or merged.");
-    out
+    const FOOT: &str = "\n\n---\nEach reviewer worked independently from the diff. This comment is advisory: nothing was approved or merged.";
+    format!("{}{}", clip(&out, BODY_LIMIT), FOOT)
 }
 
 /// Post the combined review as one comment and move the label.
@@ -657,13 +680,15 @@ mod tests {
         assert!(c.contains("off by one") && !c.contains("VERDICT"));
         assert!(c.contains("Checks passed: `make test`"));
         assert!(!c.contains("@alice"), "mentions must not notify anyone");
+        assert_eq!(quiet("Fixes #12, see a#b and C#"), "Fixes #\u{200b}12, see a#b and C#");
     }
 
     #[test]
     fn review_comment_flags_steering_files_and_keeps_logs_fenced() {
-        let reviews = vec![Review { by: AgentKind::Claude, verdict: Some(true), text: "x".repeat(200_000) }];
+        let reviews = vec![Review { by: AgentKind::Claude, verdict: Some(true), text: "@x ".repeat(80_000) }];
         let checks = (false, "boom\n```\n# injected heading".to_string());
-        let steering = vec!["CLAUDE.md".to_string()];
+        let mut steering = vec!["CLAUDE.md".to_string()];
+        steering.extend((0..5000).map(|i| format!(".claude/commands/{}.md", i)));
         let rep = Report { reviews: &reviews, checks: Some(&checks), overall: Overall::Changes, sha: "abc", steering: &steering };
         let c = review_comment(&rep, &[]);
         assert!(c.contains("Read these reviews with care") && c.contains("CLAUDE.md"));

@@ -139,6 +139,9 @@ pub fn from_answers(cfg: &Config, v: &Value) -> Result<Decision, String> {
 
     let eff = a.get("effort").ok_or("no answer for \"effort\"")?;
     let score = eff.get("score").and_then(|s| s.as_f64()).ok_or("effort answer has no score")?;
+    if !(0.0..=2.0).contains(&score) {
+        return Err(format!("effort score is {}, expected 0 to 2", score));
+    }
     // A missing confidence counts as unsure, which rounds the effort up rather than down.
     let econf = unit(eff.get("confidence").and_then(|c| c.as_f64()).unwrap_or(0.0), "effort confidence")?;
     let effort_sharp = econf >= th;
@@ -307,6 +310,9 @@ mod tests {
         let cfg = Config::default();
         let v = json!({"answers": {"agent": {"choice": "codex", "confidence": 3.0},
             "effort": {"score": 1.0, "confidence": 0.9}, "review": {"noul": 0.9}}});
+        assert!(from_answers(&cfg, &v).is_err());
+        let v = json!({"answers": {"agent": {"choice": "codex", "confidence": 0.9},
+            "effort": {"score": -3.0, "confidence": 0.9}, "review": {"noul": 0.9}}});
         assert!(from_answers(&cfg, &v).is_err());
         let v = json!({"answers": {"agent": {"choice": "codex", "confidence": 0.9},
             "effort": {"score": 0.0}, "review": {"noul": 0.05}}});

@@ -252,7 +252,7 @@ async fn spawn_and_read(
         Ok(c) => c,
         Err(e) => return fail(format!("cannot start {}: {}", cmd, e)),
     };
-    let _group = proc::Group::of(&child);
+    let group = proc::Group::of(&child);
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
@@ -274,10 +274,21 @@ async fn spawn_and_read(
     let mut final_ok: Option<bool> = None;
     let mut finished = false;
     let mut error = String::new();
+    let mut status: Option<std::io::Result<std::process::ExitStatus>> = None;
     loop {
-        raw.clear();
         // Bytes, not lines(): one invalid UTF-8 sequence must not end the loop while the agent is still writing.
-        match reader.read_until(b'\n', &mut raw).await {
+        // read_until keeps what it has read in `raw` if the other branch wins, so nothing is lost.
+        let n = tokio::select! {
+            r = reader.read_until(b'\n', &mut raw) => r,
+            s = child.wait(), if status.is_none() => {
+                // The agent itself is done. Anything it left running would hold the pipe open
+                // and keep us here until the timeout, so stop it now.
+                status = Some(s);
+                group.kill();
+                continue;
+            }
+        };
+        match n {
             Ok(0) => break,
             Ok(_) => {}
             Err(e) => {
@@ -285,8 +296,9 @@ async fn spawn_and_read(
                 break;
             }
         }
-        let line = String::from_utf8_lossy(&raw);
-        let line = line.trim();
+        let owned = String::from_utf8_lossy(&raw).trim().to_string();
+        raw.clear();
+        let line = owned.as_str();
         if line.is_empty() {
             continue;
         }
@@ -330,13 +342,20 @@ async fn spawn_and_read(
                     }
                     final_text = Some(text);
                 }
-                Parsed::Usage { .. } => finished = true,
+                Parsed::Usage { .. } => {
+                    // A turn that completed supersedes an error reported earlier in the stream (a retry that worked).
+                    finished = true;
+                    error.clear();
+                }
                 Parsed::Error(e) => error = e,
                 _ => {}
             }
         }
     }
-    let status = child.wait().await;
+    let status = match status {
+        Some(s) => s,
+        None => child.wait().await,
+    };
     let stderr_text = err_task.await.unwrap_or_default();
     let exit_ok = status.as_ref().map(|s| s.success()).unwrap_or(false);
     // A clean exit is not enough: the stream has to have reached its closing event.

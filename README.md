@@ -107,11 +107,15 @@ on the local branch, and the issue gets a comment saying why and the label
 the draft anyway.
 
 It never force-pushes. If `forkdeck/issue-N` already exists on the remote from
-an earlier attempt, the issue is handed back untouched; delete the branch and
-close its pull request before labelling the issue again.
+an earlier attempt, no work is done: the issue gets a comment saying so and
+`agent:needs-human`. Delete the branch and close its pull request before
+labelling the issue again.
 
-Files that the checks leave behind (reports, caches) are not committed: the
-agent's changes are staged before the checks run.
+The agent's changes are staged before the checks run, and anything the checks
+create or rewrite is removed again afterwards (ignored files such as build
+output are left alone). So check leftovers are never committed, and the tree
+the reviewer reads is the tree that gets pushed. It also means a check cannot
+be used to modify the change: a formatter run as a check has no effect.
 
 The labels have to exist in the repository first.
 
@@ -160,9 +164,10 @@ sandbox, on code an agent has just written from the issue text. That is the
 widest hole in the list above: keep `allowed_authors` tight on any repo that
 has checks, or run forkdeck in a container or VM.
 
-Quitting stops every running agent and the processes it started, then waits up
-to 45 seconds while claimed issues are handed back with a comment. If forkdeck
-is killed outright, an issue can be left on `agent:working`; move the label
+Quitting, closing the terminal or sending SIGTERM stops polling and every
+running agent with the processes it started, then waits up to 45 seconds while
+claimed issues are handed back with a comment. If forkdeck is killed outright
+(SIGKILL, power loss), an issue can be left on `agent:working`; move the label
 back by hand.
 
 ## Keys

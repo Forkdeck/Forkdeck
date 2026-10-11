@@ -67,7 +67,21 @@ fn parse_agent(s: &str) -> anyhow::Result<AgentKind> {
     }
 }
 
+/// Print without panicking when the terminal or pipe has gone away: a panic here would skip the shutdown.
+macro_rules! say {
+    ($($t:tt)*) => {{ let _ = writeln!(std::io::stdout(), $($t)*); }};
+}
+macro_rules! warn {
+    ($($t:tt)*) => {{ let _ = writeln!(std::io::stderr(), $($t)*); }};
+}
+
 fn main() -> anyhow::Result<()> {
+    // Whatever goes wrong, do not leave agents running with nobody watching them.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        proc::kill_all();
+        default_hook(info);
+    }));
     let cli = Cli::parse();
     if let Some(Cmd::Init { path, force }) = &cli.cmd {
         let p = path.clone().unwrap_or_else(config::user_path);
@@ -86,6 +100,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     let (mut cfg, cfg_path) = config::load(cli.config.as_deref())?;
+    let stray = cfg_path.is_none() && cli.config.is_none() && !cli.demo && std::path::Path::new("forkdeck.toml").exists();
+    if stray && cli.cmd.is_some() {
+        eprintln!("note: ./forkdeck.toml is not read. Move it to {} or pass --config.", config::user_path().display());
+    }
     cfg.demo = cli.demo;
     if cfg.demo {
         cfg.automation.enabled = true;
@@ -147,7 +165,7 @@ fn main() -> anyhow::Result<()> {
                 hub.log("config", format!("loaded {}", p.display()));
             } else if !hub.cfg.demo {
                 hub.log("config", "no config file found, using defaults (forkdeck init writes one)");
-                if std::path::Path::new("forkdeck.toml").exists() {
+                if stray {
                     hub.log("config", "ignoring ./forkdeck.toml: move it to ~/.config/forkdeck/config.toml or pass --config");
                 }
             }
@@ -185,16 +203,16 @@ async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentKin
         // Bounded buffers drop old lines; counting what was drained keeps the cursor right.
         let drained: Vec<_> = st.log.drain(..).collect();
         for l in &drained {
-            println!("{} {:<7} {}", l.time, l.who, l.msg);
+            say!("{} {:<7} {}", l.time, l.who, l.msg);
         }
         seen_log += drained.len();
         let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return 1 };
         for l in j.worker.tail.drain(..) {
-            println!("         worker  {}", l);
+            say!("         worker  {}", l);
             seen_w += 1;
         }
         for l in j.reviewer.tail.drain(..) {
-            println!("         review  {}", l);
+            say!("         review  {}", l);
             seen_r += 1;
         }
         if j.status.finished() {
@@ -301,20 +319,30 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
     if hub.cfg.demo {
         hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd.clone(), None);
     }
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // A signal (terminal closed, kill, service stop) is handled entirely on the runtime: the main
+    // thread may be stuck reading a terminal that no longer exists.
+    let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
-        let stop = stop.clone();
+        let hub = hub.clone();
+        let stopping = stopping.clone();
         rt.spawn(async move {
             stop_signal().await;
-            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = ratatui::try_restore();
+            warn!("stopping jobs and handing claimed issues back…");
+            hub.shutdown(Duration::from_secs(45)).await;
+            proc::kill_all();
+            std::process::exit(1);
         });
     }
     let mut term = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste);
     let res = (|| -> anyhow::Result<()> {
         loop {
-            if stop.load(std::sync::atomic::Ordering::SeqCst) {
-                return Ok(());
+            if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                // The signal task owns the shutdown and will exit the process; just stay out of its way.
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
             }
             sync_selection(hub, &mut u);
             term.draw(|f| ui::draw(f, &hub.state.lock().unwrap(), &u))?;
@@ -385,15 +413,16 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
         }
     })();
     let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
-    ratatui::restore();
+    let _ = ratatui::try_restore();
     // Stop any agent still running, and give claimed issues time to be handed back with a comment.
     let busy = hub.state.lock().unwrap().jobs.iter().filter(|j| !j.status.finished()).count();
     if busy > 0 {
-        eprintln!("stopping {} job(s) and handing claimed issues back…", busy);
+        warn!("stopping {} job(s) and handing claimed issues back…", busy);
     }
     let left = rt.block_on(hub.shutdown(Duration::from_secs(45)));
     if left > 0 {
-        eprintln!("{} job(s) did not finish in time; check their issues for a stale working label", left);
+        warn!("{} job(s) did not finish in time; check their issues for a stale working label", left);
     }
+    proc::kill_all();
     res
 }
