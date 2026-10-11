@@ -406,8 +406,15 @@ only: GitLab commit comments cannot be edited).
 **What is shared.** The account name, the machine name, which agent, which
 stage, when it started, when it was last updated, and the pull request link.
 No prompt, no agent output, no logs. Tasks typed into the prompt are never
-shared. The machine name is your hostname unless you set `host`; on a public
-repository you may want `host = ""`.
+shared.
+
+The machine name is your hostname on private repositories. On a public
+repository no machine name is posted, and if forkdeck cannot find out whether a
+repository is public it posts none. To show a name there anyway, set `host` to
+a label of your choosing; it is used as written. Each machine also puts a
+random id into its claims, kept in `~/.local/state/forkdeck/machine-id`, so a
+restarted forkdeck can recognise a claim its previous run left behind. The id
+is not derived from anything about the machine.
 
 **Seeing it.** `Ctrl-T` swaps the agent tree for the team pane, and
 `forkdeck team` prints the same thing:

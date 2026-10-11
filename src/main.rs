@@ -472,18 +472,22 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
         ok &= tool_ok && git_ok;
     }
     if hub.cfg.team.enabled {
-        let mut asked: Vec<Provider> = Vec::new();
         for r in &hub.cfg.repos {
-            if asked.contains(&r.provider) {
-                continue;
-            }
-            asked.push(r.provider);
-            let forge = if r.provider == Provider::Github { "GitHub" } else { "GitLab" };
             match team::me(hub, r.provider).await {
-                Ok(name) => println!("team      ok       claims on {} are made as {} from {:?}", forge, name, team::host(hub)),
+                Ok(name) => {
+                    let public = team::is_public(hub, r).await;
+                    let host = team::shown_host(hub, r).await;
+                    let shown = match (host.is_empty(), public, hub.cfg.team.host.is_some()) {
+                        (true, true, false) => "no machine name (public repository)".to_string(),
+                        (true, ..) => "no machine name".to_string(),
+                        (false, true, _) => format!("machine name {:?} from the config, on a public repository", host),
+                        (false, false, _) => format!("machine name {:?}", host),
+                    };
+                    println!("team      ok       {} claims as {}, {}", r.repo, name, shown);
+                }
                 Err(e) => {
                     ok = false;
-                    println!("team      problem  cannot tell who is logged in on {}: {}", forge, e);
+                    println!("team      problem  {}: cannot tell who is logged in: {}", r.repo, e);
                 }
             }
         }

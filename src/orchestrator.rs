@@ -26,6 +26,8 @@ pub struct Hub {
     pub git_locks: Arc<Vec<Arc<tokio::sync::Mutex<()>>>>,
     /// The account each forge CLI is logged in as (GitHub, GitLab), once asked.
     pub team_me: Arc<Mutex<[Option<String>; 2]>>,
+    /// Whether each repository is readable by anyone, once the forge has said.
+    pub team_public: Arc<Mutex<std::collections::HashMap<String, bool>>>,
 }
 
 pub fn is_loopback(url: &str) -> bool {
@@ -68,6 +70,7 @@ impl Hub {
             rt,
             git_locks: Arc::new(git_locks),
             team_me: Arc::new(Mutex::new([None, None])),
+            team_public: Arc::new(Mutex::new(Default::default())),
         }
     }
 

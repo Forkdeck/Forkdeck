@@ -49,6 +49,7 @@ if [ "$1" = "api" ]; then
   key=$(printf '%s' "$bare" | tr '/' '_')
   case "$method $path" in
     "GET user") echo "${FAKE_LOGIN:-alice}" ;;
+    "GET repos/o/r") cat "$FAKE_GH/visibility" 2>/dev/null || echo private ;;
     GET\ repos/*/commits\?*) cat "$FAKE_GH/commits.json" 2>/dev/null || echo "[]" ;;
     GET\ *)
       d="$FAKE_GH/c/$key"; printf '['; sep=""
@@ -136,9 +137,10 @@ impl Rig {
     fn new(name: &str, extra_config: &str, repo_config: &str) -> Rig {
         let root = std::env::temp_dir().join(format!("forkdeck-test-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        for d in ["bin", "gh", "mcp", "home/.config/forkdeck"] {
+        for d in ["bin", "gh", "mcp", "home/.config/forkdeck", "home/.local/state/forkdeck"] {
             fs::create_dir_all(root.join(d)).unwrap();
         }
+        fs::write(root.join("home/.local/state/forkdeck/machine-id"), "0123456789abcdef\n").unwrap();
         for (file, body) in [("claude", CLAUDE), ("gh", GH), ("mcp-stand-in", MCP)] {
             let p = root.join("bin").join(file);
             fs::write(&p, body).unwrap();
@@ -911,7 +913,9 @@ fn a_ci_pass_that_belongs_to_the_previous_push_is_not_taken_for_the_fix() {
 // ---------------------------------------------------------------------------------------------
 // Team: claims and status comments on the forge
 
-const TEAM: &str = "[team]\nenabled = true\nhost = \"rig\"";
+const TEAM: &str = "[team]\nenabled = true";
+/// The made-up machine id every rig starts with.
+const MACHINE: &str = "0123456789abcdef";
 
 /// Seconds since the epoch as the forge would print them.
 fn forge_time(ago_secs: i64) -> String {
@@ -983,7 +987,7 @@ fn a_claimed_issue_carries_one_status_comment_and_only_metadata() {
     let comments = rig.comments("issues_7");
     assert_eq!(comments.len(), 1, "one comment, edited in place: {:?}", comments);
     let c = &comments[0];
-    assert!(c.contains(r#""by":"alice""#) && c.contains(r#""host":"rig""#) && c.contains(r#""state":"done""#), "{}", c);
+    assert!(c.contains(r#""by":"alice""#) && c.contains(&format!(r#""machine":"{}""#, MACHINE)) && c.contains(r#""state":"done""#), "{}", c);
     assert!(c.contains("https://example.invalid/o/r/pull/12"), "the pull request is linked: {}", c);
     assert!(!c.contains("Did the work") && !c.contains("Please add it") && !c.contains("Looked at it"), "no prompt and no agent output may be shared: {}", c);
     let calls = rig.calls();
@@ -1059,7 +1063,9 @@ fn a_claim_left_by_a_run_that_died_on_this_machine_is_replaced() {
     let rig = Rig::new("team-own", TEAM, "");
     rig.issue();
     // Same account, same machine, and no such process any more.
-    rig.seed_claim("issues_7", 50, "alice", claim("old", "alice", "rig", 4_000_000), 30);
+    let mut left = claim("old", "alice", "", 4_000_000);
+    left["machine"] = MACHINE.into();
+    rig.seed_claim("issues_7", 50, "alice", left, 30);
     let (ok, out) = rig.once(&[]);
     assert!(ok, "{}", out);
     let comments = rig.comments("issues_7");
@@ -1069,7 +1075,9 @@ fn a_claim_left_by_a_run_that_died_on_this_machine_is_replaced() {
     // From another machine the same account is somebody else.
     let rig = Rig::new("team-other-host", TEAM, "");
     rig.issue();
-    rig.seed_claim("issues_7", 50, "alice", claim("old", "alice", "laptop", 4_000_000), 30);
+    let mut other = claim("old", "alice", "laptop", 4_000_000);
+    other["machine"] = "ffffffffffffffff".into();
+    rig.seed_claim("issues_7", 50, "alice", other, 30);
     let (_, out) = rig.once(&[]);
     assert!(out.contains("not started: alice on laptop is already on it"), "{}", out);
 }
@@ -1200,15 +1208,56 @@ fn an_issue_with_an_open_pull_request_is_not_handed_back() {
     assert!(!rig.calls().contains("label") && !rig.calls().contains("POST"), "{}", rig.calls());
 }
 
+fn this_host() -> String {
+    String::from_utf8_lossy(&Command::new("hostname").output().expect("hostname runs").stdout).trim().to_string()
+}
+
 #[test]
-fn with_the_machine_name_hidden_no_claim_is_taken_for_a_leftover() {
-    let rig = Rig::new("team-nohost", "[team]\nenabled = true\nhost = \"\"", "");
+fn no_hostname_is_posted_on_a_public_repository() {
+    let host = this_host();
+    assert!(!host.is_empty());
+    let named = format!(r#""host":"{}""#, host);
+
+    // Private: teammates see which machine it is.
+    let rig = Rig::new("team-private", TEAM, "");
     rig.issue();
-    // It may be the same account on another machine; there is no way to tell, so it holds.
-    rig.seed_claim("issues_7", 50, "alice", claim("old", "alice", "", 4_000_000), 30);
     let (ok, out) = rig.once(&[]);
-    assert!(ok && out.contains("not started: alice is already on it"), "{}", out);
-    assert!(!rig.calls().contains("label"), "{}", rig.calls());
+    assert!(ok, "{}", out);
+    assert!(rig.comments("issues_7")[0].contains(&named), "{:?}", rig.comments("issues_7"));
+
+    // Public, and a forge that gives no usable answer: nothing about the machine but its made-up id.
+    for (name, visibility) in [("team-public", "public"), ("team-unknown", "{\"message\":\"Not Found\"}")] {
+        let rig = Rig::new(name, TEAM, "");
+        fs::write(rig.root.join("gh/visibility"), visibility).unwrap();
+        rig.issue();
+        // A claim an earlier run on this machine left behind is still recognised, by the id alone.
+        let mut left = claim("old", "alice", "", 4_000_000);
+        left["machine"] = MACHINE.into();
+        rig.seed_claim("issues_7", 50, "alice", left, 30);
+        let (ok, out) = rig.once(&[]);
+        assert!(ok, "{}: {}", name, out);
+        let c = rig.comments("issues_7")[1].clone();
+        assert!(c.contains(r#""host":"""#) && !c.contains(&host), "{}: the hostname must not be posted: {}", name, c);
+        assert!(c.contains(r#""ends":["old"]"#) && c.contains("`alice` finished"), "{}: {}", name, c);
+        assert!(!out.contains(&format!("on {}", host)), "{}", out);
+    }
+
+    // A name somebody chose for the purpose is a label, not a hostname, and is used as written.
+    let rig = Rig::new("team-public-named", "[team]\nenabled = true\nhost = \"runner-a\"", "");
+    fs::write(rig.root.join("gh/visibility"), "public").unwrap();
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(rig.comments("issues_7")[0].contains(r#""host":"runner-a""#));
+
+    // And the release comment a person posts follows the same rule.
+    let rig = Rig::new("team-public-release", TEAM, "");
+    fs::write(rig.root.join("gh/visibility"), "public").unwrap();
+    rig.labelled(7, "agent:working");
+    rig.seed_claim("issues_7", 50, "bob", claim("b1", "bob", "", 1), 7200);
+    let (ok, out) = rig.run(&["team", "release", "o/r#7"], &[]);
+    assert!(ok, "{}", out);
+    assert!(!rig.comments("issues_7")[1].contains(&host), "{:?}", rig.comments("issues_7"));
 }
 
 #[test]
@@ -1245,7 +1294,7 @@ fn a_claim_that_expired_while_the_agent_ran_publishes_nothing() {
     assert_eq!(git(&rig.origin(), &["branch", "--list", "forkdeck/*"]), "");
 
     // Same, and meanwhile the issue was put back by hand and Bob's machine took it without a release.
-    let rig = Rig::new("team-expired-taken", "[team]\nenabled = true\nhost = \"rig\"\n[review]\nmax_fix_rounds = 0", "");
+    let rig = Rig::new("team-expired-taken", "[team]\nenabled = true\n[review]\nmax_fix_rounds = 0", "");
     rig.issue();
     let d = rig.comment_dir("issues_7");
     rig.seed_claim("staging", 150, "bob", claim("b1", "bob", "bobs-box", 1), 30);
@@ -1261,7 +1310,7 @@ fn a_claim_that_expired_while_the_agent_ran_publishes_nothing() {
 
 #[test]
 fn a_job_that_fails_after_it_was_released_leaves_the_labels_to_the_new_holder() {
-    let rig = Rig::new("team-fail-released", "[team]\nenabled = true\nhost = \"rig\"\n[review]\nmax_fix_rounds = 0", "");
+    let rig = Rig::new("team-fail-released", "[team]\nenabled = true\n[review]\nmax_fix_rounds = 0", "");
     rig.issue();
     rig.labelled(7, "agent:working");
     let release = format!("echo change >> by_agent.txt; FAKE_LOGIN=bob {} team release o/r#7 --force > {}/release.out 2>&1", env!("CARGO_BIN_EXE_forkdeck"), rig.root.display());

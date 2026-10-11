@@ -35,7 +35,11 @@ pub struct Marker {
     /// Names this claim, so a later comment can end it.
     pub id: String,
     pub by: String,
+    /// Shown to people. Empty on public repositories unless a name was configured.
     pub host: String,
+    /// A random id this machine made up for itself. It says nothing about the machine; it only
+    /// lets a later run on the same machine recognise a claim an earlier run left behind.
+    pub machine: String,
     pub pid: u32,
     pub agent: String,
     /// active, done, failed, cancelled, yielded or released.
@@ -90,6 +94,7 @@ fn clean(mut m: Marker) -> Marker {
     m.id = plain(&m.id, 40);
     m.by = plain(&m.by, 60);
     m.host = plain(&m.host, 60);
+    m.machine = plain(&m.machine, 40);
     m.agent = plain(&m.agent, 30);
     m.state = plain(&m.state, 20);
     m.stage = plain(&m.stage, 40);
@@ -395,10 +400,72 @@ pub async fn me(hub: &Hub, provider: Provider) -> Result<String, String> {
     Ok(name)
 }
 
-pub fn host(hub: &Hub) -> String {
+/// Can anyone on the internet read this repository? Asked once per repository. When the forge
+/// does not answer, the repository is treated as public: the cautious side for what gets posted.
+pub async fn is_public(hub: &Hub, r: &RepoCfg) -> bool {
+    let key = format!("{}:{}", tool(r), r.repo);
+    if let Some(p) = hub.team_public.lock().unwrap().get(&key) {
+        return *p;
+    }
+    let seen = match r.provider {
+        Provider::Github => issues::sh("gh", &["api", &format!("repos/{}", r.repo), "--jq", ".visibility"], None).await,
+        Provider::Gitlab => issues::sh("glab", &["api", &gitlab_project(r)], dir(r))
+            .await
+            .map(|o| serde_json::from_str::<Value>(&o).ok().and_then(|v| v.get("visibility").and_then(|x| x.as_str()).map(String::from)).unwrap_or_default()),
+    };
+    match seen {
+        Ok(v) if matches!(v.trim(), "private" | "internal") => {
+            hub.team_public.lock().unwrap().insert(key, false);
+            false
+        }
+        Ok(v) if v.trim() == "public" => {
+            hub.team_public.lock().unwrap().insert(key, true);
+            true
+        }
+        // Not cached: ask again next time rather than deciding for good on one bad answer.
+        _ => true,
+    }
+}
+
+/// The machine name teammates see on this repository. A hostname is never posted where anyone can
+/// read it; a name set in the config is a label somebody chose, and is used as given.
+pub async fn shown_host(hub: &Hub, r: &RepoCfg) -> String {
     if let Some(h) = &hub.cfg.team.host {
         return plain(h, 60);
     }
+    if is_public(hub, r).await {
+        return String::new();
+    }
+    hostname()
+}
+
+/// This machine's made-up id, created on first use and kept with forkdeck's other state.
+pub fn machine_id() -> String {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let path = crate::cicd::state_dir().join("machine-id");
+        let ok = |s: &str| s.len() >= 8 && s.len() <= 40 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if ok(s.trim()) {
+                return s.trim().to_string();
+            }
+        }
+        let mut raw = [0u8; 8];
+        let random = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut raw)).is_ok();
+        if !random {
+            // Nothing random to be had: an id that only lasts for this run, so nothing is ever matched by mistake.
+            return String::new();
+        }
+        let id: String = raw.iter().map(|b| format!("{:02x}", b)).collect();
+        let _ = std::fs::create_dir_all(crate::cicd::state_dir());
+        // If it cannot be kept, a later run will not recognise this one's claims and waits for them to go stale.
+        let _ = std::fs::write(&path, &id);
+        id
+    })
+    .clone()
+}
+
+fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: the buffer is ours and its length is passed along.
     let ok = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0;
@@ -479,7 +546,8 @@ pub fn on(hub: &Hub) -> bool {
 /// The caller moves the label next and then calls `confirm`.
 pub async fn claim(hub: &Hub, r: &RepoCfg, target: Target, what: &'static str) -> Result<Claimed, String> {
     let by = me(hub, r.provider).await.map_err(|e| format!("team: {}", e))?;
-    let host = host(hub);
+    let host = shown_host(hub, r).await;
+    let machine = machine_id();
     let seen = read_claims(&comments_surely(r, &target).await.map_err(|e| format!("team: {}", e))?);
     let t = now();
     let stale = (hub.cfg.team.stale_mins * 60) as i64;
@@ -489,14 +557,14 @@ pub async fn claim(hub: &Hub, r: &RepoCfg, target: Target, what: &'static str) -
     let mut ends: Vec<String> = seen.iter().filter(|s| s.m.state == "active" && !gone.contains(&s.m.id) && t - s.beat > stale).map(|s| s.m.id.clone()).collect();
     for s in live(&seen, t, stale) {
         // A claim this account left on this machine belongs to a run that has gone, unless that process is still there.
-        // Without a machine name there is no telling this machine's claims from the account's other machines'.
-        let mine = !host.is_empty() && s.m.by.eq_ignore_ascii_case(&by) && s.m.host == host && !(alive(s.m.pid) && s.m.pid != std::process::id());
+        // The machine is recognised by its made-up id, never by a name: names are not posted everywhere.
+        let mine = !machine.is_empty() && s.m.machine == machine && s.m.by.eq_ignore_ascii_case(&by) && !(alive(s.m.pid) && s.m.pid != std::process::id());
         if !mine {
             return Ok(Claimed::Taken(describe(s, t)));
         }
         ends.push(s.m.id.clone());
     }
-    let m = Marker { v: 1, id: new_id(), by, host, pid: std::process::id(), state: "active".into(), stage: "starting".into(), started: t, beat: t, ends, ..Marker::default() };
+    let m = Marker { v: 1, id: new_id(), by, host, machine, pid: std::process::id(), state: "active".into(), stage: "starting".into(), started: t, beat: t, ends, ..Marker::default() };
     let comment = post(r, &target, &render(&m, what)).await.map_err(|e| format!("team: {}", e))?;
     Ok(Claimed::Ours(Arc::new(Held { repo: r.clone(), target, what, comment, marker: std::sync::Mutex::new(m), closed: tokio::sync::Mutex::new(false) })))
 }
@@ -667,7 +735,7 @@ pub async fn announce(hub: &Hub, id: u32) {
         if let Some(other) = live(&seen, t, (hub.cfg.team.stale_mins * 60) as i64).into_iter().find(|s| !s.m.by.eq_ignore_ascii_case(&by)) {
             hub.log("team", format!("{} {}: {}", r.repo, clip(&sha, 12), describe(other, t)));
         }
-        let m = Marker { v: 1, id: new_id(), by, host: host(hub), pid: std::process::id(), state: "active".into(), stage: "deploying".into(), started: t, beat: t, ..Marker::default() };
+        let m = Marker { v: 1, id: new_id(), by, host: shown_host(hub, &r).await, machine: machine_id(), pid: std::process::id(), state: "active".into(), stage: "deploying".into(), started: t, beat: t, ..Marker::default() };
         let comment = post(&r, &target, &render(&m, "deployment")).await?;
         Ok::<_, String>(Arc::new(Held { repo: r.clone(), target: target.clone(), what: "deployment", comment, marker: std::sync::Mutex::new(m), closed: tokio::sync::Mutex::new(false) }))
     };
@@ -1060,7 +1128,7 @@ pub async fn release(hub: &Hub, what: &str, force: bool, unclaimed: bool) -> Res
     let said = if open.is_empty() {
         "no forkdeck claim was open on it".to_string()
     } else {
-        let m = Marker { v: 1, id: new_id(), by: by.clone(), host: host(hub), state: "released".into(), started: t, beat: t, ends: open.iter().map(|s| s.m.id.clone()).collect(), ..Marker::default() };
+        let m = Marker { v: 1, id: new_id(), by: by.clone(), host: shown_host(hub, r).await, state: "released".into(), started: t, beat: t, ends: open.iter().map(|s| s.m.id.clone()).collect(), ..Marker::default() };
         post(r, &target, &render(&m, "")).await?;
         let names: Vec<String> = open.iter().map(|s| s.m.by.clone()).collect();
         format!("ended the claim of {}", names.join(", "))

@@ -255,7 +255,8 @@ pub struct TeamCfg {
     pub heartbeat_secs: u64,
     /// How often the team pane re-reads the forge.
     pub refresh_secs: u64,
-    /// Machine name shown to teammates. Defaults to the hostname; set "" to show none.
+    /// Machine name shown to teammates. Defaults to the hostname on private repositories and to
+    /// nothing on public ones. A name set here is used everywhere; "" shows none anywhere.
     pub host: Option<String>,
     /// Assign a claimed issue to the logged-in account.
     pub assign: bool,
