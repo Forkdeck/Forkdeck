@@ -191,6 +191,11 @@ pub struct ReviewCfg {
     pub check_timeout_mins: u64,
     /// Which CLIs review a labelled pull request. Each one reviews independently.
     pub pr_reviewers: Vec<AgentKind>,
+    /// How often a pull request review that produced no result (a reviewer did not finish, the
+    /// head moved, the review could not run) is retried automatically.
+    pub max_retries: u32,
+    /// Wait before the first such retry; it triples for each later one.
+    pub retry_secs: u64,
 }
 
 impl Default for ReviewCfg {
@@ -202,6 +207,8 @@ impl Default for ReviewCfg {
             checks: vec![],
             check_timeout_mins: 20,
             pr_reviewers: vec![AgentKind::Claude, AgentKind::Codex],
+            max_retries: 3,
+            retry_secs: 120,
         }
     }
 }

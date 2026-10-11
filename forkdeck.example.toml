@@ -67,6 +67,12 @@ checks = []
 check_timeout_mins = 20
 # Every CLI listed here reviews a labelled pull request independently.
 pr_reviewers = ["claude", "codex"]
+# A pull request review that produced no result (a reviewer did not finish, the
+# head moved while it was being reviewed, the review could not run) is retried
+# this many times, waiting retry_secs before the first retry and three times
+# longer before each later one. After that, remove and re-apply the label.
+max_retries = 3
+retry_secs = 120
 
 [automation]
 enabled = false        # toggle at runtime with Ctrl-A

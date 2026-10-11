@@ -47,6 +47,8 @@ enum Cmd {
     },
     /// Show what the fork layer would decide for a task
     Route { task: Vec<String> },
+    /// Poll the configured repositories once, work through what is labelled, and exit
+    Once,
     /// Check the CLIs, the decision endpoint and the configured repositories
     Doctor,
     /// Write a commented config file
@@ -142,6 +144,12 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&r.decision)?);
             Ok(())
         }
+        Some(Cmd::Once) => {
+            anyhow::ensure!(!hub.cfg.repos.is_empty(), "no [[repos]] configured, nothing to poll");
+            rt.block_on(hub.detect_agents());
+            let code = rt.block_on(once(&hub));
+            std::process::exit(code);
+        }
         Some(Cmd::Doctor) => {
             let ok = rt.block_on(doctor(&hub, cfg_path));
             std::process::exit(if ok { 0 } else { 1 });
@@ -196,30 +204,62 @@ async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentKin
         stop_signal().await;
         h.cancel(id);
     });
-    let (mut seen_log, mut seen_w, mut seen_r) = (0usize, 0usize, 0usize);
     loop {
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let mut st = hub.state.lock().unwrap();
-        // Bounded buffers drop old lines; counting what was drained keeps the cursor right.
-        let drained: Vec<_> = st.log.drain(..).collect();
-        for l in &drained {
-            say!("{} {:<7} {}", l.time, l.who, l.msg);
+        print_progress(hub);
+        let st = hub.state.lock().unwrap();
+        let Some(j) = st.jobs.iter().find(|j| j.id == id) else { return 1 };
+        if j.status.finished() {
+            let code = if j.status == JobStatus::Done { 0 } else { 1 };
+            drop(st);
+            print_progress(hub);
+            return code;
         }
-        seen_log += drained.len();
-        let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return 1 };
+    }
+}
+
+/// Print and drain what has happened since the last call. Only for the modes without an interface.
+fn print_progress(hub: &Hub) {
+    let mut st = hub.state.lock().unwrap();
+    let lines: Vec<_> = st.log.drain(..).collect();
+    for l in &lines {
+        say!("{} {:<7} {}", l.time, l.who, l.msg);
+    }
+    for j in st.jobs.iter_mut() {
+        let id = j.id;
         for l in j.worker.tail.drain(..) {
-            say!("         worker  {}", l);
-            seen_w += 1;
+            say!("         #{:<3} worker  {}", id, l);
         }
         for l in j.reviewer.tail.drain(..) {
-            say!("         review  {}", l);
-            seen_r += 1;
+            say!("         #{:<3} review  {}", id, l);
         }
-        if j.status.finished() {
-            let _ = (seen_log, seen_w, seen_r);
-            let _ = std::io::stdout().flush();
-            return if j.status == JobStatus::Done { 0 } else { 1 };
+    }
+    let _ = std::io::stdout().flush();
+}
+
+/// One pass over the repositories, for cron and for tests: take what is labelled now, finish it, exit.
+/// Exits 1 if any job failed.
+async fn once(hub: &Hub) -> i32 {
+    let h = hub.clone();
+    tokio::spawn(async move {
+        stop_signal().await;
+        h.shutdown(Duration::from_secs(45)).await;
+    });
+    issues::poll_once(hub).await;
+    loop {
+        print_progress(hub);
+        let (open, failed) = {
+            let st = hub.state.lock().unwrap();
+            (
+                st.jobs.iter().filter(|j| !j.status.finished()).count(),
+                st.jobs.iter().filter(|j| matches!(j.status, JobStatus::Failed | JobStatus::Cancelled)).count(),
+            )
+        };
+        if open == 0 {
+            print_progress(hub);
+            return if failed == 0 { 0 } else { 1 };
         }
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 

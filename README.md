@@ -27,6 +27,7 @@ forkdeck --demo      # simulated agents, nothing is executed
 forkdeck doctor      # what is installed and reachable
 forkdeck init        # writes ~/.config/forkdeck/config.toml, fully commented
 forkdeck             # the interface
+forkdeck once        # poll once, work through what is labelled, exit
 ```
 
 The config is read from `~/.config/forkdeck/config.toml` or the file given with
@@ -96,14 +97,16 @@ label, `agent:ready` by default. For each one it:
 1. swaps the label to `agent:working`,
 2. creates a git worktree on `forkdeck/issue-N` from the base branch,
 3. runs the job as above,
-4. commits what the agent changed with your git identity, pushes the branch,
-   and opens a draft pull request that closes the issue, with the check and
-   review results in the body,
+4. commits what the agent changed as a single commit with your git identity,
+   pushes the branch, and opens a draft pull request that closes the issue,
+   with the check and review results in the body,
 5. comments on the issue and moves the label to `agent:pr-open`.
 
 If the checks or the review fail, nothing is pushed. The attempt is committed
 on the local branch, and the issue gets a comment saying why and the label
-`agent:needs-human`. Set `automation.publish_on_failed_review = true` to open
+`agent:needs-human`. Labelling the issue again starts over from the base
+branch; whatever the earlier attempt left, committed or not, is first moved to
+a local branch named `forkdeck/attempts/issue-N-<commit>` so it is never lost. Set `automation.publish_on_failed_review = true` to open
 the draft anyway.
 
 It never force-pushes. If `forkdeck/issue-N` already exists on the remote from
@@ -111,11 +114,16 @@ an earlier attempt, no work is done: the issue gets a comment saying so and
 `agent:needs-human`. Delete the branch and close its pull request before
 labelling the issue again.
 
-The agent's changes are staged before the checks run, and anything the checks
-create or rewrite is removed again afterwards (ignored files such as build
-output are left alone). So check leftovers are never committed, and the tree
-the reviewer reads is the tree that gets pushed. It also means a check cannot
-be used to modify the change: a formatter run as a check has no effect.
+What gets committed is exactly what was checked and reviewed:
+
+- When the agent finishes, its work is taken as one snapshot. Commits the agent
+  made by itself are folded into that snapshot, so the reviewer, who is shown
+  everything since the commit the work started from, cannot miss them.
+- After the checks, the index and the working tree are put back to the
+  snapshot. Files a check creates, rewrites or stages are gone again (ignored
+  files such as build output are left alone), so a formatter run as a check has
+  no effect. A check that commits or switches branch stops the job.
+- The commit is refused if the index no longer matches the snapshot.
 
 The labels have to exist in the repository first.
 
@@ -125,9 +133,22 @@ Label any open pull or merge request `review:ready`. forkdeck checks out its
 head in a detached worktree and has every CLI in `review.pr_reviewers` review
 it independently and in parallel. The findings go up as one comment with a
 section per reviewer, naming the commit that was reviewed, and the label moves
-to `review:passed` or `review:changes`. If a reviewer did not finish and nobody
-asked for changes, the comment says the review is incomplete and the request
-label goes back.
+to `review:passed` or `review:changes`.
+
+A review takes minutes, and the author can push in the meantime. Before posting,
+forkdeck looks up the pull request's head again. If it is no longer the commit
+that was reviewed, the result is discarded, a "stale" comment says so, and the
+new head is reviewed on the next poll. It looks once more after the label is
+on and takes `review:passed` off again if the head moved in that moment. A
+push after that cannot be caught, so **the label alone is not an authorisation**:
+anything that acts on it should compare the head with the commit named in the
+comment.
+
+If a reviewer did not finish and nobody asked for changes, the comment says the
+review is incomplete and the request label goes back. forkdeck retries by itself
+`review.max_retries` times (3), waiting `review.retry_secs` (120) before the
+first retry and three times longer before each later one. To retry by hand at
+any point, remove the label and apply it again.
 
 It never approves and never merges. The comment is advice for whoever does.
 
@@ -184,9 +205,10 @@ back by hand.
 Typed tasks share the current directory, so they run one at a time. Issue and
 review jobs each have a worktree and run `automation.max_parallel` at once.
 
-`forkdeck run "task"` does one job without the interface and exits non-zero if
-it fails, which is enough for a script or a cron entry. On SIGTERM or SIGINT it
-stops the agent before exiting.
+`forkdeck run "task"` does one job without the interface, and `forkdeck once`
+does one pass over the configured repositories. Both exit non-zero if a job
+fails and stop their agents on SIGTERM or SIGINT, which is enough for a script
+or a cron entry.
 
 ## Status
 

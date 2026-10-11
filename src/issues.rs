@@ -63,6 +63,17 @@ pub struct Report<'a> {
     pub sha: &'a str,
     /// Agent instruction files the pull request changes; they may have steered the reviewers.
     pub steering: &'a [String],
+    /// For an incomplete review: what happens next. Empty otherwise.
+    pub next: &'a str,
+}
+
+/// What the comment says about a retry.
+pub fn next_words(delay: Option<Duration>) -> String {
+    match delay {
+        Some(d) if d.is_zero() => "forkdeck will review the new head on its next poll.".to_string(),
+        Some(d) => format!("forkdeck will try again in about {} min.", d.as_secs().div_ceil(60)),
+        None => "No automatic retries are left. Remove the request label and apply it again to start a new review.".to_string(),
+    }
 }
 
 /// GitHub rejects bodies over 65,536 characters.
@@ -218,10 +229,27 @@ pub async fn poll_loop(hub: Hub) {
     loop {
         let on = hub.state.lock().unwrap().automation;
         if on {
+            poll_once(&hub).await;
+        }
+        let wait = if hub.cfg.demo { 4 } else { hub.cfg.automation.poll_secs.max(15) };
+        // Wake early when automation is switched on so the first poll is immediate.
+        for _ in 0..wait * 2 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if !on && hub.state.lock().unwrap().automation {
+                break;
+            }
+        }
+    }
+}
+
+/// Look at every configured repository once and start a job for each labelled item that is due.
+pub async fn poll_once(hub: &Hub) {
+    {
+        {
             for (idx, r) in hub.cfg.repos.iter().enumerate() {
                 for pr in [false, true] {
                     let found = if hub.cfg.demo {
-                        Ok(demo_items(&hub, idx, pr))
+                        Ok(demo_items(hub, idx, pr))
                     } else if pr {
                         list_prs(r).await
                     } else {
@@ -243,12 +271,17 @@ pub async fn poll_loop(hub: Hub) {
                                     st.repos[idx].last_error = None;
                                 }
                                 let mut fresh = Vec::new();
+                                let listed: Vec<u64> = list.iter().map(|i| i.number).collect();
+                                // Removing the label and applying it again is how a person asks for another go.
+                                st.forget_unlisted(idx, pr, &listed);
+                                let now = Instant::now();
                                 for i in list {
-                                    if !st.seen.insert((idx, pr, i.number)) {
+                                    if !st.should_take((idx, pr, i.number), now) {
                                         continue;
                                     }
                                     if !r.allowed_authors.is_empty() && !r.allowed_authors.iter().any(|a| a.eq_ignore_ascii_case(&i.author)) {
                                         st.log("issues", format!("{}#{} skipped: author {} is not in allowed_authors", r.repo, i.number, i.author));
+                                        st.give_up((idx, pr, i.number), now);
                                         continue;
                                     }
                                     st.repos[idx].picked += 1;
@@ -278,14 +311,6 @@ pub async fn poll_loop(hub: Hub) {
                         }
                     }
                 }
-            }
-        }
-        let wait = if hub.cfg.demo { 4 } else { hub.cfg.automation.poll_secs.max(15) };
-        // Wake early when automation is switched on so the first poll is immediate.
-        for _ in 0..wait * 2 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if !on && hub.state.lock().unwrap().automation {
-                break;
             }
         }
     }
@@ -351,42 +376,139 @@ pub async fn prepare(hub: &Hub, id: u32) -> Result<(), String> {
     }
     sh("git", &["fetch", "origin", &format!("+refs/heads/{b}:refs/remotes/origin/{b}", b = r.base)], Some(repo)).await?;
     let dir_s = dir.to_string_lossy().to_string();
+    // `worktree add -B` below resets the branch to the base. An earlier attempt saved on it must survive that.
+    if let Some(kept) = keep_earlier_attempt(repo, &dir, &branch, &r.base, n).await? {
+        hub.log("issues", format!("{}#{} earlier attempt kept on local branch {}", r.repo, n, kept));
+    }
     fresh_worktree(repo, &dir, &["-B", &branch, &dir_s, &format!("origin/{}", r.base)]).await?;
-    hub.job(id, |j| j.workdir = dir.clone());
+    let base_sha = sh("git", &["rev-parse", "--verify", "HEAD^{commit}"], Some(&dir)).await?;
+    hub.job(id, |j| {
+        j.workdir = dir.clone();
+        j.base_sha = Some(base_sha.clone());
+    });
     hub.log("issues", format!("{}#{} claimed, working on {}", r.repo, n, branch));
     Ok(())
 }
 
-/// Stage everything the agent changed. Called before the checks run, so their leftovers stay out of the commit.
+/// Before an issue branch is reset for a new attempt, move whatever the last attempt left onto a
+/// branch of its own: `forkdeck/attempts/issue-N-<sha>`. That covers the commit a failed attempt
+/// was saved as, and work still uncommitted in the old worktree (a crash, a cancel, a failed agent).
+/// Returns the name of the branch it was kept on, if there was anything to keep.
+async fn keep_earlier_attempt(repo: &Path, dir: &Path, branch: &str, base: &str, n: u64) -> Result<Option<String>, String> {
+    let full = format!("refs/heads/{}", branch);
+    if sh("git", &["rev-parse", "--verify", "--quiet", &full], Some(repo)).await.is_err() {
+        return Ok(None);
+    }
+    // Uncommitted work in the old worktree, if that worktree is still on this branch.
+    if dir.join(".git").exists() {
+        let on = sh("git", &["symbolic-ref", "--quiet", "HEAD"], Some(dir)).await.unwrap_or_default();
+        if on.trim() == full && !sh("git", &["status", "--porcelain"], Some(dir)).await.unwrap_or_default().is_empty() {
+            sh("git", &["add", "-A"], Some(dir)).await?;
+            sh("git", &["commit", "-m", &format!("Unfinished attempt at #{}", n)], Some(dir)).await?;
+        }
+    }
+    let ahead = sh("git", &["rev-list", "--count", &format!("origin/{}..{}", base, full)], Some(repo)).await?;
+    if ahead.trim().parse::<u64>().unwrap_or(0) == 0 {
+        return Ok(None);
+    }
+    let sha = sh("git", &["rev-parse", "--verify", &format!("{}^{{commit}}", full)], Some(repo)).await?;
+    let kept = format!("forkdeck/attempts/issue-{}-{}", n, &sha[..sha.len().min(10)]);
+    // Named after the commit, so keeping the same attempt twice is harmless.
+    sh("git", &["branch", "--force", &kept, &sha], Some(repo)).await?;
+    Ok(Some(kept))
+}
+
+/// Where the job's worktree is and what it has to look like.
+struct Tree {
+    dir: PathBuf,
+    branch: String,
+    base: String,
+    staged: Option<String>,
+}
+
+fn tree_of(hub: &Hub, id: u32) -> Result<Tree, String> {
+    hub.job(id, |j| {
+        Some(Tree { dir: j.workdir.clone(), branch: j.branch.clone()?, base: j.base_sha.clone()?, staged: j.staged_tree.clone() })
+    })
+    .flatten()
+    .ok_or_else(|| "the job has no prepared worktree".to_string())
+}
+
+/// The worktree must still be on the issue branch.
+async fn on_branch(t: &Tree) -> Result<(), String> {
+    let at = sh("git", &["symbolic-ref", "--quiet", "HEAD"], Some(&t.dir)).await.unwrap_or_default();
+    if at.trim() == format!("refs/heads/{}", t.branch) {
+        Ok(())
+    } else {
+        Err(format!("the worktree is no longer on {} (now {:?})", t.branch, at.trim()))
+    }
+}
+
+/// Take a snapshot of everything the agent did since the base commit, as one staged tree.
+///
+/// Commits the agent made by itself are folded back into the index first (`reset --soft` to the
+/// base), so there is exactly one place the work lives: `git diff <base>` shows all of it to the
+/// reviewer, and nothing can reach the remote in a commit the reviewer never looked at.
 pub async fn stage(hub: &Hub, id: u32) -> Result<(), String> {
     if hub.cfg.demo {
         return Ok(());
     }
-    let dir = hub.job(id, |j| j.workdir.clone()).ok_or("job vanished")?;
-    sh("git", &["add", "-A"], Some(&dir)).await.map(|_| ())
+    let t = tree_of(hub, id)?;
+    let d = Some(t.dir.as_path());
+    on_branch(&t).await?;
+    if sh("git", &["rev-parse", "HEAD"], d).await? != t.base {
+        sh("git", &["reset", "--soft", &t.base], d).await?;
+    }
+    sh("git", &["add", "-A"], d).await?;
+    let tree = sh("git", &["write-tree"], d).await?;
+    hub.job(id, |j| j.staged_tree = Some(tree.clone()));
+    Ok(())
 }
 
-/// Throw away everything that is not staged: files the checks created or rewrote. The agent's
-/// work is in the index, so nothing of it is lost, and ignored files (build output) are left alone.
-pub async fn drop_unstaged(hub: &Hub, id: u32) -> Result<(), String> {
+/// Put the index and the working tree back to the snapshot taken by `stage`. Called after the
+/// checks: whatever they created, rewrote or staged is gone again, so the tree that is reviewed
+/// and committed is the tree the checks were run on. A check that moved HEAD is an error.
+pub async fn restore_snapshot(hub: &Hub, id: u32) -> Result<(), String> {
     if hub.cfg.demo {
         return Ok(());
     }
-    let dir = hub.job(id, |j| j.workdir.clone()).ok_or("job vanished")?;
-    sh("git", &["checkout-index", "--all", "--force"], Some(&dir)).await?;
-    sh("git", &["clean", "-fd", "--quiet"], Some(&dir)).await.map(|_| ())
+    let t = tree_of(hub, id)?;
+    let d = Some(t.dir.as_path());
+    let tree = t.staged.clone().ok_or("nothing was staged")?;
+    on_branch(&t).await.map_err(|e| format!("a check command switched branches: {}", e))?;
+    let head = sh("git", &["rev-parse", "HEAD"], d).await?;
+    if head != t.base {
+        return Err(format!("a check command moved HEAD from {} to {}", &t.base[..t.base.len().min(10)], &head[..head.len().min(10)]));
+    }
+    sh("git", &["read-tree", &tree], d).await?;
+    sh("git", &["checkout-index", "--all", "--force"], d).await?;
+    // Untracked now means "not in the snapshot". Ignored files (build output) are left alone.
+    sh("git", &["clean", "-fd", "--quiet"], d).await.map(|_| ())
 }
 
-/// Commit what is staged. Returns whether the branch now has commits the base does not.
-async fn commit_staged(r: &RepoCfg, dir: &Path, msg: &str) -> Result<bool, String> {
-    let d = Some(dir);
-    // `diff --cached --quiet` exits 1 when something is staged.
-    if sh("git", &["diff", "--cached", "--quiet"], d).await.is_err() {
-        sh("git", &["commit", "-m", msg], d).await?;
+/// Commit the snapshot and nothing else. Returns false when the agent changed nothing.
+async fn commit_snapshot(t: &Tree, msg: &str) -> Result<bool, String> {
+    let d = Some(t.dir.as_path());
+    let tree = t.staged.clone().ok_or("nothing was staged")?;
+    on_branch(t).await?;
+    if sh("git", &["rev-parse", "HEAD"], d).await? != t.base {
+        return Err("HEAD moved since the work was staged; refusing to commit".into());
     }
-    // Also true when the agent committed by itself despite being told not to.
-    let ahead = sh("git", &["rev-list", "--count", &format!("origin/{}..HEAD", r.base)], d).await?;
-    Ok(ahead.trim().parse::<u64>().unwrap_or(0) > 0)
+    // The index must still be exactly what was reviewed.
+    let index = sh("git", &["write-tree"], d).await?;
+    if index != tree {
+        return Err("the index changed after the work was reviewed; refusing to commit".into());
+    }
+    if tree == sh("git", &["rev-parse", "HEAD^{tree}"], d).await? {
+        return Ok(false);
+    }
+    sh("git", &["commit", "-m", msg], d).await?;
+    // And the commit must carry that tree: a commit hook could have altered it.
+    let committed = sh("git", &["rev-parse", "HEAD^{tree}"], d).await?;
+    if committed != tree {
+        return Err("the commit does not match the reviewed tree (a commit hook changed it?)".into());
+    }
+    Ok(true)
 }
 
 fn commit_message(title: &str, n: u64) -> String {
@@ -397,11 +519,12 @@ fn commit_message(title: &str, n: u64) -> String {
 /// Keep an attempt that will not be published: commit it on the local branch. Returns the branch name if there was anything.
 pub async fn commit_local(hub: &Hub, id: u32) -> Result<Option<String>, String> {
     let (r, n, title) = issue_of(hub, id).ok_or("not an issue job")?;
-    let (dir, branch) = hub.job(id, |j| (j.workdir.clone(), j.branch.clone().unwrap_or_default())).ok_or("job vanished")?;
+    let _ = &r;
     if hub.cfg.demo {
-        return Ok(Some(branch));
+        return Ok(hub.job(id, |j| j.branch.clone()).flatten());
     }
-    Ok(commit_staged(&r, &dir, &commit_message(&title, n)).await?.then_some(branch))
+    let t = tree_of(hub, id)?;
+    Ok(commit_snapshot(&t, &commit_message(&title, n)).await?.then_some(t.branch))
 }
 
 fn first_url(s: &str) -> Option<String> {
@@ -430,7 +553,7 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
     }
     let d = Some(dir.as_path());
     let msg = commit_message(&title, n);
-    if !commit_staged(&r, &dir, &msg).await? {
+    if !commit_snapshot(&tree_of(hub, id)?, &msg).await? {
         return Err("the agent finished without changing any file".into());
     }
     // No --force: prepare() refused to start if this branch already existed on the remote.
@@ -505,11 +628,7 @@ pub async fn pr_prepare(hub: &Hub, id: u32) -> Result<String, String> {
     let lock = repo_index(hub, id).and_then(|i| hub.git_locks.get(i).cloned()).ok_or("no repository for this job")?;
     let _held = lock.lock().await;
     let repo = r.path.as_path();
-    // GitHub exposes every pull request, forks included, under refs/pull/N/head; GitLab under refs/merge-requests/N/head.
-    let pr_ref = match r.provider {
-        Provider::Github => format!("refs/pull/{}/head", n),
-        Provider::Gitlab => format!("refs/merge-requests/{}/head", n),
-    };
+    let pr_ref = pr_ref(&r, n);
     // Fetch into a ref of our own. FETCH_HEAD is shared by every fetch in this clone and would
     // hand one job another job's commit.
     let local = format!("refs/forkdeck/pr-{}", n);
@@ -522,6 +641,64 @@ pub async fn pr_prepare(hub: &Hub, id: u32) -> Result<String, String> {
     hub.job(id, |j| j.workdir = dir.clone());
     hub.log("issues", format!("{}!{} claimed for review at {}", r.repo, n, &sha[..sha.len().min(10)]));
     Ok(sha)
+}
+
+fn pr_ref(r: &RepoCfg, n: u64) -> String {
+    // GitHub exposes every pull request, forks included, under refs/pull/N/head; GitLab under refs/merge-requests/N/head.
+    match r.provider {
+        Provider::Github => format!("refs/pull/{}/head", n),
+        Provider::Gitlab => format!("refs/merge-requests/{}/head", n),
+    }
+}
+
+/// The commit the pull request points at on the remote right now.
+pub async fn pr_head(hub: &Hub, id: u32) -> Result<String, String> {
+    let (r, n, _, _) = pr_of(hub, id).ok_or("not a pull request job")?;
+    if hub.cfg.demo {
+        return Ok("0000000".into());
+    }
+    let out = sh("git", &["ls-remote", "origin", &pr_ref(&r, n)], Some(&r.path)).await?;
+    let sha = out.split_whitespace().next().unwrap_or("");
+    if sha.len() >= 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(sha.to_string())
+    } else {
+        Err(format!("the remote has no {} (was the pull request closed?)", pr_ref(&r, n)))
+    }
+}
+
+/// The head moved while the review ran: say so, post no verdict, and put the request label back.
+pub async fn pr_stale(hub: &Hub, id: u32, reviewed: &str, head: &str, next: &str) -> Result<(), String> {
+    let (r, n, _, _) = pr_of(hub, id).ok_or("not a pull request job")?;
+    if hub.cfg.demo {
+        return Ok(());
+    }
+    let text = format!(
+        "### forkdeck review: stale\n\nThe review ran on `{}`, but the head is now `{}`. The result was discarded because it does not describe the current code. {}",
+        &reviewed[..reviewed.len().min(12)],
+        &head[..head.len().min(12)],
+        next
+    );
+    comment(&r, true, n, &text).await?;
+    relabel(&r, true, n, &r.pr_working_label, &r.pr_label).await
+}
+
+/// The head moved between the last check and the label going on: take the pass label off again.
+pub async fn pr_withdraw(hub: &Hub, id: u32, reviewed: &str, head: &str, next: &str) -> Result<(), String> {
+    let (r, n, _, _) = pr_of(hub, id).ok_or("not a pull request job")?;
+    if hub.cfg.demo {
+        return Ok(());
+    }
+    // Label first: that is the part something else may be acting on.
+    let moved = relabel(&r, true, n, &r.pr_pass_label, &r.pr_label).await;
+    let text = format!(
+        "### forkdeck review: pass withdrawn\n\nThe review above passed `{}`, but the head changed to `{}` as it was posted. The `{}` label has been removed. {}",
+        &reviewed[..reviewed.len().min(12)],
+        &head[..head.len().min(12)],
+        r.pr_pass_label,
+        next
+    );
+    comment(&r, true, n, &text).await?;
+    moved
 }
 
 /// Instruction files for the agents that the pull request adds or changes.
@@ -572,8 +749,16 @@ pub fn review_comment(rep: &Report, check_cmds: &[String]) -> String {
     for r in rep.reviews {
         out.push_str(&format!("#### {}: {}\n\n{}\n\n", r.by.name(), word(r.verdict), clip(&quiet(strip_verdict(&r.text).trim()), each)));
     }
-    const FOOT: &str = "\n\n---\nEach reviewer worked independently from the diff. This comment is advisory: nothing was approved or merged.";
-    format!("{}{}", clip(&out, BODY_LIMIT), FOOT)
+    let mut out = clip(&out, BODY_LIMIT);
+    if !rep.next.is_empty() {
+        out.push_str(&format!("\n\n{}", rep.next));
+    }
+    out.push_str(&format!(
+        "\n\n---\nEach reviewer worked independently from the diff. This comment is advisory: nothing was approved or merged, \
+         and the result applies to commit `{}` only. Compare that with the head before acting on the label.",
+        &rep.sha[..rep.sha.len().min(12)]
+    ));
+    out
 }
 
 /// Post the combined review as one comment and move the label.
@@ -672,7 +857,7 @@ mod tests {
             Review { by: AgentKind::Codex, verdict: Some(false), text: "src/a.rs:10 off by one\nVERDICT: FAIL".into() },
         ];
         let checks = (true, String::new());
-        let rep = Report { reviews: &reviews, checks: Some(&checks), overall: Overall::Changes, sha: "0123456789abcdef", steering: &[] };
+        let rep = Report { reviews: &reviews, checks: Some(&checks), overall: Overall::Changes, sha: "0123456789abcdef", steering: &[], next: "" };
         let c = review_comment(&rep, &["make test".to_string()]);
         assert!(c.starts_with("### forkdeck review: changes requested"));
         assert!(c.contains("Reviewed commit `0123456789ab`"));
@@ -689,11 +874,23 @@ mod tests {
         let checks = (false, "boom\n```\n# injected heading".to_string());
         let mut steering = vec!["CLAUDE.md".to_string()];
         steering.extend((0..5000).map(|i| format!(".claude/commands/{}.md", i)));
-        let rep = Report { reviews: &reviews, checks: Some(&checks), overall: Overall::Changes, sha: "abc", steering: &steering };
+        let rep = Report { reviews: &reviews, checks: Some(&checks), overall: Overall::Changes, sha: "abc", steering: &steering, next: "" };
         let c = review_comment(&rep, &[]);
         assert!(c.contains("Read these reviews with care") && c.contains("CLAUDE.md"));
         assert_eq!(c.matches("```").count(), 2, "the log cannot close its own fence");
         assert!(c.chars().count() < 65_536);
+    }
+
+    #[test]
+    fn incomplete_review_says_what_happens_next() {
+        let reviews = vec![Review { by: AgentKind::Claude, verdict: Some(true), text: "fine".into() }, Review { by: AgentKind::Codex, verdict: None, text: "The review did not complete: not logged in".into() }];
+        let next = next_words(Some(Duration::from_secs(120)));
+        let rep = Report { reviews: &reviews, checks: None, overall: Overall::Incomplete, sha: "abcdef0123456789", steering: &[], next: &next };
+        let c = review_comment(&rep, &[]);
+        assert!(c.starts_with("### forkdeck review: incomplete"));
+        assert!(c.contains("try again in about 2 min") && c.contains("applies to commit `abcdef012345` only"));
+        assert!(next_words(None).contains("Remove the request label"));
+        assert!(next_words(Some(Duration::ZERO)).contains("next poll"));
     }
 
     #[test]
