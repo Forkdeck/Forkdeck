@@ -47,7 +47,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run one task without the interface and print progress
+    /// Run one task without the interface and print progress. Lines typed on stdin while it runs
+    /// are sent to the task; a line starting with "!" stops the agent to take it at once
     Run {
         /// Force an agent: claude, codex, copilot or copilot:<profile>
         #[arg(long)]
@@ -300,6 +301,22 @@ async fn stop_signal() {
 async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentRef>) -> i32 {
     let title = state::clip(&task, 80);
     let id = hub.submit(title, task, Source::Manual, cwd, forced);
+    // Lines typed while it runs go to the task: queued for the agent, or at once with a leading "!".
+    let h = hub.clone();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines() {
+            let Ok(line) = line else { break };
+            let text = line.trim();
+            let sent = match text.strip_prefix('!') {
+                Some(now) if !now.trim().is_empty() => h.steer_now(id, now.trim().to_string()),
+                _ if !text.is_empty() => h.reply(id, text.to_string()),
+                _ => continue,
+            };
+            if let Err(why) = sent {
+                h.log("queue", format!("#{} not sent: {}", id, why));
+            }
+        }
+    });
     wait_for(hub, &[id]).await
 }
 
@@ -744,6 +761,17 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                         }
                         KeyCode::Char('t') if ctrl => u.team = !u.team,
                         KeyCode::Char('n') if ctrl => u.new_task = !u.new_task,
+                        // Send what is typed to the selected task now, stopping its agent to take it.
+                        KeyCode::Char('s') if ctrl => {
+                            let text = u.input.trim().to_string();
+                            let target = ui::reply_target(&hub.state.lock().unwrap(), &u);
+                            if let (Some(id), false) = (target, text.is_empty()) {
+                                match hub.steer_now(id, text) {
+                                    Ok(()) => u.input.clear(),
+                                    Err(why) => hub.log("queue", format!("#{} not sent: {}", id, why)),
+                                }
+                            }
+                        }
                         KeyCode::Char('u') if ctrl => u.input.clear(),
                         KeyCode::Char(c) if !ctrl => u.input.push(c),
                         KeyCode::Backspace => {

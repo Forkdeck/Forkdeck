@@ -44,6 +44,8 @@ pub struct RunOut {
     pub session: Option<String>,
     /// How many tools the agent started.
     pub tools: u32,
+    /// Stopped because a message is to be taken at once, not because anything went wrong.
+    pub interrupted: bool,
 }
 
 pub struct CmdLine {
@@ -371,15 +373,19 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
         s.started = Some(start);
         s.last = "starting".into();
     });
-    let cancel = match hub.job(job, |j| j.cancel.clone()) {
-        Some(c) => c,
-        None => return RunOut { error: "job vanished".into(), ..Default::default() },
+    // A fresh steer for this run: one fired while nothing ran has already left its message in the inbox.
+    let Some((cancel, steer)) = hub.job(job, |j| {
+        j.steer = crate::state::Cancel::new();
+        (j.cancel.clone(), j.steer.clone())
+    }) else {
+        return RunOut { error: "job vanished".into(), ..Default::default() };
     };
 
     let out = if hub.cfg.demo {
         tokio::select! {
             o = crate::demo::run(hub, job, slot, &spec) => o,
             _ = cancel.wait() => RunOut { error: "cancelled".into(), ..Default::default() },
+            _ = steer.wait() => RunOut { error: "stopped to take a message".into(), interrupted: true, ..Default::default() },
         }
     } else {
         let limit = Duration::from_secs(hub.cfg.agents.timeout_mins.unwrap_or(45).clamp(1, 24 * 60) * 60);
@@ -387,6 +393,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
         tokio::select! {
             o = spawn_and_read(hub, job, slot, e.cli, &line, spec.prompt, spec.dir) => o,
             _ = cancel.wait() => RunOut { error: "cancelled".into(), ..Default::default() },
+            _ = steer.wait() => RunOut { error: "stopped to take a message".into(), interrupted: true, ..Default::default() },
             _ = tokio::time::sleep(limit) => RunOut { error: format!("timed out after {} min", limit.as_secs() / 60), ..Default::default() },
         }
     };
@@ -397,8 +404,10 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     }
     stage(&mut |s| {
         s.elapsed = Some(start.elapsed());
-        s.state = if out.ok { StageState::Ok } else { StageState::Failed };
-        if !out.ok && !out.error.is_empty() {
+        s.state = if out.ok || out.interrupted { StageState::Ok } else { StageState::Failed };
+        if out.interrupted {
+            s.push("› stopped to take a message");
+        } else if !out.ok && !out.error.is_empty() {
             s.push(format!("error: {}", out.error));
         }
     });
@@ -581,7 +590,7 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, kind: AgentKind, line: 
         };
     }
     let text = final_text.filter(|t| !t.is_empty()).unwrap_or(last_text);
-    RunOut { ok, text, error, rejected_model: rejected, no_models, models_used, session, tools: tools_seen }
+    RunOut { ok, text, error, rejected_model: rejected, no_models, models_used, session, tools: tools_seen, interrupted: false }
 }
 
 pub async fn on_path(cmd: &str) -> bool {

@@ -344,6 +344,10 @@ pub struct Job {
     pub session: Option<Session>,
     /// Set on an interrupted typed task that is to continue: the stage it had reached.
     pub resume_from: Option<JobStatus>,
+    /// Messages sent to a running typed task, for the agent once its current step ends.
+    pub inbox: VecDeque<String>,
+    /// Fired to stop the agent that is running now, so that it takes the first message at once.
+    pub steer: Arc<Cancel>,
 }
 
 impl Job {

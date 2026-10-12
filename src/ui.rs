@@ -135,7 +135,8 @@ pub fn draw(f: &mut Frame, st: &State, ui: &Ui) {
         None => empty_tree(f, cols[1]),
     }
     log_panel(f, rows[3], st);
-    prompt(f, rows[4], ui, reply_target(st, ui));
+    let target = reply_target(st, ui).map(|id| (id, st.jobs.iter().any(|j| j.id == id && !j.status.finished())));
+    prompt(f, rows[4], ui, target);
     status(f, rows[5], st);
 }
 
@@ -219,7 +220,8 @@ fn left_panel(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
         } else {
             spinner()
         };
-        let text = format!("#{} {}", j.id, j.title);
+        // Messages waiting for the agent show on the row.
+        let text = if j.inbox.is_empty() { format!("#{} {}", j.id, j.title) } else { format!("#{} ✉{} {}", j.id, j.inbox.len(), j.title) };
         let mut l = Line::from(vec![
             Span::styled(if sel { "◆ " } else { "  " }, fg(PURPLE)),
             Span::styled(format!("{} ", icon), fg(status_color(j.status))),
@@ -368,6 +370,7 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
             Span::styled(j.status.name(), bold(status_color(j.status))),
             Span::styled(format!("  ·  {}", mmss(secs)), fg(DIM)),
             Span::styled(j.branch.as_ref().map(|b| format!("  ·  {}", b)).unwrap_or_default(), fg(DIM)),
+            Span::styled(if j.inbox.is_empty() { String::new() } else { format!("  ·  ✉ {} queued", j.inbox.len()) }, fg(GREEN)),
         ]),
     ];
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Center).block(boxed(&format!("job #{}", j.id), ORANGE)), r);
@@ -546,10 +549,12 @@ fn log_panel(f: &mut Frame, area: Rect, st: &State) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn prompt(f: &mut Frame, area: Rect, ui: &Ui, reply: Option<u32>) {
+/// `reply`: the job Enter would send to, and whether it is still running.
+fn prompt(f: &mut Frame, area: Rect, ui: &Ui, reply: Option<(u32, bool)>) {
     let dir = ui.cwd.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let forced = match (reply, &ui.forced) {
-        (Some(id), _) => Span::styled(format!("[reply to #{}] ", id), fg(GREEN)),
+        (Some((id, true)), _) => Span::styled(format!("[message #{}] ", id), fg(GREEN)),
+        (Some((id, false)), _) => Span::styled(format!("[reply to #{}] ", id), fg(GREEN)),
         (None, None) => Span::styled("[agent: auto] ", fg(DIM)),
         (None, Some(a)) => Span::styled(format!("[agent: {}] ", a.name()), fg(agent_color(a.kind()))),
     };

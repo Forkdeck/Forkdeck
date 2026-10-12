@@ -256,6 +256,8 @@ impl Hub {
                 turns: vec![Turn { ask: prompt, answer: String::new() }],
                 session: None,
                 resume_from: None,
+                inbox: Default::default(),
+                steer: Cancel::new(),
             });
             if stopping {
                 // Shutting down: the job exists so the caller has an id, but it never starts and claims nothing.
@@ -287,7 +289,13 @@ impl Hub {
                 return Err("only typed tasks take replies".into());
             }
             if !j.status.finished() {
-                return Err("still running, wait for it or cancel it with Ctrl-X".into());
+                // It is working: the agent gets this when its current step ends.
+                j.inbox.push_back(text.clone());
+                j.worker.push(format!("› {} (queued)", clip(&text, 300)));
+                st.log("queue", format!("#{} message queued: {}", id, clip(&text, 90)));
+                drop(st);
+                self.save(id);
+                return Ok(());
             }
             j.turns.push(Turn { ask: text.clone(), answer: String::new() });
             j.status = JobStatus::Queued;
@@ -305,6 +313,34 @@ impl Hub {
         let hub = self.clone();
         self.rt.spawn(async move { run_job(hub, id).await });
         Ok(())
+    }
+
+    /// Send a message and have the running agent take it now: it is stopped and continues its
+    /// conversation with the message. A finished task takes it as a reply.
+    pub fn steer_now(&self, id: u32, text: String) -> Result<(), String> {
+        let steer = {
+            let mut st = self.state.lock().unwrap();
+            let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return Err("no such job".into()) };
+            if !j.source.is_manual() {
+                return Err("only typed tasks take messages".into());
+            }
+            if j.status.finished() {
+                None
+            } else {
+                j.inbox.push_front(text.clone());
+                j.worker.push(format!("› {} (now)", clip(&text, 300)));
+                st.log("queue", format!("#{} interrupted with a message: {}", id, clip(&text, 90)));
+                st.jobs.iter().find(|j| j.id == id).map(|j| j.steer.clone())
+            }
+        };
+        match steer {
+            Some(s) => {
+                s.fire();
+                self.save(id);
+                Ok(())
+            }
+            None => self.reply(id, text),
+        }
     }
 
     pub fn cancel(&self, id: u32) {
@@ -755,32 +791,90 @@ fn resumable(hub: &Hub, id: u32, exec: &Exec) -> Option<String> {
 /// Run the worker once and take a snapshot of what it did. The worker continues its own
 /// conversation when it can; `fresh` is the prompt for a new one, when it differs from `prompt`.
 async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, fresh: Option<&str>, cancel: &Cancel) -> Result<String, Finish> {
-    let resume = resumable(hub, id, w.worker);
-    let mut used = if resume.is_some() { prompt } else { fresh.unwrap_or(prompt) };
-    let (mut out, mut ran) = run_agent(hub, id, Slot::Worker, w.worker.clone(), w.d.tier, used, w.dir, false, resume.clone()).await;
-    if resume.is_some() && !out.ok && out.tools == 0 && !cancel.is_set() {
-        // The CLI no longer has the conversation: start a new one, told the whole story.
-        hub.log("agents", format!("#{} could not continue the earlier conversation ({}), starting a new one", id, clip(&out.error, 120)));
-        hub.job(id, |j| j.session = None);
-        used = fresh.unwrap_or(prompt);
-        (out, ran) = run_agent(hub, id, Slot::Worker, w.worker.clone(), w.d.tier, used, w.dir, false, None).await;
+    let mut prompt = prompt.to_string();
+    let mut fresh = fresh.map(String::from);
+    loop {
+        let resume = resumable(hub, id, w.worker);
+        let used = if resume.is_some() { prompt.clone() } else { fresh.clone().unwrap_or_else(|| prompt.clone()) };
+        let (mut out, mut ran) = run_agent(hub, id, Slot::Worker, w.worker.clone(), w.d.tier, &used, w.dir, false, resume.clone()).await;
+        if resume.is_some() && !out.ok && !out.interrupted && out.tools == 0 && !cancel.is_set() {
+            // The CLI no longer has the conversation: start a new one, told the whole story.
+            hub.log("agents", format!("#{} could not continue the earlier conversation ({}), starting a new one", id, clip(&out.error, 120)));
+            hub.job(id, |j| j.session = None);
+            let used = fresh.clone().unwrap_or_else(|| prompt.clone());
+            (out, ran) = run_agent(hub, id, Slot::Worker, w.worker.clone(), w.d.tier, &used, w.dir, false, None).await;
+        }
+        if let Some(sid) = &out.session {
+            hub.job(id, |j| j.session = Some(Session { cli: ran.cli, id: sid.clone(), model: ran.model.clone() }));
+            hub.save(id);
+        }
+        if cancel.is_set() {
+            return Err(cancelled());
+        }
+        if !out.ok && !out.interrupted {
+            return Err(failed(format!("{} failed: {}", ran.label(), out.error)));
+        }
+        // What the user sent while it worked comes first, in the same conversation, before any checks or review.
+        if let Some(msg) = take_messages(hub, id, out.ok.then_some(out.text.as_str())) {
+            prompt = messages_prompt(&msg);
+            fresh = hub.job(id, |j| chat_prompt(&j.turns));
+            continue;
+        }
+        if out.interrupted {
+            // Stopped for a message that was taken in the meantime: carry on where it was.
+            prompt = "Carry on with the task where you stopped, then summarise what you changed.".into();
+            continue;
+        }
+        // From here the index holds exactly what the agent did. Checks run against that, and whatever
+        // they leave behind is removed again, so the tree that is reviewed is the tree that is committed.
+        if w.is_issue {
+            issues::stage(hub, id).await.map_err(|e| failed(format!("could not stage the changes: {}", e)))?;
+        }
+        return Ok(out.text);
     }
-    if let Some(sid) = &out.session {
-        hub.job(id, |j| j.session = Some(Session { cli: ran.cli, id: sid.clone(), model: ran.model.clone() }));
-        hub.save(id);
+}
+
+/// Everything sent to the job while it worked, as one new turn of its conversation. `answer` is
+/// what the agent said in the turn before, when it got that far.
+fn take_messages(hub: &Hub, id: u32, answer: Option<&str>) -> Option<String> {
+    let msg = hub
+        .job(id, |j| {
+            if j.inbox.is_empty() {
+                return None;
+            }
+            if let (Some(a), Some(t)) = (answer, j.turns.last_mut()) {
+                t.answer = a.to_string();
+            }
+            let msg = j.inbox.drain(..).collect::<Vec<_>>().join("\n\n");
+            j.turns.push(Turn { ask: msg.clone(), answer: String::new() });
+            j.worker.push("› taking the message");
+            Some(msg)
+        })
+        .flatten()?;
+    hub.save(id);
+    Some(msg)
+}
+
+/// The task, followed by what the user asked for since, oldest first.
+fn with_later_requests(task: &str, turns: &[Turn]) -> String {
+    let later: Vec<String> = turns.iter().skip(1).map(|t| format!("- {}", t.ask)).filter(|l| !task.contains(&l[2..])).collect();
+    if later.is_empty() {
+        task.to_string()
+    } else {
+        format!("{}\n\nLater, the user also asked (oldest first):\n{}", task, later.join("\n"))
     }
-    if cancel.is_set() {
-        return Err(cancelled());
-    }
-    if !out.ok {
-        return Err(failed(format!("{} failed: {}", ran.label(), out.error)));
-    }
-    // From here the index holds exactly what the agent did. Checks run against that, and whatever
-    // they leave behind is removed again, so the tree that is reviewed is the tree that is committed.
-    if w.is_issue {
-        issues::stage(hub, id).await.map_err(|e| failed(format!("could not stage the changes: {}", e)))?;
-    }
-    Ok(out.text)
+}
+
+fn messages_prompt(msg: &str) -> String {
+    format!("While you were working, the user said:\n{}\n\nTake it into account and carry on with the task, then summarise what you changed.", msg)
+}
+
+/// When messages are waiting, the worker takes them now; the result needs checking and review again.
+async fn messages_round(hub: &Hub, id: u32, w: &Work<'_>, cancel: &Cancel) -> Result<Option<String>, Finish> {
+    let Some(msg) = take_messages(hub, id, None) else { return Ok(None) };
+    set_status(hub, id, JobStatus::Working);
+    let fresh = hub.job(id, |j| chat_prompt(&j.turns));
+    work_once(hub, id, w, &messages_prompt(&msg), fresh.as_deref(), cancel).await.map(Some)
 }
 
 /// Checks, then review by the other CLI. Either can send the work back, a bounded number of times.
@@ -810,10 +904,19 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
         if feedback.is_none() && w.d.review {
             set_status(hub, id, JobStatus::Reviewing);
             let base = hub.job(id, |j| j.base_sha.clone()).flatten();
-            let rp = review_prompt(w.prompt, base.as_deref(), w.followup);
+            // What the user asked after the task belongs to it: the reviewer must not take it for scope creep.
+            let task = hub.job(id, |j| with_later_requests(w.prompt, &j.turns)).unwrap_or_else(|| w.prompt.to_string());
+            let rp = review_prompt(&task, base.as_deref(), w.followup);
             let (rev, ran) = run_agent(hub, id, Slot::Reviewer, w.reviewer.clone(), w.d.tier.up(), &rp, w.dir, true, None).await;
             if cancel.is_set() {
                 return Err(cancelled());
+            }
+            if rev.interrupted {
+                // A message stopped the review: the worker takes it, then everything is looked at again.
+                if let Some(s) = messages_round(hub, id, w, cancel).await? {
+                    summary = s;
+                }
+                continue;
             }
             if !rev.ok {
                 hub.log("review", format!("#{} reviewer {} failed: {}", id, ran.label(), rev.error));
@@ -834,6 +937,12 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
             if v == Some(false) {
                 feedback = Some(format!("A reviewer did not pass the change. Review:\n{}", rev.text));
             }
+        }
+        // Messages that arrived during the checks or the review: the worker takes them, outside the
+        // fix rounds, and the result is checked and reviewed again.
+        if let Some(s) = messages_round(hub, id, w, cancel).await? {
+            summary = s;
+            continue;
         }
         let Some(fb) = feedback else { break };
         if round >= hub.cfg.review.max_fix_rounds {
@@ -1420,6 +1529,16 @@ pub fn parse_verdict(text: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn later_requests_go_to_the_reviewer() {
+        let t = |a: &str| Turn { ask: a.into(), answer: String::new() };
+        assert_eq!(with_later_requests("add a flag", &[t("add a flag")]), "add a flag");
+        let p = with_later_requests("add a flag", &[t("add a flag"), t("call it --fast"), t("and document it")]);
+        assert!(p.ends_with("Later, the user also asked (oldest first):\n- call it --fast\n- and document it"), "{}", p);
+        // A follow-up already folded into the task is not repeated.
+        assert!(!with_later_requests("x\n\nFollow-up request: y", &[t("x"), t("y")]).contains("Later"));
+    }
 
     #[test]
     fn chat_prompt_carries_earlier_turns() {

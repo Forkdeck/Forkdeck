@@ -2,6 +2,7 @@
 //! `claude`, `gh` and an MCP server, and a local bare repository as the remote. They need `git` and `sh`.
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1577,4 +1578,65 @@ fn a_pinned_copilot_model_the_account_refuses_falls_back_to_the_cli_choice() {
     let models: Vec<&str> = runs.iter().map(|r| model_of(r)).collect();
     assert_eq!(models, ["gpt-5.5", ""], "the refused pin is tried once, then the CLI picks: {:?}", runs);
     assert!(rig.calls().contains("--add-label review:passed"), "{}", rig.calls());
+}
+
+/// Start `forkdeck run` with a worker that waits on its first attempt (until the test says so)
+/// and works at once on later ones. Returns once the first attempt is running.
+fn run_with_slow_first_attempt(rig: &Rig, first_takes: &str) -> std::process::Child {
+    let marker = rig.root.join("first-attempt");
+    let work = format!("if [ -f {m} ]; then echo change >> by_agent.txt; else touch {m}; {first_takes}; fi", m = marker.display());
+    let (args, prompts) = (rig.root.join("args.log"), rig.root.join("prompts.log"));
+    let child = rig
+        .bare(&[("FAKE_ARGS", args.to_str().unwrap()), ("FAKE_PROMPTS", prompts.to_str().unwrap()), ("FAKE_WORK", &work)])
+        .args(["run", "add a change file"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("forkdeck starts");
+    for _ in 0..100 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(marker.exists(), "the first attempt never started");
+    child
+}
+
+fn workers(rig: &Rig) -> Vec<String> {
+    fs::read_to_string(rig.root.join("args.log")).unwrap_or_default().lines().filter(|l| l.contains("acceptEdits")).map(String::from).collect()
+}
+
+#[test]
+fn a_message_sent_while_the_agent_works_is_taken_in_the_same_conversation() {
+    let rig = Rig::new("message-queued", "", "");
+    let mut child = run_with_slow_first_attempt(&rig, "sleep 2");
+    child.stdin.as_mut().unwrap().write_all(b"also mention it in the README\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{}", said);
+    let w = workers(&rig);
+    assert_eq!(w.len(), 2, "the first attempt finished, then the message was taken: {:?}\n{}", w, said);
+    assert_eq!(arg_after(&w[1], "--resume"), arg_after(&w[0], "--session-id"), "{:?}", w);
+    let prompts = fs::read_to_string(rig.root.join("prompts.log")).unwrap();
+    assert!(prompts.contains("While you were working, the user said:\nalso mention it in the README"), "{}", prompts);
+    assert!(prompts.contains("Later, the user also asked (oldest first):\n- also mention it in the README"), "the reviewer knows: {}", prompts);
+}
+
+#[test]
+fn a_message_sent_with_a_bang_stops_the_agent_and_is_taken_at_once() {
+    let rig = Rig::new("message-now", "", "");
+    let started = std::time::Instant::now();
+    let mut child = run_with_slow_first_attempt(&rig, "sleep 30");
+    child.stdin.as_mut().unwrap().write_all(b"!use a different file name\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{}", said);
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "the slow attempt was stopped, not waited for");
+    let w = workers(&rig);
+    assert_eq!(w.len(), 2, "{:?}", w);
+    assert_eq!(arg_after(&w[1], "--resume"), arg_after(&w[0], "--session-id"));
+    let prompts = fs::read_to_string(rig.root.join("prompts.log")).unwrap();
+    assert!(prompts.contains("the user said:\nuse a different file name"), "{}", prompts);
 }

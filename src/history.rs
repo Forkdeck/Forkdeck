@@ -224,6 +224,8 @@ impl JobRecord {
             turns: self.turns,
             session: self.session,
             resume_from,
+            inbox: Default::default(),
+            steer: crate::state::Cancel::new(),
         }
     }
 }
@@ -439,6 +441,8 @@ mod tests {
             turns: vec![Turn { ask: "fix it".into(), answer: "fixed".into() }, Turn { ask: "and the test".into(), answer: String::new() }],
             session: Some(Session { cli: AgentKind::Claude, id: "s1".into(), model: "sonnet".into() }),
             resume_from: None,
+            inbox: Default::default(),
+            steer: Cancel::new(),
         }
     }
 
