@@ -379,6 +379,8 @@ pub struct State {
     pub copilot: crate::copilot::Probe,
     /// Models copilot refused in this session; they are not tried again until restart.
     pub rejected_models: HashSet<String>,
+    /// Copilot may play claude or codex when that CLI is missing (agents.copilot.stand_in).
+    pub stand_in: bool,
     pub next_id: u32,
     pub team: TeamView,
 }
@@ -404,6 +406,10 @@ impl Source {
 impl State {
     pub fn has(&self, k: AgentKind) -> bool {
         self.installed.contains(&k)
+    }
+    /// Copilot is installed and the account was not found unable to use it.
+    pub fn copilot_usable(&self) -> bool {
+        self.has(AgentKind::Copilot) && self.copilot.seat != Some(false)
     }
 
     fn active(&self, key: Key) -> bool {

@@ -181,6 +181,7 @@ impl Hub {
         let mut st = self.state.lock().unwrap();
         st.installed = installed;
         st.copilot = probe;
+        st.stand_in = self.cfg.agents.copilot.stand_in();
         if st.has(AgentKind::Copilot) {
             let who = st.copilot.login.clone().unwrap_or_else(|| "this account".into());
             let note = match (&st.copilot.error, st.copilot.seat, &st.copilot.enabled) {
@@ -194,8 +195,8 @@ impl Hub {
             }
         }
         if !st.has(AgentKind::Claude) && !st.has(AgentKind::Codex) {
-            let usable = st.has(AgentKind::Copilot) && st.copilot.seat != Some(false);
-            st.log("agents", if usable { "claude and codex not found on PATH: copilot stands in for them" } else { "neither claude, codex nor a usable copilot was found on PATH" });
+            let stands_in = st.copilot_usable() && st.stand_in;
+            st.log("agents", if stands_in { "claude and codex not found on PATH: copilot stands in for them" } else { "neither claude, codex nor a usable copilot was found on PATH" });
         }
     }
 }
@@ -329,7 +330,7 @@ fn set_status(hub: &Hub, id: u32, s: JobStatus) {
 }
 
 /// A copy of what `pick` needs, so the state lock is not held while agents run.
-struct AvailOwned {
+pub struct AvailOwned {
     installed: HashSet<AgentKind>,
     enabled: Option<HashSet<String>>,
     no_seat: bool,
@@ -340,9 +341,17 @@ impl AvailOwned {
     fn of(st: &State) -> AvailOwned {
         AvailOwned { installed: st.installed.clone(), enabled: st.copilot.enabled.clone(), no_seat: st.copilot.seat == Some(false), rejected: st.rejected_models.clone() }
     }
-    fn borrow(&self) -> pick::Avail<'_> {
+    pub fn borrow(&self) -> pick::Avail<'_> {
         pick::Avail { installed: &self.installed, enabled: self.enabled.as_ref(), no_seat: self.no_seat, rejected: &self.rejected }
     }
+}
+
+pub fn avail_of(cfg: &Config, st: &State) -> AvailOwned {
+    if cfg.demo {
+        let installed = [AgentKind::Claude, AgentKind::Codex].into_iter().collect();
+        return AvailOwned { installed, enabled: None, no_seat: false, rejected: HashSet::new() };
+    }
+    AvailOwned::of(st)
 }
 
 fn avail(hub: &Hub) -> AvailOwned {

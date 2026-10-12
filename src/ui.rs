@@ -140,7 +140,18 @@ fn title_bar(f: &mut Frame, area: Rect, ui: &Ui) {
 }
 
 fn header(f: &mut Frame, area: Rect, st: &State) {
-    let mark = |ok: bool| if ok { "on call" } else { "missing" };
+    let chip = |k: AgentKind, own: Color| -> Span {
+        let (word, color) = if st.has(k) && (k != AgentKind::Copilot || st.copilot_usable()) {
+            ("ON CALL", own)
+        } else if k == AgentKind::Copilot && st.has(k) {
+            ("NO ACCESS", RED)
+        } else if k != AgentKind::Copilot && st.stand_in && st.copilot_usable() {
+            ("VIA COPILOT", BLUE)
+        } else {
+            ("MISSING", DIM)
+        };
+        Span::styled(format!("{} {}", k.name().to_uppercase(), word), bold(color))
+    };
     let jev = match (st.router.kind.as_str(), st.router.healthy) {
         ("rules", _) => "RULES ROUTER".to_string(),
         (_, Some(false)) => "JEV DOWN · RULES".to_string(),
@@ -149,9 +160,11 @@ fn header(f: &mut Frame, area: Rect, st: &State) {
     let top = Line::from(vec![
         Span::styled("  FORKDECK AGENT TREE", bold(BRIGHT)),
         Span::styled("   ·   ", fg(DIM)),
-        Span::styled(format!("CLAUDE {}", mark(st.has(AgentKind::Claude)).to_uppercase()), bold(if st.has(AgentKind::Claude) { ORANGE } else { DIM })),
+        chip(AgentKind::Claude, ORANGE),
         Span::styled("   ·   ", fg(DIM)),
-        Span::styled(format!("CODEX {}", mark(st.has(AgentKind::Codex)).to_uppercase()), bold(if st.has(AgentKind::Codex) { GREEN } else { DIM })),
+        chip(AgentKind::Codex, GREEN),
+        Span::styled("   ·   ", fg(DIM)),
+        chip(AgentKind::Copilot, BLUE),
         Span::styled("   ·   ", fg(DIM)),
         Span::styled(jev, bold(PURPLE)),
     ]);
@@ -160,6 +173,8 @@ fn header(f: &mut Frame, area: Rect, st: &State) {
         Span::styled("claude", fg(DIM)),
         Span::styled("    ■ ", fg(GREEN)),
         Span::styled("codex", fg(DIM)),
+        Span::styled("    ■ ", fg(BLUE)),
+        Span::styled("copilot", fg(DIM)),
         Span::styled("    ■ ", fg(PURPLE)),
         Span::styled("fork layer", fg(DIM)),
         Span::styled("    ■ ", fg(RED)),
@@ -441,7 +456,7 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
                 Line::from(Span::styled(format!(" {}", clip(l, w)), fg(c)))
             })
             .collect();
-        let who = s.agent.map(|a| a.name()).unwrap_or("idle");
+        let who = s.agent.map(|a| if s.via.is_empty() { a.name().to_string() } else { format!("{} via {}", a.name(), s.via) }).unwrap_or_else(|| "idle".into());
         f.render_widget(Paragraph::new(lines).block(boxed(&format!("{} output · {}", name, who), DIM)), r);
     }
 }
@@ -459,7 +474,7 @@ fn stage_box(f: &mut Frame, area: Rect, role: &str, s: &Stage) {
     lines.push(Line::from(Span::styled(role.to_string(), bold(BRIGHT))));
     match s.agent {
         Some(a) => {
-            let mut bits = vec![a.name().to_string()];
+            let mut bits = vec![if s.via.is_empty() { a.name().to_string() } else { format!("{} via {}", a.name(), s.via) }];
             if !s.model.is_empty() {
                 bits.push(s.model.clone());
             }

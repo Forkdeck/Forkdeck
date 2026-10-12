@@ -419,22 +419,52 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
         Some(p) => println!("config    {}", p.display()),
         None => println!("config    none found, defaults in use"),
     }
-    let mut agents_found = 0;
-    for k in [AgentKind::Claude, AgentKind::Codex] {
+    hub.detect_agents().await;
+    for k in AgentKind::ALL {
         let cmd = hub.cfg.agents.get(k).cmd.unwrap_or_default();
         match issues::sh(&cmd, &["--version"], None).await {
-            Ok(v) => {
-                agents_found += 1;
-                println!("{:<9} ok       {}", k.name(), v.lines().next().unwrap_or(""));
-            }
+            Ok(v) => println!("{:<9} ok       {}", k.name(), v.lines().next().unwrap_or("")),
             Err(_) => println!("{:<9} missing  `{}` is not on PATH", k.name(), cmd),
         }
     }
-    if agents_found == 0 {
-        ok = false;
-        println!("          at least one of the two CLIs is required");
-    } else if agents_found == 1 {
-        println!("          one CLI only: it will also review its own work");
+    {
+        let st = hub.state.lock().unwrap();
+        if st.has(AgentKind::Copilot) {
+            let p = &st.copilot;
+            let who = p.login.clone().unwrap_or_else(|| "this account".into());
+            match (&p.error, p.seat, &p.enabled) {
+                (Some(e), _, _) => println!("copilot   unknown  could not list models: {}", e),
+                (None, Some(false), _) => println!("copilot   no access  {} cannot use Copilot from the CLI (see github.com/settings/copilot)", who),
+                (None, _, Some(m)) => println!("copilot   ok       logged in as {}, {} models enabled, {} switched off", who, m.len(), p.disabled.len()),
+                _ => {}
+            }
+        }
+        let a = orchestrator::avail_of(&hub.cfg, &st);
+        let mut names: Vec<AgentRef> = vec![AgentRef::Kind(AgentKind::Claude), AgentRef::Kind(AgentKind::Codex)];
+        let mut profiles: Vec<&String> = hub.cfg.agents.copilot.profiles.keys().filter(|n| *n != "claude" && *n != "codex").collect();
+        profiles.sort();
+        names.extend(profiles.into_iter().map(|n| AgentRef::Profile(n.clone())));
+        let mut workers = 0;
+        for r in &names {
+            let e = pick::resolve(&hub.cfg, &a.borrow(), r, state::Tier::Standard);
+            if matches!(r, AgentRef::Kind(_)) && e.is_some() {
+                workers += 1;
+            }
+            match e {
+                Some(e) if e.via.is_some() => println!("{:<9} via      {} (standard tier: {})", r.name(), e.label(), if e.model.is_empty() { "default model" } else { &e.model }),
+                Some(_) => {}
+                None if st.copilot_usable() => println!("{:<9} none     no model of this profile is enabled for the account", r.name()),
+                None => {}
+            }
+        }
+        if workers == 0 {
+            ok = false;
+            println!("          at least one of claude, codex or a usable copilot is required");
+        } else if let Some(w) = pick::worker_for(&hub.cfg, &a.borrow(), &AgentRef::Kind(hub.cfg.router.default_agent), state::Tier::Standard) {
+            if pick::reviewer_for(&hub.cfg, &a.borrow(), &w, state::Tier::Heavy).1 {
+                println!("          work and review will use the same vendor's models");
+            }
+        }
     }
     if hub.cfg.router.kind == "jev" {
         let r = router::route(&hub.cfg, &hub.http, "Fix a typo in the README heading", false).await;
