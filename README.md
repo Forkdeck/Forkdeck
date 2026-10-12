@@ -294,14 +294,26 @@ open as it is. Nothing is posted and no label changes.
 
 With `[repos.deploy]` set, forkdeck watches the base branch. When it moves, it:
 
-1. calls the `trigger` tool, if there is one (leave it out when merging already
-   deploys, as with GitOps auto-sync),
+1. asks the `status` tool what is going on already, and then calls the
+   `trigger` tool, if there is one (leave it out when merging already deploys,
+   as with GitOps auto-sync),
 2. polls the `status` tool until that commit is healthy,
 3. runs the `verify` commands, such as a smoke test,
 4. calls the `rollback` tool with `{last_good}`, the last commit that deployed
    and verified cleanly, **if and only if there is evidence the new commit is
    bad**, then waits for the old one to be healthy again,
 5. calls the `notify` tool, if there is one, with a one-line result.
+
+**Not starting what is already running.** Before triggering, forkdeck asks the
+deployment system, because it is the one place that knows. If the commit is
+already deployed or rolling out (a teammate's machine started it, or the
+system's own automation did), it is not triggered again: forkdeck watches it to
+the end, verifies it and records it as usual. If a rollout of a different
+revision is in progress (the answer matches `pending` or `paused`), forkdeck
+waits for it to settle before starting, up to `timeout_mins`, and starts
+nothing if it never does. If the status cannot be read, nothing is started.
+Set `status.pending` to whatever your system says mid-rollout; without it
+forkdeck cannot tell a rollout of something else from a settled environment.
 
 `status.revision` is required: a pattern whose first group is the commit the
 answer describes. Until the system reports the commit being deployed, its
@@ -531,9 +543,151 @@ with sharing off neither announces what it takes nor looks at what others
 have. Staleness compares the forge's time with this machine's clock, so a
 clock that is far ahead makes teammates look stale. On GitHub, "organisation
 member" is what the forge reports for the comment; a member the organisation
-has given no write access to the repository still counts. Deployments are announced
-but not arbitrated: two machines with a deploy stage for the same environment
-will both deploy, so give that stage to one of them.
+has given no write access to the repository still counts. Deployments are announced on the forge
+but decided by the deployment system: each machine asks it before triggering
+and does not start a commit that is already deployed or rolling out. A machine
+that sees a teammate's announcement first also waits a moment before starting.
+Two machines that ask in the same second can still both trigger, so the
+`trigger` tool should be safe to call twice for the same commit, or the deploy
+stage should live on one machine.
+
+## Limits
+
+forkdeck picks work up by itself, so it has brakes. All of them count over the
+last 24 hours from the journal (next section), which means restarting forkdeck
+resets nothing.
+
+```toml
+[limits]
+jobs_per_day = 20          # issues and reviews picked up, all repositories together
+tokens_per_day = 5000000   # in and out, all CLIs, typed tasks included
+job_mins = 90              # one issue or review may run this long
+pause_after_failures = 5   # default
+pause_mins = 60            # default
+```
+
+- **`jobs_per_day`** and a repository's own `jobs_per_day` cap how many issues
+  and reviews are picked up. Deployments and typed tasks are not counted: one
+  follows from a merge and the other from you.
+- **`tokens_per_day`** counts everything all CLIs report having used. When it
+  is reached nothing more is picked up; a job already running finishes.
+- **`job_mins`** stops an issue or review that runs too long, kills its agent,
+  and hands the item to a person with the failure label. Deployments are
+  exempt; they have their own timeouts and stopping one halfway is worse.
+- **`pause_after_failures`** is on by default: after five issues or reviews in
+  a row fail on a repository within a day, nothing more is picked up from it for an hour.
+  Then one is tried; if that fails too, the pause starts again. Cancelled jobs
+  count neither way.
+
+The limits are only as good as the journal they count from. If it cannot be
+read or written (a full disk, wrong permissions), nothing more is picked up
+until it can, and the log says why: not knowing what was used is not treated
+as nothing having been used. A job that ended while it could not be written is
+recorded as soon as it works again. This applies whenever any limit is set,
+which with the default failure pause is always.
+
+What a limit holds back is not touched at all: the label stays, nothing is
+claimed or commented, and it is picked up on the first poll with room again.
+The queue panel shows what has been used and why a repository is on hold, the
+session log says so once when it starts and once when it ends, and
+`forkdeck doctor` prints the limits in force. Only the failure pause is set out
+of the box; the other three are yours to choose.
+
+## The journal, and `forkdeck stats`
+
+Every finished job is one line in `~/.local/state/forkdeck/journal.jsonl`: what
+it was, which CLIs ran and how often, how long it took, how many times the
+work was sent back, the verdict, tokens and cost as the CLIs reported them,
+the pull request, and the one-line outcome. No prompts and no agent output,
+and for a typed task not even the title. The file stays on your machine.
+
+```
+$ forkdeck stats --days 30
+last 30 day(s): 61 job(s)
+
+issues      34   done   27   failed    6   cancelled   1
+          82% ended with a pull request · 70% of those without being sent back · 11 fix round(s) in all
+          time to a pull request: median 6m 12s, 90% within 19m 40s
+reviews     19   done   18   failed    1   cancelled   0
+          11 passed · 7 asked for changes
+deploys      8   done    7   failed    1   cancelled   0
+          1 rolled back
+
+claude      71 run(s) · 9.8M tokens in · 412.0k out · $31.40 as reported by the CLI
+codex       48 run(s) · 6.1M tokens in · 220.5k out
+```
+
+`--jobs 20` adds the latest jobs one per line, and `--json` prints the summary
+for a dashboard or a script. The journal is also the audit trail: it is
+append-only, each line stands alone, and a damaged line is skipped without
+hiding the rest.
+
+## Notes about a repository
+
+Each job would otherwise start knowing nothing about the project beyond what
+the CLIs read for themselves. forkdeck puts two things in front of the worker
+with every issue, ahead of the task:
+
+- **The team's notes:** `.forkdeck/notes.md` in the repository, as it is on the
+  base branch. It is an ordinary file: write conventions in it and change it
+  through a pull request like anything else. Everyone's forkdeck reads the
+  same one.
+- **This machine's own notes:** a file in `~/.local/state/forkdeck/notes/`, for
+  things that are nobody else's business.
+
+```sh
+forkdeck notes acme/payments          # both, and where they are
+forkdeck notes acme/payments add "Staging needs the VPN."   # your own
+forkdeck notes                        # every repository and its file
+```
+
+The worker is told the notes are background: they do not change the task and
+cannot grant access to anything. They come first in the prompt because they are
+the same for every job on the repository, which is the part a model's context
+cache can reuse.
+
+**Learning from mistakes.** With `learn = true`, a job whose work was sent
+back by a check or a reviewer, or a review that asked for changes, ends with
+one more short run: a CLI is shown the findings and asked for at most three
+general rules that would have prevented them.
+
+```toml
+[knowledge]
+learn = true
+```
+
+Those rules are **proposed, not installed**. forkdeck pushes a commit that adds
+them to `.forkdeck/notes.md` on a branch of its own (`forkdeck/notes-…`) and
+opens a pull request, listing each rule and the issue it came from. Nothing
+changes for any job until a person merges it; edit or delete rules there first,
+or close it to discard them. While that pull request is open, rules learned
+later are added to it, so there is one thing to look at per repository. The
+branch is only ever pushed to normally, never forced, and it is built without
+touching the clone's working tree.
+
+Why a pull request: a learned rule is read by every later job of everyone on
+the team, and the findings it is distilled from come from work that started
+with somebody's issue text. forkdeck narrows what can get in (one line, at
+most 200 characters, no links, no mentions, three per job, only the newest
+`max_learned` kept), but it cannot judge whether a rule is true. A person can.
+
+Two things keep the file honest:
+
+- An agent working on an issue cannot change the notes on the side. Whatever
+  it does under `.forkdeck/` is left out of the commit, and the log says so.
+- A labelled pull request that touches `.forkdeck/` gets the same warning on
+  its review as one that touches `CLAUDE.md` or `AGENTS.md`.
+
+If the pull request cannot be made (the forge is down, the push is refused),
+the rules wait in a file of their own that no job reads, and are proposed again
+on a later poll. With sharing on, a rule reaches agents through an approved
+pull request or not at all. `forkdeck notes` says how many are waiting.
+
+`share = false` keeps learned rules on this machine instead: they go into its
+own notes file under `## Learned by forkdeck` and take effect at once, for that
+machine only. `learn` is off by default either way. A job that went
+well teaches nothing and costs no extra run. Reviewers of labelled pull
+requests are not given the notes yet.
 
 ## Before you leave it unattended
 
@@ -600,8 +754,8 @@ its login and model probe against a real account without a Copilot seat. It
 has not run against Copilot's own models yet.
 
 Not there yet: feeding review comments on an open pull request back to the
-worker for another round; a record of jobs that survives a restart; arbitrating
-deployments between machines.
+worker for another round; resuming a job that was in flight when forkdeck
+stopped (the journal records finished jobs, it does not restart unfinished ones).
 
 ## License
 

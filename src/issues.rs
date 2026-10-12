@@ -118,6 +118,27 @@ pub async fn sh(cmd: &str, args: &[&str], dir: Option<&Path>) -> Result<String, 
     }
 }
 
+/// As `sh`, with extra environment variables for the command.
+pub async fn sh_env(cmd: &str, args: &[&str], dir: Option<&Path>, env: &[(&str, String)]) -> Result<String, String> {
+    let mut c = proc::command(cmd);
+    c.args(args);
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    if let Some(d) = dir {
+        c.current_dir(d);
+    }
+    let what = format!("{} {}", cmd, args.first().copied().unwrap_or(""));
+    match proc::output(c, Duration::from_secs(300)).await {
+        Err(e) => Err(format!("{}: {}", what, e)),
+        Ok((true, out, _)) => Ok(out.trim().to_string()),
+        Ok((false, out, err)) => {
+            let shown = if err.trim().is_empty() { out } else { err };
+            Err(format!("{}: {}", what, clip(&shown.trim().replace('\n', " "), 300)))
+        }
+    }
+}
+
 /// As `sh`, with text given to the command on its standard input.
 pub async fn sh_in(cmd: &str, args: &[&str], dir: Option<&Path>, input: &str) -> Result<String, String> {
     let mut c = proc::command(cmd);
@@ -201,7 +222,7 @@ pub async fn relabel(r: &RepoCfg, pr: bool, n: u64, from: &str, to: &str) -> Res
     .map(|_| ())
 }
 
-async fn comment(r: &RepoCfg, pr: bool, n: u64, text: &str) -> Result<(), String> {
+pub async fn comment(r: &RepoCfg, pr: bool, n: u64, text: &str) -> Result<(), String> {
     let n = n.to_string();
     match (r.provider, pr) {
         (Provider::Github, false) => sh("gh", &["issue", "comment", &n, "-R", &r.repo, "--body", text], None).await,
@@ -226,6 +247,12 @@ fn issue_of(hub: &Hub, id: u32) -> Option<(RepoCfg, u64, String)> {
         _ => None,
     })
     .flatten()
+}
+
+/// The end of a long output, cut at a character boundary.
+pub fn tail_of(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    s.chars().skip(n.saturating_sub(max)).collect()
 }
 
 pub fn task_prompt(r: &RepoCfg, i: &Issue) -> String {
@@ -263,11 +290,106 @@ pub async fn poll_loop(hub: Hub) {
 
 /// Look at every configured repository once and start a job for each labelled item that is due,
 /// and a deployment for each base branch that has moved.
+/// What the limits leave room for at the start of a poll.
+struct Budget {
+    /// Nothing at all is picked up, and why.
+    stop: Option<String>,
+    /// Jobs still allowed today over all repositories; None when there is no such limit.
+    jobs_left: Option<u32>,
+    entries: Vec<crate::journal::Entry>,
+    now: i64,
+}
+
+fn clock(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0).map(|d| d.with_timezone(&chrono::Local).format("%H:%M").to_string()).unwrap_or_default()
+}
+
+fn budget(hub: &Hub) -> Budget {
+    use crate::journal;
+    let lim = &hub.cfg.limits;
+    let now = journal::now();
+    if hub.cfg.demo {
+        return Budget { stop: None, jobs_left: None, entries: Vec::new(), now };
+    }
+    // The journal is the memory here: what was used before a restart still counts. Read back as far
+    // as any limit looks: a day for the counts, and the pause window if that is longer.
+    let window = journal::DAY.max((lim.pause_mins * 60) as i64);
+    let counted = lim.jobs_per_day > 0 || lim.tokens_per_day > 0 || lim.pause_after_failures > 0 || hub.cfg.repos.iter().any(|r| r.jobs_per_day > 0);
+    // Jobs that ended while the journal could not be written are owed to it first.
+    let owed: Vec<journal::Entry> = std::mem::take(&mut hub.state.lock().unwrap().unrecorded);
+    let mut broken: Option<String> = None;
+    let mut still_owed = Vec::new();
+    for e in owed {
+        match (&broken, journal::append(&e)) {
+            (None, Ok(())) => {}
+            (None, Err(err)) => {
+                broken = Some(err);
+                still_owed.push(e);
+            }
+            (Some(_), _) => still_owed.push(e),
+        }
+    }
+    hub.state.lock().unwrap().unrecorded.extend(still_owed);
+    if broken.is_none() {
+        broken = journal::writable().err();
+    }
+    let entries = match journal::read(now - window) {
+        Ok(e) => e,
+        Err(e) => {
+            broken.get_or_insert(e);
+            Vec::new()
+        }
+    };
+    // Without the journal there is no telling what has been used. Not knowing is not zero.
+    if let Some(e) = broken.filter(|_| counted) {
+        return Budget { stop: Some(format!("the journal cannot be used, so nothing is picked up: {}", clip(&e, 160))), jobs_left: None, entries, now };
+    }
+    let mut spent = journal::spent(&entries, None, now);
+    {
+        // Jobs still running are not in the journal yet.
+        let mut st = hub.state.lock().unwrap();
+        for j in st.jobs.iter().filter(|j| !j.status.finished()) {
+            spent.tokens += j.used.iter().map(journal::Usage::tokens).sum::<u64>();
+            spent.jobs += matches!(j.source, Source::Issue { .. } | Source::Pr { .. }) as u32;
+        }
+        st.spent = spent;
+    }
+    let stop = (lim.tokens_per_day > 0 && spent.tokens >= lim.tokens_per_day)
+        .then(|| format!("token limit reached: {} of {} in the last 24 h", journal::kilo(spent.tokens), journal::kilo(lim.tokens_per_day)));
+    let jobs_left = (lim.jobs_per_day > 0).then(|| lim.jobs_per_day.saturating_sub(spent.jobs));
+    Budget { stop, jobs_left, entries, now }
+}
+
+/// Why nothing may be picked up from this repository right now, if anything says so.
+fn hold_for(hub: &Hub, b: &Budget, r: &RepoCfg, taken_here: u32) -> Option<String> {
+    use crate::journal;
+    let lim = &hub.cfg.limits;
+    if let Some(s) = &b.stop {
+        return Some(s.clone());
+    }
+    if b.jobs_left == Some(0) {
+        return Some(format!("job limit reached: {} in the last 24 h", lim.jobs_per_day));
+    }
+    if r.jobs_per_day > 0 {
+        let running = hub.state.lock().unwrap().jobs.iter().filter(|j| !j.status.finished() && matches!(&j.source, Source::Issue { repo, .. } | Source::Pr { repo, .. } if repo == &r.repo)).count() as u32;
+        // `taken_here`: picked in this pass and not yet among the running jobs.
+        if journal::spent(&b.entries, Some(&r.repo), b.now).jobs + running + taken_here >= r.jobs_per_day {
+            return Some(format!("job limit for this repository reached: {} in the last 24 h", r.jobs_per_day));
+        }
+    }
+    journal::paused_until(&b.entries, &r.repo, lim.pause_after_failures, (lim.pause_mins * 60) as i64, b.now)
+        .map(|until| format!("paused until {} after {} failed jobs in a row", clock(until), lim.pause_after_failures))
+}
+
 pub async fn poll_once(hub: &Hub) {
     crate::cicd::deploy_poll(hub).await;
+    let mut budget = budget(hub);
     {
         {
             for (idx, r) in hub.cfg.repos.iter().enumerate() {
+                crate::knowledge::retry_pending(hub, idx).await;
+                // What a limit held back in this repository on this poll: the reason, and how many items.
+                let mut repo_hold: Option<(String, u32)> = None;
                 for pr in [false, true] {
                     let found = if hub.cfg.demo {
                         Ok(demo_items(hub, idx, pr))
@@ -296,7 +418,22 @@ pub async fn poll_once(hub: &Hub) {
                                 // Removing the label and applying it again is how a person asks for another go.
                                 st.forget_unlisted(idx, pr, &listed);
                                 let now = Instant::now();
+                                let mut held = 0;
+                                let mut why: Option<String> = None;
                                 for i in list {
+                                    if st.jobs.iter().any(|j| !j.status.finished() && j.source.key() == Some((idx, pr, i.number))) {
+                                        continue;
+                                    }
+                                    // Asked before the item is taken note of: what a limit holds back stays
+                                    // labelled and untouched, and is picked up when there is room again.
+                                    drop(st);
+                                    let hold = hold_for(hub, &budget, r, fresh.len() as u32);
+                                    st = hub.state.lock().unwrap();
+                                    if let Some(h) = hold {
+                                        held += 1;
+                                        why = Some(h);
+                                        continue;
+                                    }
                                     if !st.should_take((idx, pr, i.number), now) {
                                         continue;
                                     }
@@ -306,7 +443,13 @@ pub async fn poll_once(hub: &Hub) {
                                         continue;
                                     }
                                     st.repos[idx].picked += 1;
+                                    if let Some(left) = budget.jobs_left.as_mut() {
+                                        *left = left.saturating_sub(1);
+                                    }
                                     fresh.push(i);
+                                }
+                                if let Some(w) = why {
+                                    repo_hold = Some((w, repo_hold.map(|(_, n)| n).unwrap_or(0) + held));
                                 }
                                 fresh
                             }
@@ -332,13 +475,40 @@ pub async fn poll_once(hub: &Hub) {
                         }
                     }
                 }
+                // Said once when it starts and once when it ends, not on every poll.
+                let mut st = hub.state.lock().unwrap();
+                let was = st.repos[idx].hold.clone();
+                match (&repo_hold, &was) {
+                    (Some((why, _)), w) if w.as_deref().map(|x| x.split(" · ").next().unwrap_or("")) != Some(why.as_str()) => st.log("limits", format!("{}: {}", r.repo, why)),
+                    (None, Some(_)) => st.log("limits", format!("{}: picking up again", r.repo)),
+                    _ => {}
+                }
+                st.repos[idx].hold = repo_hold.map(|(why, n)| format!("{} · {} waiting", why, n));
             }
         }
     }
 }
 
-fn worktree_dir(hub: &Hub, r: &RepoCfg, kind: &str, n: u64) -> PathBuf {
+/// A directory name for a repository: readable, and different for every repository. Replacing the
+/// separators alone is not enough (`acme/foo_bar` and `acme_foo/bar` would share a name), so a
+/// short hash of the forge and the exact path goes on the end.
+pub fn repo_slug(r: &RepoCfg) -> String {
     let safe: String = r.repo.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect();
+    let forge = match r.provider {
+        Provider::Github => "github",
+        Provider::Gitlab => "gitlab",
+    };
+    // FNV-1a: small, and the same on every machine and in every version, which a path has to be.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in format!("{}:{}", forge, r.repo).bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{}-{:08x}", safe, h as u32)
+}
+
+fn worktree_dir(hub: &Hub, r: &RepoCfg, kind: &str, n: u64) -> PathBuf {
+    let safe = repo_slug(r);
     let host = match r.provider {
         Provider::Github => "github",
         Provider::Gitlab => "gitlab",
@@ -523,6 +693,13 @@ pub async fn stage(hub: &Hub, id: u32) -> Result<(), String> {
         sh("git", &["reset", "--soft", &t.base], d).await?;
     }
     sh("git", &["add", "-A"], d).await?;
+    // The team's notes steer every later job, so they change only through their own pull request,
+    // where a person reads the change. Whatever the agent did under .forkdeck/ is left out.
+    let touched = sh("git", &["diff", "--cached", "--name-only", &t.base, "--", ".forkdeck"], d).await.unwrap_or_default();
+    if !touched.trim().is_empty() {
+        sh("git", &["reset", "-q", &t.base, "--", ".forkdeck"], d).await?;
+        hub.log("notes", format!("#{} the agent's changes under .forkdeck/ were left out: {}", id, clip(&touched.replace('\n', ", "), 160)));
+    }
     let tree = sh("git", &["write-tree"], d).await?;
     hub.job(id, |j| j.staged_tree = Some(tree.clone()));
     Ok(())
@@ -590,7 +767,7 @@ pub async fn commit_local(hub: &Hub, id: u32) -> Result<Option<String>, String> 
     Ok(commit_snapshot(&t, &commit_message(&title, n)).await?.then_some(t.branch))
 }
 
-fn first_url(s: &str) -> Option<String> {
+pub fn first_url(s: &str) -> Option<String> {
     s.split_whitespace().find(|w| w.starts_with("http://") || w.starts_with("https://")).map(String::from)
 }
 
@@ -872,7 +1049,7 @@ pub fn steering_files(names: &str) -> Vec<String> {
             let lower = l.to_lowercase();
             let file = lower.rsplit('/').next().unwrap_or("");
             matches!(file, "claude.md" | "claude.local.md" | "agents.md" | "codex.md" | ".mcp.json")
-                || lower.split('/').any(|part| matches!(part, ".claude" | ".codex"))
+                || lower.split('/').any(|part| matches!(part, ".claude" | ".codex" | ".forkdeck"))
         })
         .map(String::from)
         .collect()
