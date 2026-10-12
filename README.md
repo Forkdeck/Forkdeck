@@ -1,6 +1,6 @@
 # forkdeck
 
-A terminal agent tree for the `claude` and `codex` CLIs.
+A terminal agent tree for the `claude`, `codex` and GitHub Copilot (`copilot`) CLIs.
 
 You give it a task, or label an issue, and it decides which CLI should do the
 work and at what effort, runs it, has the *other* CLI review the result, and
@@ -19,8 +19,10 @@ can be a server on your own machine.
 cargo install --git https://github.com/forkdeck/forkdeck
 ```
 
-You need at least one of `claude` and `codex` on your PATH. With only one, it
-also reviews its own work. Issue automation needs `gh` and/or `glab`, logged in.
+You need at least one of `claude`, `codex` and `copilot` on your PATH. With
+`copilot` alone, it plays both of the others (see below). With only one of
+`claude` and `codex` and no `copilot`, that one also reviews its own work. Issue
+automation needs `gh` and/or `glab`, logged in.
 
 ```
 forkdeck --demo      # simulated agents, nothing is executed
@@ -43,7 +45,7 @@ the config names commands to run.
 2. **Work.** The chosen CLI runs headless in the working directory.
 3. **Checks.** Your own commands (`checks = ["cargo test"]`) run next. A
    failure goes back to the worker with the output.
-4. **Review.** The other CLI reads the diff, read-only, and ends with
+4. **Review.** An agent running another vendor's model reads the diff, read-only, and ends with
    `VERDICT: PASS` or `VERDICT: FAIL`. It sees the task and the tree, not the
    worker's summary. A fail goes back to the worker, up to
    `review.max_fix_rounds` times. Only the last line of the review counts as
@@ -55,6 +57,44 @@ answers, unless `review.mode = "never"`.
 
 Effort tiers map to models and reasoning effort per CLI in the config, so
 "light" can be a small model for a typo and "heavy" the largest one.
+
+## GitHub Copilot CLI
+
+Copilot runs models from several vendors behind one login, so it can do two
+jobs here.
+
+**Standing in.** When `claude` or `codex` is not installed, copilot plays its
+part with a Claude or a GPT model, and the router, the reviewer choice and
+`pr_reviewers` work as if both were there. With only `copilot` installed, work
+and review still come from different vendors. Turn it off with
+`stand_in = false` under `[agents.copilot]`.
+
+**Profiles.** Any other model your copilot `/model` picker lists can be named
+as a profile and used as `copilot:<name>` in `review.pr_reviewers`,
+`review.reviewer_order` or `--agent`. The router itself still chooses between
+claude and codex.
+
+```toml
+[agents.copilot.profiles.second]
+vendor = "xai"            # needed when the model name does not say it
+models = { light = "grok-4.7", standard = "grok-4.7", heavy = "grok-4.7" }
+
+[review]
+pr_reviewers = ["claude", "codex", "copilot:second"]
+```
+
+Each tier takes a list of models in order of preference. Organisations switch
+models on and off, so at startup forkdeck asks copilot which models the account
+may use (this costs no request) and skips the others. A model refused during a
+run, before it did anything, is skipped for the rest of the session and the run
+starts again with the next one. A profile never falls back to `auto`, which
+could pick any vendor's model. When no model from another vendor is available,
+the review runs anyway and the log says it is a same-vendor review.
+
+`forkdeck doctor` shows the login, whether the account can use Copilot from the
+CLI at all, and the model each part would run. Copilot's JSON output carries no
+token counts, so they are read from the usage file it writes when it exits; the
+cost column stays empty, as Copilot bills per request.
 
 ## The fork layer
 
@@ -130,7 +170,7 @@ The labels have to exist in the repository first.
 ## Pull request reviews
 
 Label any open pull or merge request `review:ready`. forkdeck checks out its
-head in a detached worktree and has every CLI in `review.pr_reviewers` review
+head in a detached worktree and has every agent in `review.pr_reviewers` review
 it independently and in parallel. The findings go up as one comment with a
 section per reviewer, naming the commit that was reviewed, and the label moves
 to `review:passed` or `review:changes`.
@@ -158,7 +198,7 @@ on your machine, as you, and the tail of a failing check's output is posted in
 the comment. Turn it on only where everyone who can get the label applied is
 trusted.
 
-Both CLIs load instruction files such as `CLAUDE.md` and `AGENTS.md` from the
+The CLIs load instruction files such as `CLAUDE.md` and `AGENTS.md` from the
 tree they work in. A pull request that changes one can steer its own review, so
 the comment carries a warning when that is the case.
 
@@ -503,9 +543,11 @@ talked into things. The defaults are set with that in mind:
 - Polling is off until you turn it on.
 - Only labelled issues are picked up, and `allowed_authors` narrows that
   further. Use it on public repositories.
-- `claude` runs with `--permission-mode acceptEdits` and `codex` with
-  `--sandbox workspace-write`: both can edit files in the worktree, neither
-  gets an unrestricted shell. Reviewers are read-only. Loosen `write_args`
+- `claude` runs with `--permission-mode acceptEdits`, `codex` with
+  `--sandbox workspace-write` and `copilot` with `--allow-tool write
+  --deny-tool shell`: all can edit files in the worktree, none gets an
+  unrestricted shell. A copilot reviewer has write and shell denied and no
+  skills. Reviewers are read-only. Loosen `write_args`
   only for repositories you trust.
 - Work happens in a worktree on its own branch and arrives as a draft.
 
@@ -525,7 +567,7 @@ back by hand, or with `forkdeck team release`.
 | | |
 |---|---|
 | `Enter` | run the typed task in the current directory |
-| `Tab` | force the next task to claude, codex, or back to auto |
+| `Tab` | force the next task to claude, codex, copilot, or back to auto |
 | `↑` `↓` | select a job; `Esc` goes back to following the newest |
 | `Ctrl-A` | issue and pull request polling on/off |
 | `Ctrl-T` | show what teammates are working on, and back |
@@ -551,7 +593,11 @@ follow the documented formats, and the `glab` commands have not been run
 against a live GitLab yet. The team feature is tested against a stand-in for
 `gh api`; its `gh` calls follow the documented REST endpoints and have not
 been run by two real machines against one repository. Expect to adjust
-`agents.codex` arguments for your codex version.
+`agents.codex` arguments for your codex version. The copilot path is tested
+against the real `copilot` binary talking to a stand-in model server (its
+bring-your-own-key mode; `cargo test --test copilot_byok -- --ignored`), and
+its login and model probe against a real account without a Copilot seat. It
+has not run against Copilot's own models yet.
 
 Not there yet: feeding review comments on an open pull request back to the
 worker for another round; a record of jobs that survives a restart; arbitrating
