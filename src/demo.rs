@@ -26,7 +26,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: &RunSpec<'_>) -> RunOut 
     for (i, (ms, line, tool)) in script.iter().enumerate() {
         tokio::time::sleep(Duration::from_millis(*ms + (job as u64 % 3) * 120)).await;
         hub.job(job, |j| {
-            let s = if slot == Slot::Worker { &mut j.worker } else { &mut j.reviewer };
+            let s = j.stage(slot);
             if *tool {
                 s.tools += 1;
             }

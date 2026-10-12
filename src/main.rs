@@ -294,6 +294,11 @@ fn print_progress(hub: &Hub) {
         for l in j.reviewer.tail.drain(..) {
             say!("         #{:<3} review  {}", id, l);
         }
+        for (i, e) in j.extra.iter_mut().enumerate() {
+            for l in e.tail.drain(..) {
+                say!("         #{:<3} review{} {}", id, i + 3, l);
+            }
+        }
     }
     let _ = std::io::stdout().flush();
 }

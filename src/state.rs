@@ -300,6 +300,8 @@ pub struct Job {
     pub decision: Option<Decision>,
     pub worker: Stage,
     pub reviewer: Stage,
+    /// Pull request reviewers past the second, in configured order.
+    pub extra: Vec<Stage>,
     pub verdict: Option<bool>,
     /// Result of the configured check commands; None when there are none or they have not run.
     pub checks: Option<bool>,
@@ -313,6 +315,22 @@ pub struct Job {
     pub claim: Option<Arc<crate::team::Held>>,
     /// A teammate handed the item back to the queue: stop without touching its labels.
     pub released: bool,
+}
+
+impl Job {
+    pub fn stage(&mut self, slot: crate::agents::Slot) -> &mut Stage {
+        use crate::agents::Slot;
+        match slot {
+            Slot::Worker => &mut self.worker,
+            Slot::Reviewer => &mut self.reviewer,
+            Slot::Extra(i) => {
+                if self.extra.len() <= i {
+                    self.extra.resize_with(i + 1, Stage::default);
+                }
+                &mut self.extra[i]
+            }
+        }
+    }
 }
 
 pub struct LogLine {

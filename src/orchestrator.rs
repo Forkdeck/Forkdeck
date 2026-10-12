@@ -112,6 +112,7 @@ impl Hub {
                 decision: None,
                 worker: Stage::default(),
                 reviewer: Stage::default(),
+                extra: Vec::new(),
                 verdict: None,
                 checks: None,
                 outcome: String::new(),
@@ -824,23 +825,37 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     }
     set_status(hub, id, JobStatus::Reviewing);
     let prompt = pr_review_prompt(number, &title, &body, &base);
-    let first = run_agent(hub, id, Slot::Worker, reviewers[0].clone(), tier, &prompt, &dir, true);
-    let second = async {
-        match reviewers.get(1) {
-            Some(e) => Some(run_agent(hub, id, Slot::Reviewer, e.clone(), tier, &prompt, &dir, true).await),
-            None => {
-                hub.job(id, |j| j.reviewer.state = StageState::Skipped);
-                None
-            }
+    if reviewers.len() < 2 {
+        hub.job(id, |j| j.reviewer.state = StageState::Skipped);
+    }
+    // Every reviewer runs, all at once; the verdict waits for the last of them.
+    let mut set = tokio::task::JoinSet::new();
+    for (i, e) in reviewers.iter().enumerate() {
+        let slot = match i {
+            0 => Slot::Worker,
+            1 => Slot::Reviewer,
+            n => Slot::Extra(n - 2),
+        };
+        let (hub, e, prompt, dir) = (hub.clone(), e.clone(), prompt.clone(), dir.clone());
+        set.spawn(async move { (i, run_agent(&hub, id, slot, e, tier, &prompt, &dir, true).await) });
+    }
+    let mut done: Vec<Option<(RunOut, Exec)>> = (0..reviewers.len()).map(|_| None).collect();
+    while let Some(r) = set.join_next().await {
+        match r {
+            Ok((i, x)) => done[i] = Some(x),
+            Err(e) => hub.log("review", format!("#{} a reviewer task ended abnormally: {}", id, e)),
         }
-    };
-    let (a, b) = tokio::join!(first, second);
+    }
     if cancel.is_set() {
         return cancelled();
     }
     let mut reviews: Vec<issues::Review> = Vec::new();
-    for x in [Some(a), b].into_iter().flatten() {
-        let (out, ran) = x;
+    for (i, x) in done.into_iter().enumerate() {
+        // A reviewer whose task died still counts: its missing verdict keeps the result from passing.
+        let Some((out, ran)) = x else {
+            reviews.push(issues::Review { by: reviewers[i].label(), verdict: None, text: "The review did not complete.".into() });
+            continue;
+        };
         let verdict = if out.ok { parse_verdict(&out.text) } else { None };
         hub.log(
             "review",

@@ -404,14 +404,17 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
 
     // Worker and reviewer
     let pair = Rect { y: rows[4].y, height: rows[4].height, ..centered(inner, 84) };
-    let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).spacing(2).split(pair);
-    let (left, right) = match j.source {
-        Source::Pr { .. } => ("first review", "second review"),
-        Source::Deploy { .. } => ("deploy", if j.reviewer.label.is_empty() { "verify" } else { j.reviewer.label.as_str() }),
-        _ => ("worker", "reviewer"),
+    let stages: Vec<&Stage> = [&j.worker, &j.reviewer].into_iter().chain(j.extra.iter()).collect();
+    let cols = Layout::horizontal(vec![Constraint::Ratio(1, stages.len() as u32); stages.len()]).spacing(2).split(pair);
+    let names: Vec<String> = match j.source {
+        Source::Pr { .. } if stages.len() > 2 => (1..=stages.len()).map(|n| format!("review {}", n)).collect(),
+        Source::Pr { .. } => vec!["first review".into(), "second review".into()],
+        Source::Deploy { .. } => vec!["deploy".into(), if j.reviewer.label.is_empty() { "verify".into() } else { j.reviewer.label.clone() }],
+        _ => vec!["worker".into(), "reviewer".into()],
     };
-    stage_box(f, halves[0], left, &j.worker);
-    stage_box(f, halves[1], right, &j.reviewer);
+    for ((r, name), s) in cols.iter().zip(&names).zip(&stages) {
+        stage_box(f, *r, name, s);
+    }
     connector(f, rows[5], DIM);
 
     // Outcome
@@ -439,10 +442,13 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
 
     // Live output of whichever stage is active
     if rows[7].height >= 4 {
-        let (name, s) = if matches!(j.reviewer.state, StageState::Running) || (j.status.finished() && !j.reviewer.tail.is_empty() && j.verdict == Some(false)) {
-            ("reviewer", &j.reviewer)
+        let extra = j.extra.iter().enumerate().find(|(_, e)| matches!(e.state, StageState::Running) && !matches!(j.reviewer.state, StageState::Running));
+        let (name, s) = if let Some((i, e)) = extra {
+            (format!("review {}", i + 3), e)
+        } else if matches!(j.reviewer.state, StageState::Running) || (j.status.finished() && !j.reviewer.tail.is_empty() && j.verdict == Some(false)) {
+            ("reviewer".to_string(), &j.reviewer)
         } else {
-            ("worker", &j.worker)
+            ("worker".to_string(), &j.worker)
         };
         let r = rows[7];
         let h = r.height.saturating_sub(2) as usize;
