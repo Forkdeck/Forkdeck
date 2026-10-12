@@ -41,7 +41,7 @@ cmd="{root}/missing"
 [automation]
 enabled=false
 ''')
-    for mode in ("draft", "picker", "busy", "signal"):
+    for mode in ("draft", "issue-draft", "picker", "busy", "signal"):
         project = root / mode
         project.mkdir()
         master, slave = pty.openpty()
@@ -73,6 +73,9 @@ enabled=false
             if mode == "draft":
                 os.write(master, b"unfinished draft")
                 time.sleep(.2)
+            elif mode == "issue-draft":
+                os.write(master, b"\x1b[17~\t\tunfinished issue plan")
+                wait(lambda: b"unfinished issue plan" in output)
             elif mode == "picker":
                 os.write(master, b"planning options\r")
                 wait(lambda: "Planning options · task".encode() in output)
@@ -94,6 +97,8 @@ enabled=false
             snapshot = json.loads(next((project / "state/forkdeck/sessions").glob("*.json")).read_text())
             if mode == "draft":
                 assert snapshot["composer"]["draft"] == "unfinished draft"
+            if mode == "issue-draft":
+                assert snapshot["composer"]["draft"] == "unfinished issue plan"
             if mode in ("busy", "signal"):
                 assert snapshot["jobs"][0]["job"]["queued_prompts"] == ["queued follow-up"]
                 pid = int((project / "agent-pid").read_text())

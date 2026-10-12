@@ -11,11 +11,14 @@ mod knowledge;
 mod mcp;
 mod orchestrator;
 mod pick;
+mod planning;
+mod plan_ui;
 mod proc;
 mod router;
 mod session;
 mod state;
 mod team;
+mod tracker;
 mod ui;
 
 use clap::{Parser, Subcommand};
@@ -696,7 +699,7 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
 }
 
 fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
-    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false, factory: true, reply_to: None, new_task: false, choices: None, seen_choices: Default::default(), jobs_per_day: hub.cfg.limits.jobs_per_day, tokens_per_day: hub.cfg.limits.tokens_per_day }
+    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false, factory: true, reply_to: None, new_task: false, choices: None, issue_panel: None, seen_choices: Default::default(), jobs_per_day: hub.cfg.limits.jobs_per_day, tokens_per_day: hub.cfg.limits.tokens_per_day }
 }
 
 /// Quit is global, including when a picker has focus. Some terminals report uppercase keys.
@@ -750,6 +753,7 @@ fn open_choices(hub: &Hub, ui: &mut ui::Ui) {
 }
 
 fn sync_choices(hub: &Hub, ui: &mut ui::Ui) {
+    if ui.issue_panel.is_some() { return; }
     if let Some(picker) = &ui.choices {
         let valid = hub.job(picker.job, |j| j.turns.len() == picker.turn && j.status.finished()).unwrap_or(false);
         if !valid { ui.choices = None; }
@@ -758,6 +762,8 @@ fn sync_choices(hub: &Hub, ui: &mut ui::Ui) {
     if ui.new_task || !ui.input.is_empty() { return; }
     let st = hub.state.lock().unwrap();
     let Some(job) = st.jobs.iter().find(|j| Some(j.id) == ui.selected && j.source.is_manual() && j.status.finished()) else { return };
+    // Implementation steps are not choices after a tracked plan has reached review.
+    if job.issue_plan.as_ref().is_some_and(|p| !p.review.is_empty() || p.reviewed.is_some()) { return; }
     if ui.seen_choices.contains(&(job.id, job.turns.len())) { return; }
     // Record even non-choice answers so output is parsed at most once per completed turn.
     ui.seen_choices.insert((job.id, job.turns.len()));
@@ -839,6 +845,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
         let store = session::Store::open(&cicd::state_dir().join("sessions"), &cwd, &mut hub.state.lock().unwrap(), &mut u, &mut history)?;
         Some(std::sync::Arc::new(std::sync::Mutex::new(store)))
     };
+    *hub.session.lock().unwrap() = session.clone();
     rt.spawn(issues::poll_loop(hub.clone()));
     rt.spawn(team::watch_loop(hub.clone()));
     let mut checkpoint_at = std::time::Instant::now();
@@ -900,9 +907,14 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                 continue;
             }
             match event::read()? {
-                Event::Paste(s) => u.input.push_str(&s.replace(['\n', '\r'], " ")),
+                Event::Paste(s) => {
+                    if let Some(panel) = &mut u.issue_panel { panel.paste(&s); }
+                    else { u.input.push_str(&s.replace(['\n', '\r'], " ")); }
+                },
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
                     if quit_key(k) { return Ok(()); }
+                    if k.code == KeyCode::F(6) { plan_ui::open(hub, &mut u); continue; }
+                    if plan_ui::key(hub, &mut u, &mut history, k) { continue; }
                     if choice_key(hub, &mut u, &mut history, k) {
                         if let Some(store) = &session {
                             let mut store = store.lock().unwrap();

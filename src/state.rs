@@ -347,6 +347,9 @@ pub struct Job {
     /// The complete plan handed to Build, retained across interruptions.
     #[serde(default)]
     pub plan: Option<String>,
+    /// Optional issue-backed planning. Old sessions remain local-only.
+    #[serde(default)]
+    pub issue_plan: Option<crate::planning::Plan>,
     /// A teammate whose forkdeck announced the same deployment before this one did.
     pub peer: Option<String>,
     /// What each CLI was used for in this job so far: claude, codex, then copilot.

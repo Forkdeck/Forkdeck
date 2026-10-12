@@ -46,6 +46,7 @@ pub struct Ui {
     pub reply_to: Option<u32>,
     pub new_task: bool,
     pub choices: Option<crate::choices::Picker>,
+    pub issue_panel: Option<crate::plan_ui::Panel>,
     pub seen_choices: std::collections::HashSet<(u32, usize)>,
     /// The daily limits, to show next to what has been used. 0: none.
     pub jobs_per_day: u32,
@@ -144,6 +145,7 @@ pub fn draw(f: &mut Frame, st: &State, ui: &Ui) {
     prompt(f, rows[4], ui, reply_target(st, ui).and_then(|id| st.jobs.iter().find(|j| j.id == id)));
     status(f, rows[5], st);
     if let Some(picker) = &ui.choices { choice_panel(f, area, picker); }
+    if let Some(panel) = &ui.issue_panel { crate::plan_ui::draw(f, st, panel); }
 }
 
 fn choice_panel(f: &mut Frame, area: Rect, picker: &crate::choices::Picker) {
@@ -194,7 +196,10 @@ fn factory(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
         let count = if narrow { 3 } else { 6 };
         let columns = Layout::horizontal(vec![Constraint::Ratio(1, count as u32); count]).split(board_rows[index / count]);
         let cell = columns[index % count];
-        let jobs: Vec<_> = st.jobs.iter().filter(|j| lane(j.status) == index).collect();
+        let jobs: Vec<_> = st.jobs.iter().filter(|j| {
+            let status = if j.status == JobStatus::Done && j.issue_plan.as_ref().is_some_and(|p| p.build_job.is_none()) { JobStatus::Planning } else { j.status };
+            lane(status) == index
+        }).collect();
         // Keep the selected card visible, even when browsing older completed jobs.
         let room = cell.height.saturating_sub(3) as usize / 2;
         let room = room.max(1);
@@ -219,8 +224,9 @@ fn factory(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
             let review = match job.verdict { Some(true) => "passed", Some(false) => "changes requested", None => "pending / not requested" };
             let queued = job.queued_prompts.front().map(|next| format!("{} queued · next: {}", job.queued_prompts.len(), clip(next, 100)));
             let outcome = if let Some(ref queued) = queued { queued.as_str() } else if job.outcome.is_empty() { job.pr_url.as_deref().unwrap_or("Work is in progress") } else { &job.outcome };
+            let summary = job.issue_plan.as_ref().map(|p| p.status(st.automation)).unwrap_or_else(|| format!("Checks: {} · Review: {} · {}", checks, review, job.workdir.display()));
             let lines = vec![
-                Line::from(Span::styled(format!(" Checks: {} · Review: {} · {}", checks, review, job.workdir.display()), fg(TEXT))),
+                Line::from(Span::styled(format!(" {summary}"), fg(TEXT))),
                 Line::from(Span::styled(format!(" {}", outcome), fg(status_color(job.status)))),
             ];
             f.render_widget(Paragraph::new(lines).block(boxed(&format!("#{} {} · {}", job.id, job.title, job.status.name()), status_color(job.status))), detail[0]);
@@ -690,9 +696,9 @@ fn status(f: &mut Frame, area: Rect, st: &State) {
     ]);
     if area.width > 155 { f.render_widget(Paragraph::new(left), area); }
     let keys = if area.width < 110 {
-        "⏎ send · ↑↓ history · Alt↑↓ job · ^T new · F5 choices · ^X stop · ^C quit"
+        "⏎ send · ↑↓ history · ^T new · F5 choices · F6 issue plan · ^C quit"
     } else {
-        "⏎ send · ↑↓ history · Alt↑↓ job · F2 view · F5 choices · Tab agent · ^T new · ^R reply · F4 team · ^X stop · ^C quit "
+        "⏎ send · ↑↓ history · Alt↑↓ job · F2 view · F5 choices · F6 issue plan · Tab agent · ^T new · ^R reply · ^X stop · ^C quit "
     };
     f.render_widget(Paragraph::new(Span::styled(keys, fg(DIM))).alignment(Alignment::Right), area);
 }

@@ -778,6 +778,7 @@ back by hand, or with `forkdeck team release`.
 | `Alt-↑` `Alt-↓` | select a job; `Esc` goes back to following the newest |
 | `F2` | switch between the factory board and agent tree |
 | `F5` | open planning choices for the selected task |
+| `F6` | create/link an issue plan; inspect, accept, refine or mark it ready for build |
 | `Ctrl-A` | issue and pull request polling on/off |
 | `F4` | show what teammates are working on, and back |
 | `Ctrl-X` | cancel the selected job |
@@ -819,13 +820,77 @@ as choices/options and numbered Markdown option tables are supported. Use
 Up/Down to highlight a choice and Enter to send it to the same task. Select
 **Other / custom response** (or press `c`) to write your own reply. Esc closes
 the picker; F5 reopens it. Outside the picker, Up/Down still recalls messages.
-Planning-choice answers finish their turn without running code checks or a
+For local-only tasks, planning-choice answers finish their turn without running code checks or a
 review/fix loop, so the user can decide what happens next. After a choice or custom
 reply, the worker completes the plan; a ready plan automatically moves the same
 task into Build, followed by its configured checks and review. Further questions
 stay in planning. Failed or cancelled planning never starts Build. The plan is
 saved with the task so an interrupted build can resume with its context.
 CLI-native interactive permission prompts are not handled by this text-choice picker.
+
+### Issue-backed planning
+
+Press **Ctrl-T**, then **F6** to start a plan for a configured GitHub or GitLab
+repository. F6 on a completed typed task attaches issue planning to that same
+conversation. Choose the repository with Left/Right; the current directory's
+matching repository is selected by default. Tab moves between the repository,
+existing issue URL/number, and planning request. Leave the issue field blank to
+create a new issue after acceptance. Enter starts planning.
+
+The planner and plan reviewer both use the configured read-only agent arguments.
+They review the goal, steps, acceptance criteria, dependencies and test strategy;
+repository code checks run later during Build. A complete plan goes to review
+even when ordinary task review is disabled. A failed or incomplete review cannot
+be accepted. Numbered choices and custom replies continue on the same task.
+
+F6 shows the complete saved plan and reviewer feedback. Tab switches between
+them; Up/Down and PageUp/PageDown scroll. Left/Right or 1–3 selects an action,
+and Enter applies it:
+
+1. **Accept and publish / retry** creates or updates the issue only after the
+   current revision passes review. This also reconciles an interrupted publication.
+2. **Refine** returns to the same task's message field for a custom response.
+   Queued feedback receives its own planning/review turn and invalidates approval.
+3. **Ready for build** applies the repository's existing intake label only after
+   the current revision is reviewed, accepted and successfully published.
+
+Publishing never starts Build by itself. The ordinary issue poller handles Ready
+issues, using its existing author, budget, claim and concurrency checks. The
+planning card links to that issue and shows the resulting build task number in
+the current session. If intake is paused, the card says **Ready — intake paused**;
+Ctrl-A enables intake when desired. The workflow never enables it automatically.
+Refining a linked issue removes its ready label before planning starts. Closed,
+actively claimed, building and PR-open issues cannot be refined or republished.
+
+Plans occupy a `<!-- forkdeck:plan:start -->` / `<!-- forkdeck:plan:end -->`
+section in the issue description. Text outside that section is preserved, and
+each accepted revision adds a short history comment. Forkdeck re-fetches before
+publication and refuses to overwrite a changed managed section. Refine to load
+the latest issue and review the new revision. These checks are optimistic:
+GitHub/GitLab issue edits and labels are not a cross-client transaction.
+
+The issue reference, full draft/review, revision approvals and publication
+progress are saved with the TUI session before remote writes. Restarting never
+publishes or starts agents automatically. Retry from F6 after a partial failure.
+Uncertain issue/comment creation is reconciled through durable hidden markers;
+if the result cannot yet be found, retry reports uncertainty instead of issuing
+a duplicate POST. Keep those markers while recovering an interrupted operation.
+A failed session save blocks remote writes. Only one local TUI per working
+directory owns the session; separate machines still use the forge's claim checks.
+
+This uses existing `gh` / `glab` authentication and the selected clone's CLI host
+configuration. URL links must match that forge and repository. New issue plans
+are local until acceptance; linking an existing ready issue immediately holds it
+out of intake. Jira and other providers, issue-comment commands and headless
+planning commands are not part of this first version.
+
+Offline acceptance tests use fake agents and forge CLIs:
+
+```sh
+cargo test
+python3 tests/tui_issue_plans.py target/debug/forkdeck
+python3 tests/tui_exit.py target/debug/forkdeck
+```
 
 Typed tasks share the current directory, so they run one at a time. Issue and
 review jobs each have a worktree and run `automation.max_parallel` at once.

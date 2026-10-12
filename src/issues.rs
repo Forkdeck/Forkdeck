@@ -421,6 +421,12 @@ pub async fn poll_once(hub: &Hub) {
                                 let mut held = 0;
                                 let mut why: Option<String> = None;
                                 for i in list {
+                                    // A linked conversation owns refinement until the user explicitly
+                                    // marks its current published revision ready. Do not mark it seen.
+                                    if !pr && st.jobs.iter().any(|j| j.issue_plan.as_ref().is_some_and(|p| {
+                                        p.provider == r.provider && p.repo == r.repo && p.issue.as_ref().is_some_and(|linked| linked.key == i.number.to_string()) &&
+                                        (!p.ready_for_intake() || !j.queued_prompts.is_empty() || !j.status.finished())
+                                    })) { continue; }
                                     if st.jobs.iter().any(|j| !j.status.finished() && j.source.key() == Some((idx, pr, i.number))) {
                                         continue;
                                     }
@@ -465,13 +471,21 @@ pub async fn poll_once(hub: &Hub) {
                                 None,
                             );
                         } else {
-                            hub.submit(
+                            let build_id = hub.submit(
                                 format!("{}#{} {}", r.repo, i.number, i.title),
                                 task_prompt(r, &i),
                                 Source::Issue { repo_idx: idx, repo: r.repo.clone(), number: i.number, url: i.url.clone() },
                                 r.path.clone(),
                                 None,
                             );
+                            let mut st = hub.state.lock().unwrap();
+                            for j in &mut st.jobs {
+                                if let Some(p) = &mut j.issue_plan {
+                                    if p.provider == r.provider && p.repo == r.repo && p.issue.as_ref().is_some_and(|linked| linked.key == i.number.to_string()) {
+                                        p.build_job = Some(build_id);
+                                    }
+                                }
+                            }
                         }
                     }
                 }

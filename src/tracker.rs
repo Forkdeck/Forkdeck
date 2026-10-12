@@ -1,0 +1,200 @@
+//! Forge boundary for issue plans. Keys stay opaque outside this adapter.
+use crate::{config::RepoCfg, issues, state::Provider, team};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+pub const OPEN: &str = "<!-- forkdeck:plan:start -->";
+pub const CLOSE: &str = "<!-- forkdeck:plan:end -->";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct IssueRef {
+    pub provider: Provider,
+    pub repo: String,
+    pub key: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteIssue {
+    pub reference: IssueRef,
+    pub title: String,
+    pub body: String,
+    pub labels: Vec<String>,
+    pub open: bool,
+}
+
+pub fn section(body: &str) -> Result<Option<String>, String> {
+    let starts: Vec<_> = body.match_indices(OPEN).collect();
+    let ends: Vec<_> = body.match_indices(CLOSE).collect();
+    match (starts.as_slice(), ends.as_slice()) {
+        ([], []) => Ok(None),
+        ([(a, _)], [(b, _)]) if a < b => Ok(Some(body[*a..*b + CLOSE.len()].into())),
+        _ => Err("The issue has ambiguous plan markers; repair them on the forge before publishing.".into()),
+    }
+}
+
+pub fn replace(body: &str, expected: &Option<String>, replacement: &str) -> Result<String, String> {
+    let current = section(body)?;
+    if &current != expected { return Err("The issue plan changed remotely. Refine against the latest issue before accepting again.".into()); }
+    Ok(match current {
+        Some(old) => body.replacen(&old, replacement, 1),
+        None if body.is_empty() => replacement.into(),
+        None => format!("{body}\n\n{replacement}"),
+    })
+}
+
+pub fn managed(plan: &str, token: &str, revision: u64) -> String {
+    format!("{OPEN}\n<!-- forkdeck:revision {token} -->\n## Implementation plan · revision {revision}\n\n{plan}\n{CLOSE}")
+}
+
+fn tool(r: &RepoCfg) -> &'static str { if r.provider == Provider::Github { "gh" } else { "glab" } }
+fn root(r: &RepoCfg) -> String {
+    if r.provider == Provider::Github { format!("repos/{}/issues", r.repo) }
+    else { format!("projects/{}/issues", encode(&r.repo)) }
+}
+fn encode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+pub fn number(key: &str) -> Result<u64, String> {
+    key.parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(|| "Expected a positive issue number.".into())
+}
+
+/// URLs must identify the configured repository. The API response is the canonical URL.
+pub fn key(r: &RepoCfg, input: &str) -> Result<String, String> {
+    let s = input.trim();
+    if !s.contains("://") { return number(s.trim_start_matches('#')).map(|n| n.to_string()); }
+    let url = reqwest::Url::parse(s).map_err(|_| "Invalid issue URL")?;
+    if !matches!(url.scheme(), "http" | "https") || url.query().is_some() || url.fragment().is_some() {
+        return Err("Use an issue URL without a query or fragment.".into());
+    }
+    let prefix = if r.provider == Provider::Github { format!("/{}/issues/", r.repo) } else { format!("/{}/-/issues/", r.repo) };
+    let n = url.path().strip_prefix(&prefix).ok_or("Issue URL does not match the selected repository.")?;
+    number(n).map(|n| n.to_string())
+}
+
+async fn api(r: &RepoCfg, method: &str, path: &str, data: Option<Value>) -> Result<String, String> {
+    let dir = if r.path.is_dir() { Some(r.path.as_path()) } else { None };
+    if let Some(data) = data {
+        issues::sh_in(tool(r), &["api", "-X", method, path, "--input", "-"], dir, &data.to_string()).await
+    } else { issues::sh(tool(r), &["api", path], dir).await }
+}
+
+fn parse(r: &RepoCfg, v: &Value) -> Result<RemoteIssue, String> {
+    if v.get("pull_request").is_some() { return Err("Select an issue, not a pull request.".into()); }
+    let github = r.provider == Provider::Github;
+    let key = v[if github { "number" } else { "iid" }].as_u64().filter(|n| *n > 0).ok_or("Forge response has no issue number")?.to_string();
+    let url = v[if github { "html_url" } else { "web_url" }].as_str().ok_or("Forge response has no issue URL")?.into();
+    Ok(RemoteIssue {
+        reference: IssueRef { provider: r.provider, repo: r.repo.clone(), key, url },
+        title: v["title"].as_str().unwrap_or("").into(),
+        body: v[if github { "body" } else { "description" }].as_str().unwrap_or("").into(),
+        labels: v["labels"].as_array().into_iter().flatten().filter_map(|l| l.as_str().or_else(|| l["name"].as_str())).map(str::to_string).collect(),
+        open: matches!(v["state"].as_str(), Some("open" | "opened")),
+    })
+}
+
+pub async fn read(r: &RepoCfg, key: &str) -> Result<RemoteIssue, String> {
+    let out = api(r, "GET", &format!("{}/{}", root(r), number(key)?), None).await?;
+    parse(r, &serde_json::from_str(&out).map_err(|e| format!("Invalid issue response: {e}"))?)
+}
+
+pub async fn read_ref(r: &RepoCfg, reference: &IssueRef) -> Result<RemoteIssue, String> {
+    if reference.repo != r.repo || reference.provider != r.provider { return Err("Issue reference does not match the configured repository.".into()); }
+    let remote = read(r, &reference.key).await?;
+    if !reference.url.is_empty() {
+        let requested = reqwest::Url::parse(&reference.url).map_err(|_| "Invalid saved issue URL")?;
+        let actual = reqwest::Url::parse(&remote.reference.url).map_err(|_| "Invalid forge issue URL")?;
+        if requested.host_str() != actual.host_str() || requested.port_or_known_default() != actual.port_or_known_default() || requested.path() != actual.path() {
+            return Err("The issue URL does not match the configured forge CLI. Configure that repository's CLI host first.".into());
+        }
+    }
+    Ok(remote)
+}
+
+pub async fn create(r: &RepoCfg, title: &str, body: &str) -> Result<RemoteIssue, String> {
+    let data = if r.provider == Provider::Github { json!({"title":title,"body":body}) } else { json!({"title":title,"description":body}) };
+    let out = api(r, "POST", &root(r), Some(data)).await?;
+    parse(r, &serde_json::from_str(&out).map_err(|e| format!("Invalid created issue response: {e}"))?)
+}
+
+/// Find an uncertain create by its durable marker, including closed issues and all pages.
+pub async fn find_created(r: &RepoCfg, marker: &str) -> Result<Option<RemoteIssue>, String> {
+    let dir = if r.path.is_dir() { Some(r.path.as_path()) } else { None };
+    let out = issues::sh(tool(r), &["api", "--paginate", &format!("{}?state=all&per_page=100", root(r))], dir).await?;
+    let mut found = None;
+    for page in serde_json::Deserializer::from_str(&out).into_iter::<Value>() {
+        let page = page.map_err(|e| e.to_string())?;
+        let entries = page.as_array().ok_or("Invalid paginated issue response")?;
+        for entry in entries {
+            if entry.get("pull_request").is_some() { continue; }
+            let item = parse(r, entry)?;
+            if item.body.contains(marker) {
+                if found.is_some() { return Err("Multiple issues have this publication marker; link the intended issue explicitly.".into()); }
+                found = Some(item);
+            }
+        }
+    }
+    Ok(found)
+}
+
+pub async fn update(r: &RepoCfg, key: &str, body: &str) -> Result<(), String> {
+    let (method, data) = if r.provider == Provider::Github { ("PATCH", json!({"body":body})) } else { ("PUT", json!({"description":body})) };
+    api(r, method, &format!("{}/{}", root(r), number(key)?), Some(data)).await.map(|_| ())
+}
+
+pub async fn history(r: &RepoCfg, key: &str) -> Result<Vec<team::Comment>, String> {
+    team::comments(r, &team::Target::Issue(number(key)?)).await
+}
+pub async fn comment(r: &RepoCfg, key: &str, body: &str) -> Result<(), String> {
+    let path = team::list_path(r, &team::Target::Issue(number(key)?)).ok_or("Comments unsupported")?;
+    api(r, "POST", &path, Some(json!({"body":body}))).await.map(|_| ())
+}
+pub async fn readiness(r: &RepoCfg, key: &str, ready: bool) -> Result<(), String> {
+    // Label-only edits preserve unrelated labels on both forges.
+    let path = format!("{}/{}", root(r), number(key)?);
+    if r.provider == Provider::Github {
+        if ready { api(r, "POST", &format!("{path}/labels"), Some(json!({"labels":[r.label]}))).await?; }
+        else { api(r, "DELETE", &format!("{path}/labels/{}", encode(&r.label)), Some(json!({}))).await?; }
+    } else {
+        let data = if ready { json!({"add_labels":r.label}) } else { json!({"remove_labels":r.label}) };
+        api(r, "PUT", &path, Some(data)).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn preserve_human_text_and_detect_conflicts() {
+        let old = managed("old", "a", 1);
+        let body = format!("Human intro\n{old}\nHuman tail");
+        let new = managed("new", "b", 2);
+        assert_eq!(replace(&body, &Some(old.clone()), &new).unwrap(), format!("Human intro\n{new}\nHuman tail"));
+        assert!(replace(&body, &None, &new).is_err());
+        assert!(section(&format!("{old}\n{old}")).is_err());
+        assert!(section(CLOSE).is_err());
+    }
+
+    #[test]
+    fn links_and_payloads_are_provider_specific() {
+        for provider in ["github", "gitlab"] {
+            let cfg: crate::config::Config = toml::from_str(&format!("[[repos]]\nprovider='{provider}'\nrepo='a/b'\npath='/tmp'\n")).unwrap();
+            let r = &cfg.repos[0];
+            assert_eq!(key(r, "#42").unwrap(), "42");
+            assert!(key(r, "0").is_err());
+            assert!(key(r, "-3").is_err());
+            assert!(key(r, "https://example.test/wrong/repo/issues/42").is_err());
+            let path = if provider == "github" { "a/b/issues" } else { "a/b/-/issues" };
+            assert_eq!(key(r, &format!("https://example.test/{path}/42")).unwrap(), "42");
+            let github = provider == "github";
+            let value = if github { json!({"number":42,"html_url":"https://example.test/a/b/issues/42","body":"Human body","labels":[{"name":"custom"}],"state":"open"}) }
+                else { json!({"iid":42,"web_url":"https://example.test/a/b/-/issues/42","description":"Human body","labels":["custom"],"state":"opened"}) };
+            let remote = parse(r, &value).unwrap();
+            assert!(remote.open);
+            assert_eq!(remote.body, "Human body");
+            assert_eq!(remote.labels, ["custom"]);
+            assert!(parse(r, &json!({"number":42,"pull_request":{}})).is_err());
+        }
+    }
+}

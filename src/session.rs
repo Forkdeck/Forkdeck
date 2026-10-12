@@ -43,6 +43,14 @@ pub struct Store {
     error: Option<String>,
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        // A child between fork and exec may briefly inherit this open-file description.
+        // Explicitly release our lease instead of waiting for every inherited fd to close.
+        unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN); }
+    }
+}
+
 impl Store {
     pub fn open(root: &Path, cwd: &Path, st: &mut State, ui: &mut Ui, history: &mut History) -> Result<Self> {
         let workdir = fs::canonicalize(cwd).context("resolve session working directory")?;
@@ -71,6 +79,8 @@ impl Store {
             let now = Instant::now();
             for entry in saved.jobs {
                 let mut job = entry.job;
+                // Automated jobs are owned by forge intake and are not in this session snapshot.
+                if let Some(p) = &mut job.issue_plan { p.build_job = None; }
                 if !job.status.finished() {
                     job.status = JobStatus::Cancelled;
                     job.outcome = "Interrupted by a previous exit. Ctrl-R then Enter resumes this task.".into();
@@ -101,7 +111,8 @@ impl Store {
     }
 
     pub fn composer(&mut self, ui: &Ui, history: &History) {
-        self.composer = Composer { history: history.messages().to_vec(), draft: ui.input.clone(), selected: ui.selected, reply_to: ui.reply_to, new_task: ui.new_task, forced: ui.forced.clone() };
+        let draft = ui.issue_panel.as_ref().and_then(crate::plan_ui::Panel::draft).unwrap_or(&ui.input).to_string();
+        self.composer = Composer { history: history.messages().to_vec(), draft, selected: ui.selected, reply_to: ui.reply_to, new_task: ui.new_task, forced: ui.forced.clone() };
     }
 
     pub fn checkpoint(&mut self, st: &mut State) {
@@ -119,7 +130,7 @@ impl Store {
         }
     }
 
-    fn save(&mut self, st: &State) -> Result<()> {
+    pub(crate) fn save(&mut self, st: &State) -> Result<()> {
         let jobs = st.jobs.iter().filter(|j| j.source.is_manual()).map(|job| {
             let elapsed_secs = job.finished.unwrap_or_else(Instant::now).saturating_duration_since(job.created).as_secs();
             SavedJob { job: job.clone(), elapsed_secs }
@@ -151,6 +162,24 @@ mod tests {
     }
 
     #[test]
+    fn closing_session_releases_lock_even_with_an_inherited_descriptor() {
+        let root = root("inherited-lock");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = Hub::new(Config::default(), rt.handle().clone());
+        let mut ui = crate::new_ui(&hub, root.clone());
+        let mut history = History::default();
+        let store = Store::open(&root.join("sessions"), &root, &mut State::default(), &mut ui, &mut history).unwrap();
+        let inherited = unsafe { libc::dup(store._lock.as_raw_fd()) };
+        assert!(inherited >= 0);
+        drop(store);
+        let reopened = Store::open(&root.join("sessions"), &root, &mut State::default(), &mut ui, &mut history);
+        unsafe { libc::close(inherited); }
+        assert!(reopened.is_ok());
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn sessions_from_two_agent_builds_still_load() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let hub = Hub::new(Config::default(), rt.handle().clone());
@@ -158,11 +187,13 @@ mod tests {
         let mut saved = hub.job(id, |j| serde_json::to_value(j).unwrap()).unwrap();
         saved.as_object_mut().unwrap().remove("extra");
         saved.as_object_mut().unwrap().remove("queued_prompts");
+        saved.as_object_mut().unwrap().remove("issue_plan");
         saved["worker"].as_object_mut().unwrap().remove("via");
         saved["reviewer"].as_object_mut().unwrap().remove("via");
         saved["used"].as_array_mut().unwrap().truncate(2);
         let job: Job = serde_json::from_value(saved).unwrap();
         assert!(job.queued_prompts.is_empty());
+        assert!(job.issue_plan.is_none());
         assert!(job.extra.is_empty());
         assert_eq!(job.forced, Some(AgentRef::Kind(AgentKind::Codex)));
         assert_eq!(job.used[2], crate::journal::Usage::default());
