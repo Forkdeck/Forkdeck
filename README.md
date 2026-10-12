@@ -68,8 +68,58 @@ Two routers ship:
 
 ### Running the decision model locally
 
+For a local RTX 3090, the repository includes a repeatable setup for
+[AutoJev-27B Q4_K_M](https://huggingface.co/thomasgauthier/autojev-27b-GGUF).
+It uses the [jev.cpp](https://github.com/thomasgauthier/jev.cpp) fork, which
+preserves AutoJev's classifier head and serves `/v1/systemone`. This model
+requires that fork; the publisher does not support standard llama.cpp or
+LM Studio for it.
+
+Requirements: Linux/WSL with GPU access, an RTX 3090 at GPU index 0, the CUDA
+toolkit (`nvcc`), CMake, a C++ compiler, Git, curl, and `sha256sum`. Testing
+also needs Rust/Cargo and Python 3. Allow at least 25 GB of free disk space;
+the text model download is approximately 15.8 GB. No vision projector is needed.
+
+```sh
+./scripts/local-jev.sh setup   # build pinned CUDA source; download and verify weights
+./scripts/local-jev.sh start   # foreground server; Ctrl-C stops it
+```
+
+In a second terminal, from this repository:
+
+```sh
+./scripts/local-jev.sh test
+
+# Or route your own task (this does not launch coding agents):
+export FORKDECK_JEV_KEY=forkdeck-local-dev
+cargo run --locked -- --config .local/jev/forkdeck.toml route "Fix the pagination bug"
+```
+
+The script keeps source, builds, model weights, and its dedicated configuration
+in ignored `.local/jev/`. Repeating `setup` reuses the build and verified model;
+interrupted downloads resume. It never writes your normal Forkdeck configuration.
+The server binds to `127.0.0.1:8000`, uses one request slot and an 8,192-token
+context, and requests full GPU offload. The test configuration allows 60 seconds
+per routing request and disables automation. The smoke test requires real Jev
+answers for three tasks, then checks authentication failure and connection
+failure both produce explicit rules-fallback diagnostics.
+
+The development key defaults to `forkdeck-local-dev`. To change it, export
+`FORKDECK_JEV_KEY` with the same value in both terminals. Set `JEV_BUILD_JOBS`
+to change build concurrency (default 4). If `nvidia-smi` reports GPU access
+blocked, run from a GPU-enabled terminal outside the sandbox. A working driver
+alone is not sufficient to build: `nvcc` must also be installed and on PATH.
+If port 8000 is occupied, stop the other service before starting this server.
+If CUDA runs out of memory, check `nvidia-smi` and free GPU memory; the script
+does not automatically reduce context or switch to CPU. Quantized accuracy
+still needs evaluation on your tasks; passing the smoke test establishes API
+integration, not routing quality.
+
+#### Smaller GLiFormer alternative
+
 [jeff](https://github.com/logan-markewich/jeff) is a self-hosted
-implementation of that API. Start it, then point forkdeck at it:
+implementation of that API using GLiFormer. Follow its upstream installation
+and model-download instructions, start it, then point forkdeck at it:
 
 ```
 JEFF_API_KEYS=devkey uv run jeff        # listens on :8000
@@ -429,7 +479,7 @@ random id into its claims, kept in `~/.local/state/forkdeck/machine-id`, so a
 restarted forkdeck can recognise a claim its previous run left behind. The id
 is not derived from anything about the machine.
 
-**Seeing it.** `Ctrl-T` swaps the agent tree for the team pane, and
+**Seeing it.** `F4` swaps the agent tree for the team pane, and
 `forkdeck team` prints the same thing:
 
 ![the team pane in demo mode](docs/team.png)
@@ -679,19 +729,62 @@ back by hand, or with `forkdeck team release`.
 
 | | |
 |---|---|
-| `Enter` | with a typed task selected, send what you typed to it as a follow-up; otherwise run it as a new task in the current directory |
-| `Ctrl-N` | make the next `Enter` start a new task instead of replying |
+| `Enter` | reply to the current typed task, or submit a new task after Ctrl-T |
+| `Ctrl-R` | reply to the selected typed task; Enter with an empty message resumes it |
+| `Ctrl-T` | start a new task, keeping your draft (Ctrl-N also works) |
 | `Tab` | force the next task to claude, codex, or back to auto |
-| `↑` `↓` | select a job; `Esc` goes back to following the newest |
+| `↑` `↓` | recall submitted messages; edit and press Enter to resend; Down restores your draft |
+| `Alt-↑` `Alt-↓` | select a job; `Esc` goes back to following the newest |
+| `F2` | switch between the factory board and agent tree |
+| `F5` | open planning choices for the selected task |
 | `Ctrl-A` | issue and pull request polling on/off |
-| `Ctrl-T` | show what teammates are working on, and back |
+| `F4` | show what teammates are working on, and back |
 | `Ctrl-X` | cancel the selected job |
-| `Ctrl-C` | quit, stopping any running agent |
+| `Ctrl-C` / `Ctrl-Q` | quit from any view, saving the session and stopping agents |
 
-A typed task keeps its conversation: once it has finished, select it (`↑` `↓`) and
-type a follow-up. The same agent continues in the same tree, is given the earlier
-exchanges, and its change goes through the checks and review again. A job that is
-still running does not take a reply yet.
+A typed task keeps its conversation: select it (`Alt-↑` `Alt-↓`) and
+press `Ctrl-R` and type a follow-up. The same agent continues in the same tree, is given the earlier
+exchanges, and its change goes through the checks and review again. Messages sent
+while the task is running are queued on that task and run in submission order
+after the current turn (including checks and review) succeeds. The composer
+shows the queue count and the task detail shows the next prompt. Queued prompts
+are saved across restarts. Failure, cancellation, and shutdown pause the queue;
+resume the task to continue it.
+
+Press Ctrl-T, type a short message, and press Enter to create a new task. Subsequent messages reply to that task. A busy task accepts the message into its queue and clears the composer.
+
+Typed tasks, conversations, recent output, the last 100 submitted messages, and
+an unfinished draft are saved under `~/.local/state/forkdeck/sessions/` (or
+`$XDG_STATE_HOME/forkdeck/sessions/`). Restart the TUI from the same working
+directory to restore them. Select a task with `Alt-Up/Down`, press `Ctrl-R`,
+then enter a follow-up or press Enter with an empty message to continue.
+Interrupted tasks return in Attention and never start automatically. Continuing
+starts an agent with the saved conversation in the original working tree; it
+does not restore the CLI's internal process or session. The original request and
+up to eight recent exchanges are supplied as context.
+
+Session files contain task text and agent output, are created with owner-only
+permissions, and are replaced atomically. Submissions and normal exits save
+immediately; in-progress output and drafts checkpoint once a second. One TUI
+per working directory owns that session file to prevent duplicate resumes or
+lost updates. Demo and headless runs do not save TUI sessions. Issue, review,
+and deployment recovery remains managed by their existing forge/state flows.
+Tasks from builds before session saving cannot be restored from the statistics
+journal; keep their original window open if it is still running.
+
+Planning choices in a completed worker answer open a picker automatically when
+that task is selected and the message field is empty. Numbered lists introduced
+as choices/options and numbered Markdown option tables are supported. Use
+Up/Down to highlight a choice and Enter to send it to the same task. Select
+**Other / custom response** (or press `c`) to write your own reply. Esc closes
+the picker; F5 reopens it. Outside the picker, Up/Down still recalls messages.
+Planning-choice answers finish their turn without running code checks or a
+review/fix loop, so the user can decide what happens next. After a choice or custom
+reply, the worker completes the plan; a ready plan automatically moves the same
+task into Build, followed by its configured checks and review. Further questions
+stay in planning. Failed or cancelled planning never starts Build. The plan is
+saved with the task so an interrupted build can resume with its context.
+CLI-native interactive permission prompts are not handled by this text-choice picker.
 
 Typed tasks share the current directory, so they run one at a time. Issue and
 review jobs each have a worktree and run `automation.max_parallel` at once.
@@ -715,9 +808,12 @@ been run by two real machines against one repository. Expect to adjust
 `agents.codex` arguments for your codex version.
 
 Not there yet: feeding review comments on an open pull request back to the
-worker for another round; resuming a job that was in flight when forkdeck
-stopped (the journal records finished jobs, it does not restart unfinished ones).
+worker for another round.
 
 ## License
 
 MIT
+
+The TUI opens on a factory board: Queue, Build, Review, Delivery, Done, and Attention. Select a job with Alt-Up/Down to inspect its checks, review result, and live worker/reviewer output. F2 switches to the detailed agent tree. Message recall keeps the last 100 accepted submissions across TUI restarts; Enter replies to the current task; Ctrl-T starts a new task and F4 opens the team view.
+
+When a worker or reviewer reports exhausted usage before using tools, Forkdeck retries once with the other available CLI. The limited CLI is skipped for 15 minutes in that process and shown as LIMITED. A run that has used tools is not replayed automatically. If only one CLI remains available, its own review is explicitly logged.

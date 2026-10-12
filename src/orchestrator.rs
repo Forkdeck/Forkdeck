@@ -123,6 +123,9 @@ impl Hub {
                 claim: None,
                 released: false,
                 turns: vec![Turn { ask: prompt, answer: String::new() }],
+                queued_prompts: Default::default(),
+                planning: false,
+                plan: None,
                 peer: None,
                 used: Default::default(),
                 findings: Vec::new(),
@@ -144,8 +147,7 @@ impl Hub {
         id
     }
 
-    /// Send a follow-up message to a finished typed task. The agent picks up in the same working
-    /// tree and is given the conversation so far. Err says why it was not taken.
+    /// Send a follow-up on the same task. Busy tasks retain it until the current turn succeeds.
     pub fn reply(&self, id: u32, text: String) -> Result<(), String> {
         {
             let mut st = self.state.lock().unwrap();
@@ -157,23 +159,12 @@ impl Hub {
                 return Err("only typed tasks take replies".into());
             }
             if !j.status.finished() {
-                return Err("still running, wait for it or cancel it with Ctrl-X".into());
+                j.queued_prompts.push_back(text.clone());
+                let count = j.queued_prompts.len();
+                st.log("queue", format!("#{} queued prompt {}: {}", id, count, clip(&text, 90)));
+                return Ok(());
             }
-            j.turns.push(Turn { ask: text.clone(), answer: String::new() });
-            j.status = JobStatus::Queued;
-            j.finished = None;
-            j.outcome.clear();
-            j.verdict = None;
-            j.checks = None;
-            j.rounds = 0;
-            // The previous turn is already journalled; account only for this new run.
-            j.used = Default::default();
-            j.findings.clear();
-            j.over_time = false;
-            j.created = Instant::now();
-            j.cancel = Cancel::new();
-            j.worker.push(format!("› {}", clip(&text, 300)));
-            j.reviewer.state = StageState::Idle;
+            prepare_reply(j, text.clone());
             st.log("queue", format!("#{} reply: {}", id, clip(&text, 90)));
         }
         let hub = self.clone();
@@ -255,11 +246,39 @@ fn cancelled() -> Finish {
     Finish { status: JobStatus::Cancelled, outcome: "cancelled".into(), retry: None, reported: false, wait: None }
 }
 
+/// Reset a completed turn only after its usage and result have been recorded.
+fn prepare_reply(j: &mut Job, text: String) {
+    // Also recognize planning choices in snapshots written before planning state existed.
+    if j.plan.is_none() && !crate::choices::for_job(j).is_empty() {
+        j.planning = true;
+        j.plan = None;
+    }
+    j.turns.push(Turn { ask: text.clone(), answer: String::new() });
+    j.status = JobStatus::Queued;
+    j.finished = None;
+    j.outcome.clear();
+    j.verdict = None;
+    j.checks = None;
+    j.rounds = 0;
+    // The previous turn is already journalled; account only for this new run.
+    j.used = Default::default();
+    j.findings.clear();
+    j.over_time = false;
+    j.created = Instant::now();
+    j.cancel = Cancel::new();
+    j.worker.push(format!("› {}", clip(&text, 300)));
+    j.reviewer.state = StageState::Idle;
+}
+
 pub async fn run_job(hub: Hub, id: u32) {
+    while run_turn(&hub, id).await {}
+}
+
+async fn run_turn(hub: &Hub, id: u32) -> bool {
     let Some((manual, is_pr, is_deploy, cancel, reply)) = hub.job(id, |j| {
         (j.source.is_manual(), matches!(j.source, Source::Pr { .. }), matches!(j.source, Source::Deploy { .. }), j.cancel.clone(), j.turns.len() > 1)
     }) else {
-        return;
+        return false;
     };
     let fin = {
         let wait = async {
@@ -340,11 +359,6 @@ pub async fn run_job(hub: Hub, id: u32) {
             }
         }
     }
-    hub.job(id, |j| {
-        j.status = fin.status;
-        j.outcome = fin.outcome.clone();
-        j.finished = Some(Instant::now());
-    });
     if fin.status == JobStatus::Cancelled {
         let mut st = hub.state.lock().unwrap();
         let which = st.jobs.iter().find(|j| j.id == id).and_then(|j| match &j.source {
@@ -386,16 +400,65 @@ pub async fn run_job(hub: Hub, id: u32) {
         }
     }
     // The whole outcome: in the modes without an interface this line is the report.
-    hub.log("queue", format!("#{} {}: {}", id, fin.status.name(), clip(&fin.outcome, 600)));
+    finish_turn(hub, id, fin, manual, &cancel)
+}
+
+fn finish_turn(hub: &Hub, id: u32, fin: Finish, manual: bool, cancel: &Cancel) -> bool {
+    // Finish and take the next prompt under the same lock. A concurrent submission either
+    // joins this queue or starts a new run after we release it; it can never do both.
+    let mut st = hub.state.lock().unwrap();
+    st.log("queue", format!("#{} {}: {}", id, fin.status.name(), clip(&fin.outcome, 600)));
+    let stopping = st.stopping;
+    let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return false };
+    j.status = fin.status;
+    j.outcome = fin.outcome;
+    j.finished = Some(Instant::now());
+    if manual && fin.status == JobStatus::Done && !cancel.is_set() && !stopping {
+        if let Some(text) = j.queued_prompts.pop_front() {
+            prepare_reply(j, text.clone());
+            st.log("queue", format!("#{} starting queued prompt: {}", id, clip(&text, 90)));
+            return true;
+        }
+    }
+    false
 }
 
 fn set_status(hub: &Hub, id: u32, s: JobStatus) {
     hub.job(id, |j| j.status = s);
 }
 
-fn available(hub: &Hub) -> (bool, bool) {
+pub(crate) fn available(hub: &Hub) -> (bool, bool) {
     let st = hub.state.lock().unwrap();
-    (st.have_claude, st.have_codex)
+    (st.agent_ready(AgentKind::Claude), st.agent_ready(AgentKind::Codex))
+}
+
+/// Retry a quota refusal at most once, and only before the failed CLI used tools.
+async fn run_with_fallback(hub: &Hub, id: u32, slot: Slot, mut spec: RunSpec<'_>) -> agents::RunOut {
+    let ready = |kind| hub.cfg.demo || hub.state.lock().unwrap().agent_ready(kind);
+    if !ready(spec.kind) && ready(spec.kind.other()) {
+        hub.log("agents", format!("#{} {} unavailable; using {}", id, spec.kind.name(), spec.kind.other().name()));
+        spec.kind = spec.kind.other();
+    }
+    for attempt in 0..2 {
+        if !ready(spec.kind) {
+            return agents::RunOut { ok: false, text: String::new(), error: "no agent is available (missing or temporarily rate limited)".into() };
+        }
+        if slot == Slot::Worker && !spec.read_only {
+            hub.job(id, |j| if let Some(d) = &mut j.decision { d.agent = spec.kind; });
+        }
+        let kind = spec.kind;
+        let out = agents::run(hub, id, slot, RunSpec { kind, tier: spec.tier, prompt: spec.prompt, dir: spec.dir, read_only: spec.read_only }).await;
+        let can_retry = hub.job(id, |j| {
+            let stage = if slot == Slot::Worker { &j.worker } else { &j.reviewer };
+            !j.cancel.is_set() && stage.tools == 0
+        }).unwrap_or(false);
+        if out.ok || !agents::quota_error(&out.error) || !can_retry || attempt == 1 || !ready(kind.other()) {
+            return out;
+        }
+        hub.log("agents", format!("#{} {} hit a usage limit before using tools; retrying with {}", id, kind.name(), kind.other().name()));
+        spec.kind = kind.other();
+    }
+    unreachable!("two attempts always return")
 }
 
 /// Ask the fork layer and record the answer on the job.
@@ -433,11 +496,11 @@ async fn decide(hub: &Hub, id: u32, prompt: &str, is_issue: bool, forced: Option
     let has = |a: AgentKind| if a == AgentKind::Claude { have_c } else { have_x };
     if !has(d.agent) {
         if has(d.agent.other()) {
-            hub.log("router", format!("{} is not installed, using {}", d.agent.name(), d.agent.other().name()));
+            hub.log("router", format!("{} unavailable (missing or rate limited), using {}", d.agent.name(), d.agent.other().name()));
             d.agent = d.agent.other();
         } else {
             hub.job(id, |j| j.decision = Some(d.clone()));
-            return Err(failed("neither claude nor codex is installed"));
+            return Err(failed("neither claude nor codex is available (missing or temporarily rate limited)"));
         }
     }
     hub.log(
@@ -522,7 +585,6 @@ struct Work<'a> {
     prompt: &'a str,
     dir: &'a Path,
     d: &'a Decision,
-    reviewer: AgentKind,
     checks: &'a [String],
     is_issue: bool,
     /// Set for a fix pushed onto an open pull request: what it is meant to fix.
@@ -552,12 +614,17 @@ impl Refined {
 
 /// Run the worker once and take a snapshot of what it did.
 async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, cancel: &Cancel) -> Result<String, Finish> {
-    let out = agents::run(hub, id, Slot::Worker, RunSpec { kind: w.d.agent, tier: w.d.tier, prompt, dir: w.dir, read_only: false }).await;
+    run_worker(hub, id, w, prompt, cancel, false).await
+}
+
+async fn run_worker(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, cancel: &Cancel, read_only: bool) -> Result<String, Finish> {
+    let out = run_with_fallback(hub, id, Slot::Worker, RunSpec { kind: w.d.agent, tier: w.d.tier, prompt, dir: w.dir, read_only }).await;
     if cancel.is_set() {
         return Err(cancelled());
     }
     if !out.ok {
-        return Err(failed(format!("{} failed: {}", w.d.agent.name(), out.error)));
+        let actual = hub.job(id, |j| j.worker.agent).flatten().unwrap_or(w.d.agent);
+        return Err(failed(format!("{} failed: {}", actual.name(), out.error)));
     }
     // From here the index holds exactly what the agent did. Checks run against that, and whatever
     // they leave behind is removed again, so the tree that is reviewed is the tree that is committed.
@@ -596,12 +663,20 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
             set_status(hub, id, JobStatus::Reviewing);
             let base = hub.job(id, |j| j.base_sha.clone()).flatten();
             let rp = review_prompt(w.prompt, base.as_deref(), w.followup);
-            let rev = agents::run(hub, id, Slot::Reviewer, RunSpec { kind: w.reviewer, tier: w.d.tier.up(), prompt: &rp, dir: w.dir, read_only: true }).await;
+            let worker = hub.job(id, |j| j.worker.agent).flatten().unwrap_or(w.d.agent);
+            let reviewer = if hub.cfg.review.reviewer == "other" && hub.state.lock().unwrap().agent_ready(worker.other()) {
+                worker.other()
+            } else { worker };
+            let rev = run_with_fallback(hub, id, Slot::Reviewer, RunSpec { kind: reviewer, tier: w.d.tier.up(), prompt: &rp, dir: w.dir, read_only: true }).await;
+            let reviewer = hub.job(id, |j| j.reviewer.agent).flatten().unwrap_or(reviewer);
+            if reviewer == worker {
+                hub.log("review", format!("#{} reviewed by the worker's own CLI ({})", id, reviewer.name()));
+            }
             if cancel.is_set() {
                 return Err(cancelled());
             }
             if !rev.ok {
-                hub.log("review", format!("#{} reviewer {} failed: {}", id, w.reviewer.name(), rev.error));
+                hub.log("review", format!("#{} reviewer {} failed: {}", id, reviewer.name(), rev.error));
                 reasons = format!("reviewer failed: {}", rev.error);
                 break;
             }
@@ -611,7 +686,7 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
             hub.job(id, |j| j.verdict = v);
             hub.log(
                 "review",
-                format!("#{} {}: {}", id, w.reviewer.name(), match v { Some(true) => "PASS", Some(false) => "FAIL", None => "no verdict" }),
+                format!("#{} {}: {}", id, reviewer.name(), match v { Some(true) => "PASS", Some(false) => "FAIL", None => "no verdict" }),
             );
             if v == Some(false) {
                 hub.job(id, |j| j.findings.push(format!("A reviewer did not pass the change:\n{}", clip(&strip_verdict(&rev.text), 4000))));
@@ -663,9 +738,6 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
     };
     // Routed on the task alone; the worker and its reviewer also get what is known about the repository.
     let prompt = knowledge::with_notes(hub, id, prompt).await;
-    let (have_c, have_x) = available(hub);
-    let has = |a: AgentKind| if a == AgentKind::Claude { have_c } else { have_x };
-    let reviewer = if hub.cfg.review.reviewer == "other" && has(d.agent.other()) { d.agent.other() } else { d.agent };
     if !d.review {
         hub.job(id, |j| j.reviewer.state = StageState::Skipped);
     }
@@ -680,7 +752,7 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
             hub.job(id, |j| j.base_sha = Some(sha.clone()));
         }
     }
-    let w = Work { prompt: &prompt, dir: &dir, d: &d, reviewer, checks: &checks, is_issue, followup: None };
+    let w = Work { prompt: &prompt, dir: &dir, d: &d, checks: &checks, is_issue, followup: None };
 
     // 2. Work, then 3. checks and review
     set_status(hub, id, JobStatus::Working);
@@ -689,6 +761,9 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
         Err(f) => return f,
     };
     record_answer(hub, id, &summary);
+    if hub.job(id, |j| j.source.is_manual()).unwrap_or(false) && !crate::choices::parse(&summary).is_empty() {
+        return planning_options(hub, id, &summary);
+    }
     let r = match refine(hub, id, &w, summary, cancel).await {
         Ok(r) => r,
         Err(f) => return f,
@@ -750,7 +825,7 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
             prompt, excerpt
         );
         let short_log = cicd::tail_chars(&log, 4000);
-        let wf = Work { followup: Some(&short_log), ..Work { prompt: &prompt, dir: &dir, d: &d, reviewer, checks: &checks, is_issue, followup: None } };
+        let wf = Work { followup: Some(&short_log), ..Work { prompt: &prompt, dir: &dir, d: &d, checks: &checks, is_issue, followup: None } };
         let summary = match work_once(hub, id, &wf, &fp, cancel).await {
             Ok(s) => s,
             Err(f) if f.status == JobStatus::Cancelled => return stopped(),
@@ -779,6 +854,19 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
     }
 }
 
+fn planning_options(hub: &Hub, id: u32, summary: &str) -> Finish {
+    hub.job(id, |j| {
+        j.planning = true;
+        j.plan = None;
+        j.reviewer.state = StageState::Skipped;
+    });
+    done(format!("Planning options ready — F5 to choose or type a custom reply.\n{}", summary))
+}
+
+fn plan_ready(text: &str) -> bool {
+    text.trim_end().strip_suffix("\nPLAN: READY").is_some_and(|plan| !plan.trim().is_empty())
+}
+
 fn record_answer(hub: &Hub, id: u32, text: &str) {
     hub.job(id, |j| {
         if let Some(t) = j.turns.last_mut() {
@@ -799,7 +887,7 @@ fn chat_prompt(turns: &[Turn]) -> String {
         "You are continuing a conversation with the user about work in this working tree. Earlier in it:\n\n",
     );
     if skipped > 0 {
-        out.push_str(&format!("(the first {} exchange(s) are left out)\n\n", skipped));
+        out.push_str(&format!("Original task: {}\n\n(the first {} exchange(s) are left out)\n\n", turns[0].ask, skipped));
     }
     for t in &before[skipped..] {
         out.push_str(&format!("User: {}\n\nYou: {}\n\n", t.ask, if t.answer.is_empty() { "(no result)".to_string() } else { clip(&t.answer, CHAT_ANSWER_CHARS) }));
@@ -829,10 +917,9 @@ async fn followup(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     };
     let (have_c, have_x) = available(hub);
     let has = |a: AgentKind| if a == AgentKind::Claude { have_c } else { have_x };
-    if !has(d.agent) && !hub.cfg.demo {
-        return failed(format!("{} is not installed", d.agent.name()));
+    if !has(d.agent) && !has(d.agent.other()) && !hub.cfg.demo {
+        return failed("no agent is available (missing or temporarily rate limited)");
     }
-    let reviewer = if hub.cfg.review.reviewer == "other" && has(d.agent.other()) { d.agent.other() } else { d.agent };
     if !d.review {
         hub.job(id, |j| j.reviewer.state = StageState::Skipped);
     }
@@ -845,13 +932,62 @@ async fn followup(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
             hub.job(id, |j| j.base_sha = Some(sha.clone()));
         }
     }
-    let w = Work { prompt: &task, dir: &dir, d: &d, reviewer, checks: &checks, is_issue: false, followup: None };
-    set_status(hub, id, JobStatus::Working);
-    let summary = match work_once(hub, id, &w, &chat_prompt(&turns), cancel).await {
-        Ok(s) => s,
-        Err(f) => return f,
+    let planning = hub.job(id, |j| j.planning).unwrap_or(false);
+    let conversation = chat_prompt(&turns);
+    let mut task = task;
+    let summary = if planning {
+        set_status(hub, id, JobStatus::Planning);
+        let prompt = format!(
+            "{conversation}\n\nPlanning stage: incorporate the user's selected approach or custom response. \
+             Produce the complete implementation plan without changing files. If you need another decision, \
+             present numbered choices and finish with PLAN: WAITING. If the plan is complete and ready to implement, \
+             finish with PLAN: READY on its own line. Build starts automatically only when you mark the plan ready."
+        );
+        let w = Work { prompt: &task, dir: &dir, d: &d, checks: &checks, is_issue: false, followup: None };
+        let plan = match run_worker(hub, id, &w, &prompt, cancel, true).await {
+            Ok(s) => s,
+            Err(f) => return f,
+        };
+        record_answer(hub, id, &plan);
+        if !plan_ready(&plan) && !crate::choices::parse(&plan).is_empty() {
+            return planning_options(hub, id, &plan);
+        }
+        if !plan_ready(&plan) {
+            hub.job(id, |j| j.reviewer.state = StageState::Skipped);
+            return done(format!("Planning needs a reply before Build.\n{}", plan));
+        }
+        if cancel.is_set() { return cancelled(); }
+        hub.job(id, |j| { j.plan = Some(plan.clone()); j.planning = false; });
+        hub.log("plan", format!("#{} plan ready — starting Build", id));
+        task.push_str(&format!("\n\nImplementation plan:\n{plan}"));
+        let prompt = format!(
+            "{conversation}\n\nImplementation plan:\n{plan}\n\nBuild stage: implement this completed plan in the current working tree now. \
+             Inspect the current files, make the changes, and summarise the implementation."
+        );
+        set_status(hub, id, JobStatus::Working);
+        let w = Work { prompt: &task, dir: &dir, d: &d, checks: &checks, is_issue: false, followup: None };
+        match work_once(hub, id, &w, &prompt, cancel).await {
+            Ok(s) => s,
+            Err(f) => return f,
+        }
+    } else {
+        let mut prompt = conversation;
+        if let Some(plan) = hub.job(id, |j| j.plan.clone()).flatten() {
+            task.push_str(&format!("\n\nImplementation plan:\n{plan}"));
+            prompt.push_str(&format!("\n\nPreviously completed implementation plan (context for this request):\n{plan}"));
+        }
+        let w = Work { prompt: &task, dir: &dir, d: &d, checks: &checks, is_issue: false, followup: None };
+        set_status(hub, id, JobStatus::Working);
+        match work_once(hub, id, &w, &prompt, cancel).await {
+            Ok(s) => s,
+            Err(f) => return f,
+        }
     };
     record_answer(hub, id, &summary);
+    if !crate::choices::parse(&summary).is_empty() {
+        return planning_options(hub, id, &summary);
+    }
+    let w = Work { prompt: &task, dir: &dir, d: &d, checks: &checks, is_issue: false, followup: None };
     let r = match refine(hub, id, &w, summary, cancel).await {
         Ok(r) => r,
         Err(f) => return f,
@@ -1116,6 +1252,163 @@ pub fn parse_verdict(text: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn busy_replies_queue_without_changing_the_active_turn_and_drain_in_order() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = Hub::new(Config::default(), rt.handle().clone());
+        let id = hub.submit("task".into(), "original request".into(), Source::Manual, ".".into(), None);
+        hub.reply(id, "first queued".into()).unwrap();
+        hub.job(id, |j| {
+            j.status = JobStatus::Reviewing;
+            j.turns[0].answer = "original answer".into();
+            j.used[0].tokens_in = 123;
+        });
+        hub.reply(id, "second queued".into()).unwrap();
+        hub.job(id, |j| {
+            assert_eq!(j.status, JobStatus::Reviewing);
+            assert_eq!(j.turns.len(), 1);
+            assert_eq!(j.used[0].tokens_in, 123);
+            assert_eq!(j.queued_prompts.len(), 2);
+        });
+        for expected in ["first queued", "second queued"] {
+            let cancel = hub.job(id, |j| j.cancel.clone()).unwrap();
+            assert!(finish_turn(&hub, id, done("completed"), true, &cancel));
+            hub.job(id, |j| {
+                assert_eq!(j.turns.last().unwrap().ask, expected);
+                assert_eq!(j.turns[0].answer, "original answer");
+                assert_eq!(j.used[0].tokens_in, 0);
+                assert_eq!(j.status, JobStatus::Queued);
+            });
+        }
+        let cancel = hub.job(id, |j| j.cancel.clone()).unwrap();
+        assert!(!finish_turn(&hub, id, done("completed"), true, &cancel));
+        assert_eq!(hub.job(id, |j| j.status), Some(JobStatus::Done));
+        assert_eq!(hub.state.lock().unwrap().jobs.len(), 1);
+    }
+
+    #[test]
+    fn queue_pauses_on_failure_cancellation_and_shutdown() {
+        for reason in ["failed", "cancelled", "late cancel", "shutdown"] {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let hub = Hub::new(Config::default(), rt.handle().clone());
+            let id = hub.submit("task".into(), "task".into(), Source::Manual, ".".into(), None);
+            hub.reply(id, "pending".into()).unwrap();
+            let cancel = hub.job(id, |j| j.cancel.clone()).unwrap();
+            if reason == "late cancel" { cancel.fire(); }
+            if reason == "shutdown" { hub.state.lock().unwrap().stopping = true; }
+            let fin = match reason { "failed" => failed("failed"), "cancelled" => cancelled(), _ => done("done") };
+            assert!(!finish_turn(&hub, id, fin, true, &cancel), "{reason}");
+            hub.job(id, |j| {
+                assert_eq!(j.turns.len(), 1);
+                assert_eq!(j.queued_prompts.front().map(String::as_str), Some("pending"));
+            });
+        }
+    }
+
+    #[test]
+    fn planning_handoff_builds_only_ready_plans_and_preserves_context() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        for mode in ["ready", "waiting", "unmarked", "choices", "failed", "cancelled", "resume"] {
+            let root = std::env::temp_dir().join(format!("forkdeck-plan-{}-{mode}", std::process::id()));
+            fs::create_dir_all(&root).unwrap();
+            let agent = root.join("agent");
+            fs::write(&agent, r#"#!/bin/sh
+prompt=$(cat)
+case "$prompt" in
+  *"Planning stage:"*)
+    echo plan >> calls
+    printf '%s' "$prompt" > plan-prompt
+    printf '%s' "$*" > plan-args
+    case "$(cat mode)" in
+      failed) echo 'planner crashed' >&2; exit 1 ;;
+      cancelled) touch planning-started; sleep 30; exit 1 ;;
+    esac
+    cat plan-result; echo ;;
+  *"Build stage:"*|*"Previously completed implementation plan"*)
+    echo build >> calls
+    printf '%s' "$prompt" > build-prompt
+    printf '%s' "$*" > build-args
+    touch implemented
+    printf '%s\n' '{"type":"result","is_error":false,"result":"Implemented the selected plan."}' ;;
+  *"Do not modify any file"*)
+    echo review >> calls
+    printf '%s' "$prompt" > review-prompt
+    printf '%s\n' '{"type":"result","is_error":false,"result":"VERDICT: PASS"}' ;;
+  *) echo 'unexpected prompt' >&2; exit 1 ;;
+esac
+"#).unwrap();
+            fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(root.join("mode"), mode).unwrap();
+            let plan = match mode {
+                "waiting" => "Please clarify the target directory.\nPLAN: WAITING",
+                "unmarked" => "Which directory should I use?",
+                "choices" => "Choose a scope:\n1. Minimal\n2. Full\nPLAN: WAITING",
+                _ => "Selected options become these steps:\n1. Implement a small change.\n2. Verify it.\nPLAN: READY",
+            };
+            fs::write(root.join("plan-result"), serde_json::json!({"type":"result", "is_error":false, "result":plan}).to_string()).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let mut cfg = Config::default();
+            cfg.agents.claude.cmd = Some(agent.to_string_lossy().into_owned());
+            cfg.review.checks = vec!["test -f implemented && echo checks >> calls".into()];
+            let hub = Hub::new(cfg, rt.handle().clone());
+            // Seed a finished conversation without scheduling an independent job.
+            hub.state.lock().unwrap().stopping = true;
+            hub.state.lock().unwrap().have_claude = true;
+            let id = hub.submit("task".into(), "Plan a small change".into(), Source::Manual, root.clone(), None);
+            hub.job(id, |j| {
+                j.turns[0].answer = "Options:\n1. Small\n2. Large".into();
+                j.turns.push(Turn { ask: "My custom response: keep it small".into(), answer: String::new() });
+                j.planning = mode != "resume";
+                j.plan = if mode == "resume" { Some(plan.into()) } else { None };
+                j.decision = Some(Decision { agent: AgentKind::Claude, tier: Tier::Light, review: true, gates: vec![], source: "test".into(), ms: 0, note: String::new() });
+            });
+            let cancel = hub.job(id, |j| j.cancel.clone()).unwrap();
+            let fin = rt.block_on(async {
+                if mode == "cancelled" {
+                    let cancel = cancel.clone();
+                    let root = root.clone();
+                    let h = hub.clone();
+                    tokio::spawn(async move {
+                        while !root.join("planning-started").exists() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        assert_eq!(h.job(id, |j| j.status), Some(JobStatus::Planning));
+                        cancel.fire();
+                    });
+                }
+                tokio::time::timeout(Duration::from_secs(10), followup(&hub, id, &cancel)).await.unwrap()
+            });
+            let calls = fs::read_to_string(root.join("calls")).unwrap();
+            if matches!(mode, "ready" | "resume") {
+                assert_eq!(fin.status, JobStatus::Done, "{mode}: {}", fin.outcome);
+                assert_eq!(calls, if mode == "resume" { "build\nchecks\nreview\n" } else { "plan\nbuild\nchecks\nreview\n" });
+                for file in ["build-prompt", "review-prompt"] {
+                    assert!(fs::read_to_string(root.join(file)).unwrap().contains(plan));
+                }
+                assert!(fs::read_to_string(root.join("build-prompt")).unwrap().contains("My custom response: keep it small"));
+                assert!(fs::read_to_string(root.join("build-args")).unwrap().contains("--permission-mode acceptEdits"));
+                hub.job(id, |j| {
+                    assert!(!j.planning);
+                    assert_eq!(j.plan.as_deref(), Some(plan));
+                    assert_eq!(j.turns.len(), 2);
+                    assert_eq!(j.turns[1].answer, "Implemented the selected plan.");
+                    assert_eq!(j.checks, Some(true));
+                    assert_eq!(j.verdict, Some(true));
+                });
+            } else {
+                assert_eq!(calls, "plan\n", "{mode}");
+                assert!(!root.join("implemented").exists());
+                assert_eq!(fin.status, match mode { "failed" => JobStatus::Failed, "cancelled" => JobStatus::Cancelled, _ => JobStatus::Done }, "{mode}: {}", fin.outcome);
+                hub.job(id, |j| { assert!(j.planning); assert!(j.plan.is_none()); });
+            }
+            if mode != "resume" {
+                assert!(fs::read_to_string(root.join("plan-args")).unwrap().contains("--permission-mode plan"));
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn replies_keep_conversation_without_recounting_journal_usage() {

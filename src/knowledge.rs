@@ -242,10 +242,7 @@ pub async fn learn(hub: &Hub, id: u32) -> u32 {
         .flatten();
     let Some((idx, tag, findings, dir, agent)) = found else { return 0 };
     let Some(r) = hub.cfg.repos.get(idx).cloned() else { return 0 };
-    let (have_claude, have_codex) = {
-        let st = hub.state.lock().unwrap();
-        (st.have_claude, st.have_codex)
-    };
+    let (have_claude, have_codex) = crate::orchestrator::available(hub);
     let kind = match agent {
         Some(AgentKind::Codex) if have_codex => AgentKind::Codex,
         Some(AgentKind::Claude) if have_claude => AgentKind::Claude,

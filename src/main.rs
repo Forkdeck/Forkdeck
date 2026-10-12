@@ -1,14 +1,17 @@
 mod agents;
 mod cicd;
+mod choices;
 mod config;
 mod demo;
 mod issues;
+mod input;
 mod journal;
 mod knowledge;
 mod mcp;
 mod orchestrator;
 mod proc;
 mod router;
+mod session;
 mod state;
 mod team;
 mod ui;
@@ -319,9 +322,9 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Init { .. }) => unreachable!(),
         None => {
             rt.block_on(hub.detect_agents());
-            rt.spawn(issues::poll_loop(hub.clone()));
-            rt.spawn(team::watch_loop(hub.clone()));
             if let Some(path) = cli.snapshot {
+                rt.spawn(issues::poll_loop(hub.clone()));
+                rt.spawn(team::watch_loop(hub.clone()));
                 return snapshot(&rt, &hub, cwd, &path, &cli.size, cli.after, cli.team_pane);
             }
             if let Some(p) = cfg_path {
@@ -656,8 +659,115 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
 }
 
 fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
-    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false, new_task: false, jobs_per_day: hub.cfg.limits.jobs_per_day, tokens_per_day: hub.cfg.limits.tokens_per_day }
+    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false, factory: true, reply_to: None, new_task: false, choices: None, seen_choices: Default::default(), jobs_per_day: hub.cfg.limits.jobs_per_day, tokens_per_day: hub.cfg.limits.tokens_per_day }
 }
+
+/// Quit is global, including when a picker has focus. Some terminals report uppercase keys.
+fn quit_key(key: event::KeyEvent) -> bool {
+    key.kind != KeyEventKind::Release &&
+        (key.code == KeyCode::Char('\u{3}') ||
+         (key.modifiers.contains(KeyModifiers::CONTROL) &&
+          matches!(key.code, KeyCode::Char('c' | 'C' | 'q' | 'Q'))))
+}
+
+// Restore the terminal immediately; allow only a short grace period for background reporting.
+const TUI_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
+fn submit_input(hub: &Hub, ui: &mut ui::Ui, history: &mut input::History) {
+    let target = ui::reply_target(&hub.state.lock().unwrap(), ui);
+    if ui.input.trim().is_empty() && target.is_some_and(|id| {
+        hub.job(id, |j| !j.status.finished()).unwrap_or(false)
+    }) { return; }
+    let task = if ui.input.trim().is_empty() && target.is_some() {
+        "Continue the previous task from where it stopped. Inspect the current working tree before making further changes.".to_string()
+    } else { ui.input.trim().to_string() };
+    if task.is_empty() { return; }
+    let id = match target {
+        Some(id) => match hub.reply(id, task.clone()) {
+            Ok(()) => id,
+            Err(why) => { hub.log("queue", format!("#{} not sent: {}", id, why)); return; }
+        },
+        None => hub.submit(state::clip(&task, 80), task.clone(), Source::Manual, ui.cwd.clone(), ui.forced),
+    };
+    history.submitted(task);
+    ui.input.clear();
+    ui.selected = Some(id);
+    ui.follow = false;
+    ui.reply_to = Some(id);
+    ui.new_task = false;
+}
+
+fn open_choices(hub: &Hub, ui: &mut ui::Ui) {
+    let picker = hub.state.lock().unwrap().jobs.iter()
+        .find(|j| Some(j.id) == ui.selected && j.source.is_manual() && j.status.finished())
+        .and_then(|j| {
+            let options = choices::for_job(j);
+            if options.is_empty() { None } else { Some(choices::Picker { job: j.id, turn: j.turns.len(), options, selected: 0 }) }
+        });
+    if let Some(picker) = picker {
+        ui.seen_choices.insert((picker.job, picker.turn));
+        ui.choices = Some(picker);
+    } else {
+        hub.log("choices", "no completed planning choices for this task; you can type a custom reply");
+    }
+}
+
+fn sync_choices(hub: &Hub, ui: &mut ui::Ui) {
+    if let Some(picker) = &ui.choices {
+        let valid = hub.job(picker.job, |j| j.turns.len() == picker.turn && j.status.finished()).unwrap_or(false);
+        if !valid { ui.choices = None; }
+        return;
+    }
+    if ui.new_task || !ui.input.is_empty() { return; }
+    let st = hub.state.lock().unwrap();
+    let Some(job) = st.jobs.iter().find(|j| Some(j.id) == ui.selected && j.source.is_manual() && j.status.finished()) else { return };
+    if ui.seen_choices.contains(&(job.id, job.turns.len())) { return; }
+    // Record even non-choice answers so output is parsed at most once per completed turn.
+    ui.seen_choices.insert((job.id, job.turns.len()));
+    let options = choices::for_job(job);
+    if !options.is_empty() {
+        ui.choices = Some(choices::Picker { job: job.id, turn: job.turns.len(), options, selected: 0 });
+    }
+}
+
+fn choice_key(hub: &Hub, ui: &mut ui::Ui, history: &mut input::History, key: event::KeyEvent) -> bool {
+    let Some(picker) = &mut ui.choices else { return false };
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if matches!(key.code, KeyCode::Char('t' | 'n' | 'c' | 'q')) { ui.choices = None; }
+        return false;
+    }
+    match key.code {
+        KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+        KeyCode::Down | KeyCode::Tab => picker.selected = (picker.selected + 1).min(picker.options.len()),
+        KeyCode::Esc | KeyCode::F(5) => { ui.choices = None; }
+        KeyCode::Char(c @ '1'..='9') => {
+            picker.selected = ((c as u8 - b'1') as usize).min(picker.options.len());
+        }
+        KeyCode::Enter | KeyCode::Char('c') => {
+            let picker = ui.choices.take().unwrap();
+            if !hub.job(picker.job, |j| j.turns.len() == picker.turn && j.status.finished()).unwrap_or(false) {
+                hub.log("choices", "the task has changed; reopen its current choices with F5");
+                return true;
+            }
+            ui.reply_to = Some(picker.job);
+            ui.selected = Some(picker.job);
+            ui.follow = false;
+            ui.new_task = false;
+            if key.code == KeyCode::Enter && picker.selected < picker.options.len() {
+                let option = &picker.options[picker.selected];
+                // Keep any draft as additional guidance, never discard it when selecting an option.
+                let draft = ui.input.trim();
+                ui.input = format!("For planning, I choose option {}.{}", option.label,
+                    if draft.is_empty() { String::new() } else { format!("\n\n{}", draft) });
+                submit_input(hub, ui, history);
+            }
+            // The custom entry leaves the composer ready for the user's own words.
+        }
+        _ => {}
+    }
+    true
+}
+
 
 fn sync_selection(hub: &Hub, u: &mut ui::Ui) {
     let st = hub.state.lock().unwrap();
@@ -687,6 +797,14 @@ fn snapshot(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf, path: &std::p
 
 fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<()> {
     let mut u = new_ui(hub, cwd.clone());
+    let mut history = input::History::default();
+    let session = if hub.cfg.demo { None } else {
+        let store = session::Store::open(&cicd::state_dir().join("sessions"), &cwd, &mut hub.state.lock().unwrap(), &mut u, &mut history)?;
+        Some(std::sync::Arc::new(std::sync::Mutex::new(store)))
+    };
+    rt.spawn(issues::poll_loop(hub.clone()));
+    rt.spawn(team::watch_loop(hub.clone()));
+    let mut checkpoint_at = std::time::Instant::now();
     if hub.cfg.demo {
         hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd.clone(), None);
     }
@@ -696,12 +814,24 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
     {
         let hub = hub.clone();
         let stopping = stopping.clone();
+        let session = session.clone();
         rt.spawn(async move {
             stop_signal().await;
-            stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+            let already_stopping = stopping.swap(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
             let _ = ratatui::try_restore();
+            if already_stopping {
+                proc::kill_all();
+                std::process::exit(130);
+            }
+            if let Some(store) = &session {
+                store.lock().unwrap().checkpoint(&mut hub.state.lock().unwrap());
+            }
             warn!("stopping jobs and handing claimed issues back…");
-            hub.shutdown(Duration::from_secs(45)).await;
+            hub.shutdown(TUI_SHUTDOWN_GRACE).await;
+            if let Some(store) = &session {
+                store.lock().unwrap().checkpoint(&mut hub.state.lock().unwrap());
+            }
             proc::kill_all();
             std::process::exit(1);
         });
@@ -715,7 +845,16 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
+            if checkpoint_at.elapsed() >= Duration::from_secs(1) {
+                if let Some(store) = &session {
+                    let mut store = store.lock().unwrap();
+                    store.composer(&u, &history);
+                    store.checkpoint(&mut hub.state.lock().unwrap());
+                }
+                checkpoint_at = std::time::Instant::now();
+            }
             sync_selection(hub, &mut u);
+            sync_choices(hub, &mut u);
             term.draw(|f| ui::draw(f, &hub.state.lock().unwrap(), &u))?;
             if !event::poll(Duration::from_millis(100))? {
                 continue;
@@ -723,9 +862,17 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
             match event::read()? {
                 Event::Paste(s) => u.input.push_str(&s.replace(['\n', '\r'], " ")),
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
+                    if quit_key(k) { return Ok(()); }
+                    if choice_key(hub, &mut u, &mut history, k) {
+                        if let Some(store) = &session {
+                            let mut store = store.lock().unwrap();
+                            store.composer(&u, &history);
+                            store.checkpoint(&mut hub.state.lock().unwrap());
+                        }
+                        continue;
+                    }
                     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                     match k.code {
-                        KeyCode::Char('c') | KeyCode::Char('q') if ctrl => return Ok(()),
                         KeyCode::Char('a') if ctrl => {
                             let mut st = hub.state.lock().unwrap();
                             st.automation = !st.automation;
@@ -741,15 +888,32 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                                 hub.cancel(id);
                             }
                         }
-                        KeyCode::Char('t') if ctrl => u.team = !u.team,
-                        KeyCode::Char('n') if ctrl => u.new_task = !u.new_task,
-                        KeyCode::Char('u') if ctrl => u.input.clear(),
+                        KeyCode::F(2) => { u.factory = !u.factory; u.team = false; },
+                        KeyCode::F(4) => u.team = !u.team,
+                        KeyCode::F(5) => open_choices(hub, &mut u),
+                        KeyCode::Char('t') | KeyCode::Char('n') if ctrl => { u.reply_to = None; u.new_task = true; },
+                        KeyCode::Char('r') if ctrl => {
+                            let target = {
+                                let st = hub.state.lock().unwrap();
+                                st.jobs.iter().find(|j| Some(j.id) == u.selected && j.source.is_manual()).map(|j| j.id)
+                            };
+                            if let Some(id) = target {
+                                u.reply_to = Some(id);
+                                u.new_task = false;
+                            } else {
+                                hub.log("queue", "select a typed task with Alt-Up/Down to reply; Enter queues a new task");
+                            }
+                        },
+                        KeyCode::Char('u') if ctrl => { u.input.clear(); history.reset(); },
                         KeyCode::Char(c) if !ctrl => u.input.push(c),
                         KeyCode::Backspace => {
                             u.input.pop();
                         }
                         KeyCode::Esc => {
                             u.input.clear();
+                            history.reset();
+                            u.reply_to = None;
+                            u.new_task = false;
                             u.follow = true;
                         }
                         KeyCode::Tab => {
@@ -759,35 +923,26 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                                 Some(AgentKind::Codex) => None,
                             }
                         }
-                        KeyCode::Up | KeyCode::Down => {
+                        KeyCode::Up | KeyCode::Down if k.modifiers.contains(KeyModifiers::ALT) => {
                             let st = hub.state.lock().unwrap();
                             let ids: Vec<u32> = st.jobs.iter().map(|j| j.id).collect();
                             if !ids.is_empty() {
+                                if u.input.is_empty() { u.reply_to = None; u.new_task = false; }
+                                else if u.reply_to.is_none() { u.reply_to = ui::reply_target(&st, &u); }
                                 let pos = u.selected.and_then(|s| ids.iter().position(|i| *i == s)).unwrap_or(ids.len() - 1);
                                 let next = if k.code == KeyCode::Up { pos.saturating_sub(1) } else { (pos + 1).min(ids.len() - 1) };
                                 u.selected = Some(ids[next]);
                                 u.follow = false;
                             }
                         }
+                        KeyCode::Up => history.older(&mut u.input),
+                        KeyCode::Down => history.newer(&mut u.input),
                         KeyCode::Enter => {
-                            let task = u.input.trim().to_string();
-                            if !task.is_empty() {
-                                let target = ui::reply_target(&hub.state.lock().unwrap(), &u);
-                                match target {
-                                    // A typed job is selected: carry on its conversation.
-                                    Some(id) => match hub.reply(id, task) {
-                                        Ok(()) => u.input.clear(),
-                                        // Keep what was typed so it can be sent once the job is done.
-                                        Err(why) => hub.log("queue", format!("#{} not sent: {}", id, why)),
-                                    },
-                                    None => {
-                                        u.input.clear();
-                                        let id = hub.submit(state::clip(&task, 80), task, Source::Manual, cwd.clone(), u.forced);
-                                        u.selected = Some(id);
-                                        u.follow = false;
-                                        u.new_task = false;
-                                    }
-                                }
+                            submit_input(hub, &mut u, &mut history);
+                            if let Some(store) = &session {
+                                let mut store = store.lock().unwrap();
+                                store.composer(&u, &history);
+                                store.checkpoint(&mut hub.state.lock().unwrap());
                             }
                         }
                         _ => {}
@@ -799,15 +954,44 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
     })();
     let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
     let _ = ratatui::try_restore();
-    // Stop any agent still running, and give claimed issues time to be handed back with a comment.
+    // Save drafts and queued prompts before waiting for background cleanup. A second Ctrl-C
+    // can then exit immediately through the signal handler without losing the pending work.
+    if let Some(store) = &session {
+        let mut store = store.lock().unwrap();
+        store.composer(&u, &history);
+        store.checkpoint(&mut hub.state.lock().unwrap());
+    }
+    stopping.store(true, std::sync::atomic::Ordering::SeqCst);
     let busy = hub.state.lock().unwrap().jobs.iter().filter(|j| !j.status.finished()).count();
     if busy > 0 {
         warn!("stopping {} job(s) and handing claimed issues back…", busy);
     }
-    let left = rt.block_on(hub.shutdown(Duration::from_secs(45)));
+    let left = rt.block_on(hub.shutdown(TUI_SHUTDOWN_GRACE));
     if left > 0 {
         warn!("{} job(s) did not finish in time; check their issues for a stale working label", left);
     }
+    if let Some(store) = &session {
+        let mut store = store.lock().unwrap();
+        store.composer(&u, &history);
+        store.checkpoint(&mut hub.state.lock().unwrap());
+    }
     proc::kill_all();
     res
+}
+
+#[cfg(test)]
+mod quit_tests {
+    use super::*;
+
+    #[test]
+    fn quit_accepts_terminal_key_variants_but_not_plain_text() {
+        for c in ['c', 'C', 'q', 'Q'] {
+            assert!(quit_key(event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)));
+            assert!(!quit_key(event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+        }
+        assert!(quit_key(event::KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE)));
+        let mut release = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        release.kind = KeyEventKind::Release;
+        assert!(!quit_key(release));
+    }
 }

@@ -27,7 +27,7 @@ impl AgentKind {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Light,
@@ -51,10 +51,11 @@ impl Tier {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum JobStatus {
     Queued,
     Routing,
+    Planning,
     Working,
     Reviewing,
     Fixing,
@@ -73,6 +74,7 @@ impl JobStatus {
         match self {
             JobStatus::Queued => "queued",
             JobStatus::Routing => "routing",
+            JobStatus::Planning => "planning",
             JobStatus::Working => "working",
             JobStatus::Reviewing => "reviewing",
             JobStatus::Fixing => "fixing",
@@ -90,7 +92,7 @@ impl JobStatus {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum StageState {
     Idle,
     Running,
@@ -99,7 +101,7 @@ pub enum StageState {
     Skipped,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Stage {
     pub agent: Option<AgentKind>,
     /// What the box shows when no agent runs in it (a deployment step).
@@ -112,6 +114,7 @@ pub struct Stage {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cost: f64,
+    #[serde(skip)]
     pub started: Option<Instant>,
     pub elapsed: Option<Duration>,
     pub tail: VecDeque<String>,
@@ -156,7 +159,7 @@ impl Stage {
 }
 
 /// One typed answer from the decision layer, drawn as a bar in the fork-layer box.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Gate {
     pub name: String,
     pub answer: String,
@@ -164,7 +167,7 @@ pub struct Gate {
     pub sharp: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Decision {
     pub agent: AgentKind,
     pub tier: Tier,
@@ -182,7 +185,7 @@ pub enum Provider {
     Gitlab,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Source {
     Manual,
     Issue { repo_idx: usize, repo: String, number: u64, url: String },
@@ -229,13 +232,14 @@ impl Cancel {
 }
 
 /// One exchange in a typed task's conversation: what the user asked and what the agent said back.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Turn {
     pub ask: String,
     /// Empty until the turn has produced a result.
     pub answer: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: u32,
     pub title: String,
@@ -258,15 +262,28 @@ pub struct Job {
     pub outcome: String,
     pub pr_url: Option<String>,
     pub rounds: u32,
+    #[serde(skip, default = "Instant::now")]
     pub created: Instant,
+    #[serde(skip)]
     pub finished: Option<Instant>,
+    #[serde(skip, default = "Cancel::new")]
     pub cancel: Arc<Cancel>,
     /// The status comment teammates see, while this job holds one.
+    #[serde(skip)]
     pub claim: Option<Arc<crate::team::Held>>,
     /// A teammate handed the item back to the queue: stop without touching its labels.
     pub released: bool,
     /// The conversation so far. The first turn is the task itself; each reply adds one.
     pub turns: Vec<Turn>,
+    /// Follow-ups accepted while this task is busy, in submission order.
+    #[serde(default)]
+    pub queued_prompts: VecDeque<String>,
+    /// A planning conversation is waiting for a complete, ready plan.
+    #[serde(default)]
+    pub planning: bool,
+    /// The complete plan handed to Build, retained across interruptions.
+    #[serde(default)]
+    pub plan: Option<String>,
     /// A teammate whose forkdeck announced the same deployment before this one did.
     pub peer: Option<String>,
     /// What each CLI was used for in this job so far: claude, then codex.
@@ -341,6 +358,8 @@ pub struct State {
     pub deploy_cancelled: HashSet<(usize, String)>,
     pub have_claude: bool,
     pub have_codex: bool,
+    /// Short backoff after a CLI reports exhausted quota; installation state stays separate.
+    pub agent_cooldowns: [Option<Instant>; 2],
     pub next_id: u32,
     pub team: TeamView,
     /// Finished jobs the journal would not take. They are written as soon as it works again, and
@@ -348,6 +367,13 @@ pub struct State {
     pub unrecorded: Vec<crate::journal::Entry>,
     /// Used in the last 24 hours, as of the last poll.
     pub spent: crate::journal::Spent,
+}
+
+impl State {
+    pub fn agent_ready(&self, kind: AgentKind) -> bool {
+        let installed = match kind { AgentKind::Claude => self.have_claude, AgentKind::Codex => self.have_codex };
+        installed && self.agent_cooldowns[crate::journal::slot(kind)].map_or(true, |until| Instant::now() >= until)
+    }
 }
 
 /// What teammates are working on, as last read from the forge.
@@ -469,6 +495,17 @@ pub fn clip(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_cooldown_expires_without_changing_installation() {
+        let mut st = State { have_claude: true, ..State::default() };
+        st.agent_cooldowns[crate::journal::slot(AgentKind::Claude)] = Some(Instant::now() + Duration::from_secs(60));
+        assert!(!st.agent_ready(AgentKind::Claude));
+        assert!(st.have_claude);
+        assert!(!st.agent_ready(AgentKind::Codex));
+        st.agent_cooldowns[crate::journal::slot(AgentKind::Claude)] = Some(Instant::now() - Duration::from_secs(1));
+        assert!(st.agent_ready(AgentKind::Claude));
+    }
 
     #[test]
     fn retry_policy_is_bounded_and_reset_by_relabelling() {

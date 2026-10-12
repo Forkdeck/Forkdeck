@@ -29,6 +29,15 @@ pub struct RunOut {
     pub error: String,
 }
 
+/// Only terminal failures are checked, never successful model text mentioning limits.
+pub fn quota_error(error: &str) -> bool {
+    let error = error.to_lowercase().replace('’', "'");
+    ["you've hit your session limit", "you've hit your limit", "you have hit your usage limit",
+     "you've hit your usage limit", "usage limit reached", "rate limit reached",
+     "rate limit exceeded", "rate_limit_exceeded", "insufficient_quota"]
+        .iter().any(|phrase| error.contains(phrase))
+}
+
 /// What one line of agent output means for the display.
 #[derive(Debug, PartialEq)]
 pub enum Parsed {
@@ -220,6 +229,10 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
         }
     };
     // What this run used goes on the job's account, whichever box it was shown in.
+    if !out.ok && quota_error(&out.error) && !cancel.is_set() && !hub.cfg.demo {
+        hub.state.lock().unwrap().agent_cooldowns[crate::journal::slot(kind)] = Some(Instant::now() + Duration::from_secs(15 * 60));
+        hub.log("agents", format!("{} reported a usage limit; skipping it for 15 minutes: {}", kind.name(), clip(&out.error, 200)));
+    }
     hub.job(job, |j| {
         let s = if slot == Slot::Worker { &j.worker } else { &j.reviewer };
         let add = crate::journal::Usage { runs: 1, tokens_in: s.tokens_in, tokens_out: s.tokens_out, cost: s.cost };
@@ -395,6 +408,15 @@ pub async fn on_path(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_messages_are_specific() {
+        assert!(quota_error("You've hit your session limit · resets 2pm (Europe/Berlin)"));
+        assert!(quota_error("You’ve hit your limit"));
+        assert!(quota_error("rate_limit_exceeded"));
+        assert!(!quota_error("connection refused"));
+        assert!(!quota_error("token limit for this prompt"));
+    }
 
     #[test]
     fn claude_stream_lines() {
