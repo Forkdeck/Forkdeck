@@ -5,6 +5,8 @@ use crate::cicd;
 use crate::config::Config;
 use crate::issues;
 use crate::pick::{self, Exec};
+use crate::journal;
+use crate::knowledge;
 use crate::proc;
 use crate::router;
 use crate::state::*;
@@ -86,20 +88,6 @@ impl Hub {
                 None => Arc::new(tokio::sync::Mutex::new(())),
             });
         }
-        let history = if cfg.demo {
-            None
-        } else {
-            match crate::history::History::open(&crate::history::path()) {
-                Ok(h) => {
-                    let _ = h.prune(crate::history::KEEP);
-                    Some(Arc::new(h))
-                }
-                Err(e) => {
-                    st.log("history", format!("jobs will not be kept across restarts: {}", e));
-                    None
-                }
-            }
-        };
         Hub {
             state: Arc::new(Mutex::new(st)),
             cfg: Arc::new(cfg),
@@ -110,10 +98,26 @@ impl Hub {
             git_locks: Arc::new(git_locks),
             team_me: Arc::new(Mutex::new([None, None])),
             team_public: Arc::new(Mutex::new(Default::default())),
-            history,
+            history: None,
             history_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             busy: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Keep jobs in the history database. Only the program itself does this, never a test that
+    /// builds a hub, so nothing is written to the user's state directory by accident.
+    pub fn with_history(mut self) -> Hub {
+        if self.cfg.demo {
+            return self;
+        }
+        match crate::history::History::open(&crate::history::path()) {
+            Ok(h) => {
+                let _ = h.prune(crate::history::KEEP);
+                self.history = Some(Arc::new(h));
+            }
+            Err(e) => self.log("history", format!("jobs will not be kept across restarts: {}", e)),
+        }
+        self
     }
 
     /// No job is in the middle of its last steps.
@@ -262,6 +266,10 @@ impl Hub {
                 planning,
                 plan: None,
                 chose: Default::default(),
+                peer: None,
+                used: Default::default(),
+                findings: Vec::new(),
+                over_time: false,
             });
             if stopping {
                 // Shutting down: the job exists so the caller has an id, but it never starts and claims nothing.
@@ -318,6 +326,11 @@ impl Hub {
             j.verdict = None;
             j.checks = None;
             j.rounds = 0;
+            // The previous turn is already journalled; account only for this new run.
+            j.used = Default::default();
+            j.findings.clear();
+            j.over_time = false;
+            j.created = Instant::now();
             j.cancel = Cancel::new();
             j.worker.push(format!("› {}", clip(&text, 300)));
             j.reviewer.state = StageState::Idle;
@@ -496,6 +509,22 @@ pub async fn run_job(hub: Hub, id: u32) {
         };
         tokio::select! {
             _held = wait => {
+                // One issue or review may only run so long. A deployment has its own time limits,
+                // and stopping one halfway is worse than letting it finish.
+                let limit = hub.cfg.limits.job_mins;
+                if limit > 0 && !manual && !is_deploy && !hub.cfg.demo {
+                    let (h, c) = (hub.clone(), cancel.clone());
+                    hub.rt.spawn(async move {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(limit * 60)) => {}
+                            _ = c.wait() => return,
+                        }
+                        if h.job(id, |j| if j.status.finished() { false } else { j.over_time = true; true }).unwrap_or(false) {
+                            h.log("limits", format!("#{} stopped: it has run for {} min (limits.job_mins)", id, limit));
+                            c.fire();
+                        }
+                    });
+                }
                 if cancel.is_set() {
                     cancelled()
                 } else if is_deploy {
@@ -518,7 +547,17 @@ pub async fn run_job(hub: Hub, id: u32) {
     // A cancel that arrives late still makes the job "cancelled", but what was already written up stays written up.
     // What was already written up keeps its own account of what happened (a rollback that could not be
     // confirmed must not be reduced to the word "cancelled").
-    let fin = if cancel.is_set() && !matches!(fin.status, JobStatus::Done | JobStatus::Cancelled) {
+    let over_time = hub.job(id, |j| j.over_time).unwrap_or(false);
+    let fin = if over_time && fin.status != JobStatus::Done {
+        // Not a person's cancel: the job hit its time limit, and somebody should look at why.
+        Finish {
+            status: JobStatus::Failed,
+            outcome: format!("stopped after {} min, the limit for one job (limits.job_mins). It was {} at the time", hub.cfg.limits.job_mins, if fin.reported { fin.outcome.clone() } else { "still working".to_string() }),
+            reported: fin.reported,
+            retry: None,
+            wait: None,
+        }
+    } else if cancel.is_set() && !matches!(fin.status, JobStatus::Done | JobStatus::Cancelled) {
         let outcome = if fin.reported { format!("cancelled: {}", fin.outcome) } else { "cancelled".to_string() };
         Finish { reported: fin.reported, outcome, ..cancelled() }
     } else {
@@ -538,6 +577,17 @@ pub async fn run_job(hub: Hub, id: u32) {
     } else {
         fin
     };
+    // What the checks and reviewers objected to becomes a rule or two for the next job.
+    let learned = knowledge::learn(&hub, id).await;
+    // A job that was never started (a teammate holds the item) did nothing worth recording.
+    if fin.wait.is_none() && !hub.cfg.demo {
+        if let Some(e) = hub.job(id, |j| journal::entry(j, fin.status, &fin.outcome, learned)) {
+            if let Err(err) = journal::append(&e) {
+                hub.log("journal", format!("#{} not recorded: {}. Nothing more is picked up until the journal can be written", id, err));
+                hub.state.lock().unwrap().unrecorded.push(e);
+            }
+        }
+    }
     hub.job(id, |j| {
         if fin.status == JobStatus::Interrupted {
             // Where it was, unless it was already resuming from an earlier stop.
@@ -627,7 +677,7 @@ pub fn avail_of(cfg: &Config, st: &State) -> AvailOwned {
     AvailOwned::of(st)
 }
 
-fn avail(hub: &Hub) -> AvailOwned {
+pub fn avail(hub: &Hub) -> AvailOwned {
     if hub.cfg.demo {
         let installed = [AgentKind::Claude, AgentKind::Codex].into_iter().collect();
         return AvailOwned { installed, enabled: None, no_seat: false, rejected: HashSet::new() };
@@ -1074,6 +1124,7 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
             checks_ok = Some(ok);
             if !ok {
                 reasons = out.clone();
+                hub.job(id, |j| j.findings.push(format!("A check failed:\n{}", issues::tail_of(&out, 2500))));
                 feedback = Some(format!("The project's checks failed. Output:\n{}", out));
             }
             if w.is_issue {
@@ -1129,6 +1180,7 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
                 format!("#{} {}: {}", id, ran.label(), match v { Some(true) => "PASS", Some(false) => "FAIL", None => "no verdict" }),
             );
             if v == Some(false) {
+                hub.job(id, |j| j.findings.push(format!("A reviewer did not pass the change:\n{}", clip(&strip_verdict(&rev.text), 4000))));
                 feedback = Some(format!("A reviewer did not pass the change. Review:\n{}", rev.text));
             }
         }
@@ -1190,6 +1242,8 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
         Ok(x) => x,
         Err(f) => return f,
     };
+    // Routed on the task alone; the worker and its reviewer also get what is known about the repository.
+    let prompt = knowledge::with_notes(hub, id, prompt).await;
     let (reviewer, _) = pick::reviewer_for(&hub.cfg, &avail(hub).borrow(), &worker, d.tier.up());
     if !d.review {
         hub.job(id, |j| j.reviewer.state = StageState::Skipped);
@@ -1589,6 +1643,9 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
             "review",
             format!("#{} {}: {}", id, ran.label(), match verdict { Some(true) => "PASS", Some(false) => "FAIL", None => "no verdict" }),
         );
+        if verdict == Some(false) {
+            hub.job(id, |j| j.findings.push(format!("A reviewer asked for changes on a pull request:\n{}", clip(&strip_verdict(&out.text), 4000))));
+        }
         reviews.push(issues::Review { by: ran.label(), verdict, text: if out.ok { out.text } else { format!("The review did not complete: {}", out.error) } });
     }
     if reviews.iter().all(|r| r.verdict.is_none()) {
@@ -1781,6 +1838,37 @@ mod tests {
         assert!(p.ends_with("Later, the user also asked (oldest first):\n- call it --fast\n- and document it"), "{}", p);
         // A follow-up already folded into the task is not repeated.
         assert!(!with_later_requests("x\n\nFollow-up request: y", &[t("x"), t("y")]).contains("Later"));
+    }
+
+    #[test]
+    fn replies_keep_conversation_without_recounting_journal_usage() {
+        // Keep spawned jobs queued: this test exercises reply admission without running agents.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = Hub::new(Config::default(), rt.handle().clone());
+        let id = hub.submit("first task".into(), "first task".into(), Source::Manual, PathBuf::from("."), None, Planning::IfRouted);
+        hub.job(id, |j| {
+            j.status = JobStatus::Done;
+            j.turns[0].answer = "first answer".into();
+            j.used[0].runs = 1;
+            j.used[0].tokens_in = 123;
+            j.findings.push("previous finding".into());
+            j.over_time = true;
+            j.created = Instant::now() - Duration::from_secs(3600);
+        });
+        let first = hub.job(id, |j| journal::entry(j, JobStatus::Done, "done", 0)).unwrap();
+        hub.reply(id, "follow up".into()).unwrap();
+        let next = hub.job(id, |j| {
+            assert_eq!(j.turns.len(), 2);
+            assert_eq!(j.turns[0].answer, "first answer");
+            assert_eq!(j.turns[1].ask, "follow up");
+            assert!(j.findings.is_empty());
+            assert!(!j.over_time);
+            journal::entry(j, JobStatus::Done, "done", 0)
+        }).unwrap();
+        assert_eq!(first.claude.tokens_in, 123);
+        assert_eq!(next.claude.tokens_in, 0);
+        assert_eq!(next.claude.runs, 0);
+        assert!(next.secs < 60);
     }
 
     #[test]

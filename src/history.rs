@@ -236,6 +236,10 @@ impl JobRecord {
             planning: self.planning,
             plan: self.plan,
             chose: Default::default(),
+            peer: None,
+            used: Default::default(),
+            findings: Vec::new(),
+            over_time: false,
         }
     }
 }
@@ -458,6 +462,10 @@ mod tests {
             resume_from: None,
             inbox: Default::default(),
             steer: Cancel::new(),
+            peer: None,
+            used: Default::default(),
+            findings: Vec::new(),
+            over_time: false,
             planning: Planning::Always,
             plan: Some(Plan { options: vec![crate::state::PlanOption { title: "a".into(), summary: "b".into(), recommended: true }], text: "t".into(), chosen: Some(crate::state::Choice::Own("mine".into())) }),
             chose: Default::default(),

@@ -13,6 +13,8 @@ pub struct Config {
     pub review: ReviewCfg,
     pub automation: AutoCfg,
     pub team: TeamCfg,
+    pub limits: LimitsCfg,
+    pub knowledge: KnowledgeCfg,
     /// MCP servers by name. CI and deployment stages call tools on these.
     pub mcp: HashMap<String, McpServerCfg>,
     pub repos: Vec<RepoCfg>,
@@ -410,6 +412,52 @@ impl Default for TeamCfg {
     }
 }
 
+/// How much forkdeck may do by itself. Counted over the last 24 hours from the journal, so a
+/// restart does not reset anything. 0 switches a limit off.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsCfg {
+    /// Issues and reviews picked up per 24 hours, over all repositories.
+    pub jobs_per_day: u32,
+    /// Tokens (in and out, both CLIs, typed tasks included) per 24 hours. Once reached, nothing more is picked up.
+    pub tokens_per_day: u64,
+    /// Longest one issue or review may run before it is stopped and handed to a person.
+    pub job_mins: u64,
+    /// After this many issues or reviews in a row failed on a repository, stop picking up from it for a while.
+    pub pause_after_failures: u32,
+    pub pause_mins: u64,
+}
+
+impl Default for LimitsCfg {
+    fn default() -> Self {
+        LimitsCfg { jobs_per_day: 0, tokens_per_day: 0, job_mins: 0, pause_after_failures: 5, pause_mins: 60 }
+    }
+}
+
+/// Notes about each repository that are given to the worker with every issue.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct KnowledgeCfg {
+    /// Hand the notes to the worker. Without a notes file this does nothing.
+    pub enabled: bool,
+    /// After work was sent back or a review asked for changes, have a CLI distil rules from the
+    /// findings and add them to the notes. Off by default: what is learned is read by every later job.
+    pub learn: bool,
+    /// Propose learned rules to the team as a pull request against `.forkdeck/notes.md`. Off: they
+    /// are written to this machine's own notes instead and take effect at once, for this machine only.
+    pub share: bool,
+    /// Learned rules kept per repository; the oldest make room.
+    pub max_learned: usize,
+    /// How much of the notes is put into a prompt.
+    pub max_chars: usize,
+}
+
+impl Default for KnowledgeCfg {
+    fn default() -> Self {
+        KnowledgeCfg { enabled: true, learn: false, share: true, max_learned: 30, max_chars: 6000 }
+    }
+}
+
 impl AutoCfg {
     pub fn root(&self) -> PathBuf {
         if let Some(p) = &self.worktree_root {
@@ -612,6 +660,9 @@ pub struct RepoCfg {
     /// Run `checks` on labelled pull requests too. Off by default: it executes the pull request's code as you.
     #[serde(default)]
     pub pr_checks: bool,
+    /// Issues and reviews picked up from this repository per 24 hours. 0: only the overall limit applies.
+    #[serde(default)]
+    pub jobs_per_day: u32,
     #[serde(default)]
     pub ci: Option<CiCfg>,
     #[serde(default)]
@@ -711,6 +762,15 @@ impl Config {
             if !(1..=24 * 60).contains(&m) {
                 anyhow::bail!("agents.timeout_mins must be between 1 and 1440, got {}", m);
             }
+        }
+        if self.limits.pause_mins == 0 || self.limits.pause_mins > 7 * 24 * 60 {
+            anyhow::bail!("limits.pause_mins must be between 1 and a week, got {}", self.limits.pause_mins);
+        }
+        if self.limits.job_mins > 7 * 24 * 60 {
+            anyhow::bail!("limits.job_mins must be at most a week");
+        }
+        if self.knowledge.max_learned == 0 || self.knowledge.max_learned > 200 || !(200..=50_000).contains(&self.knowledge.max_chars) {
+            anyhow::bail!("knowledge.max_learned must be 1 to 200 and knowledge.max_chars 200 to 50000");
         }
         if !(30..=3600).contains(&self.team.heartbeat_secs) {
             anyhow::bail!("team.heartbeat_secs must be between 30 and 3600, got {}", self.team.heartbeat_secs);

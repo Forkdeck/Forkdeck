@@ -402,6 +402,12 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     if out.session.is_none() {
         out.session = hub.job(job, |j| j.stage(slot).session.clone()).flatten();
     }
+    // What this run used goes on the job's account, by the CLI that ran, whichever box it was shown in.
+    hub.job(job, |j| {
+        let s = j.stage(slot).clone();
+        let add = crate::journal::Usage { runs: 1, tokens_in: s.tokens_in, tokens_out: s.tokens_out, cost: s.cost };
+        j.used[crate::journal::slot(e.cli)].add(&add);
+    });
     stage(&mut |s| {
         s.elapsed = Some(start.elapsed());
         s.state = if out.ok || out.interrupted { StageState::Ok } else { StageState::Failed };
