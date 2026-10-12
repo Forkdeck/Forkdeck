@@ -26,6 +26,49 @@ case "$prompt" in
 esac
 "#;
 
+/// `copilot`, speaking its JSONL. `FAKE_COPILOT_REJECT` lists models to refuse the way GitHub does
+/// for a model the organisation has switched off, and `FAKE_COPILOT_TRUNCATE` makes a review stop
+/// before its closing line. Every run's arguments are appended to `$FAKE_GH/copilot.log`.
+const COPILOT: &str = r#"#!/bin/sh
+[ "$1" = "--version" ] && { echo "GitHub Copilot CLI stand-in"; exit 0; }
+[ "$1" = "--headless" ] && exit 1
+echo "$*" >> "$FAKE_GH/copilot.log"
+model=""; usage=""
+while [ $# -gt 0 ]; do
+  case "$1" in --model) model=$2; shift 2 ;; --usage-output-file) usage=$2; shift 2 ;; *) shift ;; esac
+done
+prompt=$(cat)
+[ -n "$FAKE_PROMPTS" ] && printf '%s\n-----\n' "$prompt" >> "$FAKE_PROMPTS"
+for m in $FAKE_COPILOT_REJECT; do
+  if [ "$m" = "$model" ]; then
+    printf '%s\n' "{\"type\":\"model.call_failure\",\"data\":{\"model\":\"$model\",\"statusCode\":400,\"errorCode\":\"model_not_supported\"}}"
+    printf '%s\n' '{"type":"session.error","data":{"errorType":"query","message":"400 The requested model is not supported."}}'
+    printf '%s\n' '{"type":"result","exitCode":1,"usage":{"premiumRequests":0}}'
+    exit 1
+  fi
+done
+[ -n "$usage" ] && printf '{"modelMetrics":{"%s":{"usage":{"inputTokens":10,"outputTokens":2}}}}' "$model" > "$usage"
+case "$prompt" in
+  *"Write at most three short rules"*)
+    [ -n "$FAKE_LESSONS_SEEN" ] && printf '%s' "$prompt" > "$FAKE_LESSONS_SEEN"
+    printf '%s\n' "{\"type\":\"assistant.message\",\"data\":{\"content\":\"${FAKE_LESSONS:-NONE}\",\"model\":\"$model\"}}"
+    ;;
+  *"Do not modify any file"*)
+    verdict=${FAKE_VERDICT:-PASS}
+    [ -n "$model" ] && [ "$model" = "$FAKE_COPILOT_FAIL_MODEL" ] && verdict=FAIL
+    printf '%s\n' "{\"type\":\"assistant.message\",\"data\":{\"content\":\"Looked at it.\\nVERDICT: $verdict\",\"model\":\"$model\"}}"
+    [ "$FAKE_COPILOT_TRUNCATE" = usage ] && printf '%s\n' "{\"type\":\"assistant.usage\",\"data\":{\"model\":\"$model\",\"inputTokens\":10,\"outputTokens\":2}}"
+    [ -n "$FAKE_COPILOT_TRUNCATE" ] && exit 0
+    ;;
+  *)
+    printf '%s\n' '{"type":"tool.execution_start","data":{"toolName":"edit","arguments":{"path":"by_agent.txt"}}}'
+    sh -c "${FAKE_WORK:-echo change >> by_agent.txt}" >/dev/null 2>&1
+    printf '%s\n' "{\"type\":\"assistant.message\",\"data\":{\"content\":\"Did the work.\",\"model\":\"$model\"}}"
+    ;;
+esac
+printf '%s\n' '{"type":"result","exitCode":0,"usage":{"premiumRequests":1}}'
+"#;
+
 /// `gh`. Lists come from files, everything else is appended to `calls.log`. `gh api` keeps
 /// comments as files under `$FAKE_GH/c/<path>/<id>.json` (what was posted), `.who` (the author),
 /// `.at` (when it last changed) and optionally `.assoc` (how the forge says the author relates to
@@ -183,7 +226,7 @@ fn quota_fallback_completes_worker_and_review() {
     assert!(rig.clone().join("by_codex.txt").exists());
     assert_eq!(fs::read_to_string(rig.root.join("gh/attempts")).unwrap(), "claude\ncodex\ncodex\n");
     assert!(out.contains("retrying with codex"), "{out}");
-    assert!(out.contains("worker's own CLI"), "{out}");
+    assert!(out.contains("same-vendor review: codex reviewed the work of codex"), "{out}");
 }
 
 #[test]
@@ -249,13 +292,18 @@ fn git(dir: &Path, args: &[&str]) -> String {
 impl Rig {
     /// A remote with one commit on main, a clone of it, the stand-ins, and a config with one repo.
     fn new(name: &str, extra_config: &str, repo_config: &str) -> Rig {
+        Rig::with_agents(name, extra_config, repo_config, &[("claude", CLAUDE)])
+    }
+
+    /// Like `new`, with these agent stand-ins on PATH instead of `claude`.
+    fn with_agents(name: &str, extra_config: &str, repo_config: &str, agents: &[(&str, &str)]) -> Rig {
         let root = std::env::temp_dir().join(format!("forkdeck-test-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for d in ["bin", "gh", "mcp", "home/.config/forkdeck", "home/.local/state/forkdeck"] {
             fs::create_dir_all(root.join(d)).unwrap();
         }
         fs::write(root.join("home/.local/state/forkdeck/machine-id"), "0123456789abcdef\n").unwrap();
-        for (file, body) in [("claude", CLAUDE), ("gh", GH), ("mcp-stand-in", MCP)] {
+        for (file, body) in agents.iter().copied().chain([("gh", GH), ("mcp-stand-in", MCP)]) {
             let p = root.join("bin").join(file);
             fs::write(&p, body).unwrap();
             fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1896,4 +1944,168 @@ fn the_open_notes_pull_request_is_found_among_any_number_of_old_branches() {
     assert_eq!(git(&rig.origin(), &["rev-list", "--count", &format!("main..{}", oldest)]), "1", "added to the open one");
     assert!(!rig.calls().contains("--title Notes for agents"), "no second pull request:\n{}", rig.calls());
     assert_eq!(git(&rig.origin(), &["for-each-ref", "--format=%(refname:short)", "refs/heads/forkdeck/notes-*"]).lines().count(), 7, "and no new branch");
+}
+
+/// Real `claude` or `codex` installed on the machine must not take part in the copilot tests.
+const NO_REAL_CLIS: &str = "[agents.claude]\ncmd = \"absent-claude\"\n[agents.codex]\ncmd = \"absent-codex\"\n";
+
+fn copilot_runs(rig: &Rig) -> Vec<String> {
+    fs::read_to_string(rig.root.join("gh/copilot.log")).unwrap_or_default().lines().map(String::from).collect()
+}
+
+fn model_of(run: &str) -> &str {
+    run.split("--model ").nth(1).and_then(|r| r.split(' ').next()).unwrap_or("")
+}
+
+#[test]
+fn with_only_copilot_work_and_review_come_from_different_vendors() {
+    let rig = Rig::with_agents("copilot-only", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    assert_eq!(runs.len(), 2, "{:?}", runs);
+    // Whichever part the router gave the work, the review comes from the other vendor.
+    let (work, review) = (model_of(&runs[0]), model_of(&runs[1]));
+    assert!(runs[0].contains("--allow-tool write") && runs[1].contains("--deny-tool write"), "{:?}", runs);
+    assert!((work.starts_with("claude-") && review.starts_with("gpt-")) || (work.starts_with("gpt-") && review.starts_with("claude-")), "{:?}", runs);
+    assert!(runs.iter().all(|r| !r.contains("allow-all") && !r.contains("--yolo")), "{:?}", runs);
+    assert!(rig.calls().contains("pr create"), "{}", rig.calls());
+    assert_eq!(git(&rig.origin(), &["show", "--name-only", "--format=", "forkdeck/issue-7"]), "by_agent.txt");
+}
+
+#[test]
+fn a_model_the_organisation_switched_off_is_skipped() {
+    let rig = Rig::with_agents("copilot-refused", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_COPILOT_REJECT", "claude-sonnet-5.5 claude-sonnet-5 gpt-5.5 gpt-5.4")]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    let workers: Vec<&str> = runs.iter().filter(|r| r.contains("--allow-tool write")).map(|r| model_of(r)).collect();
+    let claude = ["claude-sonnet-5.5", "claude-sonnet-5", "claude-sonnet-4.6"];
+    let codex = ["gpt-5.5", "gpt-5.4", "gpt-5.3-codex"];
+    assert!(workers == claude || workers == codex, "each refused model is tried once, then the next: {:?}", runs);
+    assert!(out.contains("is not available to this copilot account"), "{}", out);
+}
+
+#[test]
+fn with_codex_missing_copilot_plays_codex() {
+    let rig = Rig::with_agents("claude-and-copilot", "[agents.codex]\ncmd = \"absent-codex\"\n", "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    assert_eq!(runs.len(), 1, "claude does its own part, copilot only codex's: {:?}", runs);
+    assert!(model_of(&runs[0]).starts_with("gpt-"), "{}", runs[0]);
+}
+
+#[test]
+fn a_copilot_profile_reviews_pull_requests_next_to_claude() {
+    let extra = "[agents.codex]\ncmd = \"absent-codex\"\n[agents.copilot.profiles.second]\nvendor = \"xai\"\nmodels = { light = \"grok-4.7\", standard = \"grok-4.7\", heavy = \"grok-4.7\" }\n[review]\npr_reviewers = [\"claude\", \"copilot:second\"]";
+    let rig = Rig::with_agents("copilot-profile", extra, "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    assert_eq!(runs.len(), 1, "{:?}", runs);
+    assert_eq!(model_of(&runs[0]), "grok-4.7");
+    let calls = rig.calls();
+    assert!(calls.contains("copilot:second") && calls.contains("--add-label review:passed"), "{}", calls);
+}
+
+#[test]
+fn a_copilot_review_that_stops_early_is_not_a_pass() {
+    let rig = Rig::with_agents("copilot-truncated", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (_, out) = rig.once(&[("FAKE_COPILOT_TRUNCATE", "1")]);
+    let calls = rig.calls();
+    assert!(!calls.contains("review:passed"), "{}\n{}", calls, out);
+    assert!(calls.contains("--add-label review:ready"), "{}\n{}", calls, out);
+    assert!(out.contains("exited before reporting a result"), "it failed for the missing closing line: {}", out);
+}
+
+#[test]
+fn a_copilot_review_that_reports_usage_but_no_result_is_not_a_pass() {
+    let rig = Rig::with_agents("copilot-usage-eof", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (_, out) = rig.once(&[("FAKE_COPILOT_TRUNCATE", "usage")]);
+    let calls = rig.calls();
+    assert!(!calls.contains("review:passed"), "{}\n{}", calls, out);
+    assert!(calls.contains("--add-label review:ready"), "{}\n{}", calls, out);
+    assert!(out.contains("exited before reporting a result"), "it failed for the missing closing line: {}", out);
+}
+
+#[test]
+fn every_configured_pull_request_reviewer_runs_and_a_third_fail_counts() {
+    let extra = "[agents.codex]\ncmd = \"absent-codex\"\n[agents.copilot.profiles.second]\nvendor = \"xai\"\nmodels = { light = \"grok-4.7\", standard = \"grok-4.7\", heavy = \"grok-4.7\" }\n[agents.copilot.profiles.third]\nvendor = \"google\"\nmodels = { light = \"gemini-3.8-pro\", standard = \"gemini-3.8-pro\", heavy = \"gemini-3.8-pro\" }\n[review]\npr_reviewers = [\"claude\", \"copilot:second\", \"copilot:third\"]";
+    let rig = Rig::with_agents("three-reviewers", extra, "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[("FAKE_COPILOT_FAIL_MODEL", "gemini-3.8-pro")]);
+    assert!(ok, "{}", out);
+    let mut models: Vec<String> = copilot_runs(&rig).iter().map(|r| model_of(r).to_string()).collect();
+    models.sort();
+    assert_eq!(models, ["gemini-3.8-pro", "grok-4.7"], "both copilot profiles ran");
+    let calls = rig.calls();
+    assert!(calls.contains("copilot:third") && calls.contains("--add-label review:changes"), "{}", calls);
+    assert!(!calls.contains("review:passed"), "{}", calls);
+}
+
+#[test]
+fn a_pinned_copilot_model_the_account_refuses_falls_back_to_the_cli_choice() {
+    let extra = format!("{}[agents.copilot]\nmodels = {{ light = \"gpt-5.5\", standard = \"gpt-5.5\", heavy = \"gpt-5.5\" }}\n[review]\npr_reviewers = [\"copilot\"]", NO_REAL_CLIS);
+    let rig = Rig::with_agents("copilot-pinned-refused", &extra, "", &[("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[("FAKE_COPILOT_REJECT", "gpt-5.5")]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    let models: Vec<&str> = runs.iter().map(|r| model_of(r)).collect();
+    assert_eq!(models, ["gpt-5.5", ""], "the refused pin is tried once, then the CLI picks: {:?}", runs);
+    assert!(rig.calls().contains("--add-label review:passed"), "{}", rig.calls());
+}
+
+#[test]
+fn copilot_usage_is_recorded_separately_and_counts_toward_limits() {
+    let extra = format!("{}[limits]\ntokens_per_day = 20", NO_REAL_CLIS);
+    let rig = Rig::with_agents("copilot-journal-limit", &extra, "", &[("copilot", COPILOT)]);
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let entries = rig.journal();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["copilot"]["runs"], 2);
+    assert_eq!(entries[0]["copilot"]["tokens_in"], 20);
+    assert_eq!(entries[0]["copilot"]["tokens_out"], 4);
+    assert_eq!(entries[0]["claude"]["runs"], 0);
+    assert_eq!(entries[0]["codex"]["runs"], 0);
+    let (ok, out) = rig.run(&["stats"], &[]);
+    assert!(ok && out.contains("copilot      2 run(s) · 20 tokens in · 4 out"), "{}", out);
+    rig.issues(&[8]);
+    let before = rig.calls();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok && out.contains("token limit reached: 24 of 20 in the last 24 h"), "{}", out);
+    assert_eq!(rig.calls(), before);
+}
+
+#[test]
+fn copilot_receives_notes_and_learns_from_failed_reviews() {
+    let extra = format!("{}[review]\nmax_fix_rounds = 0\n[knowledge]\nlearn = true\nshare = false", NO_REAL_CLIS);
+    let rig = Rig::with_agents("copilot-notes", &extra, "", &[("copilot", COPILOT)]);
+    let (ok, out) = rig.run(&["notes", "o/r", "add", "Money is integer cents."], &[]);
+    assert!(ok, "{}", out);
+    rig.issue();
+    let prompts = rig.root.join("prompts.txt");
+    let asked = rig.root.join("asked.txt");
+    let (ok, out) = rig.once(&[("FAKE_PROMPTS", prompts.to_str().unwrap()), ("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", "- Run make fmt before finishing the work."), ("FAKE_LESSONS_SEEN", asked.to_str().unwrap())]);
+    assert!(!ok && out.contains("1 rule(s) added to the notes for o/r"), "{}", out);
+    assert!(fs::read_to_string(prompts).unwrap().contains("<notes>\n- Money is integer cents.\n</notes>"));
+    assert!(fs::read_to_string(asked).unwrap().contains("A reviewer did not pass the change:\nLooked at it."));
+    assert!(fs::read_to_string(rig.notes_file()).unwrap().contains("Run make fmt"));
+    let entries = rig.journal();
+    assert_eq!(entries[0]["learned"], 1);
+    assert_eq!(entries[0]["copilot"]["runs"], 3);
 }

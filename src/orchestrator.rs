@@ -1,15 +1,17 @@
 //! Job pipeline: route, work, cross-review, fix, publish.
 
-use crate::agents::{self, RunSpec, Slot};
+use crate::agents::{self, RunOut, RunSpec, Slot};
 use crate::cicd;
 use crate::config::Config;
 use crate::issues;
 use crate::journal;
 use crate::knowledge;
+use crate::pick::{self, Exec};
 use crate::proc;
 use crate::router;
 use crate::state::*;
 use crate::team;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -91,7 +93,7 @@ impl Hub {
         prompt: String,
         source: Source,
         workdir: PathBuf,
-        forced: Option<AgentKind>,
+        forced: Option<AgentRef>,
     ) -> u32 {
         let id = {
             let mut st = self.state.lock().unwrap();
@@ -111,7 +113,9 @@ impl Hub {
                 forced,
                 decision: None,
                 worker: Stage::default(),
+                worker_exec: None,
                 reviewer: Stage::default(),
+                extra: Vec::new(),
                 verdict: None,
                 checks: None,
                 outcome: String::new(),
@@ -201,18 +205,35 @@ impl Hub {
     }
 
     pub async fn detect_agents(&self) {
-        let (c, x) = if self.cfg.demo {
-            (true, true)
+        let found = if self.cfg.demo {
+            [true, true, false]
         } else {
-            let cc = self.cfg.agents.get(AgentKind::Claude).cmd.unwrap_or_default();
-            let xc = self.cfg.agents.get(AgentKind::Codex).cmd.unwrap_or_default();
-            tokio::join!(agents::on_path(&cc), agents::on_path(&xc))
+            let [cc, xc, pc] = AgentKind::ALL.map(|k| self.cfg.agents.get(k).cmd.unwrap_or_default());
+            let (c, x, p) = tokio::join!(agents::on_path(&cc), agents::on_path(&xc), agents::on_path(&pc));
+            [c, x, p]
         };
+        let installed: std::collections::HashSet<AgentKind> = AgentKind::ALL.into_iter().zip(found).filter(|(_, f)| *f).map(|(k, _)| k).collect();
+        // Which models the account may use decides what copilot can stand in for, so ask before any job starts.
+        let probe = if installed.contains(&AgentKind::Copilot) { crate::copilot::probe(&self.cfg.agents.get(AgentKind::Copilot).cmd.unwrap_or_default()).await } else { Default::default() };
         let mut st = self.state.lock().unwrap();
-        st.have_claude = c;
-        st.have_codex = x;
-        if !c && !x {
-            st.log("agents", "neither claude nor codex was found on PATH");
+        st.installed = installed;
+        st.copilot = probe;
+        st.stand_in = self.cfg.agents.copilot.stand_in();
+        if st.has(AgentKind::Copilot) {
+            let who = st.copilot.login.clone().unwrap_or_else(|| "this account".into());
+            let note = match (&st.copilot.error, st.copilot.seat, &st.copilot.enabled) {
+                (Some(e), _, _) => format!("copilot: could not list models ({}); configured models are tried as they come", e),
+                (None, Some(false), _) => format!("copilot: {} has no Copilot access for the CLI; it will not be used", who),
+                (None, _, Some(m)) => format!("copilot: {} may use {} models", who, m.len()),
+                _ => String::new(),
+            };
+            if !note.is_empty() {
+                st.log("agents", note);
+            }
+        }
+        if !st.has(AgentKind::Claude) && !st.has(AgentKind::Codex) {
+            let stands_in = st.copilot_usable() && st.stand_in;
+            st.log("agents", if stands_in { "claude and codex not found on PATH: copilot stands in for them" } else { "neither claude, codex nor a usable copilot was found on PATH" });
         }
     }
 }
@@ -266,6 +287,7 @@ fn prepare_reply(j: &mut Job, text: String) {
     j.over_time = false;
     j.created = Instant::now();
     j.cancel = Cancel::new();
+    j.worker_exec = None;
     j.worker.push(format!("› {}", clip(&text, 300)));
     j.reviewer.state = StageState::Idle;
 }
@@ -427,42 +449,90 @@ fn set_status(hub: &Hub, id: u32, s: JobStatus) {
     hub.job(id, |j| j.status = s);
 }
 
-pub(crate) fn available(hub: &Hub) -> (bool, bool) {
-    let st = hub.state.lock().unwrap();
-    (st.agent_ready(AgentKind::Claude), st.agent_ready(AgentKind::Codex))
+/// A copy of what `pick` needs, so the state lock is not held while agents run.
+pub struct AvailOwned {
+    installed: HashSet<AgentKind>,
+    enabled: Option<HashSet<String>>,
+    no_seat: bool,
+    rejected: HashSet<String>,
 }
 
-/// Retry a quota refusal at most once, and only before the failed CLI used tools.
-async fn run_with_fallback(hub: &Hub, id: u32, slot: Slot, mut spec: RunSpec<'_>) -> agents::RunOut {
-    let ready = |kind| hub.cfg.demo || hub.state.lock().unwrap().agent_ready(kind);
-    if !ready(spec.kind) && ready(spec.kind.other()) {
-        hub.log("agents", format!("#{} {} unavailable; using {}", id, spec.kind.name(), spec.kind.other().name()));
-        spec.kind = spec.kind.other();
+impl AvailOwned {
+    fn of(st: &State) -> AvailOwned {
+        AvailOwned { installed: st.installed.iter().copied().filter(|k| st.agent_ready(*k)).collect(), enabled: st.copilot.enabled.clone(), no_seat: st.copilot.seat == Some(false), rejected: st.rejected_models.clone() }
     }
-    for attempt in 0..2 {
-        if !ready(spec.kind) {
-            return agents::RunOut { ok: false, text: String::new(), error: "no agent is available (missing or temporarily rate limited)".into() };
-        }
-        if slot == Slot::Worker && !spec.read_only {
-            hub.job(id, |j| if let Some(d) = &mut j.decision { d.agent = spec.kind; });
-        }
-        let kind = spec.kind;
-        let out = agents::run(hub, id, slot, RunSpec { kind, tier: spec.tier, prompt: spec.prompt, dir: spec.dir, read_only: spec.read_only }).await;
-        let can_retry = hub.job(id, |j| {
-            let stage = if slot == Slot::Worker { &j.worker } else { &j.reviewer };
-            !j.cancel.is_set() && stage.tools == 0
-        }).unwrap_or(false);
-        if out.ok || !agents::quota_error(&out.error) || !can_retry || attempt == 1 || !ready(kind.other()) {
-            return out;
-        }
-        hub.log("agents", format!("#{} {} hit a usage limit before using tools; retrying with {}", id, kind.name(), kind.other().name()));
-        spec.kind = kind.other();
+    pub fn borrow(&self) -> pick::Avail<'_> {
+        pick::Avail { installed: &self.installed, enabled: self.enabled.as_ref(), no_seat: self.no_seat, rejected: &self.rejected }
     }
-    unreachable!("two attempts always return")
+}
+
+pub fn avail_of(cfg: &Config, st: &State) -> AvailOwned {
+    if cfg.demo {
+        let installed = [AgentKind::Claude, AgentKind::Codex].into_iter().collect();
+        return AvailOwned { installed, enabled: None, no_seat: false, rejected: HashSet::new() };
+    }
+    AvailOwned::of(st)
+}
+
+fn avail(hub: &Hub) -> AvailOwned {
+    if hub.cfg.demo {
+        let installed = [AgentKind::Claude, AgentKind::Codex].into_iter().collect();
+        return AvailOwned { installed, enabled: None, no_seat: false, rejected: HashSet::new() };
+    }
+    AvailOwned::of(&hub.state.lock().unwrap())
+}
+
+/// Run an agent. When copilot refuses the model before doing anything, remember that and run the
+/// same part with the next model the account may use. Each pass rules one model out, so this ends.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_agent(hub: &Hub, id: u32, slot: Slot, mut exec: Exec, tier: Tier, prompt: &str, dir: &Path, read_only: bool) -> (RunOut, Exec) {
+    loop {
+        if !hub.cfg.demo && !hub.state.lock().unwrap().agent_ready(exec.cli) {
+            match pick::worker_for(&hub.cfg, &avail(hub).borrow(), &exec.asked, tier) {
+                Some(next) => exec = next,
+                None => return (RunOut { error: "no agent is available (missing or temporarily rate limited)".into(), ..Default::default() }, exec),
+            }
+        }
+        if slot == Slot::Worker && !read_only && exec.family != AgentKind::Copilot {
+            hub.job(id, |j| if let Some(d) = &mut j.decision { d.agent = exec.family; });
+        }
+        let out = agents::run(hub, id, slot, RunSpec { exec: &exec, prompt, dir, read_only }).await;
+        if !out.ok && agents::quota_error(&out.error) && !hub.cfg.demo {
+            let safe = hub.job(id, |j| !j.cancel.is_set() && j.stage(slot).tools == 0).unwrap_or(false);
+            if safe {
+                if let Some(next) = pick::worker_for(&hub.cfg, &avail(hub).borrow(), &exec.asked, tier) {
+                    if next.cli != exec.cli {
+                        hub.log("agents", format!("#{} {} hit a usage limit before using tools; retrying with {}", id, exec.label(), next.label()));
+                        exec = next;
+                        continue;
+                    }
+                }
+            }
+            return (out, exec);
+        }
+        if out.no_models {
+            hub.state.lock().unwrap().copilot.seat = Some(false);
+            hub.log("agents", format!("copilot has no model this account may use: {}", out.error));
+            return (out, exec);
+        }
+        let Some(m) = out.rejected_model.clone() else { return (out, exec) };
+        let m = if m.is_empty() { exec.model.clone() } else { m };
+        hub.state.lock().unwrap().rejected_models.insert(m.clone());
+        hub.log("agents", format!("#{} {} is not available to this copilot account, skipping it", id, m));
+        match pick::resolve(&hub.cfg, &avail(hub).borrow(), &exec.asked, tier) {
+            Some(next) if next.model != exec.model => exec = next,
+            _ => return (out, exec),
+        }
+    }
+}
+
+/// A review is same-vendor when its reviewer, or a model the reviewer fell back to, comes from the worker's vendor.
+fn same_vendor(worker: &Exec, reviewer: &Exec, used: &[String]) -> bool {
+    !pick::differs(&worker.vendor, &reviewer.vendor) || used.iter().any(|m| !pick::differs(&worker.vendor, &pick::vendor_of_model(m)) && pick::vendor_of_model(m) != pick::Vendor::Unknown)
 }
 
 /// Ask the fork layer and record the answer on the job.
-async fn decide(hub: &Hub, id: u32, prompt: &str, is_issue: bool, forced: Option<AgentKind>) -> Result<Decision, Finish> {
+async fn decide(hub: &Hub, id: u32, prompt: &str, is_issue: bool, forced: Option<AgentRef>) -> Result<(Decision, Exec), Finish> {
     set_status(hub, id, JobStatus::Routing);
     let routed = router::route(&hub.cfg, &hub.http, prompt, is_issue).await;
     let mut d = routed.decision;
@@ -478,10 +548,13 @@ async fn decide(hub: &Hub, id: u32, prompt: &str, is_issue: bool, forced: Option
             st.log("router", format!("jev unavailable, used rules: {}", e));
         }
     }
-    if let Some(f) = forced {
-        d.agent = f;
+    if let Some(f) = &forced {
+        if f.kind() != AgentKind::Copilot {
+            d.agent = f.kind();
+        }
         d.note = format!("agent forced to {}", f.name());
     }
+    let wanted = forced.unwrap_or(AgentRef::Kind(d.agent));
     // Work that starts from someone else's text is reviewed whatever the router says: the router
     // read that same text, so it must not be able to talk its way out of the review.
     if is_issue {
@@ -492,23 +565,22 @@ async fn decide(hub: &Hub, id: u32, prompt: &str, is_issue: bool, forced: Option
         "never" => d.review = false,
         _ => {}
     }
-    let (have_c, have_x) = available(hub);
-    let has = |a: AgentKind| if a == AgentKind::Claude { have_c } else { have_x };
-    if !has(d.agent) {
-        if has(d.agent.other()) {
-            hub.log("router", format!("{} unavailable (missing or rate limited), using {}", d.agent.name(), d.agent.other().name()));
-            d.agent = d.agent.other();
-        } else {
-            hub.job(id, |j| j.decision = Some(d.clone()));
-            return Err(failed("neither claude nor codex is available (missing or temporarily rate limited)"));
-        }
+    let Some(worker) = pick::worker_for(&hub.cfg, &avail(hub).borrow(), &wanted, d.tier) else {
+        hub.job(id, |j| j.decision = Some(d.clone()));
+        return Err(failed(format!("{} is not available and nothing can stand in for it", wanted.name())));
+    };
+    if worker.asked != wanted {
+        hub.log("router", format!("{} is not available, using {}", wanted.name(), worker.label()));
+    }
+    if worker.family != AgentKind::Copilot {
+        d.agent = worker.family;
     }
     hub.log(
         "router",
         format!(
             "#{} → {} · {} · review {} ({}, {} ms){}",
             id,
-            d.agent.name(),
+            worker.label(),
             d.tier.name(),
             if d.review { "yes" } else { "no" },
             d.source,
@@ -517,7 +589,7 @@ async fn decide(hub: &Hub, id: u32, prompt: &str, is_issue: bool, forced: Option
         ),
     );
     hub.job(id, |j| j.decision = Some(d.clone()));
-    Ok(d)
+    Ok((d, worker))
 }
 
 /// How a set of commands ended.
@@ -585,6 +657,8 @@ struct Work<'a> {
     prompt: &'a str,
     dir: &'a Path,
     d: &'a Decision,
+    worker: &'a Exec,
+    reviewer: &'a Exec,
     checks: &'a [String],
     is_issue: bool,
     /// Set for a fix pushed onto an open pull request: what it is meant to fix.
@@ -618,14 +692,14 @@ async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, cancel: &Canc
 }
 
 async fn run_worker(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, cancel: &Cancel, read_only: bool) -> Result<String, Finish> {
-    let out = run_with_fallback(hub, id, Slot::Worker, RunSpec { kind: w.d.agent, tier: w.d.tier, prompt, dir: w.dir, read_only }).await;
+    let (out, ran) = run_agent(hub, id, Slot::Worker, w.worker.clone(), w.d.tier, prompt, w.dir, read_only).await;
     if cancel.is_set() {
         return Err(cancelled());
     }
     if !out.ok {
-        let actual = hub.job(id, |j| j.worker.agent).flatten().unwrap_or(w.d.agent);
-        return Err(failed(format!("{} failed: {}", actual.name(), out.error)));
+        return Err(failed(format!("{} failed: {}", ran.label(), out.error)));
     }
+    hub.job(id, |j| j.worker_exec = Some(ran.clone()));
     // From here the index holds exactly what the agent did. Checks run against that, and whatever
     // they leave behind is removed again, so the tree that is reviewed is the tree that is committed.
     if w.is_issue {
@@ -663,22 +737,22 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
             set_status(hub, id, JobStatus::Reviewing);
             let base = hub.job(id, |j| j.base_sha.clone()).flatten();
             let rp = review_prompt(w.prompt, base.as_deref(), w.followup);
-            let worker = hub.job(id, |j| j.worker.agent).flatten().unwrap_or(w.d.agent);
-            let reviewer = if hub.cfg.review.reviewer == "other" && hub.state.lock().unwrap().agent_ready(worker.other()) {
-                worker.other()
-            } else { worker };
-            let rev = run_with_fallback(hub, id, Slot::Reviewer, RunSpec { kind: reviewer, tier: w.d.tier.up(), prompt: &rp, dir: w.dir, read_only: true }).await;
-            let reviewer = hub.job(id, |j| j.reviewer.agent).flatten().unwrap_or(reviewer);
-            if reviewer == worker {
-                hub.log("review", format!("#{} reviewed by the worker's own CLI ({})", id, reviewer.name()));
-            }
+            let actual_worker = hub.job(id, |j| j.worker_exec.clone()).flatten();
+            let worker = actual_worker.as_ref().unwrap_or(w.worker);
+            let reviewer = if actual_worker.is_some() {
+                pick::reviewer_for(&hub.cfg, &avail(hub).borrow(), worker, w.d.tier.up()).0
+            } else { w.reviewer.clone() };
+            let (rev, ran) = run_agent(hub, id, Slot::Reviewer, reviewer, w.d.tier.up(), &rp, w.dir, true).await;
             if cancel.is_set() {
                 return Err(cancelled());
             }
             if !rev.ok {
-                hub.log("review", format!("#{} reviewer {} failed: {}", id, reviewer.name(), rev.error));
+                hub.log("review", format!("#{} reviewer {} failed: {}", id, ran.label(), rev.error));
                 reasons = format!("reviewer failed: {}", rev.error);
                 break;
+            }
+            if same_vendor(worker, &ran, &rev.models_used) {
+                hub.log("review", format!("#{} same-vendor review: {} reviewed the work of {}", id, ran.label(), worker.label()));
             }
             let v = parse_verdict(&rev.text);
             reasons = rev.text.clone();
@@ -686,7 +760,7 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
             hub.job(id, |j| j.verdict = v);
             hub.log(
                 "review",
-                format!("#{} {}: {}", id, reviewer.name(), match v { Some(true) => "PASS", Some(false) => "FAIL", None => "no verdict" }),
+                format!("#{} {}: {}", id, ran.label(), match v { Some(true) => "PASS", Some(false) => "FAIL", None => "no verdict" }),
             );
             if v == Some(false) {
                 hub.job(id, |j| j.findings.push(format!("A reviewer did not pass the change:\n{}", clip(&strip_verdict(&rev.text), 4000))));
@@ -726,18 +800,19 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
             _ => None,
         };
         let checks = repo.map(|r| r.checks.clone()).unwrap_or_else(|| hub.cfg.review.checks.clone());
-        (j.prompt.clone(), j.workdir.clone(), j.forced, checks, repo.and_then(|r| r.ci.clone()))
+        (j.prompt.clone(), j.workdir.clone(), j.forced.clone(), checks, repo.and_then(|r| r.ci.clone()))
     }) else {
         return failed("job vanished");
     };
 
     // 1. Fork layer
-    let d = match decide(hub, id, &prompt, is_issue, forced).await {
-        Ok(d) => d,
+    let (d, worker) = match decide(hub, id, &prompt, is_issue, forced).await {
+        Ok(x) => x,
         Err(f) => return f,
     };
     // Routed on the task alone; the worker and its reviewer also get what is known about the repository.
     let prompt = knowledge::with_notes(hub, id, prompt).await;
+    let (reviewer, _) = pick::reviewer_for(&hub.cfg, &avail(hub).borrow(), &worker, d.tier.up());
     if !d.review {
         hub.job(id, |j| j.reviewer.state = StageState::Skipped);
     }
@@ -752,7 +827,7 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
             hub.job(id, |j| j.base_sha = Some(sha.clone()));
         }
     }
-    let w = Work { prompt: &prompt, dir: &dir, d: &d, checks: &checks, is_issue, followup: None };
+    let w = Work { prompt: &prompt, dir: &dir, d: &d, worker: &worker, reviewer: &reviewer, checks: &checks, is_issue, followup: None };
 
     // 2. Work, then 3. checks and review
     set_status(hub, id, JobStatus::Working);
@@ -814,7 +889,7 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
             return ci_gave_up(hub, id, format!("the pull request is open, but CI is still failing after {} fix round(s): {}", round, tail)).await;
         }
         round += 1;
-        hub.log("ci", format!("#{} CI failed, sending it back to {} (round {} of {})", id, d.agent.name(), round, ci.max_fix_rounds));
+        hub.log("ci", format!("#{} CI failed, sending it back to {} (round {} of {})", id, worker.label(), round, ci.max_fix_rounds));
         set_status(hub, id, JobStatus::Fixing);
         let excerpt = cicd::tail_chars(&log, 20_000);
         // The log is output from the project's pipeline, not instructions: say so, and fence it.
@@ -825,7 +900,7 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
             prompt, excerpt
         );
         let short_log = cicd::tail_chars(&log, 4000);
-        let wf = Work { followup: Some(&short_log), ..Work { prompt: &prompt, dir: &dir, d: &d, checks: &checks, is_issue, followup: None } };
+        let wf = Work { followup: Some(&short_log), ..Work { prompt: &prompt, dir: &dir, d: &d, worker: &worker, reviewer: &reviewer, checks: &checks, is_issue, followup: None } };
         let summary = match work_once(hub, id, &wf, &fp, cancel).await {
             Ok(s) => s,
             Err(f) if f.status == JobStatus::Cancelled => return stopped(),
@@ -901,25 +976,27 @@ fn chat_prompt(turns: &[Turn]) -> String {
 
 /// A reply to a typed task: the same agent, in the same tree, with the conversation as context.
 async fn followup(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
-    let Some((turns, dir, forced, known, checks)) = hub.job(id, |j| (j.turns.clone(), j.workdir.clone(), j.forced, j.decision.clone(), hub.cfg.review.checks.clone())) else {
+    let Some((turns, dir, forced, known, checks)) = hub.job(id, |j| (j.turns.clone(), j.workdir.clone(), j.forced.clone(), j.decision.clone(), hub.cfg.review.checks.clone())) else {
         return failed("job vanished");
     };
     let task = match (turns.first(), turns.last()) {
         (Some(first), Some(last)) => format!("{}\n\nFollow-up request: {}", first.ask, last.ask),
         _ => return failed("job has no conversation"),
     };
-    let d = match known {
-        Some(d) => d,
+    let (d, worker) = match known {
+        Some(d) => {
+            let wanted = forced.unwrap_or(AgentRef::Kind(d.agent));
+            let Some(worker) = pick::worker_for(&hub.cfg, &avail(hub).borrow(), &wanted, d.tier) else {
+                return failed("no agent is available (missing or temporarily rate limited)");
+            };
+            (d, worker)
+        }
         None => match decide(hub, id, &task, false, forced).await {
             Ok(d) => d,
             Err(f) => return f,
         },
     };
-    let (have_c, have_x) = available(hub);
-    let has = |a: AgentKind| if a == AgentKind::Claude { have_c } else { have_x };
-    if !has(d.agent) && !has(d.agent.other()) && !hub.cfg.demo {
-        return failed("no agent is available (missing or temporarily rate limited)");
-    }
+    let (reviewer, _) = pick::reviewer_for(&hub.cfg, &avail(hub).borrow(), &worker, d.tier.up());
     if !d.review {
         hub.job(id, |j| j.reviewer.state = StageState::Skipped);
     }
@@ -943,7 +1020,7 @@ async fn followup(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
              present numbered choices and finish with PLAN: WAITING. If the plan is complete and ready to implement, \
              finish with PLAN: READY on its own line. Build starts automatically only when you mark the plan ready."
         );
-        let w = Work { prompt: &task, dir: &dir, d: &d, checks: &checks, is_issue: false, followup: None };
+        let w = Work { prompt: &task, dir: &dir, d: &d, worker: &worker, reviewer: &reviewer, checks: &checks, is_issue: false, followup: None };
         let plan = match run_worker(hub, id, &w, &prompt, cancel, true).await {
             Ok(s) => s,
             Err(f) => return f,
@@ -965,7 +1042,7 @@ async fn followup(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
              Inspect the current files, make the changes, and summarise the implementation."
         );
         set_status(hub, id, JobStatus::Working);
-        let w = Work { prompt: &task, dir: &dir, d: &d, checks: &checks, is_issue: false, followup: None };
+        let w = Work { prompt: &task, dir: &dir, d: &d, worker: &worker, reviewer: &reviewer, checks: &checks, is_issue: false, followup: None };
         match work_once(hub, id, &w, &prompt, cancel).await {
             Ok(s) => s,
             Err(f) => return f,
@@ -976,7 +1053,7 @@ async fn followup(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
             task.push_str(&format!("\n\nImplementation plan:\n{plan}"));
             prompt.push_str(&format!("\n\nPreviously completed implementation plan (context for this request):\n{plan}"));
         }
-        let w = Work { prompt: &task, dir: &dir, d: &d, checks: &checks, is_issue: false, followup: None };
+        let w = Work { prompt: &task, dir: &dir, d: &d, worker: &worker, reviewer: &reviewer, checks: &checks, is_issue: false, followup: None };
         set_status(hub, id, JobStatus::Working);
         match work_once(hub, id, &w, &prompt, cancel).await {
             Ok(s) => s,
@@ -987,7 +1064,7 @@ async fn followup(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     if !crate::choices::parse(&summary).is_empty() {
         return planning_options(hub, id, &summary);
     }
-    let w = Work { prompt: &task, dir: &dir, d: &d, checks: &checks, is_issue: false, followup: None };
+    let w = Work { prompt: &task, dir: &dir, d: &d, worker: &worker, reviewer: &reviewer, checks: &checks, is_issue: false, followup: None };
     let r = match refine(hub, id, &w, summary, cancel).await {
         Ok(r) => r,
         Err(f) => return f,
@@ -1027,23 +1104,25 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     .flatten() else {
         return failed("job vanished");
     };
-    let (have_c, have_x) = available(hub);
-    let mut reviewers: Vec<AgentKind> = Vec::new();
-    for k in &hub.cfg.review.pr_reviewers {
-        let have = if *k == AgentKind::Claude { have_c } else { have_x };
-        if have && !reviewers.contains(k) {
-            reviewers.push(*k);
+    // The fork layer only sets the effort tier here; every reviewer always runs.
+    let (mut d, _) = match decide(hub, id, &format!("Review this pull request.\n\n{}\n\n{}", title, body), false, None).await {
+        Ok(x) => x,
+        Err(f) => return f,
+    };
+    let tier = d.tier.up();
+    let a = avail(hub);
+    let mut reviewers: Vec<Exec> = Vec::new();
+    for r in &hub.cfg.review.pr_reviewers {
+        match pick::resolve(&hub.cfg, &a.borrow(), r, tier) {
+            Some(e) if !reviewers.iter().any(|x| x.label() == e.label()) => reviewers.push(e),
+            Some(_) => {}
+            None => hub.log("review", format!("#{} {} is not available to review, skipped", id, r.name())),
         }
     }
     if reviewers.is_empty() {
-        return failed("none of the configured pr_reviewers is installed");
+        return failed("none of the configured pr_reviewers is available");
     }
-    // The fork layer only sets the effort tier here; both reviewers always run.
-    let mut d = match decide(hub, id, &format!("Review this pull request.\n\n{}\n\n{}", title, body), false, None).await {
-        Ok(d) => d,
-        Err(f) => return f,
-    };
-    d.note = format!("independent reviews: {}", reviewers.iter().map(|k| k.name()).collect::<Vec<_>>().join(" + "));
+    d.note = format!("independent reviews: {}", reviewers.iter().map(|e| e.label()).collect::<Vec<_>>().join(" + "));
     hub.job(id, |j| j.decision = Some(d.clone()));
     let steering = issues::agent_files_changed(hub, &dir, &base).await;
 
@@ -1053,33 +1132,46 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     }
     set_status(hub, id, JobStatus::Reviewing);
     let prompt = pr_review_prompt(number, &title, &body, &base);
-    let tier = d.tier.up();
-    let first = agents::run(hub, id, Slot::Worker, RunSpec { kind: reviewers[0], tier, prompt: &prompt, dir: &dir, read_only: true });
-    let second = async {
-        match reviewers.get(1) {
-            Some(k) => Some(agents::run(hub, id, Slot::Reviewer, RunSpec { kind: *k, tier, prompt: &prompt, dir: &dir, read_only: true }).await),
-            None => {
-                hub.job(id, |j| j.reviewer.state = StageState::Skipped);
-                None
-            }
+    if reviewers.len() < 2 {
+        hub.job(id, |j| j.reviewer.state = StageState::Skipped);
+    }
+    // Every reviewer runs, all at once; the verdict waits for the last of them.
+    let mut set = tokio::task::JoinSet::new();
+    for (i, e) in reviewers.iter().enumerate() {
+        let slot = match i {
+            0 => Slot::Worker,
+            1 => Slot::Reviewer,
+            n => Slot::Extra(n - 2),
+        };
+        let (hub, e, prompt, dir) = (hub.clone(), e.clone(), prompt.clone(), dir.clone());
+        set.spawn(async move { (i, run_agent(&hub, id, slot, e, tier, &prompt, &dir, true).await) });
+    }
+    let mut done: Vec<Option<(RunOut, Exec)>> = (0..reviewers.len()).map(|_| None).collect();
+    while let Some(r) = set.join_next().await {
+        match r {
+            Ok((i, x)) => done[i] = Some(x),
+            Err(e) => hub.log("review", format!("#{} a reviewer task ended abnormally: {}", id, e)),
         }
-    };
-    let (a, b) = tokio::join!(first, second);
+    }
     if cancel.is_set() {
         return cancelled();
     }
     let mut reviews: Vec<issues::Review> = Vec::new();
-    for (k, out) in std::iter::once((reviewers[0], Some(a))).chain(reviewers.get(1).map(|k| (*k, b))) {
-        let Some(out) = out else { continue };
+    for (i, x) in done.into_iter().enumerate() {
+        // A reviewer whose task died still counts: its missing verdict keeps the result from passing.
+        let Some((out, ran)) = x else {
+            reviews.push(issues::Review { by: reviewers[i].label(), verdict: None, text: "The review did not complete.".into() });
+            continue;
+        };
         let verdict = if out.ok { parse_verdict(&out.text) } else { None };
         hub.log(
             "review",
-            format!("#{} {}: {}", id, k.name(), match verdict { Some(true) => "PASS", Some(false) => "FAIL", None => "no verdict" }),
+            format!("#{} {}: {}", id, ran.label(), match verdict { Some(true) => "PASS", Some(false) => "FAIL", None => "no verdict" }),
         );
         if verdict == Some(false) {
             hub.job(id, |j| j.findings.push(format!("A reviewer asked for changes on a pull request:\n{}", clip(&strip_verdict(&out.text), 4000))));
         }
-        reviews.push(issues::Review { by: k, verdict, text: if out.ok { out.text } else { format!("The review did not complete: {}", out.error) } });
+        reviews.push(issues::Review { by: ran.label(), verdict, text: if out.ok { out.text } else { format!("The review did not complete: {}", out.error) } });
     }
     if reviews.iter().all(|r| r.verdict.is_none()) {
         return failed("no reviewer produced a verdict");
@@ -1145,7 +1237,7 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
         outcome: format!(
             "review posted: {} ({})",
             overall.words(),
-            reviews.iter().map(|r| format!("{} {}", r.by.name(), match r.verdict { Some(true) => "pass", Some(false) => "fail", None => "no verdict" })).collect::<Vec<_>>().join(", ")
+            reviews.iter().map(|r| format!("{} {}", r.by, match r.verdict { Some(true) => "pass", Some(false) => "fail", None => "no verdict" })).collect::<Vec<_>>().join(", ")
         ),
         // An incomplete review puts the request label back; it is retried with a delay, a bounded number of times.
         retry: incomplete.then_some(false),
@@ -1355,7 +1447,7 @@ esac
             let hub = Hub::new(cfg, rt.handle().clone());
             // Seed a finished conversation without scheduling an independent job.
             hub.state.lock().unwrap().stopping = true;
-            hub.state.lock().unwrap().have_claude = true;
+            hub.state.lock().unwrap().installed.insert(AgentKind::Claude);
             let id = hub.submit("task".into(), "Plan a small change".into(), Source::Manual, root.clone(), None);
             hub.job(id, |j| {
                 j.turns[0].answer = "Options:\n1. Small\n2. Large".into();
@@ -1483,7 +1575,7 @@ esac
 
     #[test]
     fn crashed_reviewer_is_incomplete_not_negative() {
-        let r = |by, verdict| issues::Review { by, verdict, text: String::new() };
+        let r = |by: AgentKind, verdict| issues::Review { by: by.name().to_string(), verdict, text: String::new() };
         use AgentKind::*;
         assert_eq!(overall(&[r(Claude, Some(true)), r(Codex, Some(true))], None), issues::Overall::Pass);
         assert_eq!(overall(&[r(Claude, Some(true)), r(Codex, None)], None), issues::Overall::Incomplete);
@@ -1499,5 +1591,30 @@ esac
         for u in ["https://api.typesafe.ai", "http://localhost.evil.example", "http://10.0.0.5:8000", "http://127.evil.example"] {
             assert!(!is_loopback(u), "{}", u);
         }
+    }
+
+    #[test]
+    fn availability_follows_what_copilot_reported() {
+        let mut st = State::default();
+        st.installed.insert(AgentKind::Copilot);
+        st.copilot.seat = Some(false);
+        assert!(AvailOwned::of(&st).borrow().no_seat);
+        st.copilot.seat = Some(true);
+        st.copilot.enabled = Some(["gpt-5.4".to_string()].into_iter().collect());
+        st.rejected_models.insert("gpt-5.5".into());
+        let a = AvailOwned::of(&st);
+        let b = a.borrow();
+        assert!(!b.no_seat && b.enabled.unwrap().contains("gpt-5.4") && b.rejected.contains("gpt-5.5"));
+    }
+
+    #[test]
+    fn same_vendor_reviews_are_noticed() {
+        let e = |model: &str, vendor| Exec { asked: AgentRef::Kind(AgentKind::Copilot), cli: AgentKind::Copilot, family: AgentKind::Copilot, via: None, model: model.into(), effort: String::new(), vendor };
+        let worker = e("claude-sonnet-4.5", pick::Vendor::Anthropic);
+        let reviewer = e("gpt-5.4", pick::Vendor::OpenAI);
+        assert!(!same_vendor(&worker, &reviewer, &["gpt-5.4".into()]));
+        assert!(same_vendor(&worker, &reviewer, &["claude-haiku-4.5".into()]), "a switch to the worker's vendor mid-run");
+        assert!(!same_vendor(&worker, &reviewer, &["mystery-1".into()]), "unknown models say nothing");
+        assert!(same_vendor(&worker, &e("auto", pick::Vendor::Unknown), &[]));
     }
 }

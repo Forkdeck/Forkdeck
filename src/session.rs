@@ -22,7 +22,7 @@ struct Composer {
     reply_to: Option<u32>,
     #[serde(default)]
     new_task: bool,
-    forced: Option<AgentKind>,
+    forced: Option<AgentRef>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -89,7 +89,7 @@ impl Store {
             ui.selected = store.composer.selected.filter(|id| ids.contains(id)).or_else(|| st.jobs.last().map(|j| j.id));
             ui.follow = ui.selected.is_none();
             ui.reply_to = store.composer.reply_to.filter(|id| ids.contains(id));
-            ui.forced = store.composer.forced;
+            ui.forced = store.composer.forced.clone();
             ui.new_task = store.composer.new_task;
             if !st.jobs.is_empty() {
                 st.log("session", format!("restored {} typed task(s); select one, Ctrl-R then Enter to resume", st.jobs.len()));
@@ -101,7 +101,7 @@ impl Store {
     }
 
     pub fn composer(&mut self, ui: &Ui, history: &History) {
-        self.composer = Composer { history: history.messages().to_vec(), draft: ui.input.clone(), selected: ui.selected, reply_to: ui.reply_to, new_task: ui.new_task, forced: ui.forced };
+        self.composer = Composer { history: history.messages().to_vec(), draft: ui.input.clone(), selected: ui.selected, reply_to: ui.reply_to, new_task: ui.new_task, forced: ui.forced.clone() };
     }
 
     pub fn checkpoint(&mut self, st: &mut State) {
@@ -151,6 +151,24 @@ mod tests {
     }
 
     #[test]
+    fn sessions_from_two_agent_builds_still_load() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = Hub::new(Config::default(), rt.handle().clone());
+        let id = hub.submit("old task".into(), "request".into(), Source::Manual, ".".into(), Some(AgentRef::Kind(AgentKind::Codex)));
+        let mut saved = hub.job(id, |j| serde_json::to_value(j).unwrap()).unwrap();
+        saved.as_object_mut().unwrap().remove("extra");
+        saved.as_object_mut().unwrap().remove("queued_prompts");
+        saved["worker"].as_object_mut().unwrap().remove("via");
+        saved["reviewer"].as_object_mut().unwrap().remove("via");
+        saved["used"].as_array_mut().unwrap().truncate(2);
+        let job: Job = serde_json::from_value(saved).unwrap();
+        assert!(job.queued_prompts.is_empty());
+        assert!(job.extra.is_empty());
+        assert_eq!(job.forced, Some(AgentRef::Kind(AgentKind::Codex)));
+        assert_eq!(job.used[2], crate::journal::Usage::default());
+    }
+
+    #[test]
     fn restart_restores_context_without_running_or_recounting_tasks() {
         let root = root("restart");
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -165,7 +183,7 @@ mod tests {
             j.used[0].tokens_in = 123;
             j.base_sha = Some("base-commit".into());
         });
-        let second = hub.submit("interrupted".into(), "unfinished request".into(), Source::Manual, root.clone(), Some(AgentKind::Codex));
+        let second = hub.submit("interrupted".into(), "unfinished request".into(), Source::Manual, root.clone(), Some(AgentRef::Kind(AgentKind::Codex)));
         hub.job(second, |j| {
             j.status = JobStatus::Working;
             j.worker.state = StageState::Running;

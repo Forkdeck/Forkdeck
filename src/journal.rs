@@ -58,6 +58,7 @@ pub struct Entry {
     pub checks: Option<bool>,
     pub claude: Usage,
     pub codex: Usage,
+    pub copilot: Usage,
     pub pr: String,
     pub rolled_back: bool,
     /// Rules added to the repository's notes from this job.
@@ -67,7 +68,7 @@ pub struct Entry {
 
 impl Entry {
     pub fn tokens(&self) -> u64 {
-        self.claude.tokens() + self.codex.tokens()
+        self.claude.tokens() + self.codex.tokens() + self.copilot.tokens()
     }
     /// Work forkdeck picked up by itself, as opposed to a typed task or a deployment.
     pub fn automated(&self) -> bool {
@@ -108,6 +109,7 @@ pub fn entry(j: &Job, status: JobStatus, outcome: &str, learned: u32) -> Entry {
         checks: j.checks,
         claude: j.used[0],
         codex: j.used[1],
+        copilot: j.used[2],
         pr: j.pr_url.clone().unwrap_or_default(),
         rolled_back: kind == "deploy" && outcome.contains("Rolled back to"),
         learned,
@@ -116,7 +118,11 @@ pub fn entry(j: &Job, status: JobStatus, outcome: &str, learned: u32) -> Entry {
 }
 
 pub fn slot(a: AgentKind) -> usize {
-    (a == AgentKind::Codex) as usize
+    match a {
+        AgentKind::Claude => 0,
+        AgentKind::Codex => 1,
+        AgentKind::Copilot => 2,
+    }
 }
 
 /// Add one line. Appends are single writes, so several forkdecks can share the file.
@@ -267,6 +273,7 @@ pub struct Summary {
     pub tasks: Group,
     pub claude: Usage,
     pub codex: Usage,
+    pub copilot: Usage,
     pub learned: u32,
     pub repos: Vec<(String, Group)>,
 }
@@ -318,6 +325,7 @@ pub fn summarise(entries: &[Entry], days: u32) -> Summary {
         }
         s.claude.add(&e.claude);
         s.codex.add(&e.codex);
+        s.copilot.add(&e.copilot);
         s.learned += e.learned;
         if !e.repo.is_empty() {
             match s.repos.iter_mut().find(|(r, _)| r == &e.repo) {
@@ -398,7 +406,7 @@ pub fn text(s: &Summary) -> Vec<String> {
         out.push(line("tasks", &s.tasks));
     }
     out.push(String::new());
-    for (name, u) in [("claude", &s.claude), ("codex", &s.codex)] {
+    for (name, u) in [("claude", &s.claude), ("codex", &s.codex), ("copilot", &s.copilot)] {
         if u.runs > 0 {
             let cost = if u.cost > 0.0 { format!(" · ${:.2} as reported by the CLI", u.cost) } else { String::new() };
             out.push(format!("{:<9} {:>4} run(s) · {} tokens in · {} out{}", name, u.runs, kilo(u.tokens_in), kilo(u.tokens_out), cost));
@@ -436,6 +444,13 @@ mod tests {
 
     fn e(ts: i64, kind: &str, repo: &str, status: &str) -> Entry {
         Entry { ts, kind: kind.into(), repo: repo.into(), status: status.into(), ..Entry::default() }
+    }
+
+    #[test]
+    fn older_journal_entries_default_copilot_usage_to_zero() {
+        let entry: Entry = serde_json::from_str(r#"{"ts":1,"claude":{"runs":1,"tokens_in":10},"codex":{"runs":1,"tokens_out":5}}"#).unwrap();
+        assert_eq!(entry.copilot, Usage::default());
+        assert_eq!(entry.tokens(), 15);
     }
 
     #[test]

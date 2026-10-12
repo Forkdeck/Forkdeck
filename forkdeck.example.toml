@@ -57,15 +57,43 @@ efforts = { light = "low", standard = "medium", heavy = "high" }
 write_args = ["--sandbox", "workspace-write"]
 review_args = ["--sandbox", "read-only"]
 
+[agents.copilot]
+cmd = "copilot"
+# Empty model names keep the copilot CLI's own default; "auto" lets Copilot pick.
+models = { light = "", standard = "", heavy = "" }
+efforts = { light = "low", standard = "medium", heavy = "high" }
+# Edit files, no shell commands unattended. Never use --allow-all or --yolo here.
+write_args = ["--allow-tool", "write", "--deny-tool", "shell"]
+review_args = ["--deny-tool", "write", "--deny-tool", "shell", "--excluded-tools", "skill"]
+# With claude or codex missing, copilot plays that part with a Claude or GPT model,
+# so work and review still come from different vendors.
+stand_in = true
+
+# Models per tier, in order of preference: the first one your account allows is
+# used. Organisations switch models on and off; forkdeck asks copilot which are
+# enabled and skips the others.
+#~ [agents.copilot.profiles.claude.models]
+#~ standard = ["claude-sonnet-5.5", "claude-sonnet-4.5"]
+
+# Any other model your copilot /model picker lists can be a profile, named
+# "copilot:<name>" in reviewer_order, pr_reviewers or --agent.
+#~ [agents.copilot.profiles.second]
+#~ vendor = "xai"
+#~ models = { light = "grok-4.7", standard = "grok-4.7", heavy = "grok-4.7" }
+
 [review]
 mode = "auto"          # auto | always | never
 reviewer = "other"     # other: the CLI that did not do the work | same
+# With reviewer = "other": the first of these that is available and runs a model
+# from a different vendor than the worker's reviews.
+reviewer_order = ["claude", "codex"]
 max_fix_rounds = 1
 # Commands run after the worker finishes a task typed into the prompt. A failing
 # command goes back to the worker as a fix round. Repositories list their own below.
 checks = []
 check_timeout_mins = 20
-# Every CLI listed here reviews a labelled pull request independently.
+# Every agent listed here reviews a labelled pull request independently;
+# "copilot:<profile>" works too.
 pr_reviewers = ["claude", "codex"]
 # A pull request review that produced no result (a reviewer did not finish, the
 # head moved while it was being reviewed, the review could not run) is retried
@@ -87,7 +115,7 @@ publish_on_failed_review = false
 # 0 switches a limit off. What a limit holds back stays labelled and untouched.
 [limits]
 jobs_per_day = 0           # issues and reviews picked up, all repositories together
-tokens_per_day = 0         # tokens in and out, both CLIs, typed tasks included
+tokens_per_day = 0         # tokens in and out, all CLIs, typed tasks included
 job_mins = 0               # one issue or review may run this long, then goes to a person
 pause_after_failures = 5   # this many failed in a row on a repository: stop picking up from it
 pause_mins = 60            # ...for this long

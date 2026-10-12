@@ -2,6 +2,7 @@ mod agents;
 mod cicd;
 mod choices;
 mod config;
+mod copilot;
 mod demo;
 mod issues;
 mod input;
@@ -9,6 +10,7 @@ mod journal;
 mod knowledge;
 mod mcp;
 mod orchestrator;
+mod pick;
 mod proc;
 mod router;
 mod session;
@@ -19,7 +21,7 @@ mod ui;
 use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use orchestrator::Hub;
-use state::{AgentKind, JobStatus, Provider, Source};
+use state::{AgentKind, AgentRef, JobStatus, Provider, Source};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -51,7 +53,7 @@ struct Cli {
 enum Cmd {
     /// Run one task without the interface and print progress
     Run {
-        /// Force an agent: claude or codex
+        /// Force an agent: claude, codex, copilot or copilot:<profile>
         #[arg(long)]
         agent: Option<String>,
         task: Vec<String>,
@@ -142,12 +144,8 @@ enum McpCmd {
     },
 }
 
-fn parse_agent(s: &str) -> anyhow::Result<AgentKind> {
-    match s {
-        "claude" => Ok(AgentKind::Claude),
-        "codex" => Ok(AgentKind::Codex),
-        other => anyhow::bail!("unknown agent {:?}: use claude or codex", other),
-    }
+fn parse_agent(s: &str) -> anyhow::Result<AgentRef> {
+    AgentRef::parse(s).map_err(anyhow::Error::msg)
 }
 
 /// Print without panicking when the terminal or pipe has gone away: a panic here would skip the shutdown.
@@ -335,7 +333,11 @@ fn main() -> anyhow::Result<()> {
                     hub.log("config", "ignoring ./forkdeck.toml: move it to ~/.config/forkdeck/config.toml or pass --config");
                 }
             }
-            tui(&rt, &hub, cwd)
+            let result = tui(&rt, &hub, cwd);
+            // Tokio's default drop waits indefinitely for blocking tasks (for example DNS).
+            // The TUI has already saved its session and stopped child processes.
+            rt.shutdown_timeout(Duration::from_millis(200));
+            result
         }
     }
 }
@@ -353,7 +355,7 @@ async fn stop_signal() {
     }
 }
 
-async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentKind>) -> i32 {
+async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentRef>) -> i32 {
     let title = state::clip(&task, 80);
     let id = hub.submit(title, task, Source::Manual, cwd, forced);
     // The agent runs in its own process group, so a signal sent to us has to be passed on by hand.
@@ -390,6 +392,11 @@ fn print_progress(hub: &Hub) {
         }
         for l in j.reviewer.tail.drain(..) {
             say!("         #{:<3} review  {}", id, l);
+        }
+        for (i, e) in j.extra.iter_mut().enumerate() {
+            for l in e.tail.drain(..) {
+                say!("         #{:<3} review{} {}", id, i + 3, l);
+            }
         }
     }
     let _ = std::io::stdout().flush();
@@ -516,22 +523,52 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
         Some(p) => println!("config    {}", p.display()),
         None => println!("config    none found, defaults in use"),
     }
-    let mut agents_found = 0;
-    for k in [AgentKind::Claude, AgentKind::Codex] {
+    hub.detect_agents().await;
+    for k in AgentKind::ALL {
         let cmd = hub.cfg.agents.get(k).cmd.unwrap_or_default();
         match issues::sh(&cmd, &["--version"], None).await {
-            Ok(v) => {
-                agents_found += 1;
-                println!("{:<9} ok       {}", k.name(), v.lines().next().unwrap_or(""));
-            }
+            Ok(v) => println!("{:<9} ok       {}", k.name(), v.lines().next().unwrap_or("")),
             Err(_) => println!("{:<9} missing  `{}` is not on PATH", k.name(), cmd),
         }
     }
-    if agents_found == 0 {
-        ok = false;
-        println!("          at least one of the two CLIs is required");
-    } else if agents_found == 1 {
-        println!("          one CLI only: it will also review its own work");
+    {
+        let st = hub.state.lock().unwrap();
+        if st.has(AgentKind::Copilot) {
+            let p = &st.copilot;
+            let who = p.login.clone().unwrap_or_else(|| "this account".into());
+            match (&p.error, p.seat, &p.enabled) {
+                (Some(e), _, _) => println!("copilot   unknown  could not list models: {}", e),
+                (None, Some(false), _) => println!("copilot   no access  {} cannot use Copilot from the CLI (see github.com/settings/copilot)", who),
+                (None, _, Some(m)) => println!("copilot   ok       logged in as {}, {} models enabled, {} switched off", who, m.len(), p.disabled.len()),
+                _ => {}
+            }
+        }
+        let a = orchestrator::avail_of(&hub.cfg, &st);
+        let mut names: Vec<AgentRef> = vec![AgentRef::Kind(AgentKind::Claude), AgentRef::Kind(AgentKind::Codex)];
+        let mut profiles: Vec<&String> = hub.cfg.agents.copilot.profiles.keys().filter(|n| *n != "claude" && *n != "codex").collect();
+        profiles.sort();
+        names.extend(profiles.into_iter().map(|n| AgentRef::Profile(n.clone())));
+        let mut workers = 0;
+        for r in &names {
+            let e = pick::resolve(&hub.cfg, &a.borrow(), r, state::Tier::Standard);
+            if matches!(r, AgentRef::Kind(_)) && e.is_some() {
+                workers += 1;
+            }
+            match e {
+                Some(e) if e.via.is_some() => println!("{:<9} via      {} (standard tier: {})", r.name(), e.label(), if e.model.is_empty() { "default model" } else { &e.model }),
+                Some(_) => {}
+                None if st.copilot_usable() => println!("{:<9} none     no model of this profile is enabled for the account", r.name()),
+                None => {}
+            }
+        }
+        if workers == 0 {
+            ok = false;
+            println!("          at least one of claude, codex or a usable copilot is required");
+        } else if let Some(w) = pick::worker_for(&hub.cfg, &a.borrow(), &AgentRef::Kind(hub.cfg.router.default_agent), state::Tier::Standard) {
+            if pick::reviewer_for(&hub.cfg, &a.borrow(), &w, state::Tier::Heavy).1 {
+                println!("          work and review will use the same vendor's models");
+            }
+        }
     }
     if hub.cfg.router.kind == "jev" {
         let r = router::route(&hub.cfg, &hub.http, "Fix a typo in the README heading", false).await;
@@ -687,7 +724,7 @@ fn submit_input(hub: &Hub, ui: &mut ui::Ui, history: &mut input::History) {
             Ok(()) => id,
             Err(why) => { hub.log("queue", format!("#{} not sent: {}", id, why)); return; }
         },
-        None => hub.submit(state::clip(&task, 80), task.clone(), Source::Manual, ui.cwd.clone(), ui.forced),
+        None => hub.submit(state::clip(&task, 80), task.clone(), Source::Manual, ui.cwd.clone(), ui.forced.clone()),
     };
     history.submitted(task);
     ui.input.clear();
@@ -828,7 +865,10 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                 store.lock().unwrap().checkpoint(&mut hub.state.lock().unwrap());
             }
             warn!("stopping jobs and handing claimed issues back…");
-            hub.shutdown(TUI_SHUTDOWN_GRACE).await;
+            tokio::select! {
+                _ = hub.shutdown(TUI_SHUTDOWN_GRACE) => {}
+                _ = stop_signal() => {}
+            }
             if let Some(store) = &session {
                 store.lock().unwrap().checkpoint(&mut hub.state.lock().unwrap());
             }
@@ -917,10 +957,12 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                             u.follow = true;
                         }
                         KeyCode::Tab => {
-                            u.forced = match u.forced {
-                                None => Some(AgentKind::Claude),
-                                Some(AgentKind::Claude) => Some(AgentKind::Codex),
-                                Some(AgentKind::Codex) => None,
+                            // Profiles are for --agent and the config; Tab steps through the CLIs.
+                            u.forced = match u.forced.as_ref().map(|r| r.kind()) {
+                                None => Some(AgentRef::Kind(AgentKind::Claude)),
+                                Some(AgentKind::Claude) => Some(AgentRef::Kind(AgentKind::Codex)),
+                                Some(AgentKind::Codex) => Some(AgentRef::Kind(AgentKind::Copilot)),
+                                Some(AgentKind::Copilot) => None,
                             }
                         }
                         KeyCode::Up | KeyCode::Down if k.modifiers.contains(KeyModifiers::ALT) => {

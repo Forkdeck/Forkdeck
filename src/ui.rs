@@ -18,6 +18,7 @@ const ORANGE: Color = Color::Rgb(240, 136, 62);
 const GREEN: Color = Color::Rgb(63, 220, 150);
 const PURPLE: Color = Color::Rgb(150, 142, 240);
 const RED: Color = Color::Rgb(248, 81, 73);
+const BLUE: Color = Color::Rgb(110, 160, 255);
 const SEL: Color = Color::Rgb(38, 36, 72);
 
 const DASHED: border::Set = border::Set {
@@ -35,7 +36,7 @@ pub struct Ui {
     pub input: String,
     pub selected: Option<u32>,
     pub follow: bool,
-    pub forced: Option<AgentKind>,
+    pub forced: Option<AgentRef>,
     pub cwd: PathBuf,
     pub demo: bool,
     /// Show what teammates are working on in place of the agent tree.
@@ -66,6 +67,7 @@ fn agent_color(a: AgentKind) -> Color {
     match a {
         AgentKind::Claude => ORANGE,
         AgentKind::Codex => GREEN,
+        AgentKind::Copilot => BLUE,
     }
 }
 fn status_color(s: JobStatus) -> Color {
@@ -253,11 +255,19 @@ fn title_bar(f: &mut Frame, area: Rect, ui: &Ui) {
 }
 
 fn header(f: &mut Frame, area: Rect, st: &State) {
-    let mark = |kind, installed: bool| {
-        if !installed { "missing" }
-        else if !st.agent_ready(kind) { "limited" }
-        else if st.jobs.iter().any(|j| [&j.worker, &j.reviewer].iter().any(|s| s.agent == Some(kind) && s.state == StageState::Running)) { "busy" }
-        else { "ready" }
+    let chip = |k: AgentKind, own: Color| -> Span {
+        let (word, color) = if st.has(k) && !st.agent_ready(k) {
+            ("LIMITED", DIM)
+        } else if st.has(k) && (k != AgentKind::Copilot || st.copilot_usable()) {
+            ("ON CALL", own)
+        } else if k == AgentKind::Copilot && st.has(k) {
+            ("NO ACCESS", RED)
+        } else if k != AgentKind::Copilot && st.stand_in && st.copilot_usable() {
+            ("VIA COPILOT", BLUE)
+        } else {
+            ("MISSING", DIM)
+        };
+        Span::styled(format!("{} {}", k.name().to_uppercase(), word), bold(color))
     };
     let jev = match (st.router.kind.as_str(), st.router.healthy) {
         ("rules", _) => "RULES ROUTER".to_string(),
@@ -267,9 +277,11 @@ fn header(f: &mut Frame, area: Rect, st: &State) {
     let top = Line::from(vec![
         Span::styled("  FORKDECK SOFTWARE FACTORY", bold(BRIGHT)),
         Span::styled("   ·   ", fg(DIM)),
-        Span::styled(format!("CLAUDE {}", mark(AgentKind::Claude, st.have_claude).to_uppercase()), bold(if st.agent_ready(AgentKind::Claude) { ORANGE } else { DIM })),
+        chip(AgentKind::Claude, ORANGE),
         Span::styled("   ·   ", fg(DIM)),
-        Span::styled(format!("CODEX {}", mark(AgentKind::Codex, st.have_codex).to_uppercase()), bold(if st.agent_ready(AgentKind::Codex) { GREEN } else { DIM })),
+        chip(AgentKind::Codex, GREEN),
+        Span::styled("   ·   ", fg(DIM)),
+        chip(AgentKind::Copilot, BLUE),
         Span::styled("   ·   ", fg(DIM)),
         Span::styled(jev, bold(PURPLE)),
     ]);
@@ -513,14 +525,17 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
 
     // Worker and reviewer
     let pair = Rect { y: rows[4].y, height: rows[4].height, ..centered(inner, 84) };
-    let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).spacing(2).split(pair);
-    let (left, right) = match j.source {
-        Source::Pr { .. } => ("first review", "second review"),
-        Source::Deploy { .. } => ("deploy", if j.reviewer.label.is_empty() { "verify" } else { j.reviewer.label.as_str() }),
-        _ => ("worker", "reviewer"),
+    let stages: Vec<&Stage> = [&j.worker, &j.reviewer].into_iter().chain(j.extra.iter()).collect();
+    let cols = Layout::horizontal(vec![Constraint::Ratio(1, stages.len() as u32); stages.len()]).spacing(2).split(pair);
+    let names: Vec<String> = match j.source {
+        Source::Pr { .. } if stages.len() > 2 => (1..=stages.len()).map(|n| format!("review {}", n)).collect(),
+        Source::Pr { .. } => vec!["first review".into(), "second review".into()],
+        Source::Deploy { .. } => vec!["deploy".into(), if j.reviewer.label.is_empty() { "verify".into() } else { j.reviewer.label.clone() }],
+        _ => vec!["worker".into(), "reviewer".into()],
     };
-    stage_box(f, halves[0], left, &j.worker);
-    stage_box(f, halves[1], right, &j.reviewer);
+    for ((r, name), s) in cols.iter().zip(&names).zip(&stages) {
+        stage_box(f, *r, name, s);
+    }
     connector(f, rows[5], DIM);
 
     // Outcome
@@ -548,12 +563,15 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
 
     // Live output of whichever stage is active
     if rows[7].height >= 4 {
-        let (name, s) = if matches!(j.reviewer.state, StageState::Running) || (j.status.finished() && !j.reviewer.tail.is_empty() && j.verdict == Some(false)) {
-            ("reviewer", &j.reviewer)
+        let extra = j.extra.iter().enumerate().find(|(_, e)| matches!(e.state, StageState::Running) && !matches!(j.reviewer.state, StageState::Running));
+        let (name, s) = if let Some((i, e)) = extra {
+            (format!("review {}", i + 3), e)
+        } else if matches!(j.reviewer.state, StageState::Running) || (j.status.finished() && !j.reviewer.tail.is_empty() && j.verdict == Some(false)) {
+            ("reviewer".to_string(), &j.reviewer)
         } else {
-            ("worker", &j.worker)
+            ("worker".to_string(), &j.worker)
         };
-        let who = s.agent.map(|a| a.name()).unwrap_or("idle");
+        let who = s.agent.map(|a| if s.via.is_empty() { a.name().to_string() } else { format!("{} via {}", a.name(), s.via) }).unwrap_or_else(|| "idle".into());
         output_panel(f, rows[7], &format!("{} output · {}", name, who), s, DIM);
     }
 }
@@ -587,7 +605,7 @@ fn stage_box(f: &mut Frame, area: Rect, role: &str, s: &Stage) {
     lines.push(Line::from(Span::styled(role.to_string(), bold(BRIGHT))));
     match s.agent {
         Some(a) => {
-            let mut bits = vec![a.name().to_string()];
+            let mut bits = vec![if s.via.is_empty() { a.name().to_string() } else { format!("{} via {}", a.name(), s.via) }];
             if !s.model.is_empty() {
                 bits.push(s.model.clone());
             }
@@ -645,7 +663,7 @@ fn prompt(f: &mut Frame, area: Rect, ui: &Ui, target: Option<&Job>) {
     let title = match target {
         Some(j) if !j.status.finished() => format!("Reply to #{} · {} queued · Enter to queue · Ctrl-T new task", j.id, j.queued_prompts.len()),
         Some(j) => format!("Reply to #{} · {} queued · Enter to send / resume · Ctrl-T new task", j.id, j.queued_prompts.len()),
-        None => format!("Quick task · {} · Enter to queue", ui.forced.map(|a| a.name()).unwrap_or("auto")),
+        None => format!("Quick task · {} · Enter to queue", ui.forced.as_ref().map(|a| a.name()).unwrap_or_else(|| "auto".into())),
     };
     let room = area.width.saturating_sub(5) as usize;
     let count = ui.input.chars().count();
