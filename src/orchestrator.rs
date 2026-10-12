@@ -30,6 +30,29 @@ pub struct Hub {
     pub team_me: Arc<Mutex<[Option<String>; 2]>>,
     /// Whether each repository is readable by anyone, once the forge has said.
     pub team_public: Arc<Mutex<std::collections::HashMap<String, bool>>>,
+    /// Jobs kept across restarts. None in demo mode, or when the database cannot be used.
+    pub history: Option<Arc<crate::history::History>>,
+    /// The history failed once and said so; it is not repeated on every save.
+    history_failed: Arc<std::sync::atomic::AtomicBool>,
+    /// `run_job` calls still going. A job's status says finished before its last steps (labels,
+    /// the closing log line, saving) are done, so whoever exits waits for this to reach zero.
+    busy: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Counts a `run_job` from its start until it returns, whichever way it does.
+struct Busy(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Busy {
+    fn enter(n: &Arc<std::sync::atomic::AtomicUsize>) -> Busy {
+        n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Busy(n.clone())
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 pub fn is_loopback(url: &str) -> bool {
@@ -63,6 +86,20 @@ impl Hub {
                 None => Arc::new(tokio::sync::Mutex::new(())),
             });
         }
+        let history = if cfg.demo {
+            None
+        } else {
+            match crate::history::History::open(&crate::history::path()) {
+                Ok(h) => {
+                    let _ = h.prune(crate::history::KEEP);
+                    Some(Arc::new(h))
+                }
+                Err(e) => {
+                    st.log("history", format!("jobs will not be kept across restarts: {}", e));
+                    None
+                }
+            }
+        };
         Hub {
             state: Arc::new(Mutex::new(st)),
             cfg: Arc::new(cfg),
@@ -73,7 +110,98 @@ impl Hub {
             git_locks: Arc::new(git_locks),
             team_me: Arc::new(Mutex::new([None, None])),
             team_public: Arc::new(Mutex::new(Default::default())),
+            history,
+            history_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            busy: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// No job is in the middle of its last steps.
+    pub fn settled(&self) -> bool {
+        self.busy.load(std::sync::atomic::Ordering::SeqCst) == 0
+    }
+
+    /// Write the job as it is now to the history.
+    pub fn save(&self, id: u32) {
+        let Some(h) = &self.history else { return };
+        let Some(rec) = self.job(id, |j| crate::history::JobRecord::of(j)) else { return };
+        if let Err(e) = h.save(&rec) {
+            if !self.history_failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.log("history", format!("could not save job #{}: {}", id, e));
+            }
+        }
+    }
+
+    /// Save running jobs every few seconds, so their output is there after a crash too.
+    pub fn start_autosave(&self) {
+        if self.history.is_none() {
+            return;
+        }
+        let hub = self.clone();
+        self.rt.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let open: Vec<u32> = hub.state.lock().unwrap().jobs.iter().filter(|j| !j.status.finished()).map(|j| j.id).collect();
+                for id in open {
+                    hub.save(id);
+                }
+            }
+        });
+    }
+
+    /// Bring back the saved jobs. Returns the typed tasks that were interrupted and can continue.
+    pub fn restore(&self) -> Vec<u32> {
+        let Some(h) = &self.history else { return vec![] };
+        let records = match h.load(crate::history::KEEP) {
+            Ok(r) => r,
+            Err(e) => {
+                self.log("history", format!("could not read the saved jobs: {}", e));
+                return vec![];
+            }
+        };
+        let mut resumable = Vec::new();
+        let mut st = self.state.lock().unwrap();
+        for r in records {
+            if st.jobs.iter().any(|j| j.id == r.id) {
+                continue;
+            }
+            let j = r.job();
+            if j.status == JobStatus::Interrupted && j.source.is_manual() && j.resume_from.is_some() {
+                resumable.push(j.id);
+            }
+            st.next_id = st.next_id.max(j.id + 1);
+            st.jobs.push(j);
+        }
+        st.jobs.sort_by_key(|j| j.id);
+        resumable
+    }
+
+    /// Continue an interrupted typed task from the stage it had reached. Err says why not.
+    pub fn resume(&self, id: u32) -> Result<(), String> {
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.stopping {
+                return Err("shutting down".into());
+            }
+            let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return Err("no such job".into()) };
+            if j.status != JobStatus::Interrupted || !j.source.is_manual() {
+                return Err("only an interrupted typed task can be resumed".into());
+            }
+            if !j.workdir.is_dir() {
+                return Err(format!("{} no longer exists", j.workdir.display()));
+            }
+            j.resume_from.get_or_insert(JobStatus::Working);
+            j.status = JobStatus::Queued;
+            j.finished = None;
+            j.outcome.clear();
+            j.cancel = Cancel::new();
+            j.worker.push("› continuing after forkdeck was stopped");
+            st.log("queue", format!("#{} continues where it stopped", id));
+        }
+        self.save(id);
+        let hub = self.clone();
+        self.rt.spawn(async move { run_job(hub, id).await });
+        Ok(())
     }
 
     pub fn log(&self, who: &str, msg: impl Into<String>) {
@@ -93,11 +221,13 @@ impl Hub {
         workdir: PathBuf,
         forced: Option<AgentRef>,
     ) -> u32 {
+        // The database hands out ids, so jobs from another forkdeck sharing it never collide.
+        let from_db = self.history.as_ref().and_then(|h| h.new_id().ok());
         let id = {
             let mut st = self.state.lock().unwrap();
             let stopping = st.stopping;
-            let id = st.next_id;
-            st.next_id += 1;
+            let id = from_db.unwrap_or(st.next_id).max(st.next_id);
+            st.next_id = id + 1;
             st.jobs.push(Job {
                 id,
                 title: title.clone(),
@@ -124,6 +254,7 @@ impl Hub {
                 released: false,
                 turns: vec![Turn { ask: prompt, answer: String::new() }],
                 session: None,
+                resume_from: None,
             });
             if stopping {
                 // Shutting down: the job exists so the caller has an id, but it never starts and claims nothing.
@@ -138,6 +269,7 @@ impl Hub {
         };
         let hub = self.clone();
         self.rt.spawn(async move { run_job(hub, id).await });
+        self.save(id);
         id
     }
 
@@ -168,6 +300,7 @@ impl Hub {
             j.reviewer.state = StageState::Idle;
             st.log("queue", format!("#{} reply: {}", id, clip(&text, 90)));
         }
+        self.save(id);
         let hub = self.clone();
         self.rt.spawn(async move { run_job(hub, id).await });
         Ok(())
@@ -194,7 +327,12 @@ impl Hub {
             for c in &open {
                 c.fire();
             }
-            if open.is_empty() || Instant::now() >= deadline {
+            if (open.is_empty() && self.settled()) || Instant::now() >= deadline {
+                // Whatever is still running is saved as it stands; it comes back interrupted.
+                let left: Vec<u32> = self.state.lock().unwrap().jobs.iter().filter(|j| !j.status.finished()).map(|j| j.id).collect();
+                for id in left {
+                    self.save(id);
+                }
                 return open.len();
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -265,8 +403,9 @@ fn cancelled() -> Finish {
 }
 
 pub async fn run_job(hub: Hub, id: u32) {
-    let Some((manual, is_pr, is_deploy, cancel, reply)) = hub.job(id, |j| {
-        (j.source.is_manual(), matches!(j.source, Source::Pr { .. }), matches!(j.source, Source::Deploy { .. }), j.cancel.clone(), j.turns.len() > 1)
+    let _busy = Busy::enter(&hub.busy);
+    let Some((manual, is_pr, is_deploy, cancel, reply, resuming)) = hub.job(id, |j| {
+        (j.source.is_manual(), matches!(j.source, Source::Pr { .. }), matches!(j.source, Source::Deploy { .. }), j.cancel.clone(), j.turns.len() > 1, j.resume_from.is_some())
     }) else {
         return;
     };
@@ -285,6 +424,8 @@ pub async fn run_job(hub: Hub, id: u32) {
                     team::announce(&hub, id).await;
                     let (status, outcome) = cicd::deploy_run(&hub, id, &cancel).await;
                     Finish { status, outcome, retry: None, reported: true, wait: None }
+                } else if manual && resuming {
+                    resumed(&hub, id, &cancel).await
                 } else if manual && reply {
                     followup(&hub, id, &cancel).await
                 } else if is_pr {
@@ -312,7 +453,21 @@ pub async fn run_job(hub: Hub, id: u32) {
     }
     // Before the job counts as finished, so that a shutdown waits for the last word to teammates.
     team::finish(&hub, id, fin.status).await;
+    // Stopped by a shutdown, a typed task is not cancelled: it continues on the next start.
+    let stopping = hub.state.lock().unwrap().stopping;
+    let fin = if stopping && manual && fin.status == JobStatus::Cancelled {
+        Finish { status: JobStatus::Interrupted, outcome: "interrupted: forkdeck stopped while this ran".into(), ..fin }
+    } else {
+        fin
+    };
     hub.job(id, |j| {
+        if fin.status == JobStatus::Interrupted {
+            // Where it was, unless it was already resuming from an earlier stop.
+            let at = j.resume_from.unwrap_or(j.status);
+            j.resume_from = Some(at);
+        } else {
+            j.resume_from = None;
+        }
         j.status = fin.status;
         j.outcome = fin.outcome.clone();
         j.finished = Some(Instant::now());
@@ -357,12 +512,16 @@ pub async fn run_job(hub: Hub, id: u32) {
             }
         }
     }
+    // Saved last: the modes without an interface exit once every job counts as finished, and a
+    // write before the steps above would let that happen before they are done.
+    hub.save(id);
     // The whole outcome: in the modes without an interface this line is the report.
     hub.log("queue", format!("#{} {}: {}", id, fin.status.name(), clip(&fin.outcome, 600)));
 }
 
 fn set_status(hub: &Hub, id: u32, s: JobStatus) {
     hub.job(id, |j| j.status = s);
+    hub.save(id);
 }
 
 /// A copy of what `pick` needs, so the state lock is not held while agents run.
@@ -607,6 +766,7 @@ async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, fresh: Option
     }
     if let Some(sid) = &out.session {
         hub.job(id, |j| j.session = Some(Session { cli: ran.cli, id: sid.clone(), model: ran.model.clone() }));
+        hub.save(id);
     }
     if cancel.is_set() {
         return Err(cancelled());
@@ -837,6 +997,7 @@ fn record_answer(hub: &Hub, id: u32, text: &str) {
             t.answer = text.to_string();
         }
     });
+    hub.save(id);
 }
 
 /// How many earlier exchanges a reply carries along, and how much of each answer.
@@ -866,6 +1027,75 @@ fn chat_prompt(turns: &[Turn]) -> String {
         now.ask
     ));
     out
+}
+
+const CONTINUE: &str = "forkdeck was stopped while you were working on this. Continue the task from where you stopped, then summarise what you changed.";
+
+/// For an agent that does not have the conversation: the task again, told that part of it may be done.
+fn continue_fresh(turns: &[Turn], prompt: &str) -> String {
+    let note = "An earlier attempt at this was interrupted, so this working tree may already contain part of the work. Check what is there, finish the task, then summarise what you changed.";
+    if turns.len() > 1 {
+        format!("{}\n\n{}", chat_prompt(turns), note)
+    } else {
+        format!("{}\n\n{}", prompt, note)
+    }
+}
+
+/// An interrupted typed task, continued from the stage it had reached: the worker carries on (in
+/// its own conversation when the CLI still has it), or, if the work was done, the review runs again.
+async fn resumed(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
+    let Some((turns, prompt, dir, forced, known, from)) = hub.job(id, |j| (j.turns.clone(), j.prompt.clone(), j.workdir.clone(), j.forced.clone(), j.decision.clone(), j.resume_from.take())) else {
+        return failed("job vanished");
+    };
+    let from = from.unwrap_or(JobStatus::Working);
+    let checks = hub.cfg.review.checks.clone();
+    let task = match (turns.first(), turns.last()) {
+        (Some(first), Some(last)) if turns.len() > 1 => format!("{}\n\nFollow-up request: {}", first.ask, last.ask),
+        _ => prompt.clone(),
+    };
+    let (d, worker) = match known {
+        Some(d) => {
+            let wanted = forced.unwrap_or(AgentRef::Kind(d.agent));
+            match pick::worker_for(&hub.cfg, &avail(hub).borrow(), &wanted, d.tier) {
+                Some(w) => (d, w),
+                None => return failed(format!("{} is not available and nothing can stand in for it", wanted.name())),
+            }
+        }
+        None => match decide(hub, id, &task, false, forced).await {
+            Ok(x) => x,
+            Err(f) => return f,
+        },
+    };
+    let (reviewer, _) = pick::reviewer_for(&hub.cfg, &avail(hub).borrow(), &worker, d.tier.up());
+    if !d.review {
+        hub.job(id, |j| j.reviewer.state = StageState::Skipped);
+    }
+    if cancel.is_set() {
+        return cancelled();
+    }
+    let w = Work { prompt: &task, dir: &dir, d: &d, worker: &worker, reviewer: &reviewer, checks: &checks, is_issue: false, followup: None };
+    // The work was finished and only the review was cut short: review it again.
+    let answered = turns.last().map(|t| t.answer.clone()).filter(|a| !a.is_empty());
+    let summary = match (from, answered) {
+        (JobStatus::Reviewing, Some(a)) => a,
+        _ => {
+            set_status(hub, id, JobStatus::Working);
+            match work_once(hub, id, &w, CONTINUE, Some(&continue_fresh(&turns, &prompt)), cancel).await {
+                Ok(s) => s,
+                Err(f) => return f,
+            }
+        }
+    };
+    record_answer(hub, id, &summary);
+    let r = match refine(hub, id, &w, summary, cancel).await {
+        Ok(r) => r,
+        Err(f) => return f,
+    };
+    record_answer(hub, id, &r.summary);
+    if cancel.is_set() {
+        return cancelled();
+    }
+    if r.good { done(clip(&first_para(&r.summary), 300)) } else { failed(r.why_not()) }
 }
 
 /// A reply to a typed task: the same agent, in the same tree, with the conversation as context.

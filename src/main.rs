@@ -3,6 +3,7 @@ mod cicd;
 mod config;
 mod copilot;
 mod demo;
+mod history;
 mod issues;
 mod mcp;
 mod orchestrator;
@@ -53,6 +54,13 @@ enum Cmd {
         agent: Option<String>,
         task: Vec<String>,
     },
+    /// Continue the typed tasks that were cut off when forkdeck last stopped, without the interface
+    Resume,
+    /// List the jobs kept from earlier runs, or clear them
+    History {
+        #[command(subcommand)]
+        cmd: Option<HistoryCmd>,
+    },
     /// Show what the fork layer would decide for a task
     Route { task: Vec<String> },
     /// Poll the configured repositories once, work through what is labelled, and exit
@@ -98,6 +106,12 @@ enum TeamCmd {
         #[arg(long)]
         unclaimed: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum HistoryCmd {
+    /// Remove every saved job
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -198,6 +212,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Once) => {
             anyhow::ensure!(!hub.cfg.repos.is_empty(), "no [[repos]] configured, nothing to poll");
             rt.block_on(hub.detect_agents());
+            hub.start_autosave();
             let code = rt.block_on(once(&hub));
             std::process::exit(code);
         }
@@ -219,8 +234,27 @@ fn main() -> anyhow::Result<()> {
             anyhow::ensure!(!task.trim().is_empty(), "give a task to run");
             let forced = agent.as_deref().map(parse_agent).transpose()?;
             rt.block_on(hub.detect_agents());
+            hub.start_autosave();
             let code = rt.block_on(headless(&hub, task, cwd, forced));
             std::process::exit(code);
+        }
+        Some(Cmd::Resume) => {
+            rt.block_on(hub.detect_agents());
+            hub.start_autosave();
+            let code = rt.block_on(resume_cmd(&hub));
+            std::process::exit(code);
+        }
+        Some(Cmd::History { cmd }) => {
+            let Some(h) = &hub.history else { anyhow::bail!("no history: {}", history::path().display()) };
+            match cmd {
+                Some(HistoryCmd::Clear) => println!("removed {} job(s)", h.clear().map_err(anyhow::Error::msg)?),
+                None => {
+                    for r in h.load(history::KEEP).map_err(anyhow::Error::msg)? {
+                        println!("{}", history::summary(&r));
+                    }
+                }
+            }
+            Ok(())
         }
         Some(Cmd::Init { .. }) => unreachable!(),
         None => {
@@ -229,6 +263,13 @@ fn main() -> anyhow::Result<()> {
             rt.spawn(team::watch_loop(hub.clone()));
             if let Some(path) = cli.snapshot {
                 return snapshot(&rt, &hub, cwd, &path, &cli.size, cli.after, cli.team_pane);
+            }
+            // Earlier jobs come back; typed tasks that were cut off continue by themselves.
+            hub.start_autosave();
+            for id in hub.restore() {
+                if let Err(e) = hub.resume(id) {
+                    hub.log("queue", format!("#{} not resumed: {} (Ctrl-R tries again)", id, e));
+                }
             }
             if let Some(p) = cfg_path {
                 hub.log("config", format!("loaded {}", p.display()));
@@ -259,19 +300,45 @@ async fn stop_signal() {
 async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentRef>) -> i32 {
     let title = state::clip(&task, 80);
     let id = hub.submit(title, task, Source::Manual, cwd, forced);
-    // The agent runs in its own process group, so a signal sent to us has to be passed on by hand.
+    wait_for(hub, &[id]).await
+}
+
+/// Continue every typed task that was cut off, and wait for them.
+async fn resume_cmd(hub: &Hub) -> i32 {
+    let mut ids = Vec::new();
+    for id in hub.restore() {
+        match hub.resume(id) {
+            Ok(()) => ids.push(id),
+            Err(e) => hub.log("queue", format!("#{} not resumed: {}", id, e)),
+        }
+    }
+    if ids.is_empty() {
+        print_progress(hub);
+        say!("nothing to resume");
+        return 0;
+    }
+    wait_for(hub, &ids).await
+}
+
+/// Print progress until the jobs are finished: 0 when all are done.
+async fn wait_for(hub: &Hub, ids: &[u32]) -> i32 {
+    // The agents run in their own process groups, so a signal sent to us has to be passed on by
+    // hand. Stopping this way leaves typed tasks interrupted, to continue with `forkdeck resume`.
     let h = hub.clone();
     tokio::spawn(async move {
         stop_signal().await;
-        h.cancel(id);
+        h.shutdown(Duration::from_secs(45)).await;
     });
     loop {
         tokio::time::sleep(Duration::from_millis(150)).await;
         print_progress(hub);
         let st = hub.state.lock().unwrap();
-        let Some(j) = st.jobs.iter().find(|j| j.id == id) else { return 1 };
-        if j.status.finished() {
-            let code = if j.status == JobStatus::Done { 0 } else { 1 };
+        let mine: Vec<_> = st.jobs.iter().filter(|j| ids.contains(&j.id)).collect();
+        if mine.len() < ids.len() {
+            return 1;
+        }
+        if mine.iter().all(|j| j.status.finished()) && hub.settled() {
+            let code = if mine.iter().all(|j| j.status == JobStatus::Done) { 0 } else { 1 };
             drop(st);
             print_progress(hub);
             return code;
@@ -316,7 +383,7 @@ async fn once(hub: &Hub) -> i32 {
                 st.jobs.iter().filter(|j| matches!(j.status, JobStatus::Failed | JobStatus::Cancelled)).count(),
             )
         };
-        if open == 0 {
+        if open == 0 && hub.settled() {
             print_progress(hub);
             return if failed == 0 { 0 } else { 1 };
         }
@@ -656,6 +723,13 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                             st.log("issues", if on { "polling on" } else { "polling paused" });
                             if on && none {
                                 st.log("issues", "no [[repos]] configured, nothing to poll");
+                            }
+                        }
+                        KeyCode::Char('r') if ctrl => {
+                            if let Some(id) = u.selected {
+                                if let Err(why) = hub.resume(id) {
+                                    hub.log("queue", format!("#{} not resumed: {}", id, why));
+                                }
                             }
                         }
                         KeyCode::Char('x') if ctrl => {

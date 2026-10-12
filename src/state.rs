@@ -80,7 +80,7 @@ impl Serialize for AgentRef {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Light,
@@ -104,7 +104,8 @@ impl Tier {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Queued,
     Routing,
@@ -119,6 +120,8 @@ pub enum JobStatus {
     Done,
     Failed,
     Cancelled,
+    /// forkdeck stopped while the job ran. A typed task continues on the next start.
+    Interrupted,
 }
 
 impl JobStatus {
@@ -136,10 +139,11 @@ impl JobStatus {
             JobStatus::Done => "done",
             JobStatus::Failed => "failed",
             JobStatus::Cancelled => "cancelled",
+            JobStatus::Interrupted => "interrupted",
         }
     }
     pub fn finished(self) -> bool {
-        matches!(self, JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled)
+        matches!(self, JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled | JobStatus::Interrupted)
     }
 }
 
@@ -157,6 +161,8 @@ pub struct Stage {
     pub agent: Option<AgentKind>,
     /// Set when the agent ran on another CLI: "copilot" standing in, or a "copilot:<name>" profile.
     pub via: String,
+    /// The CLI's id for the conversation in this box, as soon as it is known.
+    pub session: Option<String>,
     /// What the box shows when no agent runs in it (a deployment step).
     pub label: String,
     pub model: String,
@@ -177,6 +183,7 @@ impl Default for Stage {
         Stage {
             agent: None,
             via: String::new(),
+            session: None,
             label: String::new(),
             model: String::new(),
             effort: String::new(),
@@ -212,7 +219,7 @@ impl Stage {
 }
 
 /// One typed answer from the decision layer, drawn as a bar in the fork-layer box.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Gate {
     pub name: String,
     pub answer: String,
@@ -220,7 +227,7 @@ pub struct Gate {
     pub sharp: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Decision {
     pub agent: AgentKind,
     pub tier: Tier,
@@ -238,7 +245,7 @@ pub enum Provider {
     Gitlab,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Source {
     Manual,
     Issue { repo_idx: usize, repo: String, number: u64, url: String },
@@ -293,7 +300,7 @@ pub struct Session {
 }
 
 /// One exchange in a typed task's conversation: what the user asked and what the agent said back.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Turn {
     pub ask: String,
     /// Empty until the turn has produced a result.
@@ -333,6 +340,8 @@ pub struct Job {
     pub turns: Vec<Turn>,
     /// The worker's conversation, once its CLI has named it.
     pub session: Option<Session>,
+    /// Set on an interrupted typed task that is to continue: the stage it had reached.
+    pub resume_from: Option<JobStatus>,
 }
 
 pub struct LogLine {

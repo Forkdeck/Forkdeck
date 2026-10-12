@@ -73,6 +73,7 @@ fn status_color(s: JobStatus) -> Color {
         JobStatus::Done => GREEN,
         JobStatus::Failed => RED,
         JobStatus::Cancelled => DIM,
+        JobStatus::Interrupted => Color::Rgb(230, 190, 60),
         JobStatus::Routing => PURPLE,
         _ => ORANGE,
     }

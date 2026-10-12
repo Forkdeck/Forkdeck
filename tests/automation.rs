@@ -1490,3 +1490,46 @@ fn a_fix_round_continues_the_workers_own_conversation() {
     assert!(reviews.iter().all(|r| arg_after(r, "--resume").is_none()), "reviews start fresh: {:?}", reviews);
 }
 
+
+#[test]
+fn a_typed_task_cut_off_by_a_stop_continues_its_own_conversation_later() {
+    let rig = Rig::new("resume", "", "");
+    let log = rig.root.join("args.log");
+    let logged = log.to_str().unwrap().to_string();
+    // The first attempt works slowly, and forkdeck is stopped while it does.
+    let child = rig
+        .bare(&[("FAKE_ARGS", &logged), ("FAKE_WORK", "sleep 30")])
+        .args(["run", "add a change file"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("forkdeck starts");
+    for _ in 0..100 {
+        if fs::read_to_string(&log).map(|l| l.contains("acceptEdits")).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    let out = child.wait_with_output().unwrap();
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success() && said.contains("interrupted"), "{}", said);
+    assert!(!rig.clone().join("by_agent.txt").exists(), "the first attempt never finished");
+
+    let (_, listed) = rig.run(&["history"], &[]);
+    assert!(listed.contains("interrupted") && listed.contains("add a change file"), "{}", listed);
+
+    // Next time, the task carries on in the same conversation and finishes.
+    let (ok, out) = rig.run(&["resume"], &[("FAKE_ARGS", &logged)]);
+    assert!(ok, "{}", out);
+    let runs = fs::read_to_string(&log).unwrap();
+    let workers: Vec<&str> = runs.lines().filter(|r| r.contains("acceptEdits")).collect();
+    assert_eq!(workers.len(), 2, "{:?}", workers);
+    let first = arg_after(workers[0], "--session-id").expect("the first attempt named its conversation");
+    assert_eq!(arg_after(workers[1], "--resume"), Some(first), "{:?}", workers);
+    assert!(rig.clone().join("by_agent.txt").exists());
+    let (_, listed) = rig.run(&["history"], &[]);
+    assert!(listed.contains("done") && !listed.contains("interrupted"), "{}", listed);
+    let (ok, again) = rig.run(&["resume"], &[]);
+    assert!(ok && again.contains("nothing to resume"), "{}", again);
+}

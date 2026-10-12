@@ -362,6 +362,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
         s.tail = keep;
         s.agent = Some(e.family);
         s.via = e.via.clone().unwrap_or_default();
+        s.session = line.session.clone();
         s.model = e.model.clone();
         s.effort = e.effort.clone();
         s.state = StageState::Running;
@@ -387,6 +388,11 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
             _ = tokio::time::sleep(limit) => RunOut { error: format!("timed out after {} min", limit.as_secs() / 60), ..Default::default() },
         }
     };
+    // A run that was cancelled or timed out still had a conversation, and it can be continued.
+    let mut out = out;
+    if out.session.is_none() {
+        out.session = hub.job(job, |j| if slot == Slot::Worker { j.worker.session.clone() } else { j.reviewer.session.clone() }).flatten();
+    }
     stage(&mut |s| {
         s.elapsed = Some(start.elapsed());
         s.state = if out.ok { StageState::Ok } else { StageState::Failed };
@@ -500,7 +506,10 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, kind: AgentKind, line: 
             match p {
                 Parsed::Text(t) => last_text = t,
                 Parsed::Tool(_) => tools_seen += 1,
-                Parsed::Session(id) => session = Some(id),
+                Parsed::Session(id) => {
+                    hub.job(job, |j| if slot == Slot::Worker { j.worker.session = Some(id.clone()) } else { j.reviewer.session = Some(id.clone()) });
+                    session = Some(id)
+                }
                 // Only a refusal before anything was done can be retried with another model.
                 Parsed::ModelRejected(m) if tools_seen == 0 => rejected = Some(m),
                 Parsed::NoModels(e) => {
