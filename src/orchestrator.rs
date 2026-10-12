@@ -720,10 +720,15 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     };
     let (have_c, have_x) = available(hub);
     let mut reviewers: Vec<AgentKind> = Vec::new();
-    for k in &hub.cfg.review.pr_reviewers {
-        let have = if *k == AgentKind::Claude { have_c } else { have_x };
-        if have && !reviewers.contains(k) {
-            reviewers.push(*k);
+    for r in &hub.cfg.review.pr_reviewers {
+        let have = match r {
+            AgentRef::Kind(AgentKind::Claude) => have_c,
+            AgentRef::Kind(AgentKind::Codex) => have_x,
+            _ => false,
+        };
+        let k = r.kind();
+        if have && !reviewers.contains(&k) {
+            reviewers.push(k);
         }
     }
     if reviewers.is_empty() {

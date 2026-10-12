@@ -5,6 +5,7 @@ mod demo;
 mod issues;
 mod mcp;
 mod orchestrator;
+mod pick;
 mod proc;
 mod router;
 mod state;
