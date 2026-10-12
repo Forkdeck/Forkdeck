@@ -20,6 +20,13 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: &RunSpec<'_>) -> RunOut 
         (900, "The change is limited to the retry path and the new test covers it", false),
         (500, "VERDICT: PASS", false),
     ];
+    // Asked for a plan: a canned one, so choosing can be tried too.
+    if spec.prompt.contains("<options>") {
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        hub.job(job, |j| j.stage(slot).push("Read src/net/client.rs and the retry tests".to_string()));
+        let text = "Two ways to go.\n<options>{\"options\": [{\"title\": \"Reset the backoff on success\", \"summary\": \"one-line fix in the retry loop, plus a regression test\", \"recommended\": true}, {\"title\": \"Replace the retry loop\", \"summary\": \"use a small backoff helper; cleaner, touches more code\"}]}</options>";
+        return RunOut { ok: true, text: text.into(), ..Default::default() };
+    }
     let reviewing = spec.read_only;
     let script = if reviewing { reviewer } else { worker };
     let mut last = String::new();

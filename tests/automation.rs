@@ -2,7 +2,7 @@
 //! `claude`, `gh` and an MCP server, and a local bare repository as the remote. They need `git` and `sh`.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,6 +13,9 @@ const CLAUDE: &str = r#"#!/bin/sh
 prompt=$(cat)
 [ -n "$FAKE_PROMPTS" ] && printf '%s\n-----\n' "$prompt" >> "$FAKE_PROMPTS"
 case "$prompt" in
+  *"<options>"*)
+    printf '%s\n' '{"type":"result","is_error":false,"result":"Two ways.\n<options>{\"options\": [{\"title\": \"Patch it\", \"summary\": \"small\"}, {\"title\": \"Rewrite it\", \"summary\": \"clean\", \"recommended\": true}]}</options>"}'
+    ;;
   *"Do not modify any file"*)
     [ -n "$FAKE_DURING_REVIEW" ] && PROMPT="$prompt" sh -c "$FAKE_DURING_REVIEW" >/dev/null 2>&1
     printf '%s\n' "{\"type\":\"result\",\"is_error\":false,\"result\":\"Looked at it.\\nVERDICT: ${FAKE_VERDICT:-PASS}\"}"
@@ -1580,6 +1583,35 @@ fn a_pinned_copilot_model_the_account_refuses_falls_back_to_the_cli_choice() {
     assert!(rig.calls().contains("--add-label review:passed"), "{}", rig.calls());
 }
 
+/// Collect a child's output as it comes, so a test can wait for a line before doing the next thing.
+fn tee(child: &mut std::process::Child) -> std::sync::Arc<std::sync::Mutex<String>> {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    for stream in [child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>)].into_iter().flatten() {
+        let seen = seen.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut stream = stream;
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                seen.lock().unwrap().push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+    }
+    seen
+}
+
+fn wait_until_said(seen: &std::sync::Arc<std::sync::Mutex<String>>, needle: &str) {
+    for _ in 0..600 {
+        if seen.lock().unwrap().contains(needle) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("never said {:?}:\n{}", needle, seen.lock().unwrap());
+}
+
 /// Start `forkdeck run` with a worker that waits on its first attempt (until the test says so)
 /// and works at once on later ones. Returns once the first attempt is running.
 fn run_with_slow_first_attempt(rig: &Rig, first_takes: &str) -> std::process::Child {
@@ -1594,7 +1626,7 @@ fn run_with_slow_first_attempt(rig: &Rig, first_takes: &str) -> std::process::Ch
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("forkdeck starts");
-    for _ in 0..100 {
+    for _ in 0..600 {
         if marker.exists() {
             break;
         }
@@ -1611,11 +1643,17 @@ fn workers(rig: &Rig) -> Vec<String> {
 #[test]
 fn a_message_sent_while_the_agent_works_is_taken_in_the_same_conversation() {
     let rig = Rig::new("message-queued", "", "");
-    let mut child = run_with_slow_first_attempt(&rig, "sleep 2");
+    // The first attempt finishes only once the message is known to be queued.
+    let go = rig.root.join("go");
+    let mut child = run_with_slow_first_attempt(&rig, &format!("while [ ! -f {} ]; do sleep 0.1; done", go.display()));
+    let seen = tee(&mut child);
     child.stdin.as_mut().unwrap().write_all(b"also mention it in the README\n").unwrap();
-    let out = child.wait_with_output().unwrap();
-    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(out.status.success(), "{}", said);
+    wait_until_said(&seen, "message queued");
+    fs::write(&go, "").unwrap();
+    let status = child.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let said = seen.lock().unwrap().clone();
+    assert!(status.success(), "{}", said);
     let w = workers(&rig);
     assert_eq!(w.len(), 2, "the first attempt finished, then the message was taken: {:?}\n{}", w, said);
     assert_eq!(arg_after(&w[1], "--resume"), arg_after(&w[0], "--session-id"), "{:?}", w);
@@ -1627,16 +1665,93 @@ fn a_message_sent_while_the_agent_works_is_taken_in_the_same_conversation() {
 #[test]
 fn a_message_sent_with_a_bang_stops_the_agent_and_is_taken_at_once() {
     let rig = Rig::new("message-now", "", "");
-    let started = std::time::Instant::now();
-    let mut child = run_with_slow_first_attempt(&rig, "sleep 30");
+    // The first attempt would never finish on its own: only stopping it lets the job go on.
+    let mut child = run_with_slow_first_attempt(&rig, "sleep 600");
+    let seen = tee(&mut child);
     child.stdin.as_mut().unwrap().write_all(b"!use a different file name\n").unwrap();
-    let out = child.wait_with_output().unwrap();
-    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(out.status.success(), "{}", said);
-    assert!(started.elapsed() < std::time::Duration::from_secs(20), "the slow attempt was stopped, not waited for");
+    let status = child.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let said = seen.lock().unwrap().clone();
+    assert!(status.success(), "{}", said);
     let w = workers(&rig);
     assert_eq!(w.len(), 2, "{:?}", w);
     assert_eq!(arg_after(&w[1], "--resume"), arg_after(&w[0], "--session-id"));
     let prompts = fs::read_to_string(rig.root.join("prompts.log")).unwrap();
     assert!(prompts.contains("the user said:\nuse a different file name"), "{}", prompts);
+}
+
+fn plan_runs(rig: &Rig) -> (Vec<String>, String) {
+    let args = fs::read_to_string(rig.root.join("args.log")).unwrap_or_default().lines().map(String::from).collect();
+    (args, fs::read_to_string(rig.root.join("prompts.log")).unwrap_or_default())
+}
+
+fn run_planned(rig: &Rig, typed: &str) -> (bool, String) {
+    let (args, prompts) = (rig.root.join("args.log"), rig.root.join("prompts.log"));
+    let mut child = rig
+        .bare(&[("FAKE_ARGS", args.to_str().unwrap()), ("FAKE_PROMPTS", prompts.to_str().unwrap())])
+        .args(["run", "--plan", "add a change file"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("forkdeck starts");
+    // Typed straight away, before the plan is even there: it is kept for the choice.
+    child.stdin.as_mut().unwrap().write_all(typed.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+}
+
+#[test]
+fn a_planned_task_goes_ahead_with_the_option_picked_in_the_plans_conversation() {
+    let rig = Rig::new("plan-pick", "", "");
+    let (ok, out) = run_planned(&rig, "1\n");
+    assert!(ok, "{}", out);
+    let (args, prompts) = plan_runs(&rig);
+    let plan = args.iter().find(|a| a.contains("--permission-mode plan")).expect("planned read-only");
+    let work: Vec<&String> = args.iter().filter(|a| a.contains("acceptEdits")).collect();
+    assert_eq!(work.len(), 1, "{:?}", args);
+    assert_eq!(arg_after(work[0], "--resume"), arg_after(plan, "--session-id"), "the work continues the plan's conversation: {:?}", args);
+    assert!(prompts.contains("Go ahead with this: Option 1: Patch it. small"), "{}", prompts);
+    assert!(out.contains("option 1: Patch it"), "{}", out);
+    assert!(rig.clone().join("by_agent.txt").exists());
+}
+
+#[test]
+fn a_planned_task_can_go_its_own_way() {
+    let rig = Rig::new("plan-own", "", "");
+    let (ok, out) = run_planned(&rig, "keep it to one line\n");
+    assert!(ok, "{}", out);
+    let (_, prompts) = plan_runs(&rig);
+    assert!(prompts.contains("None of the proposed options; the user wants this instead: keep it to one line"), "{}", prompts);
+}
+
+/// A decision server that asks for a plan first, whatever the task.
+fn jev_wanting_a_plan() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 65536];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let body = r#"{"answers":{"agent":{"choice":"claude","confidence":0.9},"effort":{"score":1,"confidence":0.9},"review":{"noul":0.9},"plan":{"noul":0.97}}}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        }
+    });
+    url
+}
+
+#[test]
+fn an_issue_the_router_wants_planned_takes_the_recommended_option_and_says_so() {
+    let jev = jev_wanting_a_plan();
+    let rig = Rig::new("plan-issue", &format!("[router]\nkind = \"jev\"\n[router.jev]\nbase_url = \"{}\"", jev), "");
+    rig.issue();
+    let log = rig.root.join("prompts.log");
+    let (ok, out) = rig.once(&[("FAKE_PROMPTS", log.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    assert!(out.contains("took option 2: Rewrite it"), "{}", out);
+    let prompts = fs::read_to_string(&log).unwrap();
+    assert!(prompts.contains("Go ahead with this: Option 2: Rewrite it. clean"), "{}", prompts);
+    let calls = rig.calls();
+    assert!(calls.contains("Planned first: option 2: Rewrite it. Also proposed: Patch it."), "{}", calls);
 }

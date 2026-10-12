@@ -644,6 +644,7 @@ pub async fn deploy_poll(hub: &Hub) {
                     Source::Deploy { repo_idx: idx, repo: r.repo.clone(), sha: head },
                     r.path.clone(),
                     None,
+                    crate::state::Planning::Never,
                 );
             }
         }

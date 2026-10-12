@@ -28,6 +28,9 @@ pub struct RouterCfg {
     pub default_agent: AgentKind,
     /// Answers below this confidence are "split": the safer branch is taken.
     pub threshold: f64,
+    /// "auto": the decision server may ask for a plan first on open-ended tasks; "never": it is
+    /// not asked. Ctrl-P and `run --plan` ask for one either way.
+    pub plan: String,
     pub jev: JevCfg,
     pub rules: RulesCfg,
 }
@@ -38,6 +41,7 @@ impl Default for RouterCfg {
             kind: "rules".into(),
             default_agent: AgentKind::Claude,
             threshold: 0.6,
+            plan: "auto".into(),
             jev: JevCfg::default(),
             rules: RulesCfg::default(),
         }
@@ -691,6 +695,9 @@ impl Config {
         }
         if !matches!(self.review.reviewer.as_str(), "other" | "same") {
             anyhow::bail!("review.reviewer must be other or same");
+        }
+        if !matches!(self.router.plan.as_str(), "auto" | "never") {
+            anyhow::bail!("router.plan must be auto or never");
         }
         if !(0.5..=1.0).contains(&self.router.threshold) {
             anyhow::bail!("router.threshold must be between 0.5 and 1.0, got {}", self.router.threshold);

@@ -50,7 +50,7 @@ pub fn request_body(cfg: &Config, task: &str) -> Value {
     let j = &cfg.router.jev;
     // Keep the state short: decision servers have small context windows.
     let state: String = task.chars().take(6000).collect();
-    json!({
+    let mut body = json!({
         "state": state,
         "model": j.model,
         "questions": {
@@ -71,9 +71,19 @@ pub fn request_body(cfg: &Config, task: &str) -> Value {
             "review": {
                 "type": "noul",
                 "instructions": "This change is risky enough that someone else should review it before it is published"
+            },
+            "plan": {
+                "type": "noul",
+                "instructions": "The task is open enough that the user should choose between approaches before any work starts"
             }
         }
-    })
+    });
+    if cfg.router.plan == "never" {
+        if let Some(q) = body.get_mut("questions").and_then(|q| q.as_object_mut()) {
+            q.remove("plan");
+        }
+    }
+    body
 }
 
 async fn ask_jev(cfg: &Config, http: &reqwest::Client, task: &str) -> Result<Value, String> {
@@ -164,24 +174,28 @@ pub fn from_answers(cfg: &Config, v: &Value) -> Result<Decision, String> {
     // Any unsure answer buys a review.
     let review = rv >= 0.5 || !review_sharp || !agent_sharp || !effort_sharp;
 
-    Ok(Decision {
-        agent,
-        tier,
-        review,
-        gates: vec![
-            Gate { name: "which agent".into(), answer: picked.name().into(), value: conf, sharp: agent_sharp },
-            Gate { name: "effort".into(), answer: tier.name().into(), value: econf, sharp: effort_sharp },
-            Gate {
-                name: "needs review".into(),
-                answer: if review { "yes".into() } else { "no".into() },
-                value: rv,
-                sharp: review_sharp,
-            },
-        ],
-        source: "jev".into(),
-        ms: 0,
-        note: note.join("; "),
-    })
+    let mut gates = vec![
+        Gate { name: "which agent".into(), answer: picked.name().into(), value: conf, sharp: agent_sharp },
+        Gate { name: "effort".into(), answer: tier.name().into(), value: econf, sharp: effort_sharp },
+        Gate {
+            name: "needs review".into(),
+            answer: if review { "yes".into() } else { "no".into() },
+            value: rv,
+            sharp: review_sharp,
+        },
+    ];
+    // A server that does not know the plan question leaves it out: then there is no plan.
+    let mut plan = false;
+    if cfg.router.plan != "never" {
+        if let Some(pv) = a.get("plan").and_then(|r| r.get("noul")).and_then(|n| n.as_f64()) {
+            let pv = unit(pv, "plan noul")?;
+            let sharp = (pv - 0.5).abs() >= (th - 0.5).max(0.05);
+            // Unlike a review, an unsure plan question is not worth a stop: only a clear yes asks the user.
+            plan = pv >= 0.5 && sharp;
+            gates.push(Gate { name: "plan first".into(), answer: if plan { "yes".into() } else { "no".into() }, value: pv, sharp });
+        }
+    }
+    Ok(Decision { agent, tier, review, gates, source: "jev".into(), ms: 0, note: note.join("; "), plan })
 }
 
 fn unit(v: f64, what: &str) -> Result<f64, String> {
@@ -263,6 +277,7 @@ pub fn rules(cfg: &Config, task: &str, is_issue: bool) -> Decision {
         source: "rules".into(),
         ms: 0,
         note: note.join("; "),
+        plan: false,
     }
 }
 
@@ -289,6 +304,32 @@ mod tests {
         assert_eq!(d.tier, Tier::Heavy);
         assert!(d.review);
         assert!(d.gates.iter().all(|g| g.sharp));
+    }
+
+    #[test]
+    fn the_plan_question_is_optional_and_only_a_clear_yes_counts() {
+        let answers = |plan: Option<f64>| {
+            let mut a = json!({
+                "agent": {"choice": "claude", "confidence": 0.9},
+                "effort": {"score": 1.0, "confidence": 0.9},
+                "review": {"noul": 0.9}
+            });
+            if let Some(p) = plan {
+                a["plan"] = json!({"noul": p});
+            }
+            json!({"answers": a})
+        };
+        let cfg = Config::default();
+        let d = from_answers(&cfg, &answers(Some(0.95))).unwrap();
+        assert!(d.plan && d.gates.iter().any(|g| g.name == "plan first" && g.answer == "yes"));
+        assert!(!from_answers(&cfg, &answers(Some(0.55))).unwrap().plan, "unsure is not a stop");
+        let d = from_answers(&cfg, &answers(None)).unwrap();
+        assert!(!d.plan && d.gates.len() == 3, "a server that does not know the question");
+        let never: Config = toml::from_str("[router]\nplan = \"never\"").unwrap();
+        assert!(!from_answers(&never, &answers(Some(0.99))).unwrap().plan);
+        assert!(request_body(&cfg, "t")["questions"].get("plan").is_some());
+        assert!(request_body(&never, "t")["questions"].get("plan").is_none());
+        assert!(!rules(&cfg, "redesign the architecture", false).plan, "rules never ask for a plan");
     }
 
     #[test]

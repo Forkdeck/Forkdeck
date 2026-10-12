@@ -43,6 +43,8 @@ pub struct Ui {
     pub team: bool,
     /// Enter starts a new task even though a typed job is selected (Ctrl-N).
     pub new_task: bool,
+    /// The next new task proposes approaches first (Ctrl-P).
+    pub plan_next: bool,
 }
 
 /// The selected job, when Enter would send what is typed to it as a reply.
@@ -566,6 +568,7 @@ fn prompt(f: &mut Frame, area: Rect, ui: &Ui, reply: Option<(u32, bool)>) {
     let line = Line::from(vec![
         Span::styled(format!(" ~/{} ", dir), fg(GREEN)),
         Span::styled("$ ", fg(BRIGHT)),
+        Span::styled(if ui.plan_next && reply.is_none() { "[plan first] " } else { "" }, fg(PURPLE)),
         forced,
         Span::styled(shown, fg(BRIGHT)),
         Span::styled("█", fg(PURPLE)),

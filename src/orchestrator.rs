@@ -220,6 +220,7 @@ impl Hub {
         source: Source,
         workdir: PathBuf,
         forced: Option<AgentRef>,
+        planning: Planning,
     ) -> u32 {
         // The database hands out ids, so jobs from another forkdeck sharing it never collide.
         let from_db = self.history.as_ref().and_then(|h| h.new_id().ok());
@@ -258,6 +259,9 @@ impl Hub {
                 resume_from: None,
                 inbox: Default::default(),
                 steer: Cancel::new(),
+                planning,
+                plan: None,
+                chose: Default::default(),
             });
             if stopping {
                 // Shutting down: the job exists so the caller has an id, but it never starts and claims nothing.
@@ -288,6 +292,16 @@ impl Hub {
             if !j.source.is_manual() {
                 return Err("only typed tasks take replies".into());
             }
+            if j.status == JobStatus::Choosing {
+                // While it waits for a choice, a number picks an option and anything else is the user's own way.
+                let n = j.plan.as_ref().map(|p| p.options.len()).unwrap_or(0);
+                let c = match text.trim().parse::<usize>() {
+                    Ok(k) if (1..=n).contains(&k) => Choice::Option(k - 1),
+                    _ => Choice::Own(text.clone()),
+                };
+                drop(st);
+                return self.choose(id, c);
+            }
             if !j.status.finished() {
                 // It is working: the agent gets this when its current step ends.
                 j.inbox.push_back(text.clone());
@@ -315,6 +329,33 @@ impl Hub {
         Ok(())
     }
 
+    /// Pick how a planned task goes ahead.
+    pub fn choose(&self, id: u32, c: Choice) -> Result<(), String> {
+        let chose = {
+            let mut st = self.state.lock().unwrap();
+            let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return Err("no such job".into()) };
+            if j.status != JobStatus::Choosing {
+                return Err("it is not waiting for a choice".into());
+            }
+            let Some(plan) = &mut j.plan else { return Err("there is no plan".into()) };
+            if let Choice::Option(i) = c {
+                if i >= plan.options.len() {
+                    return Err(format!("there is no option {}", i + 1));
+                }
+            }
+            let what = plan.describe(&c);
+            plan.chosen = Some(c);
+            j.worker.push(format!("› {}", what));
+            let chose = j.chose.clone();
+            st.log("plan", format!("#{} {}", id, what));
+            chose
+        };
+        self.save(id);
+        // A permit is kept if the job is not waiting yet, so the choice is never missed.
+        chose.notify_one();
+        Ok(())
+    }
+
     /// Send a message and have the running agent take it now: it is stopped and continues its
     /// conversation with the message. A finished task takes it as a reply.
     pub fn steer_now(&self, id: u32, text: String) -> Result<(), String> {
@@ -324,7 +365,7 @@ impl Hub {
             if !j.source.is_manual() {
                 return Err("only typed tasks take messages".into());
             }
-            if j.status.finished() {
+            if j.status.finished() || j.status == JobStatus::Choosing {
                 None
             } else {
                 j.inbox.push_front(text.clone());
@@ -834,6 +875,111 @@ async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, fresh: Option
     }
 }
 
+fn plan_prompt(task: &str) -> String {
+    format!(
+        "Before anything is changed, propose how to do the task below. Do not change any files yet: look at the code as much as you need, then describe 2 to 4 distinct approaches, \
+         with what each would change and its trade-offs. Mark the one you would choose as recommended. End your answer with exactly one block in this form, \
+         the JSON may span several lines:\n<options>{{\"options\": [{{\"title\": \"a short name\", \"summary\": \"what you would do, and the trade-off\", \"recommended\": true}}]}}</options>\n\nThe task:\n{}",
+        task
+    )
+}
+
+/// What to tell the agent once a choice is made.
+fn choice_text(plan: &Plan, c: &Choice) -> String {
+    match c {
+        Choice::Option(i) => {
+            let o = &plan.options[*i];
+            format!("Option {}: {}. {}", i + 1, o.title, o.summary)
+        }
+        Choice::Own(t) => format!("None of the proposed options; the user wants this instead: {}", t),
+    }
+}
+
+/// The planning stage: the worker proposes approaches without changing anything, and one is chosen,
+/// by the user when there is one to ask, else the recommended one. Returns the prompt that has the
+/// agent go ahead (in the conversation it planned in) and the one for a new conversation. None:
+/// no usable plan, work from the task as written.
+async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool, cancel: &Cancel) -> Result<Option<(String, String)>, Finish> {
+    let plan = match hub.job(id, |j| j.plan.clone()).flatten() {
+        // Planned before forkdeck was stopped: not again.
+        Some(p) => p,
+        None => {
+            set_status(hub, id, JobStatus::Planning);
+            let (out, ran) = run_agent(hub, id, Slot::Worker, w.worker.clone(), w.d.tier, &plan_prompt(task), w.dir, true, None).await;
+            if let Some(sid) = &out.session {
+                hub.job(id, |j| j.session = Some(Session { cli: ran.cli, id: sid.clone(), model: ran.model.clone() }));
+            }
+            if cancel.is_set() {
+                return Err(cancelled());
+            }
+            if !out.ok {
+                return Err(failed(format!("{} could not make a plan: {}", ran.label(), out.error)));
+            }
+            let options = parse_options(&out.text).unwrap_or_default();
+            if options.is_empty() && !ask_user {
+                hub.log("plan", format!("#{} the plan had no usable options; working from the task as written", id));
+                return Ok(None);
+            }
+            record_answer(hub, id, &out.text);
+            let plan = Plan { options, text: out.text.clone(), chosen: None };
+            hub.job(id, |j| {
+                for (i, o) in plan.options.iter().enumerate() {
+                    j.worker.push(format!("{}) {}{} — {}", i + 1, o.title, if o.recommended { " (recommended)" } else { "" }, o.summary));
+                }
+                j.plan = Some(plan.clone());
+            });
+            hub.save(id);
+            plan
+        }
+    };
+    let choice = match plan.chosen.clone() {
+        Some(c) => c,
+        None if !ask_user => {
+            let c = Choice::Option(plan.default_choice());
+            hub.log("plan", format!("#{} took {} of {}", id, plan.describe(&c), plan.options.len()));
+            hub.job(id, |j| if let Some(p) = &mut j.plan { p.chosen = Some(c.clone()) });
+            c
+        }
+        None if hub.job(id, |j| !j.inbox.is_empty()).unwrap_or(false) => {
+            // Typed while it was still planning: that is the choice.
+            let text = hub.job(id, |j| j.inbox.pop_front()).flatten().unwrap_or_default();
+            let c = match text.trim().parse::<usize>() {
+                Ok(k) if (1..=plan.options.len()).contains(&k) => Choice::Option(k - 1),
+                _ => Choice::Own(text),
+            };
+            hub.job(id, |j| if let Some(p) = &mut j.plan { p.chosen = Some(c.clone()) });
+            hub.log("plan", format!("#{} {}", id, plan.describe(&c)));
+            c
+        }
+        None => {
+            set_status(hub, id, JobStatus::Choosing);
+            let how = if plan.options.is_empty() { "type how to go ahead".to_string() } else { format!("pick 1–{} or type your own", plan.options.len()) };
+            hub.log("plan", format!("#{} {}", id, how));
+            hub.job(id, |j| j.worker.push(format!("› {}", how)));
+            loop {
+                let Some(chose) = hub.job(id, |j| j.chose.clone()) else { return Err(failed("job vanished")) };
+                if let Some(c) = hub.job(id, |j| j.plan.as_ref().and_then(|p| p.chosen.clone())).flatten() {
+                    break c;
+                }
+                tokio::select! {
+                    _ = chose.notified() => {}
+                    _ = cancel.wait() => return Err(cancelled()),
+                }
+            }
+        }
+    };
+    let said = format!("Chosen: {}", plan.describe(&choice));
+    hub.job(id, |j| {
+        if j.turns.last().map(|t| t.ask != said).unwrap_or(true) {
+            j.turns.push(Turn { ask: said.clone(), answer: String::new() });
+        }
+    });
+    hub.save(id);
+    let go = format!("Go ahead with this: {}\n\nMake the change in this working tree, then summarise what you changed.", choice_text(&plan, &choice));
+    let fresh = format!("{}\n\nYou proposed approaches earlier, and this one was chosen: {}\n\nMake the change in this working tree, then summarise what you changed.", task, choice_text(&plan, &choice));
+    Ok(Some((go, fresh)))
+}
+
 /// Everything sent to the job while it worked, as one new turn of its conversation. `answer` is
 /// what the agent said in the turn before, when it got that far.
 fn take_messages(hub: &Hub, id: u32, answer: Option<&str>) -> Option<String> {
@@ -1004,9 +1150,26 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
     }
     let w = Work { prompt: &prompt, dir: &dir, d: &d, worker: &worker, reviewer: &reviewer, checks: &checks, is_issue, followup: None };
 
-    // 2. Work, then 3. checks and review
+    // 2. A plan first, when asked for: the agent proposes approaches and one is chosen.
+    let planning = hub.job(id, |j| j.planning).unwrap_or_default();
+    let plan_now = match planning {
+        Planning::Always => true,
+        Planning::Never => false,
+        Planning::IfRouted => d.plan,
+    };
+    let (first, fresh) = if plan_now {
+        match plan_stage(hub, id, &w, &prompt, !is_issue, cancel).await {
+            Ok(Some((p, f))) => (p, Some(f)),
+            Ok(None) => (prompt.clone(), None),
+            Err(f) => return f,
+        }
+    } else {
+        (prompt.clone(), None)
+    };
+
+    // 3. Work, then 4. checks and review
     set_status(hub, id, JobStatus::Working);
-    let summary = match work_once(hub, id, &w, &prompt, None, cancel).await {
+    let summary = match work_once(hub, id, &w, &first, fresh.as_deref(), cancel).await {
         Ok(s) => s,
         Err(f) => return f,
     };
@@ -1188,6 +1351,19 @@ async fn resumed(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     let answered = turns.last().map(|t| t.answer.clone()).filter(|a| !a.is_empty());
     let summary = match (from, answered) {
         (JobStatus::Reviewing, Some(a)) => a,
+        // Stopped while planning or choosing: finish that first, then work as chosen.
+        (JobStatus::Planning | JobStatus::Choosing, _) => {
+            let (go, fresh) = match plan_stage(hub, id, &w, &prompt, true, cancel).await {
+                Ok(Some(x)) => x,
+                Ok(None) => (prompt.clone(), prompt.clone()),
+                Err(f) => return f,
+            };
+            set_status(hub, id, JobStatus::Working);
+            match work_once(hub, id, &w, &go, Some(&fresh), cancel).await {
+                Ok(s) => s,
+                Err(f) => return f,
+            }
+        }
         _ => {
             set_status(hub, id, JobStatus::Working);
             match work_once(hub, id, &w, CONTINUE, Some(&continue_fresh(&turns, &prompt)), cancel).await {

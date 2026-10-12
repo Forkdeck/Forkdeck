@@ -53,6 +53,9 @@ enum Cmd {
         /// Force an agent: claude, codex, copilot or copilot:<profile>
         #[arg(long)]
         agent: Option<String>,
+        /// Have the agent propose approaches first; pick one on stdin by its number, or type your own
+        #[arg(long)]
+        plan: bool,
         task: Vec<String>,
     },
     /// Continue the typed tasks that were cut off when forkdeck last stopped, without the interface
@@ -230,13 +233,13 @@ fn main() -> anyhow::Result<()> {
             let ok = rt.block_on(doctor(&hub, cfg_path));
             std::process::exit(if ok { 0 } else { 1 });
         }
-        Some(Cmd::Run { agent, task }) => {
+        Some(Cmd::Run { agent, plan, task }) => {
             let task = task.join(" ");
             anyhow::ensure!(!task.trim().is_empty(), "give a task to run");
             let forced = agent.as_deref().map(parse_agent).transpose()?;
             rt.block_on(hub.detect_agents());
             hub.start_autosave();
-            let code = rt.block_on(headless(&hub, task, cwd, forced));
+            let code = rt.block_on(headless(&hub, task, cwd, forced, plan));
             std::process::exit(code);
         }
         Some(Cmd::Resume) => {
@@ -298,9 +301,10 @@ async fn stop_signal() {
     }
 }
 
-async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentRef>) -> i32 {
+async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentRef>, plan: bool) -> i32 {
     let title = state::clip(&task, 80);
-    let id = hub.submit(title, task, Source::Manual, cwd, forced);
+    // Without --plan nobody may be there to choose, so a plan is never waited for.
+    let id = hub.submit(title, task, Source::Manual, cwd, forced, if plan { state::Planning::Always } else { state::Planning::Never });
     // Lines typed while it runs go to the task: queued for the agent, or at once with a leading "!".
     let h = hub.clone();
     std::thread::spawn(move || {
@@ -666,8 +670,14 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
     ok
 }
 
+/// The selected job, when it is waiting for a choice of plan.
+fn choosing(hub: &Hub, u: &ui::Ui) -> Option<u32> {
+    let id = u.selected?;
+    hub.state.lock().unwrap().jobs.iter().find(|j| j.id == id && j.status == JobStatus::Choosing).map(|j| j.id)
+}
+
 fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
-    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false, new_task: false }
+    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false, new_task: false, plan_next: false }
 }
 
 fn sync_selection(hub: &Hub, u: &mut ui::Ui) {
@@ -684,7 +694,7 @@ fn snapshot(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf, path: &std::p
     let mut u = new_ui(hub, cwd.clone());
     u.team = team_pane;
     if hub.cfg.demo {
-        hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd, None);
+        hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd, None, state::Planning::IfRouted);
     }
     rt.block_on(async { tokio::time::sleep(Duration::from_secs(after)).await });
     sync_selection(hub, &mut u);
@@ -699,7 +709,7 @@ fn snapshot(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf, path: &std::p
 fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<()> {
     let mut u = new_ui(hub, cwd.clone());
     if hub.cfg.demo {
-        hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd.clone(), None);
+        hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd.clone(), None, state::Planning::IfRouted);
     }
     // A signal (terminal closed, kill, service stop) is handled entirely on the runtime: the main
     // thread may be stuck reading a terminal that no longer exists.
@@ -761,6 +771,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                         }
                         KeyCode::Char('t') if ctrl => u.team = !u.team,
                         KeyCode::Char('n') if ctrl => u.new_task = !u.new_task,
+                        KeyCode::Char('p') if ctrl => u.plan_next = !u.plan_next,
                         // Send what is typed to the selected task now, stopping its agent to take it.
                         KeyCode::Char('s') if ctrl => {
                             let text = u.input.trim().to_string();
@@ -773,6 +784,13 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                             }
                         }
                         KeyCode::Char('u') if ctrl => u.input.clear(),
+                        // With nothing typed, a digit picks that option of a plan waiting for a choice.
+                        KeyCode::Char(c) if !ctrl && u.input.is_empty() && c.is_ascii_digit() && c != '0' && choosing(hub, &u).is_some() => {
+                            let id = choosing(hub, &u).expect("checked");
+                            if let Err(why) = hub.choose(id, state::Choice::Option(c as usize - '1' as usize)) {
+                                hub.log("plan", format!("#{} {}", id, why));
+                            }
+                        }
                         KeyCode::Char(c) if !ctrl => u.input.push(c),
                         KeyCode::Backspace => {
                             u.input.pop();
@@ -813,7 +831,9 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                                     },
                                     None => {
                                         u.input.clear();
-                                        let id = hub.submit(state::clip(&task, 80), task, Source::Manual, cwd.clone(), u.forced.clone());
+                                        let planning = if u.plan_next { state::Planning::Always } else { state::Planning::IfRouted };
+                                        let id = hub.submit(state::clip(&task, 80), task, Source::Manual, cwd.clone(), u.forced.clone(), planning);
+                                        u.plan_next = false;
                                         u.selected = Some(id);
                                         u.follow = false;
                                         u.new_task = false;

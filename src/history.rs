@@ -1,7 +1,7 @@
 //! Jobs kept across restarts, in a SQLite database next to the deployment state. Several forkdecks
 //! may share it: it runs in WAL mode, and job ids come from the database so they never clash.
 
-use crate::state::{clip, AgentKind, Decision, Job, JobStatus, Session, Source, Stage, StageState, Turn};
+use crate::state::{clip, AgentKind, Decision, Job, JobStatus, Plan, Planning, Session, Source, Stage, StageState, Turn};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -43,6 +43,9 @@ const MIGRATIONS: &[&str] = &["
         answer TEXT NOT NULL,
         PRIMARY KEY (job, n)
     );
+", "
+    ALTER TABLE jobs ADD COLUMN planning TEXT;
+    ALTER TABLE jobs ADD COLUMN plan TEXT;
 "];
 
 pub fn path() -> PathBuf {
@@ -158,6 +161,8 @@ pub struct JobRecord {
     pub worker: StageRecord,
     pub reviewer: StageRecord,
     pub turns: Vec<Turn>,
+    pub planning: Planning,
+    pub plan: Option<Plan>,
 }
 
 impl JobRecord {
@@ -185,6 +190,8 @@ impl JobRecord {
             worker: StageRecord::of(&j.worker),
             reviewer: StageRecord::of(&j.reviewer),
             turns: j.turns.clone(),
+            planning: j.planning,
+            plan: j.plan.clone(),
         }
     }
 
@@ -226,6 +233,9 @@ impl JobRecord {
             resume_from,
             inbox: Default::default(),
             steer: crate::state::Cancel::new(),
+            planning: self.planning,
+            plan: self.plan,
+            chose: Default::default(),
         }
     }
 }
@@ -284,13 +294,14 @@ impl History {
         let tx = db.transaction().map_err(|e| e.to_string())?;
         let json = |v: &dyn erased::Json| v.json();
         tx.execute(
-            "INSERT INTO jobs (id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+            "INSERT INTO jobs (id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
              ON CONFLICT(id) DO UPDATE SET title = excluded.title, prompt = excluded.prompt, source = excluded.source, workdir = excluded.workdir,
                branch = excluded.branch, base_sha = excluded.base_sha, status = excluded.status, resume_from = excluded.resume_from,
                outcome = excluded.outcome, decision = excluded.decision, forced = excluded.forced, session = excluded.session,
                pr_url = excluded.pr_url, rounds = excluded.rounds, verdict = excluded.verdict, checks = excluded.checks,
-               created = excluded.created, finished = excluded.finished, worker = excluded.worker, reviewer = excluded.reviewer",
+               created = excluded.created, finished = excluded.finished, worker = excluded.worker, reviewer = excluded.reviewer,
+               planning = excluded.planning, plan = excluded.plan",
             params![
                 r.id,
                 r.title,
@@ -313,6 +324,8 @@ impl History {
                 r.finished.map(|f| f as i64),
                 json(&r.worker),
                 json(&r.reviewer),
+                json(&r.planning),
+                r.plan.as_ref().map(|p| json(p)),
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -329,7 +342,7 @@ impl History {
         let e = |e: rusqlite::Error| e.to_string();
         let mut q = db
             .prepare(
-                "SELECT id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer
+                "SELECT id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan
                  FROM jobs WHERE source != 'null' ORDER BY id DESC LIMIT ?1",
             )
             .map_err(e)?;
@@ -359,6 +372,8 @@ impl History {
                     worker: serde_json::from_str(&text(19)?).unwrap_or_default(),
                     reviewer: serde_json::from_str(&text(20)?).unwrap_or_default(),
                     turns: Vec::new(),
+                    planning: serde_json::from_str(&text(21)?).unwrap_or_default(),
+                    plan: r.get::<_, Option<String>>(22)?.and_then(|p| serde_json::from_str(&p).ok()),
                 })
             })
             .map_err(e)?;
@@ -424,7 +439,7 @@ mod tests {
             staged_tree: None,
             status,
             forced: Some(AgentRef::Profile("second".into())),
-            decision: Some(Decision { agent: AgentKind::Codex, tier: Tier::Heavy, review: true, gates: vec![Gate { name: "effort".into(), answer: "heavy".into(), value: 0.9, sharp: true }], source: "rules".into(), ms: 3, note: String::new() }),
+            decision: Some(Decision { agent: AgentKind::Codex, tier: Tier::Heavy, review: true, gates: vec![Gate { name: "effort".into(), answer: "heavy".into(), value: 0.9, sharp: true }], source: "rules".into(), ms: 3, note: String::new(), plan: true }),
             worker,
             reviewer: Stage::default(),
             extra: Vec::new(),
@@ -443,6 +458,9 @@ mod tests {
             resume_from: None,
             inbox: Default::default(),
             steer: Cancel::new(),
+            planning: Planning::Always,
+            plan: Some(Plan { options: vec![crate::state::PlanOption { title: "a".into(), summary: "b".into(), recommended: true }], text: "t".into(), chosen: Some(crate::state::Choice::Own("mine".into())) }),
+            chose: Default::default(),
         }
     }
 

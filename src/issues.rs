@@ -3,7 +3,7 @@
 
 use crate::config::RepoCfg;
 use crate::orchestrator::{strip_verdict, Hub};
-use crate::state::{clip, Provider, Source};
+use crate::state::{clip, Planning, Provider, Source};
 use crate::team::{self, Claimed, Target};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -320,6 +320,7 @@ pub async fn poll_once(hub: &Hub) {
                                 Source::Pr { repo_idx: idx, repo: r.repo.clone(), number: i.number, url: i.url.clone(), head: i.head.clone(), base: if i.base.is_empty() { r.base.clone() } else { i.base.clone() } },
                                 r.path.clone(),
                                 None,
+                                Planning::IfRouted,
                             );
                         } else {
                             hub.submit(
@@ -328,6 +329,7 @@ pub async fn poll_once(hub: &Hub) {
                                 Source::Issue { repo_idx: idx, repo: r.repo.clone(), number: i.number, url: i.url.clone() },
                                 r.path.clone(),
                                 None,
+                                Planning::IfRouted,
                             );
                         }
                     }
@@ -641,10 +643,21 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
         }
         _ => "The review produced no verdict.".to_string(),
     };
+    // When the agent planned first, say which approach was taken and what else was on the table.
+    let plan = hub
+        .job(id, |j| {
+            let p = j.plan.as_ref()?;
+            let c = p.chosen.as_ref()?;
+            let others: Vec<String> = p.options.iter().enumerate().filter(|(i, _)| *c != crate::state::Choice::Option(*i)).map(|(_, o)| o.title.clone()).collect();
+            Some(format!("\n\nPlanned first: {}.{}", p.describe(c), if others.is_empty() { String::new() } else { format!(" Also proposed: {}.", others.join("; ")) }))
+        })
+        .flatten()
+        .unwrap_or_default();
     let body = format!(
-        "Closes #{}\n\n{}\n\n---\nOpened by forkdeck. Work by {}. {} {}",
+        "Closes #{}\n\n{}{}\n\n---\nOpened by forkdeck. Work by {}. {} {}",
         n,
         clip(&quiet(o.summary), 30_000),
+        quiet(&plan),
         worker,
         checks,
         verdict
