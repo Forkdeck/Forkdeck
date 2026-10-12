@@ -1,4 +1,4 @@
-//! Runs the `claude` and `codex` CLIs headless and turns their JSONL streams into stage updates.
+//! Runs the `claude`, `codex` and `copilot` CLIs headless and turns their JSONL streams into stage updates.
 
 use crate::orchestrator::Hub;
 use crate::state::{clip, AgentKind, Stage, StageState, Tier};
@@ -39,6 +39,10 @@ pub enum Parsed {
     Error(String),
     /// Shown in the output pane but never taken as the agent's answer.
     Note(String),
+    /// The account or provider refused this model. Before any tool ran, another model may be tried.
+    ModelRejected(String),
+    /// The account has no model it may use at all.
+    NoModels(String),
     Nothing,
 }
 
@@ -183,6 +187,33 @@ pub fn parse_codex(line: &str) -> Vec<Parsed> {
     vec![one]
 }
 
+pub fn parse_copilot(line: &str) -> Vec<Parsed> {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return vec![Parsed::Text(line.to_string())],
+    };
+    let s = |p: &str| v.pointer(p).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let n = |p: &str| v.pointer(p).and_then(|x| x.as_u64()).unwrap_or(0);
+    let one = match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        // A message that only asks for tools has no text; the tools arrive as their own events.
+        "assistant.message" if !s("/data/content").trim().is_empty() => Parsed::Text(s("/data/content")),
+        "tool.execution_start" => Parsed::Tool(tool_summary(&s("/data/toolName"), v.pointer("/data/arguments").unwrap_or(&Value::Null))),
+        "tool.execution_complete" if v.pointer("/data/success").and_then(|b| b.as_bool()) == Some(false) => {
+            Parsed::Note(format!("tool failed: {}", s("/data/error/message")))
+        }
+        "assistant.usage" => Parsed::Usage { tokens_in: n("/data/inputTokens"), tokens_out: n("/data/outputTokens") },
+        "model.call_failure" if s("/data/errorCode") == "model_not_supported" => Parsed::ModelRejected(s("/data/model")),
+        "session.error" if s("/data/message").contains("No model available") => Parsed::NoModels(s("/data/message")),
+        "session.error" => Parsed::Error(s("/data/message")),
+        "session.warning" => Parsed::Note(format!("warning: {}", s("/data/message"))),
+        "session.model_change" if !s("/data/cause").is_empty() => Parsed::Note(format!("model switched to {} ({})", s("/data/newModel"), s("/data/cause"))),
+        // The closing line. It carries no token counts; those come from the usage file.
+        "result" => Parsed::Final { ok: v.get("exitCode").and_then(|c| c.as_u64()) == Some(0), text: String::new(), tokens_in: 0, tokens_out: 0, cost: 0.0 },
+        _ => Parsed::Nothing,
+    };
+    vec![one]
+}
+
 pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     let (cmd, args, model, effort) = command_line(hub, &spec);
     let start = Instant::now();
@@ -275,6 +306,9 @@ async fn spawn_and_read(
     let mut final_ok: Option<bool> = None;
     let mut finished = false;
     let mut error = String::new();
+    let mut tools_seen = 0u32;
+    let mut rejected: Option<String> = None;
+    let mut no_models = false;
     let mut status: Option<std::io::Result<std::process::ExitStatus>> = None;
     loop {
         // Bytes, not lines(): one invalid UTF-8 sequence must not end the loop while the agent is still writing.
@@ -305,7 +339,8 @@ async fn spawn_and_read(
         }
         let parsed = match kind {
             AgentKind::Claude => parse_claude(line),
-            AgentKind::Codex | AgentKind::Copilot => parse_codex(line),
+            AgentKind::Codex => parse_codex(line),
+            AgentKind::Copilot => parse_copilot(line),
         };
         for p in parsed {
             hub.job(job, |j| {
@@ -329,12 +364,20 @@ async fn spawn_and_read(
                         s.tokens_in += *tokens_in;
                         s.tokens_out += *tokens_out;
                     }
-                    Parsed::Error(e) => s.push(format!("error: {}", e)),
+                    Parsed::Error(e) | Parsed::NoModels(e) => s.push(format!("error: {}", e)),
+                    Parsed::ModelRejected(m) => s.push(format!("error: model {} is not available to this account", m)),
                     Parsed::Nothing => {}
                 }
             });
             match p {
                 Parsed::Text(t) => last_text = t,
+                Parsed::Tool(_) => tools_seen += 1,
+                // Only a refusal before anything was done can be retried with another model.
+                Parsed::ModelRejected(m) if tools_seen == 0 => rejected = Some(m),
+                Parsed::NoModels(e) => {
+                    no_models = true;
+                    error = e;
+                }
                 Parsed::Final { ok, text, .. } => {
                     finished = true;
                     final_ok = Some(ok);
@@ -358,6 +401,13 @@ async fn spawn_and_read(
         None => child.wait().await,
     };
     let stderr_text = err_task.await.unwrap_or_default();
+    if stderr_text.contains("No model available") {
+        no_models = true;
+    }
+    if stderr_text.contains("The requested model is not supported") && tools_seen == 0 {
+        rejected.get_or_insert_with(String::new);
+    }
+    let _ = (rejected, no_models);
     let exit_ok = status.as_ref().map(|s| s.success()).unwrap_or(false);
     // A clean exit is not enough: the stream has to have reached its closing event.
     let ok = exit_ok && finished && final_ok.unwrap_or(true) && error.is_empty();
@@ -418,6 +468,57 @@ mod tests {
         assert_eq!(parse_codex(l), vec![Parsed::Note("warning: slow down".into())]);
         let l = r#"{"type":"turn.failed","error":{"message":"quota"}}"#;
         assert_eq!(parse_codex(l), vec![Parsed::Error("quota".into())]);
+    }
+
+    fn fixture(name: &str) -> Vec<Parsed> {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/copilot").join(name);
+        std::fs::read_to_string(p).unwrap().lines().filter(|l| !l.trim().is_empty()).flat_map(parse_copilot).filter(|p| *p != Parsed::Nothing).collect()
+    }
+
+    #[test]
+    fn copilot_worker_stream() {
+        assert_eq!(
+            fixture("worker.jsonl"),
+            vec![
+                Parsed::Tool("view /work/notes.txt".into()),
+                Parsed::Text("All good.\nVERDICT: PASS".into()),
+                Parsed::Final { ok: true, text: String::new(), tokens_in: 0, tokens_out: 0, cost: 0.0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn copilot_refused_model_stream() {
+        assert_eq!(
+            fixture("rejected.jsonl"),
+            vec![
+                Parsed::ModelRejected("fake-model".into()),
+                Parsed::Error("400 The requested model is not supported.".into()),
+                Parsed::Final { ok: false, text: String::new(), tokens_in: 0, tokens_out: 0, cost: 0.0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn copilot_other_lines() {
+        assert_eq!(parse_copilot("plain"), vec![Parsed::Text("plain".into())]);
+        assert_eq!(parse_copilot(r#"{"type":"model.call_start","data":{}}"#), vec![Parsed::Nothing]);
+        assert_eq!(parse_copilot(r#"{"type":"assistant.message_delta","data":{"deltaContent":"x"},"ephemeral":true}"#), vec![Parsed::Nothing]);
+        assert_eq!(parse_copilot(r#"{"type":"assistant.message","data":{"content":"","toolRequests":[{"name":"view"}]}}"#), vec![Parsed::Nothing]);
+        let l = r#"{"type":"tool.execution_complete","data":{"toolCallId":"1","success":false,"error":{"message":"denied"}}}"#;
+        assert_eq!(parse_copilot(l), vec![Parsed::Note("tool failed: denied".into())]);
+        assert_eq!(parse_copilot(r#"{"type":"session.warning","data":{"message":"slow","warningType":"x"}}"#), vec![Parsed::Note("warning: slow".into())]);
+        let l = r#"{"type":"session.model_change","data":{"newModel":"gpt-5.4","cause":"rate_limit_auto_switch"}}"#;
+        assert_eq!(parse_copilot(l), vec![Parsed::Note("model switched to gpt-5.4 (rate_limit_auto_switch)".into())]);
+        let l = r#"{"type":"assistant.usage","data":{"model":"m","inputTokens":5,"outputTokens":2},"ephemeral":true}"#;
+        assert_eq!(parse_copilot(l), vec![Parsed::Usage { tokens_in: 5, tokens_out: 2 }]);
+        let none = "No model available. Check policy enablement under GitHub Settings > Copilot";
+        let l = format!(r#"{{"type":"session.error","data":{{"errorType":"authorization","message":"{}"}}}}"#, none);
+        assert_eq!(parse_copilot(&l), vec![Parsed::NoModels(none.into())]);
+        let l = r#"{"type":"tool.execution_start","data":{"toolName":"bash","arguments":{"command":"cargo test\nmore"}}}"#;
+        assert_eq!(parse_copilot(l), vec![Parsed::Tool("bash cargo test".into())]);
+        let l = r#"{"type":"result","sessionId":"x","usage":{}}"#;
+        assert_eq!(parse_copilot(l), vec![Parsed::Final { ok: false, text: String::new(), tokens_in: 0, tokens_out: 0, cost: 0.0 }]);
     }
 
     #[test]
