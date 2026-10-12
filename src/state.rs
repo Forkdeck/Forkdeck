@@ -155,6 +155,8 @@ pub enum StageState {
 #[derive(Clone, Debug)]
 pub struct Stage {
     pub agent: Option<AgentKind>,
+    /// Set when the agent ran on another CLI: "copilot" standing in, or a "copilot:<name>" profile.
+    pub via: String,
     /// What the box shows when no agent runs in it (a deployment step).
     pub label: String,
     pub model: String,
@@ -174,6 +176,7 @@ impl Default for Stage {
     fn default() -> Self {
         Stage {
             agent: None,
+            via: String::new(),
             label: String::new(),
             model: String::new(),
             effort: String::new(),

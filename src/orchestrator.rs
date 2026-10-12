@@ -310,6 +310,14 @@ fn set_status(hub: &Hub, id: u32, s: JobStatus) {
     hub.job(id, |j| j.status = s);
 }
 
+/// Temporary bridge until workers and reviewers are chosen through `pick`.
+fn exec_of(hub: &Hub, k: AgentKind, tier: Tier) -> crate::pick::Exec {
+    let installed: std::collections::HashSet<AgentKind> = AgentKind::ALL.into_iter().collect();
+    let none = std::collections::HashSet::new();
+    let a = crate::pick::Avail { installed: &installed, enabled: None, no_seat: false, rejected: &none };
+    crate::pick::resolve(&hub.cfg, &a, &AgentRef::Kind(k), tier).expect("an installed CLI always resolves")
+}
+
 fn available(hub: &Hub) -> (bool, bool) {
     let st = hub.state.lock().unwrap();
     (st.have_claude, st.have_codex)
@@ -469,7 +477,7 @@ impl Refined {
 
 /// Run the worker once and take a snapshot of what it did.
 async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, cancel: &Cancel) -> Result<String, Finish> {
-    let out = agents::run(hub, id, Slot::Worker, RunSpec { kind: w.d.agent, tier: w.d.tier, prompt, dir: w.dir, read_only: false }).await;
+    let out = agents::run(hub, id, Slot::Worker, RunSpec { exec: &exec_of(hub, w.d.agent, w.d.tier), prompt, dir: w.dir, read_only: false }).await;
     if cancel.is_set() {
         return Err(cancelled());
     }
@@ -512,7 +520,7 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
             set_status(hub, id, JobStatus::Reviewing);
             let base = hub.job(id, |j| j.base_sha.clone()).flatten();
             let rp = review_prompt(w.prompt, base.as_deref(), w.followup);
-            let rev = agents::run(hub, id, Slot::Reviewer, RunSpec { kind: w.reviewer, tier: w.d.tier.up(), prompt: &rp, dir: w.dir, read_only: true }).await;
+            let rev = agents::run(hub, id, Slot::Reviewer, RunSpec { exec: &exec_of(hub, w.reviewer, w.d.tier.up()), prompt: &rp, dir: w.dir, read_only: true }).await;
             if cancel.is_set() {
                 return Err(cancelled());
             }
@@ -750,10 +758,11 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     set_status(hub, id, JobStatus::Reviewing);
     let prompt = pr_review_prompt(number, &title, &body, &base);
     let tier = d.tier.up();
-    let first = agents::run(hub, id, Slot::Worker, RunSpec { kind: reviewers[0], tier, prompt: &prompt, dir: &dir, read_only: true });
+    let first_exec = exec_of(hub, reviewers[0], tier);
+    let first = agents::run(hub, id, Slot::Worker, RunSpec { exec: &first_exec, prompt: &prompt, dir: &dir, read_only: true });
     let second = async {
         match reviewers.get(1) {
-            Some(k) => Some(agents::run(hub, id, Slot::Reviewer, RunSpec { kind: *k, tier, prompt: &prompt, dir: &dir, read_only: true }).await),
+            Some(k) => Some(agents::run(hub, id, Slot::Reviewer, RunSpec { exec: &exec_of(hub, *k, tier), prompt: &prompt, dir: &dir, read_only: true }).await),
             None => {
                 hub.job(id, |j| j.reviewer.state = StageState::Skipped);
                 None

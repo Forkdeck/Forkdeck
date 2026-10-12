@@ -1,9 +1,12 @@
 //! Runs the `claude`, `codex` and `copilot` CLIs headless and turns their JSONL streams into stage updates.
 
+use crate::config::Config;
 use crate::orchestrator::Hub;
-use crate::state::{clip, AgentKind, Stage, StageState, Tier};
+use crate::pick::Exec;
+use crate::state::{clip, AgentKind, Stage, StageState};
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use crate::proc;
@@ -16,17 +19,30 @@ pub enum Slot {
 }
 
 pub struct RunSpec<'a> {
-    pub kind: AgentKind,
-    pub tier: Tier,
+    pub exec: &'a Exec,
     pub prompt: &'a str,
     pub dir: &'a Path,
     pub read_only: bool,
 }
 
+#[derive(Default)]
 pub struct RunOut {
     pub ok: bool,
     pub text: String,
     pub error: String,
+    /// Copilot refused the model before doing anything (the model, or empty when only stderr said so).
+    pub rejected_model: Option<String>,
+    /// Copilot said the account has no model it may use.
+    pub no_models: bool,
+    /// The models that actually answered, from copilot's usage file.
+    pub models_used: Vec<String>,
+}
+
+pub struct CmdLine {
+    pub cmd: String,
+    pub args: Vec<String>,
+    /// Where copilot writes its usage statistics when it exits.
+    pub usage_file: Option<PathBuf>,
 }
 
 /// What one line of agent output means for the display.
@@ -48,39 +64,75 @@ pub enum Parsed {
 
 /// The prompt is not part of the command line: it is written to the agent's stdin, so its size
 /// and its first character (a leading `-` would read as an option) do not matter.
-pub fn command_line(hub: &Hub, spec: &RunSpec) -> (String, Vec<String>, String, String) {
-    let a = hub.cfg.agents.get(spec.kind);
-    let cmd = a.cmd.unwrap_or_else(|| spec.kind.name().to_string());
-    let model = a.models.map(|m| m.get(spec.tier).to_string()).unwrap_or_default();
-    let effort = a.efforts.map(|m| m.get(spec.tier).to_string()).unwrap_or_default();
+pub fn command_line(hub: &Hub, spec: &RunSpec) -> CmdLine {
+    let e = spec.exec;
+    let a = hub.cfg.agents.get(e.cli);
+    let cmd = a.cmd.unwrap_or_else(|| e.cli.name().to_string());
     let extra = if spec.read_only { a.review_args } else { a.write_args }.unwrap_or_default();
     let mut args: Vec<String> = Vec::new();
-    match spec.kind {
+    let mut usage_file = None;
+    match e.cli {
         AgentKind::Claude => {
             args.extend(["-p", "--output-format", "stream-json", "--verbose"].map(String::from));
-            if !model.is_empty() {
-                args.extend(["--model".to_string(), model.clone()]);
+            if !e.model.is_empty() {
+                args.extend(["--model".to_string(), e.model.clone()]);
             }
-            if !effort.is_empty() {
-                args.extend(["--effort".to_string(), effort.clone()]);
+            if !e.effort.is_empty() {
+                args.extend(["--effort".to_string(), e.effort.clone()]);
             }
             args.extend(extra);
         }
         AgentKind::Codex => {
             args.extend(["exec", "--json", "--skip-git-repo-check"].map(String::from));
-            if !model.is_empty() {
-                args.extend(["--model".to_string(), model.clone()]);
+            if !e.model.is_empty() {
+                args.extend(["--model".to_string(), e.model.clone()]);
             }
-            if !effort.is_empty() {
-                args.extend(["-c".to_string(), format!("model_reasoning_effort=\"{}\"", effort)]);
+            if !e.effort.is_empty() {
+                args.extend(["-c".to_string(), format!("model_reasoning_effort=\"{}\"", e.effort)]);
             }
             args.extend(extra);
             // "-" makes codex read the prompt from stdin.
             args.push("-".to_string());
         }
-        AgentKind::Copilot => {}
+        AgentKind::Copilot => {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let f = std::env::temp_dir().join(format!("forkdeck-copilot-usage-{}-{}.json", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            args = copilot_args(&hub.cfg, e, spec.read_only, &f);
+            usage_file = Some(f);
+        }
     }
-    (cmd, args, model, effort)
+    CmdLine { cmd, args, usage_file }
+}
+
+/// Arguments for one copilot run. The prompt goes to stdin, so it never needs `-p`. Tokens are not
+/// in its JSON output, so they come from the usage file it writes on exit.
+pub fn copilot_args(cfg: &Config, exec: &Exec, read_only: bool, usage: &Path) -> Vec<String> {
+    let a = cfg.agents.get(AgentKind::Copilot);
+    let mut args: Vec<String> = ["--output-format", "json", "--no-ask-user", "--no-auto-update", "--usage-output-file"].map(String::from).to_vec();
+    args.push(usage.display().to_string());
+    if !exec.model.is_empty() {
+        args.extend(["--model".to_string(), exec.model.clone()]);
+    }
+    if !exec.effort.is_empty() {
+        args.extend(["--reasoning-effort".to_string(), exec.effort.clone()]);
+    }
+    args.extend(if read_only { a.review_args } else { a.write_args }.unwrap_or_default());
+    args
+}
+
+/// Tokens in (cache reads and writes included) and out, and the models that ran, from copilot's usage file.
+pub fn read_usage(path: &Path) -> (u64, u64, Vec<String>) {
+    let Some(v) = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()) else {
+        return (0, 0, vec![]);
+    };
+    let (mut i, mut o, mut models) = (0, 0, vec![]);
+    for (name, m) in v.get("modelMetrics").and_then(|m| m.as_object()).into_iter().flatten() {
+        let n = |k: &str| m.pointer(&format!("/usage/{}", k)).and_then(|n| n.as_u64()).unwrap_or(0);
+        i += n("inputTokens") + n("cacheReadTokens") + n("cacheWriteTokens");
+        o += n("outputTokens");
+        models.push(name.clone());
+    }
+    (i, o, models)
 }
 
 fn first_line(s: &str) -> String {
@@ -215,9 +267,9 @@ pub fn parse_copilot(line: &str) -> Vec<Parsed> {
 }
 
 pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
-    let (cmd, args, model, effort) = command_line(hub, &spec);
+    let line = command_line(hub, &spec);
     let start = Instant::now();
-    let kind = spec.kind;
+    let e = spec.exec;
     let stage = |f: &mut dyn FnMut(&mut Stage)| {
         hub.job(job, |j| f(if slot == Slot::Worker { &mut j.worker } else { &mut j.reviewer }));
     };
@@ -225,30 +277,31 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
         let keep = std::mem::take(&mut s.tail);
         *s = Stage::default();
         s.tail = keep;
-        s.agent = Some(kind);
-        s.model = model.clone();
-        s.effort = effort.clone();
+        s.agent = Some(e.family);
+        s.via = e.via.clone().unwrap_or_default();
+        s.model = e.model.clone();
+        s.effort = e.effort.clone();
         s.state = StageState::Running;
         s.started = Some(start);
         s.last = "starting".into();
     });
     let cancel = match hub.job(job, |j| j.cancel.clone()) {
         Some(c) => c,
-        None => return RunOut { ok: false, text: String::new(), error: "job vanished".into() },
+        None => return RunOut { error: "job vanished".into(), ..Default::default() },
     };
 
     let out = if hub.cfg.demo {
         tokio::select! {
             o = crate::demo::run(hub, job, slot, &spec) => o,
-            _ = cancel.wait() => RunOut { ok: false, text: String::new(), error: "cancelled".into() },
+            _ = cancel.wait() => RunOut { error: "cancelled".into(), ..Default::default() },
         }
     } else {
         let limit = Duration::from_secs(hub.cfg.agents.timeout_mins.unwrap_or(45).clamp(1, 24 * 60) * 60);
         // Dropping the losing branch drops the process group guard, which kills the agent and its children.
         tokio::select! {
-            o = spawn_and_read(hub, job, slot, kind, &cmd, &args, spec.prompt, spec.dir) => o,
-            _ = cancel.wait() => RunOut { ok: false, text: String::new(), error: "cancelled".into() },
-            _ = tokio::time::sleep(limit) => RunOut { ok: false, text: String::new(), error: format!("timed out after {} min", limit.as_secs() / 60) },
+            o = spawn_and_read(hub, job, slot, e.cli, &line, spec.prompt, spec.dir) => o,
+            _ = cancel.wait() => RunOut { error: "cancelled".into(), ..Default::default() },
+            _ = tokio::time::sleep(limit) => RunOut { error: format!("timed out after {} min", limit.as_secs() / 60), ..Default::default() },
         }
     };
     stage(&mut |s| {
@@ -261,18 +314,9 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     out
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn spawn_and_read(
-    hub: &Hub,
-    job: u32,
-    slot: Slot,
-    kind: AgentKind,
-    cmd: &str,
-    args: &[String],
-    prompt: &str,
-    dir: &Path,
-) -> RunOut {
-    let fail = |e: String| RunOut { ok: false, text: String::new(), error: e };
+async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, kind: AgentKind, line: &CmdLine, prompt: &str, dir: &Path) -> RunOut {
+    let (cmd, args) = (line.cmd.as_str(), &line.args);
+    let fail = |e: String| RunOut { error: e, ..Default::default() };
     let mut child = match proc::command(cmd)
         .args(args)
         .current_dir(dir)
@@ -407,10 +451,22 @@ async fn spawn_and_read(
     if stderr_text.contains("The requested model is not supported") && tools_seen == 0 {
         rejected.get_or_insert_with(String::new);
     }
-    let _ = (rejected, no_models);
+    let mut models_used = Vec::new();
+    if let Some(f) = &line.usage_file {
+        let (tokens_in, tokens_out, models) = read_usage(f);
+        let _ = std::fs::remove_file(f);
+        if tokens_in + tokens_out > 0 {
+            hub.job(job, |j| {
+                let s = if slot == Slot::Worker { &mut j.worker } else { &mut j.reviewer };
+                s.tokens_in = tokens_in;
+                s.tokens_out = tokens_out;
+            });
+        }
+        models_used = models;
+    }
     let exit_ok = status.as_ref().map(|s| s.success()).unwrap_or(false);
     // A clean exit is not enough: the stream has to have reached its closing event.
-    let ok = exit_ok && finished && final_ok.unwrap_or(true) && error.is_empty();
+    let ok = exit_ok && finished && final_ok.unwrap_or(true) && error.is_empty() && rejected.is_none() && !no_models;
     if !ok && error.is_empty() {
         let tail: Vec<&str> = stderr_text.lines().rev().filter(|l| !l.trim().is_empty()).take(3).collect();
         let tail: Vec<&str> = tail.into_iter().rev().collect();
@@ -425,7 +481,8 @@ async fn spawn_and_read(
             }
         };
     }
-    RunOut { ok, text: final_text.filter(|t| !t.is_empty()).unwrap_or(last_text), error }
+    let text = final_text.filter(|t| !t.is_empty()).unwrap_or(last_text);
+    RunOut { ok, text, error, rejected_model: rejected, no_models, models_used }
 }
 
 pub async fn on_path(cmd: &str) -> bool {
@@ -519,6 +576,44 @@ mod tests {
         assert_eq!(parse_copilot(l), vec![Parsed::Tool("bash cargo test".into())]);
         let l = r#"{"type":"result","sessionId":"x","usage":{}}"#;
         assert_eq!(parse_copilot(l), vec![Parsed::Final { ok: false, text: String::new(), tokens_in: 0, tokens_out: 0, cost: 0.0 }]);
+    }
+
+    #[test]
+    fn copilot_command_lines() {
+        let cfg: Config = toml::from_str("").unwrap();
+        let exec = Exec {
+            asked: crate::state::AgentRef::Kind(AgentKind::Claude),
+            cli: AgentKind::Copilot,
+            family: AgentKind::Claude,
+            via: Some("copilot".into()),
+            model: "claude-sonnet-4.5".into(),
+            effort: "medium".into(),
+            vendor: crate::pick::Vendor::Anthropic,
+        };
+        let usage = Path::new("/tmp/u.json");
+        let has = |a: &[String], pair: [&str; 2]| a.windows(2).any(|p| p[0] == pair[0] && p[1] == pair[1]);
+        let w = copilot_args(&cfg, &exec, false, usage);
+        assert_eq!(&w[..6], ["--output-format", "json", "--no-ask-user", "--no-auto-update", "--usage-output-file", "/tmp/u.json"]);
+        assert!(has(&w, ["--model", "claude-sonnet-4.5"]) && has(&w, ["--reasoning-effort", "medium"]));
+        assert!(has(&w, ["--allow-tool", "write"]) && has(&w, ["--deny-tool", "shell"]));
+        assert!(!w.iter().any(|a| a == "-p" || a.contains("allow-all") || a == "--yolo"), "prompt on stdin, never allow-all: {:?}", w);
+        let r = copilot_args(&cfg, &exec, true, usage);
+        assert!(has(&r, ["--deny-tool", "write"]) && has(&r, ["--excluded-tools", "skill"]), "{:?}", r);
+        let bare = Exec { model: String::new(), effort: String::new(), ..exec };
+        assert!(!copilot_args(&cfg, &bare, false, usage).iter().any(|a| a == "--model" || a == "--reasoning-effort"));
+    }
+
+    #[test]
+    fn usage_file_gives_tokens_and_models() {
+        let dir = std::env::temp_dir().join(format!("forkdeck-usage-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("u.json");
+        std::fs::write(&p, r#"{"modelMetrics":{"claude-sonnet-4.5":{"usage":{"inputTokens":200,"outputTokens":14,"cacheReadTokens":50}},"gpt-5.4":{"usage":{"inputTokens":1,"outputTokens":1}}}}"#).unwrap();
+        let (i, o, mut m) = read_usage(&p);
+        m.sort();
+        assert_eq!((i, o, m), (251, 15, vec!["claude-sonnet-4.5".to_string(), "gpt-5.4".to_string()]));
+        assert_eq!(read_usage(&dir.join("missing.json")), (0, 0, vec![]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
