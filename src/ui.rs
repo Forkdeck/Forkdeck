@@ -804,6 +804,31 @@ mod tests {
     }
 
     #[test]
+    fn agent_output_survives_ingestion_and_wrapping() {
+        for role in ["worker", "reviewer"] {
+            for kind in 0..3 {
+                let text = format!("{} END_SENTINEL", "日本語 paragraph ".repeat(60));
+                let event = match kind {
+                    0 => crate::agents::Parsed::Text(text.clone()),
+                    1 => crate::agents::Parsed::Note(text.clone()),
+                    _ => crate::agents::Parsed::Tool(text.clone()),
+                };
+                let mut stage = Stage::default();
+                crate::agents::record_event(&mut stage, &event);
+                let expected = if kind == 2 { format!("▸ {text}") } else { text };
+                assert_eq!(stage.tail.back(), Some(&expected));
+                for width in [22, 40, 80] {
+                    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 6)).unwrap();
+                    term.draw(|f| output_panel(f, f.area(), role, &stage, GREEN)).unwrap();
+                    let visible = to_text(term.backend().buffer());
+                    assert!(visible.contains("END_SENTINEL"), "{visible}");
+                    assert!(!visible.contains('…'), "{visible}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn board_keeps_selected_older_job_visible_and_renders_small_terminals() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let hub = crate::orchestrator::Hub::new(crate::config::Config::default(), rt.handle().clone());

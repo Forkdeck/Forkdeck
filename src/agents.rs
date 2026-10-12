@@ -335,6 +335,32 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     out
 }
 
+pub(crate) fn record_event(s: &mut crate::state::Stage, p: &Parsed) {
+    match p {
+        Parsed::Text(t) | Parsed::Note(t) => {
+            for l in t.lines().filter(|l| !l.trim().is_empty()) {
+                s.push(l);
+            }
+        }
+        Parsed::Tool(t) => {
+            s.tools += 1;
+            s.push(format!("▸ {}", t));
+        }
+        Parsed::Final { tokens_in, tokens_out, cost, .. } => {
+            s.tokens_in = *tokens_in;
+            s.tokens_out = *tokens_out;
+            s.cost = *cost;
+        }
+        Parsed::Usage { tokens_in, tokens_out } => {
+            s.tokens_in += *tokens_in;
+            s.tokens_out += *tokens_out;
+        }
+        Parsed::Error(e) | Parsed::NoModels(e) => s.push(format!("error: {}", e)),
+        Parsed::ModelRejected(m) => s.push(format!("error: model {} is not available to this account", m)),
+        Parsed::Nothing => {}
+    }
+}
+
 async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, kind: AgentKind, line: &CmdLine, prompt: &str, dir: &Path) -> RunOut {
     let (cmd, args) = (line.cmd.as_str(), &line.args);
     let fail = |e: String| RunOut { error: e, ..Default::default() };
@@ -410,29 +436,7 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, kind: AgentKind, line: 
         for p in parsed {
             hub.job(job, |j| {
                 let s = j.stage(slot);
-                match &p {
-                    Parsed::Text(t) | Parsed::Note(t) => {
-                        for l in t.lines().filter(|l| !l.trim().is_empty()) {
-                            s.push(clip(l, 400));
-                        }
-                    }
-                    Parsed::Tool(t) => {
-                        s.tools += 1;
-                        s.push(format!("▸ {}", clip(t, 160)));
-                    }
-                    Parsed::Final { tokens_in, tokens_out, cost, .. } => {
-                        s.tokens_in = *tokens_in;
-                        s.tokens_out = *tokens_out;
-                        s.cost = *cost;
-                    }
-                    Parsed::Usage { tokens_in, tokens_out } => {
-                        s.tokens_in += *tokens_in;
-                        s.tokens_out += *tokens_out;
-                    }
-                    Parsed::Error(e) | Parsed::NoModels(e) => s.push(format!("error: {}", e)),
-                    Parsed::ModelRejected(m) => s.push(format!("error: model {} is not available to this account", m)),
-                    Parsed::Nothing => {}
-                }
+                record_event(s, &p);
             });
             match p {
                 Parsed::Text(t) => last_text = t,
