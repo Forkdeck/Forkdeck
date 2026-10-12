@@ -42,6 +42,9 @@ pub struct Ui {
     pub team: bool,
     /// Enter starts a new task even though a typed job is selected (Ctrl-N).
     pub new_task: bool,
+    /// The daily limits, to show next to what has been used. 0: none.
+    pub jobs_per_day: u32,
+    pub tokens_per_day: u64,
 }
 
 /// The selected job, when Enter would send what is typed to it as a reply.
@@ -257,6 +260,14 @@ fn left_panel(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
         if let Some(e) = &rp.last_error {
             lines.push(Line::from(Span::styled(format!("  {}", clip(e, w.saturating_sub(2))), fg(RED))));
         }
+        if let Some(h) = &rp.hold {
+            lines.push(Line::from(Span::styled(format!("  {}", clip(h, w.saturating_sub(2))), fg(ORANGE))));
+        }
+    }
+    if !st.repos.is_empty() && !ui.demo {
+        let of = |limit: u64| if limit == 0 { String::new() } else { format!("/{}", kilo(limit)) };
+        let used = format!("24 h: {}{} jobs · {}{} tok", st.spent.jobs, of(ui.jobs_per_day as u64), kilo(st.spent.tokens), of(ui.tokens_per_day));
+        lines.push(Line::from(Span::styled(format!("  {}", clip(&used, w.saturating_sub(2))), fg(DIM))));
     }
     f.render_widget(Paragraph::new(lines).block(boxed("queue", PURPLE)), area);
 }

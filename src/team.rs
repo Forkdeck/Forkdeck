@@ -643,7 +643,9 @@ pub fn attach(hub: &Hub, id: u32, held: Arc<Held>) {
             }
             // Never refresh a claim that is no longer the winning one: that would take the item
             // back from whoever has it now. Stop quietly instead; it is theirs.
-            match check(&hub, &held).await {
+            // A deployment is announced, not claimed: there is no holder to lose it to.
+            let now_stands = if held.what == "deployment" { Standing::Owned } else { check(&hub, &held).await };
+            match now_stands {
                 Standing::Owned => {}
                 Standing::Unavailable(e) => {
                     if !complained {
@@ -732,8 +734,12 @@ pub async fn announce(hub: &Hub, id: u32) {
         let by = me(hub, r.provider).await?;
         let t = now();
         let seen = read_claims(&comments(&r, &target).await?);
-        if let Some(other) = live(&seen, t, (hub.cfg.team.stale_mins * 60) as i64).into_iter().find(|s| !s.m.by.eq_ignore_ascii_case(&by)) {
+        let machine = machine_id();
+        // Another machine got here first. The deploy stage holds back a moment so that it does not start the same rollout twice.
+        if let Some(other) = live(&seen, t, (hub.cfg.team.stale_mins * 60) as i64).into_iter().find(|s| !s.m.by.eq_ignore_ascii_case(&by) || s.m.machine != machine) {
             hub.log("team", format!("{} {}: {}", r.repo, clip(&sha, 12), describe(other, t)));
+            let who = other.m.by.clone();
+            hub.job(id, |j| j.peer = Some(who));
         }
         let m = Marker { v: 1, id: new_id(), by, host: shown_host(hub, &r).await, machine: machine_id(), pid: std::process::id(), state: "active".into(), stage: "deploying".into(), started: t, beat: t, ..Marker::default() };
         let comment = post(&r, &target, &render(&m, "deployment")).await?;
