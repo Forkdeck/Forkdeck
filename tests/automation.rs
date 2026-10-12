@@ -22,6 +22,41 @@ case "$prompt" in
 esac
 "#;
 
+/// `copilot`, speaking its JSONL. `FAKE_COPILOT_REJECT` lists models to refuse the way GitHub does
+/// for a model the organisation has switched off, and `FAKE_COPILOT_TRUNCATE` makes a review stop
+/// before its closing line. Every run's arguments are appended to `$FAKE_GH/copilot.log`.
+const COPILOT: &str = r#"#!/bin/sh
+[ "$1" = "--version" ] && { echo "GitHub Copilot CLI stand-in"; exit 0; }
+[ "$1" = "--headless" ] && exit 1
+echo "$*" >> "$FAKE_GH/copilot.log"
+model=""; usage=""
+while [ $# -gt 0 ]; do
+  case "$1" in --model) model=$2; shift 2 ;; --usage-output-file) usage=$2; shift 2 ;; *) shift ;; esac
+done
+prompt=$(cat)
+for m in $FAKE_COPILOT_REJECT; do
+  if [ "$m" = "$model" ]; then
+    printf '%s\n' "{\"type\":\"model.call_failure\",\"data\":{\"model\":\"$model\",\"statusCode\":400,\"errorCode\":\"model_not_supported\"}}"
+    printf '%s\n' '{"type":"session.error","data":{"errorType":"query","message":"400 The requested model is not supported."}}'
+    printf '%s\n' '{"type":"result","exitCode":1,"usage":{"premiumRequests":0}}'
+    exit 1
+  fi
+done
+[ -n "$usage" ] && printf '{"modelMetrics":{"%s":{"usage":{"inputTokens":10,"outputTokens":2}}}}' "$model" > "$usage"
+case "$prompt" in
+  *"Do not modify any file"*)
+    printf '%s\n' "{\"type\":\"assistant.message\",\"data\":{\"content\":\"Looked at it.\\nVERDICT: ${FAKE_VERDICT:-PASS}\",\"model\":\"$model\"}}"
+    [ -n "$FAKE_COPILOT_TRUNCATE" ] && exit 0
+    ;;
+  *)
+    printf '%s\n' '{"type":"tool.execution_start","data":{"toolName":"edit","arguments":{"path":"by_agent.txt"}}}'
+    sh -c "${FAKE_WORK:-echo change >> by_agent.txt}" >/dev/null 2>&1
+    printf '%s\n' "{\"type\":\"assistant.message\",\"data\":{\"content\":\"Did the work.\",\"model\":\"$model\"}}"
+    ;;
+esac
+printf '%s\n' '{"type":"result","exitCode":0,"usage":{"premiumRequests":1}}'
+"#;
+
 /// `gh`. Lists come from files, everything else is appended to `calls.log`. `gh api` keeps
 /// comments as files under `$FAKE_GH/c/<path>/<id>.json` (what was posted), `.who` (the author),
 /// `.at` (when it last changed) and optionally `.assoc` (how the forge says the author relates to
@@ -135,13 +170,18 @@ fn git(dir: &Path, args: &[&str]) -> String {
 impl Rig {
     /// A remote with one commit on main, a clone of it, the stand-ins, and a config with one repo.
     fn new(name: &str, extra_config: &str, repo_config: &str) -> Rig {
+        Rig::with_agents(name, extra_config, repo_config, &[("claude", CLAUDE)])
+    }
+
+    /// Like `new`, with these agent stand-ins on PATH instead of `claude`.
+    fn with_agents(name: &str, extra_config: &str, repo_config: &str, agents: &[(&str, &str)]) -> Rig {
         let root = std::env::temp_dir().join(format!("forkdeck-test-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for d in ["bin", "gh", "mcp", "home/.config/forkdeck", "home/.local/state/forkdeck"] {
             fs::create_dir_all(root.join(d)).unwrap();
         }
         fs::write(root.join("home/.local/state/forkdeck/machine-id"), "0123456789abcdef\n").unwrap();
-        for (file, body) in [("claude", CLAUDE), ("gh", GH), ("mcp-stand-in", MCP)] {
+        for (file, body) in agents.iter().copied().chain([("gh", GH), ("mcp-stand-in", MCP)]) {
             let p = root.join("bin").join(file);
             fs::write(&p, body).unwrap();
             fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1346,4 +1386,84 @@ fn a_finished_item_cannot_be_put_back_in_the_queue_by_a_release() {
         assert!(!ok && out.contains("does not carry the label \"review:running\""), "{:?}: {}", extra, out);
     }
     assert!(!rig.calls().contains("label") && !rig.calls().contains("POST"), "{}", rig.calls());
+}
+
+/// Real `claude` or `codex` installed on the machine must not take part in the copilot tests.
+const NO_REAL_CLIS: &str = "[agents.claude]\ncmd = \"absent-claude\"\n[agents.codex]\ncmd = \"absent-codex\"\n";
+
+fn copilot_runs(rig: &Rig) -> Vec<String> {
+    fs::read_to_string(rig.root.join("gh/copilot.log")).unwrap_or_default().lines().map(String::from).collect()
+}
+
+fn model_of(run: &str) -> &str {
+    run.split("--model ").nth(1).and_then(|r| r.split(' ').next()).unwrap_or("")
+}
+
+#[test]
+fn with_only_copilot_work_and_review_come_from_different_vendors() {
+    let rig = Rig::with_agents("copilot-only", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    assert_eq!(runs.len(), 2, "{:?}", runs);
+    // Whichever part the router gave the work, the review comes from the other vendor.
+    let (work, review) = (model_of(&runs[0]), model_of(&runs[1]));
+    assert!(runs[0].contains("--allow-tool write") && runs[1].contains("--deny-tool write"), "{:?}", runs);
+    assert!((work.starts_with("claude-") && review.starts_with("gpt-")) || (work.starts_with("gpt-") && review.starts_with("claude-")), "{:?}", runs);
+    assert!(runs.iter().all(|r| !r.contains("allow-all") && !r.contains("--yolo")), "{:?}", runs);
+    assert!(rig.calls().contains("pr create"), "{}", rig.calls());
+    assert_eq!(git(&rig.origin(), &["show", "--name-only", "--format=", "forkdeck/issue-7"]), "by_agent.txt");
+}
+
+#[test]
+fn a_model_the_organisation_switched_off_is_skipped() {
+    let rig = Rig::with_agents("copilot-refused", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_COPILOT_REJECT", "claude-sonnet-5.5 claude-sonnet-5 gpt-5.5 gpt-5.4")]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    let workers: Vec<&str> = runs.iter().filter(|r| r.contains("--allow-tool write")).map(|r| model_of(r)).collect();
+    let claude = ["claude-sonnet-5.5", "claude-sonnet-5", "claude-sonnet-4.6"];
+    let codex = ["gpt-5.5", "gpt-5.4", "gpt-5.3-codex"];
+    assert!(workers == claude || workers == codex, "each refused model is tried once, then the next: {:?}", runs);
+    assert!(out.contains("is not available to this copilot account"), "{}", out);
+}
+
+#[test]
+fn with_codex_missing_copilot_plays_codex() {
+    let rig = Rig::with_agents("claude-and-copilot", "[agents.codex]\ncmd = \"absent-codex\"\n", "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    assert_eq!(runs.len(), 1, "claude does its own part, copilot only codex's: {:?}", runs);
+    assert!(model_of(&runs[0]).starts_with("gpt-"), "{}", runs[0]);
+}
+
+#[test]
+fn a_copilot_profile_reviews_pull_requests_next_to_claude() {
+    let extra = "[agents.codex]\ncmd = \"absent-codex\"\n[agents.copilot.profiles.second]\nvendor = \"xai\"\nmodels = { light = \"grok-4.7\", standard = \"grok-4.7\", heavy = \"grok-4.7\" }\n[review]\npr_reviewers = [\"claude\", \"copilot:second\"]";
+    let rig = Rig::with_agents("copilot-profile", extra, "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    assert_eq!(runs.len(), 1, "{:?}", runs);
+    assert_eq!(model_of(&runs[0]), "grok-4.7");
+    let calls = rig.calls();
+    assert!(calls.contains("copilot:second") && calls.contains("--add-label review:passed"), "{}", calls);
+}
+
+#[test]
+fn a_copilot_review_that_stops_early_is_not_a_pass() {
+    let rig = Rig::with_agents("copilot-truncated", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (_, out) = rig.once(&[("FAKE_COPILOT_TRUNCATE", "1")]);
+    let calls = rig.calls();
+    assert!(!calls.contains("review:passed"), "{}\n{}", calls, out);
+    assert!(calls.contains("--add-label review:ready"), "{}\n{}", calls, out);
+    assert!(out.contains("exited before reporting a result"), "it failed for the missing closing line: {}", out);
 }

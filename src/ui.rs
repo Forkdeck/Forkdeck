@@ -18,6 +18,7 @@ const ORANGE: Color = Color::Rgb(240, 136, 62);
 const GREEN: Color = Color::Rgb(63, 220, 150);
 const PURPLE: Color = Color::Rgb(150, 142, 240);
 const RED: Color = Color::Rgb(248, 81, 73);
+const BLUE: Color = Color::Rgb(110, 160, 255);
 const SEL: Color = Color::Rgb(38, 36, 72);
 
 const DASHED: border::Set = border::Set {
@@ -35,7 +36,7 @@ pub struct Ui {
     pub input: String,
     pub selected: Option<u32>,
     pub follow: bool,
-    pub forced: Option<AgentKind>,
+    pub forced: Option<AgentRef>,
     pub cwd: PathBuf,
     pub demo: bool,
     /// Show what teammates are working on in place of the agent tree.
@@ -63,6 +64,7 @@ fn agent_color(a: AgentKind) -> Color {
     match a {
         AgentKind::Claude => ORANGE,
         AgentKind::Codex => GREEN,
+        AgentKind::Copilot => BLUE,
     }
 }
 fn status_color(s: JobStatus) -> Color {
@@ -149,7 +151,18 @@ fn title_bar(f: &mut Frame, area: Rect, ui: &Ui) {
 }
 
 fn header(f: &mut Frame, area: Rect, st: &State) {
-    let mark = |ok: bool| if ok { "on call" } else { "missing" };
+    let chip = |k: AgentKind, own: Color| -> Span {
+        let (word, color) = if st.has(k) && (k != AgentKind::Copilot || st.copilot_usable()) {
+            ("ON CALL", own)
+        } else if k == AgentKind::Copilot && st.has(k) {
+            ("NO ACCESS", RED)
+        } else if k != AgentKind::Copilot && st.stand_in && st.copilot_usable() {
+            ("VIA COPILOT", BLUE)
+        } else {
+            ("MISSING", DIM)
+        };
+        Span::styled(format!("{} {}", k.name().to_uppercase(), word), bold(color))
+    };
     let jev = match (st.router.kind.as_str(), st.router.healthy) {
         ("rules", _) => "RULES ROUTER".to_string(),
         (_, Some(false)) => "JEV DOWN · RULES".to_string(),
@@ -158,9 +171,11 @@ fn header(f: &mut Frame, area: Rect, st: &State) {
     let top = Line::from(vec![
         Span::styled("  FORKDECK AGENT TREE", bold(BRIGHT)),
         Span::styled("   ·   ", fg(DIM)),
-        Span::styled(format!("CLAUDE {}", mark(st.have_claude).to_uppercase()), bold(if st.have_claude { ORANGE } else { DIM })),
+        chip(AgentKind::Claude, ORANGE),
         Span::styled("   ·   ", fg(DIM)),
-        Span::styled(format!("CODEX {}", mark(st.have_codex).to_uppercase()), bold(if st.have_codex { GREEN } else { DIM })),
+        chip(AgentKind::Codex, GREEN),
+        Span::styled("   ·   ", fg(DIM)),
+        chip(AgentKind::Copilot, BLUE),
         Span::styled("   ·   ", fg(DIM)),
         Span::styled(jev, bold(PURPLE)),
     ]);
@@ -169,6 +184,8 @@ fn header(f: &mut Frame, area: Rect, st: &State) {
         Span::styled("claude", fg(DIM)),
         Span::styled("    ■ ", fg(GREEN)),
         Span::styled("codex", fg(DIM)),
+        Span::styled("    ■ ", fg(BLUE)),
+        Span::styled("copilot", fg(DIM)),
         Span::styled("    ■ ", fg(PURPLE)),
         Span::styled("fork layer", fg(DIM)),
         Span::styled("    ■ ", fg(RED)),
@@ -450,7 +467,7 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
                 Line::from(Span::styled(format!(" {}", clip(l, w)), fg(c)))
             })
             .collect();
-        let who = s.agent.map(|a| a.name()).unwrap_or("idle");
+        let who = s.agent.map(|a| if s.via.is_empty() { a.name().to_string() } else { format!("{} via {}", a.name(), s.via) }).unwrap_or_else(|| "idle".into());
         f.render_widget(Paragraph::new(lines).block(boxed(&format!("{} output · {}", name, who), DIM)), r);
     }
 }
@@ -468,7 +485,7 @@ fn stage_box(f: &mut Frame, area: Rect, role: &str, s: &Stage) {
     lines.push(Line::from(Span::styled(role.to_string(), bold(BRIGHT))));
     match s.agent {
         Some(a) => {
-            let mut bits = vec![a.name().to_string()];
+            let mut bits = vec![if s.via.is_empty() { a.name().to_string() } else { format!("{} via {}", a.name(), s.via) }];
             if !s.model.is_empty() {
                 bits.push(s.model.clone());
             }
@@ -524,10 +541,10 @@ fn log_panel(f: &mut Frame, area: Rect, st: &State) {
 
 fn prompt(f: &mut Frame, area: Rect, ui: &Ui, reply: Option<u32>) {
     let dir = ui.cwd.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let forced = match (reply, ui.forced) {
+    let forced = match (reply, &ui.forced) {
         (Some(id), _) => Span::styled(format!("[reply to #{}] ", id), fg(GREEN)),
         (None, None) => Span::styled("[agent: auto] ", fg(DIM)),
-        (None, Some(a)) => Span::styled(format!("[agent: {}] ", a.name()), fg(agent_color(a))),
+        (None, Some(a)) => Span::styled(format!("[agent: {}] ", a.name()), fg(agent_color(a.kind()))),
     };
     let room = (area.width as usize).saturating_sub(dir.len() + 28);
     let shown: String = {

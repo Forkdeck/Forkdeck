@@ -3,7 +3,7 @@
 
 use crate::config::RepoCfg;
 use crate::orchestrator::{strip_verdict, Hub};
-use crate::state::{clip, AgentKind, Provider, Source};
+use crate::state::{clip, Provider, Source};
 use crate::team::{self, Claimed, Target};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -33,7 +33,7 @@ pub struct Outcome<'a> {
 }
 
 pub struct Review {
-    pub by: AgentKind,
+    pub by: String,
     pub verdict: Option<bool>,
     pub text: String,
 }
@@ -898,7 +898,7 @@ pub fn review_comment(rep: &Report, check_cmds: &[String]) -> String {
     }
     let each = (BODY_LIMIT - 5000) / rep.reviews.len().max(1);
     for r in rep.reviews {
-        out.push_str(&format!("#### {}: {}\n\n{}\n\n", r.by.name(), word(r.verdict), clip(&quiet(strip_verdict(&r.text).trim()), each)));
+        out.push_str(&format!("#### {}: {}\n\n{}\n\n", r.by, word(r.verdict), clip(&quiet(strip_verdict(&r.text).trim()), each)));
     }
     let mut out = clip(&out, BODY_LIMIT);
     if !rep.next.is_empty() {
@@ -1009,8 +1009,8 @@ mod tests {
     #[test]
     fn review_comment_shows_each_reviewer_and_never_claims_approval() {
         let reviews = vec![
-            Review { by: AgentKind::Claude, verdict: Some(true), text: "Looks right, thanks @alice.\nVERDICT: PASS".into() },
-            Review { by: AgentKind::Codex, verdict: Some(false), text: "src/a.rs:10 off by one\nVERDICT: FAIL".into() },
+            Review { by: "claude".into(), verdict: Some(true), text: "Looks right, thanks @alice.\nVERDICT: PASS".into() },
+            Review { by: "codex".into(), verdict: Some(false), text: "src/a.rs:10 off by one\nVERDICT: FAIL".into() },
         ];
         let checks = (true, String::new());
         let rep = Report { reviews: &reviews, checks: Some(&checks), overall: Overall::Changes, sha: "0123456789abcdef", steering: &[], next: "" };
@@ -1026,7 +1026,7 @@ mod tests {
 
     #[test]
     fn review_comment_flags_steering_files_and_keeps_logs_fenced() {
-        let reviews = vec![Review { by: AgentKind::Claude, verdict: Some(true), text: "@x ".repeat(80_000) }];
+        let reviews = vec![Review { by: "claude".into(), verdict: Some(true), text: "@x ".repeat(80_000) }];
         let checks = (false, "boom\n```\n# injected heading".to_string());
         let mut steering = vec!["CLAUDE.md".to_string()];
         steering.extend((0..5000).map(|i| format!(".claude/commands/{}.md", i)));
@@ -1039,7 +1039,7 @@ mod tests {
 
     #[test]
     fn incomplete_review_says_what_happens_next() {
-        let reviews = vec![Review { by: AgentKind::Claude, verdict: Some(true), text: "fine".into() }, Review { by: AgentKind::Codex, verdict: None, text: "The review did not complete: not logged in".into() }];
+        let reviews = vec![Review { by: "claude".into(), verdict: Some(true), text: "fine".into() }, Review { by: "codex".into(), verdict: None, text: "The review did not complete: not logged in".into() }];
         let next = next_words(Some(Duration::from_secs(120)));
         let rep = Report { reviews: &reviews, checks: None, overall: Overall::Incomplete, sha: "abcdef0123456789", steering: &[], next: &next };
         let c = review_comment(&rep, &[]);

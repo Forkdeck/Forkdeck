@@ -43,5 +43,5 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: &RunSpec<'_>) -> RunOut 
     } else {
         "The change is limited to the retry path and the new test covers it.\nVERDICT: PASS".to_string()
     };
-    RunOut { ok: true, text, error: String::new() }
+    RunOut { ok: true, text, ..Default::default() }
 }
