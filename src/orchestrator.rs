@@ -166,18 +166,34 @@ impl Hub {
     }
 
     pub async fn detect_agents(&self) {
-        let (c, x) = if self.cfg.demo {
-            (true, true)
+        let found = if self.cfg.demo {
+            [true, true, false]
         } else {
-            let cc = self.cfg.agents.get(AgentKind::Claude).cmd.unwrap_or_default();
-            let xc = self.cfg.agents.get(AgentKind::Codex).cmd.unwrap_or_default();
-            tokio::join!(agents::on_path(&cc), agents::on_path(&xc))
+            let [cc, xc, pc] = AgentKind::ALL.map(|k| self.cfg.agents.get(k).cmd.unwrap_or_default());
+            let (c, x, p) = tokio::join!(agents::on_path(&cc), agents::on_path(&xc), agents::on_path(&pc));
+            [c, x, p]
         };
+        let installed: std::collections::HashSet<AgentKind> = AgentKind::ALL.into_iter().zip(found).filter(|(_, f)| *f).map(|(k, _)| k).collect();
+        // Which models the account may use decides what copilot can stand in for, so ask before any job starts.
+        let probe = if installed.contains(&AgentKind::Copilot) { crate::copilot::probe(&self.cfg.agents.get(AgentKind::Copilot).cmd.unwrap_or_default()).await } else { Default::default() };
         let mut st = self.state.lock().unwrap();
-        st.have_claude = c;
-        st.have_codex = x;
-        if !c && !x {
-            st.log("agents", "neither claude nor codex was found on PATH");
+        st.installed = installed;
+        st.copilot = probe;
+        if st.has(AgentKind::Copilot) {
+            let who = st.copilot.login.clone().unwrap_or_else(|| "this account".into());
+            let note = match (&st.copilot.error, st.copilot.seat, &st.copilot.enabled) {
+                (Some(e), _, _) => format!("copilot: could not list models ({}); configured models are tried as they come", e),
+                (None, Some(false), _) => format!("copilot: {} has no Copilot access for the CLI; it will not be used", who),
+                (None, _, Some(m)) => format!("copilot: {} may use {} models", who, m.len()),
+                _ => String::new(),
+            };
+            if !note.is_empty() {
+                st.log("agents", note);
+            }
+        }
+        if !st.has(AgentKind::Claude) && !st.has(AgentKind::Codex) {
+            let usable = st.has(AgentKind::Copilot) && st.copilot.seat != Some(false);
+            st.log("agents", if usable { "claude and codex not found on PATH: copilot stands in for them" } else { "neither claude, codex nor a usable copilot was found on PATH" });
         }
     }
 }
@@ -320,7 +336,7 @@ fn exec_of(hub: &Hub, k: AgentKind, tier: Tier) -> crate::pick::Exec {
 
 fn available(hub: &Hub) -> (bool, bool) {
     let st = hub.state.lock().unwrap();
-    (st.have_claude, st.have_codex)
+    (st.has(AgentKind::Claude), st.has(AgentKind::Codex))
 }
 
 /// Ask the fork layer and record the answer on the job.

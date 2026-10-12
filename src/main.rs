@@ -1,6 +1,7 @@
 mod agents;
 mod cicd;
 mod config;
+mod copilot;
 mod demo;
 mod issues;
 mod mcp;

@@ -373,8 +373,12 @@ pub struct State {
     pub deploy_note: Option<String>,
     /// Deployments cancelled in this session (repo index, commit). They are not started again until forkdeck restarts.
     pub deploy_cancelled: HashSet<(usize, String)>,
-    pub have_claude: bool,
-    pub have_codex: bool,
+    /// The agent CLIs found on PATH.
+    pub installed: HashSet<AgentKind>,
+    /// What copilot said about the login and the account's models.
+    pub copilot: crate::copilot::Probe,
+    /// Models copilot refused in this session; they are not tried again until restart.
+    pub rejected_models: HashSet<String>,
     pub next_id: u32,
     pub team: TeamView,
 }
@@ -398,6 +402,10 @@ impl Source {
 }
 
 impl State {
+    pub fn has(&self, k: AgentKind) -> bool {
+        self.installed.contains(&k)
+    }
+
     fn active(&self, key: Key) -> bool {
         self.jobs.iter().any(|j| !j.status.finished() && j.source.key() == Some(key))
     }

@@ -149,9 +149,9 @@ fn header(f: &mut Frame, area: Rect, st: &State) {
     let top = Line::from(vec![
         Span::styled("  FORKDECK AGENT TREE", bold(BRIGHT)),
         Span::styled("   ·   ", fg(DIM)),
-        Span::styled(format!("CLAUDE {}", mark(st.have_claude).to_uppercase()), bold(if st.have_claude { ORANGE } else { DIM })),
+        Span::styled(format!("CLAUDE {}", mark(st.has(AgentKind::Claude)).to_uppercase()), bold(if st.has(AgentKind::Claude) { ORANGE } else { DIM })),
         Span::styled("   ·   ", fg(DIM)),
-        Span::styled(format!("CODEX {}", mark(st.have_codex).to_uppercase()), bold(if st.have_codex { GREEN } else { DIM })),
+        Span::styled(format!("CODEX {}", mark(st.has(AgentKind::Codex)).to_uppercase()), bold(if st.has(AgentKind::Codex) { GREEN } else { DIM })),
         Span::styled("   ·   ", fg(DIM)),
         Span::styled(jev, bold(PURPLE)),
     ]);
