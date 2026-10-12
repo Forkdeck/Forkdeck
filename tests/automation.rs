@@ -46,7 +46,10 @@ done
 [ -n "$usage" ] && printf '{"modelMetrics":{"%s":{"usage":{"inputTokens":10,"outputTokens":2}}}}' "$model" > "$usage"
 case "$prompt" in
   *"Do not modify any file"*)
-    printf '%s\n' "{\"type\":\"assistant.message\",\"data\":{\"content\":\"Looked at it.\\nVERDICT: ${FAKE_VERDICT:-PASS}\",\"model\":\"$model\"}}"
+    verdict=${FAKE_VERDICT:-PASS}
+    [ -n "$model" ] && [ "$model" = "$FAKE_COPILOT_FAIL_MODEL" ] && verdict=FAIL
+    printf '%s\n' "{\"type\":\"assistant.message\",\"data\":{\"content\":\"Looked at it.\\nVERDICT: $verdict\",\"model\":\"$model\"}}"
+    [ "$FAKE_COPILOT_TRUNCATE" = usage ] && printf '%s\n' "{\"type\":\"assistant.usage\",\"data\":{\"model\":\"$model\",\"inputTokens\":10,\"outputTokens\":2}}"
     [ -n "$FAKE_COPILOT_TRUNCATE" ] && exit 0
     ;;
   *)
@@ -1532,4 +1535,46 @@ fn a_typed_task_cut_off_by_a_stop_continues_its_own_conversation_later() {
     assert!(listed.contains("done") && !listed.contains("interrupted"), "{}", listed);
     let (ok, again) = rig.run(&["resume"], &[]);
     assert!(ok && again.contains("nothing to resume"), "{}", again);
+}
+
+#[test]
+fn a_copilot_review_that_reports_usage_but_no_result_is_not_a_pass() {
+    let rig = Rig::with_agents("copilot-usage-eof", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (_, out) = rig.once(&[("FAKE_COPILOT_TRUNCATE", "usage")]);
+    let calls = rig.calls();
+    assert!(!calls.contains("review:passed"), "{}\n{}", calls, out);
+    assert!(calls.contains("--add-label review:ready"), "{}\n{}", calls, out);
+    assert!(out.contains("exited before reporting a result"), "it failed for the missing closing line: {}", out);
+}
+
+#[test]
+fn every_configured_pull_request_reviewer_runs_and_a_third_fail_counts() {
+    let extra = "[agents.codex]\ncmd = \"absent-codex\"\n[agents.copilot.profiles.second]\nvendor = \"xai\"\nmodels = { light = \"grok-4.7\", standard = \"grok-4.7\", heavy = \"grok-4.7\" }\n[agents.copilot.profiles.third]\nvendor = \"google\"\nmodels = { light = \"gemini-3.8-pro\", standard = \"gemini-3.8-pro\", heavy = \"gemini-3.8-pro\" }\n[review]\npr_reviewers = [\"claude\", \"copilot:second\", \"copilot:third\"]";
+    let rig = Rig::with_agents("three-reviewers", extra, "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[("FAKE_COPILOT_FAIL_MODEL", "gemini-3.8-pro")]);
+    assert!(ok, "{}", out);
+    let mut models: Vec<String> = copilot_runs(&rig).iter().map(|r| model_of(r).to_string()).collect();
+    models.sort();
+    assert_eq!(models, ["gemini-3.8-pro", "grok-4.7"], "both copilot profiles ran");
+    let calls = rig.calls();
+    assert!(calls.contains("copilot:third") && calls.contains("--add-label review:changes"), "{}", calls);
+    assert!(!calls.contains("review:passed"), "{}", calls);
+}
+
+#[test]
+fn a_pinned_copilot_model_the_account_refuses_falls_back_to_the_cli_choice() {
+    let extra = format!("{}[agents.copilot]\nmodels = {{ light = \"gpt-5.5\", standard = \"gpt-5.5\", heavy = \"gpt-5.5\" }}\n[review]\npr_reviewers = [\"copilot\"]", NO_REAL_CLIS);
+    let rig = Rig::with_agents("copilot-pinned-refused", &extra, "", &[("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[("FAKE_COPILOT_REJECT", "gpt-5.5")]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    let models: Vec<&str> = runs.iter().map(|r| model_of(r)).collect();
+    assert_eq!(models, ["gpt-5.5", ""], "the refused pin is tried once, then the CLI picks: {:?}", runs);
+    assert!(rig.calls().contains("--add-label review:passed"), "{}", rig.calls());
 }

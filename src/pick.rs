@@ -112,7 +112,8 @@ pub fn resolve(cfg: &Config, a: &Avail, r: &AgentRef, tier: Tier) -> Option<Exec
                 return None;
             }
             let c = cfg.agents.get(AgentKind::Copilot);
-            let model = c.models.map(|m| m.get(tier).to_string()).unwrap_or_default();
+            // A pinned model the account may not use falls back to the CLI's own choice, once; it is never asked for again.
+            let model = c.models.map(|m| m.get(tier).to_string()).filter(|m| m.is_empty() || m == "auto" || a.usable(m)).unwrap_or_default();
             Some(Exec {
                 asked: r.clone(),
                 cli: AgentKind::Copilot,
@@ -268,6 +269,21 @@ mod tests {
         assert_eq!((e.model.as_str(), e.vendor.clone(), e.label()), ("grok-4.7", Vendor::Other("xai".into()), "copilot:second".to_string()));
         assert!(resolve(&c, &a, &second, Tier::Heavy).is_none(), "a tier without models");
         assert!(resolve(&c, &a, &AgentRef::Profile("nope".into()), Tier::Standard).is_none());
+    }
+
+    #[test]
+    fn a_pinned_copilot_model_obeys_policy_and_refusals() {
+        let c = cfg("[agents.copilot]\nmodels = { standard = \"gpt-5.5\" }");
+        let only = set(&[Copilot]);
+        let none = HashSet::new();
+        let a = Avail { installed: &only, enabled: None, no_seat: false, rejected: &none };
+        assert_eq!(resolve(&c, &a, &k(Copilot), Tier::Standard).unwrap().model, "gpt-5.5");
+        let enabled = set(&["gpt-5.4".to_string()]);
+        let a = Avail { installed: &only, enabled: Some(&enabled), no_seat: false, rejected: &none };
+        assert_eq!(resolve(&c, &a, &k(Copilot), Tier::Standard).unwrap().model, "", "switched off: the CLI chooses");
+        let rejected = set(&["gpt-5.5".to_string()]);
+        let a = Avail { installed: &only, enabled: None, no_seat: false, rejected: &rejected };
+        assert_eq!(resolve(&c, &a, &k(Copilot), Tier::Standard).unwrap().model, "", "refused once: never asked for again");
     }
 
     #[test]

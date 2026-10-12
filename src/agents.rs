@@ -16,6 +16,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 pub enum Slot {
     Worker,
     Reviewer,
+    /// A pull request reviewer past the second.
+    Extra(usize),
 }
 
 pub struct RunSpec<'a> {
@@ -354,7 +356,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     let start = Instant::now();
     let e = spec.exec;
     let stage = |f: &mut dyn FnMut(&mut Stage)| {
-        hub.job(job, |j| f(if slot == Slot::Worker { &mut j.worker } else { &mut j.reviewer }));
+        hub.job(job, |j| f(j.stage(slot)));
     };
     stage(&mut |s| {
         let keep = std::mem::take(&mut s.tail);
@@ -391,7 +393,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     // A run that was cancelled or timed out still had a conversation, and it can be continued.
     let mut out = out;
     if out.session.is_none() {
-        out.session = hub.job(job, |j| if slot == Slot::Worker { j.worker.session.clone() } else { j.reviewer.session.clone() }).flatten();
+        out.session = hub.job(job, |j| j.stage(slot).session.clone()).flatten();
     }
     stage(&mut |s| {
         s.elapsed = Some(start.elapsed());
@@ -478,7 +480,7 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, kind: AgentKind, line: 
         };
         for p in parsed {
             hub.job(job, |j| {
-                let s = if slot == Slot::Worker { &mut j.worker } else { &mut j.reviewer };
+                let s = j.stage(slot);
                 match &p {
                     Parsed::Text(t) | Parsed::Note(t) => {
                         for l in t.lines().filter(|l| !l.trim().is_empty()) {
@@ -507,7 +509,7 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, kind: AgentKind, line: 
                 Parsed::Text(t) => last_text = t,
                 Parsed::Tool(_) => tools_seen += 1,
                 Parsed::Session(id) => {
-                    hub.job(job, |j| if slot == Slot::Worker { j.worker.session = Some(id.clone()) } else { j.reviewer.session = Some(id.clone()) });
+                    hub.job(job, |j| j.stage(slot).session = Some(id.clone()));
                     session = Some(id)
                 }
                 // Only a refusal before anything was done can be retried with another model.
@@ -525,9 +527,12 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, kind: AgentKind, line: 
                     final_text = Some(text);
                 }
                 Parsed::Usage { .. } => {
-                    // A turn that completed supersedes an error reported earlier in the stream (a retry that worked).
-                    finished = true;
+                    // A model call that completed supersedes an error reported earlier in the stream (a retry that worked).
                     error.clear();
+                    // Codex's turn.completed ends the run. Copilot reports usage per model call; only its result line ends the run.
+                    if kind == AgentKind::Codex {
+                        finished = true;
+                    }
                 }
                 Parsed::Error(e) => error = e,
                 _ => {}
@@ -551,7 +556,7 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, kind: AgentKind, line: 
         let _ = std::fs::remove_file(f);
         if tokens_in + tokens_out > 0 {
             hub.job(job, |j| {
-                let s = if slot == Slot::Worker { &mut j.worker } else { &mut j.reviewer };
+                let s = j.stage(slot);
                 s.tokens_in = tokens_in;
                 s.tokens_out = tokens_out;
             });
