@@ -91,7 +91,10 @@ reviewer = "other"     # other: the CLI that did not do the work | same
 # With reviewer = "other": the first of these that is available and runs a model
 # from a different vendor than the worker's reviews.
 reviewer_order = ["claude", "codex"]
-max_fix_rounds = 1
+# Fix rounds after a failed review or failed checks. The worker addresses each
+# failure until the review passes; this only caps runaway loops. It also stops
+# early when a fix changes nothing.
+max_fix_rounds = 5
 # Commands run after the worker finishes a task typed into the prompt. A failing
 # command goes back to the worker as a fix round. Repositories list their own below.
 checks = []

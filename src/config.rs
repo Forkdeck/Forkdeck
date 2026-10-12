@@ -326,6 +326,8 @@ pub struct ReviewCfg {
     /// Who reviews when `reviewer` is "other": the first one that is available and runs a model
     /// from a different vendor than the worker's.
     pub reviewer_order: Vec<AgentRef>,
+    /// How many times a failed review or failed checks go back to the worker. It keeps fixing
+    /// until the review passes; this only caps runaway loops.
     pub max_fix_rounds: u32,
     /// Shell commands run after the worker finishes a typed task. Repositories have their own list.
     pub checks: Vec<String>,
@@ -345,7 +347,7 @@ impl Default for ReviewCfg {
             mode: "auto".into(),
             reviewer: "other".into(),
             reviewer_order: vec![AgentRef::Kind(AgentKind::Claude), AgentRef::Kind(AgentKind::Codex)],
-            max_fix_rounds: 1,
+            max_fix_rounds: 5,
             checks: vec![],
             check_timeout_mins: 20,
             pr_reviewers: vec![AgentRef::Kind(AgentKind::Claude), AgentRef::Kind(AgentKind::Codex)],

@@ -18,7 +18,19 @@ case "$prompt" in
     ;;
   *"Do not modify any file"*)
     [ -n "$FAKE_DURING_REVIEW" ] && PROMPT="$prompt" sh -c "$FAKE_DURING_REVIEW" >/dev/null 2>&1
-    printf '%s\n' "{\"type\":\"result\",\"is_error\":false,\"result\":\"Looked at it.\\nVERDICT: ${FAKE_VERDICT:-PASS}\"}"
+    # Reviews are counted: FAKE_VERDICTS gives one verdict per review in turn (PASS after the
+    # list), FAKE_REVIEW_CRASH=1 crashes the first review (=always: every one), and
+    # FAKE_REVIEW_NOVERDICT=1 leaves the verdict out of the first.
+    n=$(cat "$FAKE_GH/reviews" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_GH/reviews"
+    [ "$FAKE_REVIEW_CRASH" = always ] && { echo "reviewer crashed" >&2; exit 1; }
+    [ "$n" = 1 ] && [ -n "$FAKE_REVIEW_CRASH" ] && { echo "reviewer crashed" >&2; exit 1; }
+    if [ "$n" = 1 ] && [ -n "$FAKE_REVIEW_NOVERDICT" ]; then
+      printf '%s\n' '{"type":"result","is_error":false,"result":"Looked at it, it seems fine."}'
+      exit 0
+    fi
+    v=${FAKE_VERDICT:-PASS}
+    [ -n "$FAKE_VERDICTS" ] && { v=$(echo "$FAKE_VERDICTS" | cut -d' ' -f"$n"); [ -n "$v" ] || v=PASS; }
+    printf '%s\n' "{\"type\":\"result\",\"is_error\":false,\"result\":\"Looked at it.\\nVERDICT: $v\"}"
     ;;
   *)
     sh -c "${FAKE_WORK:-echo change >> by_agent.txt}" >/dev/null 2>&1
@@ -1487,7 +1499,7 @@ fn a_fix_round_continues_the_workers_own_conversation() {
     let rig = Rig::new("session", "", "");
     rig.issue();
     let log = rig.root.join("args.log");
-    let (_, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_ARGS", log.to_str().unwrap())]);
+    let (_, out) = rig.once(&[("FAKE_VERDICTS", "FAIL PASS"), ("FAKE_ARGS", log.to_str().unwrap())]);
     let runs: Vec<String> = fs::read_to_string(&log).unwrap().lines().map(String::from).collect();
     let workers: Vec<&String> = runs.iter().filter(|r| r.contains("acceptEdits")).collect();
     let reviews: Vec<&String> = runs.iter().filter(|r| r.contains("--permission-mode plan")).collect();
@@ -1755,3 +1767,68 @@ fn an_issue_the_router_wants_planned_takes_the_recommended_option_and_says_so() 
     let calls = rig.calls();
     assert!(calls.contains("Planned first: option 2: Rewrite it. Also proposed: Patch it."), "{}", calls);
 }
+
+fn reviews_run(rig: &Rig) -> u32 {
+    fs::read_to_string(rig.root.join("gh/reviews")).map(|n| n.trim().parse().unwrap_or(0)).unwrap_or(0)
+}
+
+#[test]
+fn a_failed_review_goes_back_to_the_worker_until_it_passes() {
+    let rig = Rig::new("fix-until-pass", "", "");
+    rig.issue();
+    let log = rig.root.join("args.log");
+    let (ok, out) = rig.once(&[("FAKE_VERDICTS", "FAIL FAIL PASS"), ("FAKE_ARGS", log.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    let workers = fs::read_to_string(&log).unwrap().lines().filter(|l| l.contains("acceptEdits")).count();
+    assert_eq!((workers, reviews_run(&rig)), (3, 3), "work, then a fix for each failed review: {}", out);
+    assert!(out.contains("fix round 2 of 5"), "{}", out);
+    assert!(rig.calls().contains("pr create"), "{}", rig.calls());
+}
+
+#[test]
+fn fixing_stops_at_the_cap_and_says_so() {
+    let rig = Rig::new("fix-cap", "[review]\nmax_fix_rounds = 2", "");
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_VERDICT", "FAIL")]);
+    assert!(!ok, "{}", out);
+    assert_eq!(reviews_run(&rig), 3);
+    assert!(out.contains("review still failing after 2 fix rounds"), "{}", out);
+}
+
+#[test]
+fn a_fix_that_changes_nothing_ends_the_rounds() {
+    let rig = Rig::new("fix-stalled", "", "");
+    rig.issue();
+    // Every attempt writes the same file with the same content: after the first, nothing changes.
+    let (ok, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_WORK", "echo same > by_agent.txt")]);
+    assert!(!ok, "{}", out);
+    assert_eq!(reviews_run(&rig), 1, "no second review of an unchanged tree: {}", out);
+    assert!(out.contains("the last fix changed nothing"), "{}", out);
+}
+
+#[test]
+fn a_reviewer_that_crashes_is_asked_again() {
+    let rig = Rig::new("review-crash-once", "", "");
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_REVIEW_CRASH", "1")]);
+    assert!(ok, "{}", out);
+    assert!(out.contains("gave no verdict") && out.contains("asking again"), "{}", out);
+    assert_eq!(reviews_run(&rig), 2);
+
+    let rig = Rig::new("review-crash-always", "", "");
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_REVIEW_CRASH", "always")]);
+    assert!(!ok && out.contains("reviewer failed"), "{}", out);
+    assert_eq!(reviews_run(&rig), 2, "asked once more, not forever");
+}
+
+#[test]
+fn a_review_without_a_verdict_is_asked_for_one() {
+    let rig = Rig::new("review-noverdict", "", "");
+    rig.issue();
+    let log = rig.root.join("prompts.log");
+    let (ok, out) = rig.once(&[("FAKE_REVIEW_NOVERDICT", "1"), ("FAKE_PROMPTS", log.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    assert!(fs::read_to_string(&log).unwrap().contains("Your previous review ended without a verdict."));
+}
+

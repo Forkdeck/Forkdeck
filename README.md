@@ -47,8 +47,10 @@ the config names commands to run.
    failure goes back to the worker with the output.
 4. **Review.** An agent running another vendor's model reads the diff, read-only, and ends with
    `VERDICT: PASS` or `VERDICT: FAIL`. It sees the task and the tree, not the
-   worker's summary. A fail goes back to the worker, up to
-   `review.max_fix_rounds` times. Only the last line of the review counts as
+   worker's summary. A fail goes back to the worker with the review, and the
+   worker keeps addressing it until the review passes. `review.max_fix_rounds`
+   (5) only caps runaway loops, and fixing also stops when a fix changes
+   nothing. A reviewer that crashes or gives no verdict is asked once more. Only the last line of the review counts as
    the verdict, so one quoted from a description or a code comment is ignored,
    and no verdict is never treated as a pass.
 

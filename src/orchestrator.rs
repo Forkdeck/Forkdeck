@@ -807,14 +807,27 @@ struct Refined {
     checks_ok: Option<bool>,
     passed: Option<bool>,
     reasons: String,
+    /// Fix rounds that were run.
+    rounds: u32,
+    /// The last fix round left the tree as it was.
+    stalled: bool,
 }
 
 impl Refined {
     fn why_not(&self) -> String {
+        // How the fixing ended, when there was any.
+        let after = if self.stalled {
+            " and the last fix changed nothing".to_string()
+        } else if self.rounds > 0 {
+            format!(" after {} fix round{}", self.rounds, if self.rounds == 1 { "" } else { "s" })
+        } else {
+            String::new()
+        };
         if self.checks_ok == Some(false) {
-            format!("checks failed: {}", clip(self.reasons.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(""), 200))
+            format!("checks failed{}: {}", after, clip(self.reasons.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or(""), 200))
         } else if self.passed == Some(false) {
-            format!("review did not pass: {}", clip(&first_para(&strip_verdict(&self.reasons)), 240))
+            let still = if self.rounds > 0 && !self.stalled { "review still failing" } else { "review did not pass" };
+            format!("{}{}: {}", still, after, clip(&first_para(&strip_verdict(&self.reasons)), 240))
         } else {
             format!("review gave no verdict: {}", clip(&self.reasons, 200))
         }
@@ -1024,11 +1037,34 @@ async fn messages_round(hub: &Hub, id: u32, w: &Work<'_>, cancel: &Cancel) -> Re
 }
 
 /// Checks, then review by the other CLI. Either can send the work back, a bounded number of times.
+/// A fingerprint of the work as it stands: the staged tree of an issue job, or the changes in a
+/// typed task's directory. None when it cannot be told (then fixing is never cut short).
+async fn tree_state(hub: &Hub, id: u32, w: &Work<'_>) -> Option<String> {
+    if hub.cfg.demo {
+        return None;
+    }
+    if w.is_issue {
+        return hub.job(id, |j| j.staged_tree.clone()).flatten();
+    }
+    let status = issues::sh("git", &["status", "--porcelain", "--untracked-files=all"], Some(w.dir)).await.ok()?;
+    let diff = issues::sh("git", &["diff", "HEAD"], Some(w.dir)).await.ok()?;
+    // Untracked files show by name only; their content counts too.
+    let mut untracked = String::new();
+    for f in status.lines().filter_map(|l| l.strip_prefix("?? ")) {
+        untracked.push_str(&std::fs::read_to_string(w.dir.join(f)).unwrap_or_default());
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (status, diff, untracked).hash(&mut h);
+    Some(format!("{:x}", h.finish()))
+}
+
 async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &Cancel) -> Result<Refined, Finish> {
     let mut passed: Option<bool>;
     let mut checks_ok: Option<bool> = None;
     let mut reasons = String::new();
     let mut round = 0;
+    let mut stalled = false;
     loop {
         let mut feedback: Option<String> = None;
         // Results from an earlier round say nothing about the tree as it is now.
@@ -1053,7 +1089,19 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
             // What the user asked after the task belongs to it: the reviewer must not take it for scope creep.
             let task = hub.job(id, |j| with_later_requests(w.prompt, &j.turns)).unwrap_or_else(|| w.prompt.to_string());
             let rp = review_prompt(&task, base.as_deref(), w.followup);
-            let (rev, ran) = run_agent(hub, id, Slot::Reviewer, w.reviewer.clone(), w.d.tier.up(), &rp, w.dir, true, None).await;
+            let (mut rev, mut ran) = run_agent(hub, id, Slot::Reviewer, w.reviewer.clone(), w.d.tier.up(), &rp, w.dir, true, None).await;
+            // A review that crashed, timed out or ended without a verdict says nothing about the change: ask once more.
+            let unanswered = |r: &RunOut| !r.interrupted && (!r.ok || parse_verdict(&r.text).is_none());
+            if unanswered(&rev) && !cancel.is_set() {
+                let why = if rev.ok { "no VERDICT line".to_string() } else { clip(&rev.error, 120) };
+                hub.log("review", format!("#{} {} gave no verdict ({}), asking again", id, ran.label(), why));
+                let again = if rev.ok {
+                    format!("{}\n\nYour previous review ended without a verdict. Finish with VERDICT: PASS or VERDICT: FAIL alone on the last line.", rp)
+                } else {
+                    rp.clone()
+                };
+                (rev, ran) = run_agent(hub, id, Slot::Reviewer, w.reviewer.clone(), w.d.tier.up(), &again, w.dir, true, None).await;
+            }
             if cancel.is_set() {
                 return Err(cancelled());
             }
@@ -1097,14 +1145,23 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
         round += 1;
         hub.job(id, |j| j.rounds = round);
         set_status(hub, id, JobStatus::Fixing);
+        hub.log("review", format!("#{} sent back, fix round {} of {}", id, round, hub.cfg.review.max_fix_rounds));
+        let again = if round > 1 { format!(" This is fix round {}: the problems are not all solved yet. Address every point below, not only the new ones.", round) } else { String::new() };
         let fp = format!(
-            "{}\n\nYour previous attempt is in this working tree and was sent back. Address the points below, then summarise what you changed.\n\n{}",
-            w.prompt, fb
+            "{}\n\nYour previous attempt is in this working tree and was sent back.{} Address the points below, then summarise what you changed.\n\n{}",
+            w.prompt, again, fb
         );
+        let before = tree_state(hub, id, w).await;
         summary = work_once(hub, id, w, &fp, None, cancel).await?;
+        // A fix that changed nothing would get the same verdict again: stop instead of going round.
+        if before.is_some() && before == tree_state(hub, id, w).await {
+            hub.log("review", format!("#{} the fix changed nothing, stopping", id));
+            stalled = true;
+            break;
+        }
     }
     let good = checks_ok != Some(false) && (!w.d.review || passed == Some(true));
-    Ok(Refined { summary, good, checks_ok, passed, reasons })
+    Ok(Refined { summary, good, checks_ok, passed, reasons, rounds: round, stalled })
 }
 
 async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish {
@@ -1705,6 +1762,16 @@ pub fn parse_verdict(text: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_outcome_says_how_the_fixing_ended() {
+        let r = |rounds, stalled, checks_ok| Refined { summary: String::new(), good: false, checks_ok, passed: Some(false), reasons: "src/a.rs:3 still wrong\nVERDICT: FAIL".into(), rounds, stalled };
+        assert_eq!(r(0, false, None).why_not(), "review did not pass: src/a.rs:3 still wrong");
+        assert_eq!(r(1, false, None).why_not(), "review still failing after 1 fix round: src/a.rs:3 still wrong");
+        assert_eq!(r(5, false, None).why_not(), "review still failing after 5 fix rounds: src/a.rs:3 still wrong");
+        assert_eq!(r(2, true, None).why_not(), "review did not pass and the last fix changed nothing: src/a.rs:3 still wrong");
+        assert!(r(3, false, Some(false)).why_not().starts_with("checks failed after 3 fix rounds: "));
+    }
 
     #[test]
     fn later_requests_go_to_the_reviewer() {
