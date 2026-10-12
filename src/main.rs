@@ -16,7 +16,7 @@ mod ui;
 use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use orchestrator::Hub;
-use state::{AgentKind, JobStatus, Provider, Source};
+use state::{AgentKind, AgentRef, JobStatus, Provider, Source};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -48,7 +48,7 @@ struct Cli {
 enum Cmd {
     /// Run one task without the interface and print progress
     Run {
-        /// Force an agent: claude or codex
+        /// Force an agent: claude, codex, copilot or copilot:<profile>
         #[arg(long)]
         agent: Option<String>,
         task: Vec<String>,
@@ -114,12 +114,8 @@ enum McpCmd {
     },
 }
 
-fn parse_agent(s: &str) -> anyhow::Result<AgentKind> {
-    match s {
-        "claude" => Ok(AgentKind::Claude),
-        "codex" => Ok(AgentKind::Codex),
-        other => anyhow::bail!("unknown agent {:?}: use claude or codex", other),
-    }
+fn parse_agent(s: &str) -> anyhow::Result<AgentRef> {
+    AgentRef::parse(s).map_err(anyhow::Error::msg)
 }
 
 /// Print without panicking when the terminal or pipe has gone away: a panic here would skip the shutdown.
@@ -260,7 +256,7 @@ async fn stop_signal() {
     }
 }
 
-async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentKind>) -> i32 {
+async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentRef>) -> i32 {
     let title = state::clip(&task, 80);
     let id = hub.submit(title, task, Source::Manual, cwd, forced);
     // The agent runs in its own process group, so a signal sent to us has to be passed on by hand.
@@ -648,10 +644,12 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                             u.follow = true;
                         }
                         KeyCode::Tab => {
-                            u.forced = match u.forced {
-                                None => Some(AgentKind::Claude),
-                                Some(AgentKind::Claude) => Some(AgentKind::Codex),
-                                Some(AgentKind::Codex) | Some(AgentKind::Copilot) => None,
+                            // Profiles are for --agent and the config; Tab steps through the CLIs.
+                            u.forced = match u.forced.as_ref().map(|r| r.kind()) {
+                                None => Some(AgentRef::Kind(AgentKind::Claude)),
+                                Some(AgentKind::Claude) => Some(AgentRef::Kind(AgentKind::Codex)),
+                                Some(AgentKind::Codex) => Some(AgentRef::Kind(AgentKind::Copilot)),
+                                Some(AgentKind::Copilot) => None,
                             }
                         }
                         KeyCode::Up | KeyCode::Down => {
@@ -668,7 +666,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                             let task = u.input.trim().to_string();
                             if !task.is_empty() {
                                 u.input.clear();
-                                let id = hub.submit(state::clip(&task, 80), task, Source::Manual, cwd.clone(), u.forced);
+                                let id = hub.submit(state::clip(&task, 80), task, Source::Manual, cwd.clone(), u.forced.clone());
                                 u.selected = Some(id);
                                 u.follow = false;
                             }

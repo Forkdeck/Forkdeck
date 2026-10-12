@@ -36,7 +36,7 @@ pub struct Ui {
     pub input: String,
     pub selected: Option<u32>,
     pub follow: bool,
-    pub forced: Option<AgentKind>,
+    pub forced: Option<AgentRef>,
     pub cwd: PathBuf,
     pub demo: bool,
     /// Show what teammates are working on in place of the agent tree.
@@ -515,9 +515,9 @@ fn log_panel(f: &mut Frame, area: Rect, st: &State) {
 
 fn prompt(f: &mut Frame, area: Rect, ui: &Ui) {
     let dir = ui.cwd.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let forced = match ui.forced {
+    let forced = match &ui.forced {
         None => Span::styled("[agent: auto] ", fg(DIM)),
-        Some(a) => Span::styled(format!("[agent: {}] ", a.name()), fg(agent_color(a))),
+        Some(a) => Span::styled(format!("[agent: {}] ", a.name()), fg(agent_color(a.kind()))),
     };
     let room = (area.width as usize).saturating_sub(dir.len() + 24);
     let shown: String = {

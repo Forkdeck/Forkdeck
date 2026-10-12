@@ -296,7 +296,7 @@ pub struct Job {
     /// Tree of the agent's work as last staged. Only this tree may be committed.
     pub staged_tree: Option<String>,
     pub status: JobStatus,
-    pub forced: Option<AgentKind>,
+    pub forced: Option<AgentRef>,
     pub decision: Option<Decision>,
     pub worker: Stage,
     pub reviewer: Stage,
