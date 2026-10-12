@@ -649,7 +649,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                             u.forced = match u.forced {
                                 None => Some(AgentKind::Claude),
                                 Some(AgentKind::Claude) => Some(AgentKind::Codex),
-                                Some(AgentKind::Codex) => None,
+                                Some(AgentKind::Codex) | Some(AgentKind::Copilot) => None,
                             }
                         }
                         KeyCode::Up | KeyCode::Down => {

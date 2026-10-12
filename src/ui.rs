@@ -18,6 +18,7 @@ const ORANGE: Color = Color::Rgb(240, 136, 62);
 const GREEN: Color = Color::Rgb(63, 220, 150);
 const PURPLE: Color = Color::Rgb(150, 142, 240);
 const RED: Color = Color::Rgb(248, 81, 73);
+const BLUE: Color = Color::Rgb(110, 160, 255);
 const SEL: Color = Color::Rgb(38, 36, 72);
 
 const DASHED: border::Set = border::Set {
@@ -52,6 +53,7 @@ fn agent_color(a: AgentKind) -> Color {
     match a {
         AgentKind::Claude => ORANGE,
         AgentKind::Codex => GREEN,
+        AgentKind::Copilot => BLUE,
     }
 }
 fn status_color(s: JobStatus) -> Color {

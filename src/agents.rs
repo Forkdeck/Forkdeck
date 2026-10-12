@@ -74,6 +74,7 @@ pub fn command_line(hub: &Hub, spec: &RunSpec) -> (String, Vec<String>, String, 
             // "-" makes codex read the prompt from stdin.
             args.push("-".to_string());
         }
+        AgentKind::Copilot => {}
     }
     (cmd, args, model, effort)
 }
@@ -304,7 +305,7 @@ async fn spawn_and_read(
         }
         let parsed = match kind {
             AgentKind::Claude => parse_claude(line),
-            AgentKind::Codex => parse_codex(line),
+            AgentKind::Codex | AgentKind::Copilot => parse_codex(line),
         };
         for p in parsed {
             hub.job(job, |j| {

@@ -106,6 +106,8 @@ impl AgentsCfg {
         let (cfg, def) = match k {
             AgentKind::Claude => (&self.claude, AgentCfg::claude()),
             AgentKind::Codex => (&self.codex, AgentCfg::codex()),
+            // Replaced by [agents.copilot] in the configuration change.
+            AgentKind::Copilot => (&self.claude, AgentCfg::claude()),
         };
         AgentCfg {
             cmd: cfg.cmd.clone().or(def.cmd),
