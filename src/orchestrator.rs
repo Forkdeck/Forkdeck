@@ -99,7 +99,7 @@ impl Hub {
             st.jobs.push(Job {
                 id,
                 title: title.clone(),
-                prompt,
+                prompt: prompt.clone(),
                 source,
                 workdir,
                 branch: None,
@@ -120,6 +120,7 @@ impl Hub {
                 cancel: Cancel::new(),
                 claim: None,
                 released: false,
+                turns: vec![Turn { ask: prompt, answer: String::new() }],
             });
             if stopping {
                 // Shutting down: the job exists so the caller has an id, but it never starts and claims nothing.
@@ -135,6 +136,38 @@ impl Hub {
         let hub = self.clone();
         self.rt.spawn(async move { run_job(hub, id).await });
         id
+    }
+
+    /// Send a follow-up message to a finished typed task. The agent picks up in the same working
+    /// tree and is given the conversation so far. Err says why it was not taken.
+    pub fn reply(&self, id: u32, text: String) -> Result<(), String> {
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.stopping {
+                return Err("shutting down".into());
+            }
+            let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return Err("no such job".into()) };
+            if !j.source.is_manual() {
+                return Err("only typed tasks take replies".into());
+            }
+            if !j.status.finished() {
+                return Err("still running, wait for it or cancel it with Ctrl-X".into());
+            }
+            j.turns.push(Turn { ask: text.clone(), answer: String::new() });
+            j.status = JobStatus::Queued;
+            j.finished = None;
+            j.outcome.clear();
+            j.verdict = None;
+            j.checks = None;
+            j.rounds = 0;
+            j.cancel = Cancel::new();
+            j.worker.push(format!("› {}", clip(&text, 300)));
+            j.reviewer.state = StageState::Idle;
+            st.log("queue", format!("#{} reply: {}", id, clip(&text, 90)));
+        }
+        let hub = self.clone();
+        self.rt.spawn(async move { run_job(hub, id).await });
+        Ok(())
     }
 
     pub fn cancel(&self, id: u32) {
@@ -212,9 +245,9 @@ fn cancelled() -> Finish {
 }
 
 pub async fn run_job(hub: Hub, id: u32) {
-    let Some((manual, is_pr, is_deploy, cancel)) =
-        hub.job(id, |j| (j.source.is_manual(), matches!(j.source, Source::Pr { .. }), matches!(j.source, Source::Deploy { .. }), j.cancel.clone()))
-    else {
+    let Some((manual, is_pr, is_deploy, cancel, reply)) = hub.job(id, |j| {
+        (j.source.is_manual(), matches!(j.source, Source::Pr { .. }), matches!(j.source, Source::Deploy { .. }), j.cancel.clone(), j.turns.len() > 1)
+    }) else {
         return;
     };
     let fin = {
@@ -232,6 +265,8 @@ pub async fn run_job(hub: Hub, id: u32) {
                     team::announce(&hub, id).await;
                     let (status, outcome) = cicd::deploy_run(&hub, id, &cancel).await;
                     Finish { status, outcome, retry: None, reported: true, wait: None }
+                } else if manual && reply {
+                    followup(&hub, id, &cancel).await
                 } else if is_pr {
                     pr_pipeline(&hub, id, &cancel).await
                 } else {
@@ -601,10 +636,12 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
         Ok(s) => s,
         Err(f) => return f,
     };
+    record_answer(hub, id, &summary);
     let r = match refine(hub, id, &w, summary, cancel).await {
         Ok(r) => r,
         Err(f) => return f,
     };
+    record_answer(hub, id, &r.summary);
     if cancel.is_set() {
         return cancelled();
     }
@@ -688,6 +725,90 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
             return ci_gave_up(hub, id, format!("the pull request is open and its CI failed. The fix could not be pushed: {}", e)).await;
         }
     }
+}
+
+fn record_answer(hub: &Hub, id: u32, text: &str) {
+    hub.job(id, |j| {
+        if let Some(t) = j.turns.last_mut() {
+            t.answer = text.to_string();
+        }
+    });
+}
+
+/// How many earlier exchanges a reply carries along, and how much of each answer.
+const CHAT_TURNS: usize = 8;
+const CHAT_ANSWER_CHARS: usize = 3000;
+
+/// The prompt for the latest turn: the conversation so far, then what the user says now.
+fn chat_prompt(turns: &[Turn]) -> String {
+    let Some((now, before)) = turns.split_last() else { return String::new() };
+    let skipped = before.len().saturating_sub(CHAT_TURNS);
+    let mut out = String::from(
+        "You are continuing a conversation with the user about work in this working tree. Earlier in it:\n\n",
+    );
+    if skipped > 0 {
+        out.push_str(&format!("(the first {} exchange(s) are left out)\n\n", skipped));
+    }
+    for t in &before[skipped..] {
+        out.push_str(&format!("User: {}\n\nYou: {}\n\n", t.ask, if t.answer.is_empty() { "(no result)".to_string() } else { clip(&t.answer, CHAT_ANSWER_CHARS) }));
+    }
+    out.push_str(&format!(
+        "The user now says:\n{}\n\nDo what they ask in this working tree, then summarise what you changed or answer their question.",
+        now.ask
+    ));
+    out
+}
+
+/// A reply to a typed task: the same agent, in the same tree, with the conversation as context.
+async fn followup(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
+    let Some((turns, dir, forced, known, checks)) = hub.job(id, |j| (j.turns.clone(), j.workdir.clone(), j.forced, j.decision.clone(), hub.cfg.review.checks.clone())) else {
+        return failed("job vanished");
+    };
+    let task = match (turns.first(), turns.last()) {
+        (Some(first), Some(last)) => format!("{}\n\nFollow-up request: {}", first.ask, last.ask),
+        _ => return failed("job has no conversation"),
+    };
+    let d = match known {
+        Some(d) => d,
+        None => match decide(hub, id, &task, false, forced).await {
+            Ok(d) => d,
+            Err(f) => return f,
+        },
+    };
+    let (have_c, have_x) = available(hub);
+    let has = |a: AgentKind| if a == AgentKind::Claude { have_c } else { have_x };
+    if !has(d.agent) && !hub.cfg.demo {
+        return failed(format!("{} is not installed", d.agent.name()));
+    }
+    let reviewer = if hub.cfg.review.reviewer == "other" && has(d.agent.other()) { d.agent.other() } else { d.agent };
+    if !d.review {
+        hub.job(id, |j| j.reviewer.state = StageState::Skipped);
+    }
+    if cancel.is_set() {
+        return cancelled();
+    }
+    let have_base = hub.job(id, |j| j.base_sha.is_some()).unwrap_or(false);
+    if !have_base && !hub.cfg.demo {
+        if let Ok(sha) = issues::sh("git", &["rev-parse", "--verify", "HEAD^{commit}"], Some(&dir)).await {
+            hub.job(id, |j| j.base_sha = Some(sha.clone()));
+        }
+    }
+    let w = Work { prompt: &task, dir: &dir, d: &d, reviewer, checks: &checks, is_issue: false, followup: None };
+    set_status(hub, id, JobStatus::Working);
+    let summary = match work_once(hub, id, &w, &chat_prompt(&turns), cancel).await {
+        Ok(s) => s,
+        Err(f) => return f,
+    };
+    record_answer(hub, id, &summary);
+    let r = match refine(hub, id, &w, summary, cancel).await {
+        Ok(r) => r,
+        Err(f) => return f,
+    };
+    record_answer(hub, id, &r.summary);
+    if cancel.is_set() {
+        return cancelled();
+    }
+    if r.good { done(clip(&first_para(&r.summary), 300)) } else { failed(r.why_not()) }
 }
 
 /// CI did not come good: say so on the pull request and hand the issue to a person. The pull request stays open.
@@ -940,6 +1061,18 @@ pub fn parse_verdict(text: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_prompt_carries_earlier_turns() {
+        let t = |a: &str, b: &str| Turn { ask: a.into(), answer: b.into() };
+        let p = chat_prompt(&[t("add a flag", "added --x"), t("rename it", "")]);
+        assert!(p.contains("User: add a flag") && p.contains("You: added --x"));
+        assert!(p.ends_with("summarise what you changed or answer their question."));
+        assert!(p.contains("The user now says:\nrename it"));
+        let many: Vec<Turn> = (0..12).map(|i| t(&format!("q{}", i), "a")).collect();
+        let p = chat_prompt(&many);
+        assert!(p.contains("the first 3 exchange(s) are left out") && !p.contains("User: q2\n") && p.contains("User: q3\n"));
+    }
 
     #[test]
     fn verdicts() {

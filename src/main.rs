@@ -550,7 +550,7 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
 }
 
 fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
-    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false }
+    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false, new_task: false }
 }
 
 fn sync_selection(hub: &Hub, u: &mut ui::Ui) {
@@ -636,6 +636,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                             }
                         }
                         KeyCode::Char('t') if ctrl => u.team = !u.team,
+                        KeyCode::Char('n') if ctrl => u.new_task = !u.new_task,
                         KeyCode::Char('u') if ctrl => u.input.clear(),
                         KeyCode::Char(c) if !ctrl => u.input.push(c),
                         KeyCode::Backspace => {
@@ -665,10 +666,22 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                         KeyCode::Enter => {
                             let task = u.input.trim().to_string();
                             if !task.is_empty() {
-                                u.input.clear();
-                                let id = hub.submit(state::clip(&task, 80), task, Source::Manual, cwd.clone(), u.forced);
-                                u.selected = Some(id);
-                                u.follow = false;
+                                let target = ui::reply_target(&hub.state.lock().unwrap(), &u);
+                                match target {
+                                    // A typed job is selected: carry on its conversation.
+                                    Some(id) => match hub.reply(id, task) {
+                                        Ok(()) => u.input.clear(),
+                                        // Keep what was typed so it can be sent once the job is done.
+                                        Err(why) => hub.log("queue", format!("#{} not sent: {}", id, why)),
+                                    },
+                                    None => {
+                                        u.input.clear();
+                                        let id = hub.submit(state::clip(&task, 80), task, Source::Manual, cwd.clone(), u.forced);
+                                        u.selected = Some(id);
+                                        u.follow = false;
+                                        u.new_task = false;
+                                    }
+                                }
                             }
                         }
                         _ => {}

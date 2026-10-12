@@ -228,6 +228,14 @@ impl Cancel {
     }
 }
 
+/// One exchange in a typed task's conversation: what the user asked and what the agent said back.
+#[derive(Clone, Debug)]
+pub struct Turn {
+    pub ask: String,
+    /// Empty until the turn has produced a result.
+    pub answer: String,
+}
+
 pub struct Job {
     pub id: u32,
     pub title: String,
@@ -257,6 +265,8 @@ pub struct Job {
     pub claim: Option<Arc<crate::team::Held>>,
     /// A teammate handed the item back to the queue: stop without touching its labels.
     pub released: bool,
+    /// The conversation so far. The first turn is the task itself; each reply adds one.
+    pub turns: Vec<Turn>,
 }
 
 pub struct LogLine {

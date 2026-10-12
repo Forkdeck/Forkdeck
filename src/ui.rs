@@ -40,6 +40,17 @@ pub struct Ui {
     pub demo: bool,
     /// Show what teammates are working on in place of the agent tree.
     pub team: bool,
+    /// Enter starts a new task even though a typed job is selected (Ctrl-N).
+    pub new_task: bool,
+}
+
+/// The selected job, when Enter would send what is typed to it as a reply.
+pub fn reply_target(st: &State, ui: &Ui) -> Option<u32> {
+    if ui.new_task {
+        return None;
+    }
+    let id = ui.selected?;
+    st.jobs.iter().find(|j| j.id == id && j.source.is_manual()).map(|j| j.id)
 }
 
 fn fg(c: Color) -> Style {
@@ -121,7 +132,7 @@ pub fn draw(f: &mut Frame, st: &State, ui: &Ui) {
         None => empty_tree(f, cols[1]),
     }
     log_panel(f, rows[3], st);
-    prompt(f, rows[4], ui);
+    prompt(f, rows[4], ui, reply_target(st, ui));
     status(f, rows[5], st);
 }
 
@@ -511,13 +522,14 @@ fn log_panel(f: &mut Frame, area: Rect, st: &State) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn prompt(f: &mut Frame, area: Rect, ui: &Ui) {
+fn prompt(f: &mut Frame, area: Rect, ui: &Ui, reply: Option<u32>) {
     let dir = ui.cwd.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let forced = match ui.forced {
-        None => Span::styled("[agent: auto] ", fg(DIM)),
-        Some(a) => Span::styled(format!("[agent: {}] ", a.name()), fg(agent_color(a))),
+    let forced = match (reply, ui.forced) {
+        (Some(id), _) => Span::styled(format!("[reply to #{}] ", id), fg(GREEN)),
+        (None, None) => Span::styled("[agent: auto] ", fg(DIM)),
+        (None, Some(a)) => Span::styled(format!("[agent: {}] ", a.name()), fg(agent_color(a))),
     };
-    let room = (area.width as usize).saturating_sub(dir.len() + 24);
+    let room = (area.width as usize).saturating_sub(dir.len() + 28);
     let shown: String = {
         let n = ui.input.chars().count();
         ui.input.chars().skip(n.saturating_sub(room)).collect()

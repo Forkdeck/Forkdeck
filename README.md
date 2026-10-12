@@ -19,7 +19,8 @@ can be a server on your own machine.
 cargo install --git https://github.com/forkdeck/forkdeck
 ```
 
-You need at least one of `claude` and `codex` on your PATH. With only one, it
+You need at least one of `claude` and `codex` on your PATH. Adding the GitHub Copilot CLI
+as a third agent is planned: see [docs/copilot-plan.md](docs/copilot-plan.md). With only one, it
 also reviews its own work. Issue automation needs `gh` and/or `glab`, logged in.
 
 ```
@@ -524,13 +525,19 @@ back by hand, or with `forkdeck team release`.
 
 | | |
 |---|---|
-| `Enter` | run the typed task in the current directory |
+| `Enter` | with a typed task selected, send what you typed to it as a follow-up; otherwise run it as a new task in the current directory |
+| `Ctrl-N` | make the next `Enter` start a new task instead of replying |
 | `Tab` | force the next task to claude, codex, or back to auto |
 | `↑` `↓` | select a job; `Esc` goes back to following the newest |
 | `Ctrl-A` | issue and pull request polling on/off |
 | `Ctrl-T` | show what teammates are working on, and back |
 | `Ctrl-X` | cancel the selected job |
 | `Ctrl-C` | quit, stopping any running agent |
+
+A typed task keeps its conversation: once it has finished, select it (`↑` `↓`) and
+type a follow-up. The same agent continues in the same tree, is given the earlier
+exchanges, and its change goes through the checks and review again. A job that is
+still running does not take a reply yet.
 
 Typed tasks share the current directory, so they run one at a time. Issue and
 review jobs each have a worktree and run `automation.max_parallel` at once.
