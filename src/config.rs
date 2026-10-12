@@ -1,4 +1,4 @@
-use crate::state::{AgentKind, Provider, Tier};
+use crate::state::{AgentKind, AgentRef, Provider, Tier};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -100,21 +100,140 @@ impl Default for RulesCfg {
 pub struct AgentsCfg {
     pub claude: AgentCfg,
     pub codex: AgentCfg,
+    pub copilot: CopilotCfg,
     pub timeout_mins: Option<u64>,
+}
+
+/// `[agents.copilot]`: the CLI's own settings plus the profiles it can run.
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct CopilotCfg {
+    pub cmd: Option<String>,
+    /// Models for `copilot` itself (forced with --agent copilot). May be "auto".
+    pub models: Option<Tiers>,
+    pub efforts: Option<Tiers>,
+    pub write_args: Option<Vec<String>>,
+    pub review_args: Option<Vec<String>>,
+    /// Run the `claude` and `codex` profiles on copilot when that CLI is not installed.
+    pub stand_in: Option<bool>,
+    pub profiles: HashMap<String, ProfileCfg>,
+}
+
+impl CopilotCfg {
+    pub fn stand_in(&self) -> bool {
+        self.stand_in.unwrap_or(true)
+    }
+}
+
+/// A set of models copilot runs under one name, used as `copilot:<name>`.
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfileCfg {
+    /// Needed when the model IDs do not say it (claude-* is anthropic, gpt-* and o<digit>* openai).
+    pub vendor: Option<String>,
+    pub models: Option<TierLists>,
+    pub efforts: Option<Tiers>,
+}
+
+/// A model preference list per tier: the first one the account allows is used.
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TierLists {
+    pub light: Option<OneOrMany>,
+    pub standard: Option<OneOrMany>,
+    pub heavy: Option<OneOrMany>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            OneOrMany::One(s) => vec![s.clone()],
+            OneOrMany::Many(v) => v.clone(),
+        }
+    }
+}
+
+impl TierLists {
+    pub fn get(&self, t: Tier) -> Vec<String> {
+        match t {
+            Tier::Light => &self.light,
+            Tier::Standard => &self.standard,
+            Tier::Heavy => &self.heavy,
+        }
+        .as_ref()
+        .map(|l| l.to_vec())
+        .unwrap_or_default()
+    }
+    fn of(l: &[&str], s: &[&str], h: &[&str]) -> TierLists {
+        let m = |v: &[&str]| Some(OneOrMany::Many(v.iter().map(|x| x.to_string()).collect()));
+        TierLists { light: m(l), standard: m(s), heavy: m(h) }
+    }
+    fn over(self, d: TierLists) -> TierLists {
+        TierLists { light: self.light.or(d.light), standard: self.standard.or(d.standard), heavy: self.heavy.or(d.heavy) }
+    }
+    fn all(&self) -> Vec<String> {
+        [Tier::Light, Tier::Standard, Tier::Heavy].into_iter().flat_map(|t| self.get(t)).collect()
+    }
+}
+
+/// The stand-in profiles. IDs follow GitHub's documented pattern (gpt-5.4, claude-haiku-4.5);
+/// which of them an account may use is checked when they run, and a missing one is skipped.
+fn builtin_profile(name: &str) -> Option<ProfileCfg> {
+    let models = match name {
+        "claude" => TierLists::of(
+            &["claude-haiku-5.5", "claude-haiku-4.5"],
+            &["claude-sonnet-5.5", "claude-sonnet-5", "claude-sonnet-4.6", "claude-sonnet-4.5"],
+            &["claude-opus-5.5", "claude-opus-5", "claude-opus-4.8"],
+        ),
+        "codex" => TierLists::of(
+            &["gpt-5.4-mini", "gpt-5-mini", "gpt-5.3-codex"],
+            &["gpt-5.5", "gpt-5.4", "gpt-5.3-codex"],
+            &["gpt-5.5", "gpt-5.4", "gpt-5.3-codex"],
+        ),
+        _ => return None,
+    };
+    Some(ProfileCfg { vendor: None, models: Some(models), efforts: Tiers::of("low", "medium", "high") })
 }
 
 impl AgentsCfg {
     pub fn get(&self, k: AgentKind) -> AgentCfg {
         let (cfg, def) = match k {
-            AgentKind::Claude => (&self.claude, AgentCfg::claude()),
-            AgentKind::Codex => (&self.codex, AgentCfg::codex()),
+            AgentKind::Claude => (self.claude.clone(), AgentCfg::claude()),
+            AgentKind::Codex => (self.codex.clone(), AgentCfg::codex()),
+            AgentKind::Copilot => {
+                let c = &self.copilot;
+                let cfg = AgentCfg { cmd: c.cmd.clone(), models: c.models.clone(), efforts: c.efforts.clone(), write_args: c.write_args.clone(), review_args: c.review_args.clone() };
+                (cfg, AgentCfg::copilot())
+            }
         };
         AgentCfg {
-            cmd: cfg.cmd.clone().or(def.cmd),
-            models: Some(cfg.models.clone().unwrap_or_default().over(def.models)),
-            efforts: Some(cfg.efforts.clone().unwrap_or_default().over(def.efforts)),
-            write_args: cfg.write_args.clone().or(def.write_args),
-            review_args: cfg.review_args.clone().or(def.review_args),
+            cmd: cfg.cmd.or(def.cmd),
+            models: Some(cfg.models.unwrap_or_default().over(def.models)),
+            efforts: Some(cfg.efforts.unwrap_or_default().over(def.efforts)),
+            write_args: cfg.write_args.or(def.write_args),
+            review_args: cfg.review_args.or(def.review_args),
+        }
+    }
+
+    /// A copilot profile, the built-in values under the user's, or None if there is no such profile.
+    pub fn profile(&self, name: &str) -> Option<ProfileCfg> {
+        let user = self.copilot.profiles.get(name).cloned();
+        match (user, builtin_profile(name)) {
+            (None, None) => None,
+            (Some(u), None) => Some(u),
+            (None, Some(b)) => Some(b),
+            (Some(u), Some(b)) => Some(ProfileCfg {
+                vendor: u.vendor.or(b.vendor),
+                models: Some(u.models.unwrap_or_default().over(b.models.unwrap_or_default())),
+                efforts: Some(u.efforts.unwrap_or_default().over(b.efforts)),
+            }),
         }
     }
 }
@@ -182,6 +301,17 @@ impl AgentCfg {
             review_args: strs(&["--sandbox", "read-only"]),
         }
     }
+    fn copilot() -> AgentCfg {
+        AgentCfg {
+            cmd: Some("copilot".into()),
+            models: Tiers::of("", "", ""),
+            efforts: Tiers::of("low", "medium", "high"),
+            // Like claude's acceptEdits: edit files, no shell commands unattended.
+            write_args: strs(&["--allow-tool", "write", "--deny-tool", "shell"]),
+            // Skills load even with --no-custom-instructions, so a reviewer does not get them.
+            review_args: strs(&["--deny-tool", "write", "--deny-tool", "shell", "--excluded-tools", "skill"]),
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -191,12 +321,15 @@ pub struct ReviewCfg {
     pub mode: String,
     /// "other" (the CLI that did not do the work) or "same"
     pub reviewer: String,
+    /// Who reviews when `reviewer` is "other": the first one that is available and runs a model
+    /// from a different vendor than the worker's.
+    pub reviewer_order: Vec<AgentRef>,
     pub max_fix_rounds: u32,
     /// Shell commands run after the worker finishes a typed task. Repositories have their own list.
     pub checks: Vec<String>,
     pub check_timeout_mins: u64,
-    /// Which CLIs review a labelled pull request. Each one reviews independently.
-    pub pr_reviewers: Vec<AgentKind>,
+    /// Which agents review a labelled pull request. Each one reviews independently.
+    pub pr_reviewers: Vec<AgentRef>,
     /// How often a pull request review that produced no result (a reviewer did not finish, the
     /// head moved, the review could not run) is retried automatically.
     pub max_retries: u32,
@@ -209,10 +342,11 @@ impl Default for ReviewCfg {
         ReviewCfg {
             mode: "auto".into(),
             reviewer: "other".into(),
+            reviewer_order: vec![AgentRef::Kind(AgentKind::Claude), AgentRef::Kind(AgentKind::Codex)],
             max_fix_rounds: 1,
             checks: vec![],
             check_timeout_mins: 20,
-            pr_reviewers: vec![AgentKind::Claude, AgentKind::Codex],
+            pr_reviewers: vec![AgentRef::Kind(AgentKind::Claude), AgentRef::Kind(AgentKind::Codex)],
             max_retries: 3,
             retry_secs: 120,
         }
@@ -641,11 +775,15 @@ impl Config {
         if !(1..=24 * 60).contains(&self.review.check_timeout_mins) {
             anyhow::bail!("review.check_timeout_mins must be between 1 and 1440");
         }
-        for k in [AgentKind::Claude, AgentKind::Codex] {
+        for k in AgentKind::ALL {
             if self.agents.get(k).cmd.unwrap_or_default().trim().is_empty() {
                 anyhow::bail!("agents.{}.cmd must not be empty", k.name());
             }
         }
+        if self.router.default_agent == AgentKind::Copilot {
+            anyhow::bail!("router.default_agent must be claude or codex");
+        }
+        self.validate_profiles()?;
         // Two stages deploying the same repository to the same environment would each wait on, and
         // roll back, the other's work.
         let mut targets = std::collections::HashSet::new();
@@ -721,6 +859,53 @@ impl Config {
             for (name, v) in [("repo", &r.repo), ("base", &r.base)] {
                 if v.is_empty() || v.starts_with('-') || v.contains(char::is_whitespace) {
                     anyhow::bail!("repos: {} {:?} is not a valid name", name, v);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_profiles(&self) -> anyhow::Result<()> {
+        use crate::pick::{vendor_of_model, Vendor};
+        let mut names: Vec<String> = self.agents.copilot.profiles.keys().cloned().collect();
+        names.sort();
+        for b in ["claude", "codex"] {
+            if !names.iter().any(|n| n == b) {
+                names.push(b.to_string());
+            }
+        }
+        for name in &names {
+            if AgentRef::parse(&format!("copilot:{}", name)).is_err() {
+                anyhow::bail!("agents.copilot.profiles.{:?}: profile names use a-z, 0-9, - and _", name);
+            }
+            let p = self.agents.profile(name).expect("listed above");
+            let models = p.models.clone().unwrap_or_default();
+            if models.all().is_empty() {
+                anyhow::bail!("agents.copilot.profiles.{}: list at least one model", name);
+            }
+            let want = match name.as_str() {
+                "claude" => Some(Vendor::Anthropic),
+                "codex" => Some(Vendor::OpenAI),
+                _ => None,
+            };
+            for m in models.all() {
+                if m.trim().is_empty() || m == "auto" {
+                    anyhow::bail!("agents.copilot.profiles.{}: name the models; \"auto\" could pick any vendor's", name);
+                }
+                let v = vendor_of_model(&m);
+                match &want {
+                    Some(w) if &v != w => anyhow::bail!("agents.copilot.profiles.{}: {} is not a {} model", name, m, name),
+                    None if v == Vendor::Unknown && p.vendor.as_deref().unwrap_or("").trim().is_empty() => {
+                        anyhow::bail!("agents.copilot.profiles.{}: set vendor, the name {} does not say whose model it is", name, m)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for r in self.review.pr_reviewers.iter().chain(&self.review.reviewer_order) {
+            if let AgentRef::Profile(p) = r {
+                if self.agents.profile(p).is_none() {
+                    anyhow::bail!("{} is not defined under [agents.copilot.profiles]", r.name());
                 }
             }
         }
@@ -839,5 +1024,56 @@ tool = "rollback"
         cfg.validate().unwrap();
         assert_eq!(cfg.router.kind, "rules");
         assert!(!cfg.automation.enabled);
+    }
+
+    #[test]
+    fn copilot_defaults_and_profiles() {
+        let cfg: Config = toml::from_str("").unwrap();
+        let c = cfg.agents.get(AgentKind::Copilot);
+        assert_eq!(c.cmd.as_deref(), Some("copilot"));
+        assert!(c.write_args.unwrap().iter().all(|a| !a.contains("allow-all") && a != "--yolo"));
+        assert!(cfg.agents.copilot.stand_in());
+        let p = cfg.agents.profile("claude").unwrap();
+        assert!(p.models.unwrap().get(Tier::Standard).iter().all(|m| m.starts_with("claude-")));
+        assert!(cfg.agents.profile("codex").unwrap().models.unwrap().get(Tier::Light).iter().all(|m| m.starts_with("gpt-")));
+        assert!(cfg.agents.profile("second").is_none());
+        assert_eq!(cfg.review.reviewer_order, vec![AgentRef::Kind(AgentKind::Claude), AgentRef::Kind(AgentKind::Codex)]);
+
+        let cfg: Config = toml::from_str(
+            r#"
+            [agents.copilot]
+            stand_in = false
+            [agents.copilot.profiles.claude.models]
+            standard = "claude-sonnet-4.5"
+            [agents.copilot.profiles.second]
+            vendor = "xai"
+            models = { standard = ["grok-4.7", "grok-4.6"] }
+            [review]
+            pr_reviewers = ["claude", "copilot:second"]
+            "#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.agents.copilot.stand_in());
+        let claude = cfg.agents.profile("claude").unwrap().models.unwrap();
+        assert_eq!(claude.get(Tier::Standard), vec!["claude-sonnet-4.5".to_string()]);
+        assert!(!claude.get(Tier::Heavy).is_empty(), "untouched tiers keep their defaults");
+        assert_eq!(cfg.agents.profile("second").unwrap().models.unwrap().get(Tier::Standard), vec!["grok-4.7", "grok-4.6"]);
+        assert_eq!(cfg.review.pr_reviewers[1], AgentRef::Profile("second".into()));
+    }
+
+    #[test]
+    fn copilot_profiles_are_validated() {
+        let check = |s: &str| toml::from_str::<Config>(s).map_err(|e| e.to_string()).and_then(|c| c.validate().map_err(|e| e.to_string()));
+        assert!(check("[agents.copilot.profiles.claude]\nmodels = { standard = \"gpt-5.4\" }").is_err(), "wrong vendor for claude");
+        assert!(check("[agents.copilot.profiles.x]\nmodels = { standard = \"grok-4.7\" }").is_err(), "unknown prefix needs a vendor");
+        assert!(check("[agents.copilot.profiles.x]\nvendor = \"xai\"\nmodels = { standard = \"auto\" }").is_err(), "never auto in a profile");
+        assert!(check("[agents.copilot.profiles.x]\nvendor = \"xai\"\nmodels = { standard = [] }").is_err(), "no models at all");
+        assert!(check("[agents.copilot.profiles.\"Bad Name\"]\nvendor = \"xai\"\nmodels = { standard = \"grok-4.7\" }").is_err());
+        assert!(check("[review]\npr_reviewers = [\"copilot:missing\"]").is_err(), "undefined profile");
+        assert!(check("[review]\nreviewer_order = [\"copilot:missing\"]").is_err(), "undefined profile");
+        assert!(check("[router]\ndefault_agent = \"copilot\"").is_err(), "the router stays two-way");
+        assert!(check("[agents.copilot]\ntypo = 1").is_err());
+        assert!(check("[agents.copilot]\nmodels = { standard = \"auto\" }").is_ok(), "auto is fine for copilot itself");
     }
 }

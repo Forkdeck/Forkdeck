@@ -11,11 +11,12 @@
 //! Each machine also has a file of its own (`~/.local/state/forkdeck/notes/<forge>/<repo>.md`) for
 //! notes that are nobody else's business, and as the place learned rules go when sharing is off.
 
-use crate::agents::{self, RunSpec, Slot};
+use crate::agents::Slot;
 use crate::config::RepoCfg;
 use crate::issues;
-use crate::orchestrator::Hub;
-use crate::state::{clip, AgentKind, Provider, Source, Tier};
+use crate::orchestrator::{self, Hub};
+use crate::pick;
+use crate::state::{clip, AgentKind, AgentRef, Provider, Source, Tier};
 use std::path::PathBuf;
 
 pub const LEARNED: &str = "## Learned by forkdeck";
@@ -242,20 +243,12 @@ pub async fn learn(hub: &Hub, id: u32) -> u32 {
         .flatten();
     let Some((idx, tag, findings, dir, agent)) = found else { return 0 };
     let Some(r) = hub.cfg.repos.get(idx).cloned() else { return 0 };
-    let (have_claude, have_codex) = {
-        let st = hub.state.lock().unwrap();
-        (st.have_claude, st.have_codex)
-    };
-    let kind = match agent {
-        Some(AgentKind::Codex) if have_codex => AgentKind::Codex,
-        Some(AgentKind::Claude) if have_claude => AgentKind::Claude,
-        _ if have_claude => AgentKind::Claude,
-        _ if have_codex => AgentKind::Codex,
-        _ => return 0,
-    };
+    let available = orchestrator::avail_of(&hub.cfg, &hub.state.lock().unwrap());
+    let wanted = AgentRef::Kind(agent.unwrap_or(AgentKind::Claude));
+    let Some(exec) = pick::worker_for(&hub.cfg, &available.borrow(), &wanted, Tier::Light) else { return 0 };
     let dir = if dir.is_dir() { dir } else { r.path.clone() };
     let prompt = ask(&r.repo, &findings);
-    let out = agents::run(hub, id, Slot::Reviewer, RunSpec { kind, tier: Tier::Light, prompt: &prompt, dir: &dir, read_only: true }).await;
+    let (out, _) = orchestrator::run_agent(hub, id, Slot::Reviewer, exec, Tier::Light, &prompt, &dir, true).await;
     if !out.ok {
         hub.log("notes", format!("#{} nothing learned: {}", id, clip(&out.error, 120)));
         return 0;

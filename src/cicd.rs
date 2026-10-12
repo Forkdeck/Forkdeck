@@ -679,7 +679,7 @@ async fn branch_head(r: &RepoCfg) -> Option<String> {
 
 fn step(hub: &Hub, id: u32, slot: Slot, label: &str, state: StageState, line: &str) {
     hub.job(id, |j| {
-        let s = if slot == Slot::Worker { &mut j.worker } else { &mut j.reviewer };
+        let s = j.stage(slot);
         if s.label != label {
             *s = Stage::default();
             s.label = label.to_string();

@@ -5,25 +5,78 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
     Claude,
     Codex,
+    Copilot,
 }
 
 impl AgentKind {
+    pub const ALL: [AgentKind; 3] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Copilot];
+
     pub fn name(self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::Copilot => "copilot",
         }
     }
     pub fn other(self) -> AgentKind {
         match self {
             AgentKind::Claude => AgentKind::Codex,
-            AgentKind::Codex => AgentKind::Claude,
+            AgentKind::Codex | AgentKind::Copilot => AgentKind::Claude,
         }
+    }
+}
+
+/// What a task, a reviewer list or `--agent` asks for: a CLI by name, or a named copilot profile
+/// (`copilot:<name>`). Which program and model actually run is decided later, in `pick`.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum AgentRef {
+    Kind(AgentKind),
+    Profile(String),
+}
+
+impl AgentRef {
+    pub fn parse(s: &str) -> Result<AgentRef, String> {
+        let s = s.trim();
+        if let Some(k) = AgentKind::ALL.into_iter().find(|k| k.name() == s) {
+            return Ok(AgentRef::Kind(k));
+        }
+        match s.strip_prefix("copilot:") {
+            Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') => {
+                Ok(AgentRef::Profile(n.to_string()))
+            }
+            _ => Err(format!("unknown agent {:?}: use claude, codex, copilot or copilot:<profile>", s)),
+        }
+    }
+    pub fn name(&self) -> String {
+        match self {
+            AgentRef::Kind(k) => k.name().to_string(),
+            AgentRef::Profile(p) => format!("copilot:{}", p),
+        }
+    }
+    /// The CLI this runs on when nothing stands in for anything.
+    pub fn kind(&self) -> AgentKind {
+        match self {
+            AgentRef::Kind(k) => *k,
+            AgentRef::Profile(_) => AgentKind::Copilot,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        AgentRef::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for AgentRef {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.name())
     }
 }
 
@@ -102,6 +155,8 @@ pub enum StageState {
 #[derive(Clone, Debug)]
 pub struct Stage {
     pub agent: Option<AgentKind>,
+    /// Set when the agent ran on another CLI: "copilot" standing in, or a "copilot:<name>" profile.
+    pub via: String,
     /// What the box shows when no agent runs in it (a deployment step).
     pub label: String,
     pub model: String,
@@ -121,6 +176,7 @@ impl Default for Stage {
     fn default() -> Self {
         Stage {
             agent: None,
+            via: String::new(),
             label: String::new(),
             model: String::new(),
             effort: String::new(),
@@ -240,10 +296,12 @@ pub struct Job {
     /// Tree of the agent's work as last staged. Only this tree may be committed.
     pub staged_tree: Option<String>,
     pub status: JobStatus,
-    pub forced: Option<AgentKind>,
+    pub forced: Option<AgentRef>,
     pub decision: Option<Decision>,
     pub worker: Stage,
     pub reviewer: Stage,
+    /// Pull request reviewers past the second, in configured order.
+    pub extra: Vec<Stage>,
     pub verdict: Option<bool>,
     /// Result of the configured check commands; None when there are none or they have not run.
     pub checks: Option<bool>,
@@ -259,12 +317,28 @@ pub struct Job {
     pub released: bool,
     /// A teammate whose forkdeck announced the same deployment before this one did.
     pub peer: Option<String>,
-    /// What each CLI was used for in this job so far: claude, then codex.
-    pub used: [crate::journal::Usage; 2],
+    /// What each CLI was used for in this job so far: claude, codex, then copilot.
+    pub used: [crate::journal::Usage; 3],
     /// What checks and reviewers objected to, for the repository's notes.
     pub findings: Vec<String>,
     /// Stopped by `limits.job_mins`.
     pub over_time: bool,
+}
+
+impl Job {
+    pub fn stage(&mut self, slot: crate::agents::Slot) -> &mut Stage {
+        use crate::agents::Slot;
+        match slot {
+            Slot::Worker => &mut self.worker,
+            Slot::Reviewer => &mut self.reviewer,
+            Slot::Extra(i) => {
+                if self.extra.len() <= i {
+                    self.extra.resize_with(i + 1, Stage::default);
+                }
+                &mut self.extra[i]
+            }
+        }
+    }
 }
 
 pub struct LogLine {
@@ -329,8 +403,14 @@ pub struct State {
     pub deploy_note: Option<String>,
     /// Deployments cancelled in this session (repo index, commit). They are not started again until forkdeck restarts.
     pub deploy_cancelled: HashSet<(usize, String)>,
-    pub have_claude: bool,
-    pub have_codex: bool,
+    /// The agent CLIs found on PATH.
+    pub installed: HashSet<AgentKind>,
+    /// What copilot said about the login and the account's models.
+    pub copilot: crate::copilot::Probe,
+    /// Models copilot refused in this session; they are not tried again until restart.
+    pub rejected_models: HashSet<String>,
+    /// Copilot may play claude or codex when that CLI is missing (agents.copilot.stand_in).
+    pub stand_in: bool,
     pub next_id: u32,
     pub team: TeamView,
     /// Finished jobs the journal would not take. They are written as soon as it works again, and
@@ -359,6 +439,14 @@ impl Source {
 }
 
 impl State {
+    pub fn has(&self, k: AgentKind) -> bool {
+        self.installed.contains(&k)
+    }
+    /// Copilot is installed and the account was not found unable to use it.
+    pub fn copilot_usable(&self) -> bool {
+        self.has(AgentKind::Copilot) && self.copilot.seat != Some(false)
+    }
+
     fn active(&self, key: Key) -> bool {
         self.jobs.iter().any(|j| !j.status.finished() && j.source.key() == Some(key))
     }
@@ -500,5 +588,23 @@ mod tests {
         assert!(!st.should_take(k, t0 + Duration::from_secs(10_000)));
         st.forget_unlisted(0, false, &[1, 2]);
         assert!(st.should_take(k, t0));
+    }
+    #[test]
+    fn agent_refs_round_trip() {
+        for s in ["claude", "codex", "copilot", "copilot:second", "copilot:a_b-1"] {
+            assert_eq!(AgentRef::parse(s).unwrap().name(), s);
+        }
+        assert_eq!(AgentRef::parse("copilot:x").unwrap().kind(), AgentKind::Copilot);
+        assert_eq!(AgentRef::parse(" codex ").unwrap(), AgentRef::Kind(AgentKind::Codex));
+        for bad in ["", "gpt", "copilot:", "copilot:Has Space", "claude:x"] {
+            assert!(AgentRef::parse(bad).is_err(), "{:?}", bad);
+        }
+        #[derive(Deserialize)]
+        struct T {
+            r: Vec<AgentRef>,
+        }
+        let t: T = toml::from_str(r#"r = ["claude", "copilot:second"]"#).unwrap();
+        assert_eq!(t.r, vec![AgentRef::Kind(AgentKind::Claude), AgentRef::Profile("second".into())]);
+        assert!(toml::from_str::<T>(r#"r = ["nope"]"#).is_err());
     }
 }
