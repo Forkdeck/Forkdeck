@@ -95,7 +95,7 @@ fn durable(hub: &Hub, id: u32) -> Result<(), String> {
 async fn guard(hub: &Hub, r: &RepoCfg, remote: &tracker::RemoteIssue) -> Result<(), String> {
     if !remote.open { return Err("This issue is closed. Reopen it before refining or publishing.".into()); }
     let n = tracker::number(&remote.reference.key)?;
-    if remote.labels.contains(&r.working_label) || remote.labels.contains(&r.done_label) || hub.state.lock().unwrap().jobs.iter().any(|j| !j.status.finished() && matches!(&j.source, Source::Issue { repo, number, .. } if repo == &r.repo && *number == n)) {
+    if remote.labels.contains(&r.working_label) || remote.labels.contains(&r.done_label) || hub.state.lock().unwrap().jobs.iter().any(|j| !j.status.finished() && matches!(&j.source, Source::Issue { repo_idx, repo, number, .. } if repo == &r.repo && *number == n && hub.cfg.repos.get(*repo_idx).is_some_and(|configured| configured.provider == r.provider))) {
         return Err("This issue is already claimed, building or awaiting delivery.".into());
     }
     let comments = tracker::history(r, &remote.reference.key).await?;
@@ -239,5 +239,27 @@ mod tests {
         assert_eq!(p.pending.as_ref().unwrap().token, token);
         assert!(!p.pending.as_ref().unwrap().section.contains("PLAN: READY"));
         assert!(p.request_ready(true).is_err());
+    }
+
+    #[test]
+    fn linking_keeps_the_existing_conversation_and_agent() {
+        let cfg: crate::config::Config = toml::from_str("[[repos]]\nprovider='gitlab'\nrepo='a/b'\npath='/tmp'\n").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let plan = Plan::new(&cfg.repos[0], "42").unwrap();
+        let hub = Hub::new(cfg, rt.handle().clone());
+        let forced = Some(AgentRef::Kind(AgentKind::Codex));
+        let id = hub.submit("Existing task".into(), "Original request".into(), Source::Manual, ".".into(), forced.clone());
+        hub.job(id, |j| { j.status = JobStatus::Done; j.turns[0].answer = "A local planning answer".into(); });
+        hub.link_plan(id, plan, "Keep the existing decisions".into()).unwrap();
+        let st = hub.state.lock().unwrap();
+        assert_eq!(st.jobs.len(), 1);
+        let j = &st.jobs[0];
+        assert_eq!(j.id, id);
+        assert_eq!(j.forced, forced);
+        assert_eq!(j.turns[0].ask, "Original request");
+        assert_eq!(j.turns[0].answer, "A local planning answer");
+        assert!(j.turns[1].ask.contains("Keep the existing decisions"));
+        assert_eq!(j.workdir, std::path::PathBuf::from("/tmp"));
+        assert_eq!(j.issue_plan.as_ref().unwrap().issue.as_ref().unwrap().key, "42");
     }
 }

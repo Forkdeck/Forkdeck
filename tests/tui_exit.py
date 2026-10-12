@@ -75,7 +75,8 @@ enabled=false
                 time.sleep(.2)
             elif mode == "issue-draft":
                 os.write(master, b"\x1b[17~\t\tunfinished issue plan")
-                wait(lambda: b"unfinished issue plan" in output)
+                wait(lambda: any(json.loads(path.read_text())["composer"]["draft"] == "unfinished issue plan"
+                                 for path in (project / "state/forkdeck/sessions").glob("*.json")))
             elif mode == "picker":
                 os.write(master, b"planning options\r")
                 wait(lambda: "Planning options · task".encode() in output)

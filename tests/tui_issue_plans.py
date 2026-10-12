@@ -36,7 +36,17 @@ if pathlib.Path(sys.argv[0]).name == 'planner':
  else:
   result = 'Goal: implement the request.\nSteps: inspect, implement, test.\nDependencies: existing library.\nAcceptance criteria: requested behavior passes.\nTests: unit and integration.\n' + ('日本語 ' * 250) + '\nPLAN_TAIL\nPLAN: READY'
  print(json.dumps({'type':'result', 'is_error':False, 'result':result})); sys.exit(0)
-assert args[0] == 'api', args
+if args[0] != 'api':
+ if len(args)>1 and args[1]=='list':
+  issue=json.loads((root/'forge.json').read_text())['issue']
+  if args[0]=='issue' and issue and 'agent:ready' in issue['labels']:
+   issue['url']=issue['html_url']; issue['author']={'login':'tester','username':'tester'}
+   print(json.dumps([issue]))
+  else: print('[]')
+  sys.exit(0)
+ # Confirm the normal build pipeline took over, then stop before any git changes.
+ log('handoff.jsonl', args)
+ print('fixture stops at build preparation', file=sys.stderr); sys.exit(1)
 method = 'GET'; path = None; i = 1
 while i < len(args):
  if args[i] in ('-X', '--method'): method=args[i+1]; i+=2
@@ -271,6 +281,23 @@ with tempfile.TemporaryDirectory(prefix="forkdeck-plan-tests-") as directory:
         print('PASS conflicts preserve remote edits; refinement refreshes context; claimed issue is refused')
     finally: rig.cleanup()
 
+    rig = Rig(root/'intake', 'github')
+    try:
+        rig.start(); rig.begin(); rig.reviewed(1); rig.publish(1)
+        assert rig.plan()['build_job'] is None
+        rig.send(b'3\r')
+        rig.wait(lambda: rig.plan().get('ready') and rig.job().get('status')=='Done')
+        assert rig.plan()['build_job'] is None, 'Ready bypassed paused intake'
+        rig.send(b'\x01')  # Ctrl-A is available inside the issue panel.
+        rig.wait(lambda: rig.plan().get('build_job') is not None)
+        rig.wait(lambda: any(e.get('kind')=='issue' for e in rig.records('state/forkdeck/journal.jsonl')))
+        assert rig.plan()['build_job'] != rig.job()['id']
+        assert len([e for e in rig.records('state/forkdeck/journal.jsonl') if e.get('kind')=='issue'])==1
+        assert rig.records('handoff.jsonl'), 'ordinary issue build pipeline was not used'
+        rig.stop()
+        print('PASS Ready uses ordinary intake and correlates one build job with the planning card')
+    finally: rig.cleanup()
+
     rig = Rig(root/'review-rejected', 'github')
     try:
         (rig.root/'reject').touch()
@@ -292,9 +319,12 @@ with tempfile.TemporaryDirectory(prefix="forkdeck-plan-tests-") as directory:
         snapshot=next((rig.root/'state/forkdeck/sessions').glob('*.json'))
         obstacle=snapshot.with_suffix('.tmp'); obstacle.mkdir()
         rig.send(b'1\r')
-        rig.wait(lambda: b'Cannot save issue plan' in rig.output)
+        # Terminal differential rendering may split the error across ANSI cursor moves.
+        rig.wait(lambda: any(e.get('status')=='failed' for e in rig.records('state/forkdeck/journal.jsonl')))
         assert not rig.records('forge.jsonl'), 'publication started without a durable save'
-        obstacle.rmdir(); rig.failed(); rig.publish(1); rig.stop()
+        obstacle.rmdir(); rig.failed()
+        assert 'Cannot save issue plan' in rig.job()['outcome']
+        rig.publish(1); rig.stop()
         print('PASS a session save failure blocks publication and can be retried after repair')
     finally: rig.cleanup()
 
