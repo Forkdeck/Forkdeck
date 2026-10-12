@@ -191,8 +191,10 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     };
     stage(&mut |s| {
         let keep = std::mem::take(&mut s.tail);
+        let pushed = s.pushed;
         *s = Stage::default();
         s.tail = keep;
+        s.pushed = pushed;
         s.agent = Some(kind);
         s.model = model.clone();
         s.effort = effort.clone();

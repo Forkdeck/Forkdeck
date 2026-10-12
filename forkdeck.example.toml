@@ -121,6 +121,18 @@ deploys = true         # announce deployments on the commit (GitHub only)
 # nothing on public ones. A name set here is posted everywhere; "" posts none.
 # host = "build-02"
 
+# Control from a phone on the same network (the forkdeck Android app), over mutual TLS.
+# Pair a phone with `forkdeck remote pair` while forkdeck is running: it shows a QR code
+# that works once, for two minutes, and only from the same subnet as this machine.
+# A paired phone can start tasks that agents carry out in `workdir`; remove one with
+# `forkdeck remote revoke <name>`.
+[remote]
+enabled = false
+listen = "0.0.0.0:7443"
+lan_only = true        # refuse connections from outside this machine's subnets, not only pairing
+dir = "~/.config/forkdeck/remote"   # certificate authority, paired devices
+# workdir = "~/src/project"         # where tasks from the phone run; default: where forkdeck started
+
 #~ [[repos]]
 #~ provider = "github"    # uses the gh CLI and its login
 #~ repo = "your-name/your-project"

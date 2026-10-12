@@ -8,8 +8,12 @@ repository = "https://github.com/forkdeck/forkdeck"
 readme = "README.md"
 description = "Terminal agent tree that routes work between the claude and codex CLIs, with a local Jev-compatible decision layer and GitHub/GitLab issue automation"
 
+[workspace]
+members = [".", "crates/remote-proto"]
+
 [dependencies]
 anyhow = "1"
+forkdeck-remote-proto = { path = "crates/remote-proto" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
 regex = "1"
@@ -21,6 +25,21 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
+# remote control
+fory-rpc-streaming = "0.1.1"
+futures = "0.3"
+getrandom = "0.2"
+if-addrs = "0.13"
+qrcode = { version = "0.14", default-features = false }
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.10"
+tarpc = { version = "0.37", features = ["serde1"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[dev-dependencies]
+forkdeck-remote-proto = { path = "crates/remote-proto", features = ["client"] }
 
 [profile.release]
 opt-level = 2

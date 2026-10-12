@@ -8,6 +8,7 @@ mod knowledge;
 mod mcp;
 mod orchestrator;
 mod proc;
+mod remote;
 mod router;
 mod state;
 mod team;
@@ -92,6 +93,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<NotesCmd>,
     },
+    /// Control from a phone on the local network: pair one, list or revoke paired phones
+    Remote {
+        #[command(subcommand)]
+        cmd: RemoteCmd,
+    },
     /// Check the CLIs, the decision endpoint, the MCP servers and the configured repositories
     Doctor,
     /// Write a commented config file
@@ -108,6 +114,26 @@ enum Cmd {
 enum NotesCmd {
     /// Add a note of your own; it is kept above what forkdeck learns and never rewritten
     Add { text: Vec<String> },
+}
+
+#[derive(Subcommand)]
+enum RemoteCmd {
+    /// Show a one-time QR code for the forkdeck app; the phone must be on this machine's subnet
+    Pair {
+        /// Network interface the phone will connect through (default: the first private IPv4 address)
+        #[arg(long)]
+        iface: Option<String>,
+        /// Seconds the code works for
+        #[arg(long, default_value_t = 120)]
+        ttl: u64,
+    },
+    /// List paired phones
+    Devices,
+    /// Unpair a phone; a running forkdeck disconnects it
+    Revoke { name: String },
+    /// Run polling and the remote listener without the interface
+    #[command(hide = true)]
+    Serve,
 }
 
 #[derive(Subcommand)]
@@ -304,6 +330,26 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Some(Cmd::Remote { cmd }) => match cmd {
+            RemoteCmd::Pair { iface, ttl } => remote::pair_cmd(&hub.cfg, iface.as_deref(), ttl),
+            RemoteCmd::Devices => remote::devices_cmd(&hub.cfg),
+            RemoteCmd::Revoke { name } => remote::revoke_cmd(&hub.cfg, &name),
+            RemoteCmd::Serve => {
+                anyhow::ensure!(hub.cfg.remote.enabled, "[remote] enabled = false in the config");
+                rt.block_on(hub.detect_agents());
+                rt.spawn(issues::poll_loop(hub.clone()));
+                rt.spawn(team::watch_loop(hub.clone()));
+                let stopped = rt.block_on(async {
+                    tokio::select! {
+                        r = remote::serve(hub.clone()) => r,
+                        _ = stop_signal() => Ok(()),
+                    }
+                });
+                rt.block_on(hub.shutdown(Duration::from_secs(45)));
+                proc::kill_all();
+                stopped
+            }
+        },
         Some(Cmd::Doctor) => {
             let ok = rt.block_on(doctor(&hub, cfg_path));
             std::process::exit(if ok { 0 } else { 1 });
@@ -321,6 +367,14 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(hub.detect_agents());
             rt.spawn(issues::poll_loop(hub.clone()));
             rt.spawn(team::watch_loop(hub.clone()));
+            if hub.cfg.remote.enabled {
+                let h = hub.clone();
+                rt.spawn(async move {
+                    if let Err(e) = remote::serve(h.clone()).await {
+                        h.log("remote", format!("not listening: {}", e));
+                    }
+                });
+            }
             if let Some(path) = cli.snapshot {
                 return snapshot(&rt, &hub, cwd, &path, &cli.size, cli.after, cli.team_pane);
             }
@@ -547,6 +601,22 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
         }
     } else {
         println!("router    rules    keyword rules, no endpoint configured");
+    }
+    let r = &hub.cfg.remote;
+    if r.enabled {
+        let phones = remote::devices::Registry::new(&r.dir).list().len();
+        match std::net::TcpListener::bind(&r.listen) {
+            Ok(_) => println!("remote    on       {} free, {} phone(s) paired", r.listen, phones),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                println!("remote    on       {} in use (forkdeck running?), {} phone(s) paired", r.listen, phones)
+            }
+            Err(e) => {
+                ok = false;
+                println!("remote    broken   cannot listen on {}: {}", r.listen, e);
+            }
+        }
+    } else {
+        println!("remote    off      [remote] enabled = false");
     }
     for r in &hub.cfg.repos {
         let tool = if r.provider == Provider::Github { "gh" } else { "glab" };

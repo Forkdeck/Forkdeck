@@ -1,0 +1,25 @@
+[package]
+name = "forkdeck-remote-proto"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Wire types shared by forkdeck's remote-control server and its clients"
+publish = false
+
+[features]
+# A ready-made client: pairing, mutual TLS, calls and the event stream.
+client = ["dep:tokio", "dep:tokio-rustls", "dep:rustls", "dep:rcgen", "dep:futures", "dep:tokio-util", "dep:tarpc", "dep:sha2"]
+
+[dependencies]
+fory = "0.17"
+fory-core = "0.17"
+tarpc-fory = "0.1"
+fory-rpc-streaming = "0.1.1"
+tokio = { version = "1", features = ["net", "sync", "rt", "time", "macros"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rcgen = { version = "0.13", optional = true }
+futures = { version = "0.3", optional = true }
+tokio-util = { version = "0.7", features = ["codec"], optional = true }
+tarpc = { version = "0.37", features = ["serde1"], optional = true }
+sha2 = { version = "0.10", optional = true }

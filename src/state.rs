@@ -115,6 +115,8 @@ pub struct Stage {
     pub started: Option<Instant>,
     pub elapsed: Option<Duration>,
     pub tail: VecDeque<String>,
+    /// Lines ever pushed, so a remote viewer can ask for the ones it has not seen.
+    pub pushed: u64,
 }
 
 impl Default for Stage {
@@ -133,6 +135,7 @@ impl Default for Stage {
             started: None,
             elapsed: None,
             tail: VecDeque::new(),
+            pushed: 0,
         }
     }
 }
@@ -142,6 +145,7 @@ impl Stage {
         let line = line.into();
         self.last = line.clone();
         self.tail.push_back(line);
+        self.pushed += 1;
         while self.tail.len() > 200 {
             self.tail.pop_front();
         }
@@ -326,6 +330,8 @@ pub fn backoff(base_secs: u64, attempt: u32) -> Duration {
 pub struct State {
     pub jobs: Vec<Job>,
     pub log: VecDeque<LogLine>,
+    /// Lines ever logged; the log holds the newest ones.
+    pub log_seq: u64,
     pub router: RouterStats,
     pub repos: Vec<RepoStatus>,
     /// Items a job has been started for. An item in here is not taken again unless a retry is due.
@@ -447,6 +453,7 @@ impl State {
             who: who.to_string(),
             msg,
         });
+        self.log_seq += 1;
         while self.log.len() > 500 {
             self.log.pop_front();
         }
