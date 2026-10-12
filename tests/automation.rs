@@ -1875,7 +1875,8 @@ fn a_fix_round_continues_the_workers_own_conversation() {
     assert_eq!((workers.len(), reviews.len()), (2, 2), "work, review, fix, review: {:?}\n{}", runs, out);
     let first = arg_after(workers[0], "--session-id").expect("the first run names its conversation");
     assert_eq!(arg_after(workers[1], "--resume"), Some(first), "the fix continues it: {:?}", workers);
-    assert!(reviews.iter().all(|r| arg_after(r, "--resume").is_none()), "reviews start fresh: {:?}", reviews);
+    // A reviewer may continue its own earlier review, never the worker's conversation.
+    assert!(reviews.iter().all(|r| arg_after(r, "--resume") != Some(first)), "reviews are not the worker's conversation: {:?}", reviews);
 }
 
 
@@ -2282,4 +2283,20 @@ fn the_open_notes_pull_request_is_found_among_any_number_of_old_branches() {
     assert_eq!(git(&rig.origin(), &["rev-list", "--count", &format!("main..{}", oldest)]), "1", "added to the open one");
     assert!(!rig.calls().contains("--title Notes for agents"), "no second pull request:\n{}", rig.calls());
     assert_eq!(git(&rig.origin(), &["for-each-ref", "--format=%(refname:short)", "refs/heads/forkdeck/notes-*"]).lines().count(), 7, "and no new branch");
+}
+
+#[test]
+fn the_second_review_continues_the_first_and_checks_its_own_points() {
+    let rig = Rig::new("re-review", "", "");
+    rig.issue();
+    let (args, prompts) = (rig.root.join("args.log"), rig.root.join("prompts.log"));
+    let (ok, out) = rig.once(&[("FAKE_VERDICTS", "FAIL PASS"), ("FAKE_ARGS", args.to_str().unwrap()), ("FAKE_PROMPTS", prompts.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    let runs = fs::read_to_string(&args).unwrap();
+    let reviews: Vec<&str> = runs.lines().filter(|l| l.contains("--permission-mode plan")).collect();
+    assert_eq!(reviews.len(), 2, "{:?}", reviews);
+    let first = arg_after(reviews[0], "--session-id").expect("the first review names its conversation");
+    assert_eq!(arg_after(reviews[1], "--resume"), Some(first), "the second review continues it: {:?}", reviews);
+    let p = fs::read_to_string(&prompts).unwrap();
+    assert!(p.contains("For each point you raised, check whether it is fixed."), "{}", p);
 }
