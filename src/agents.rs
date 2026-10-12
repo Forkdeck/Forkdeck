@@ -23,6 +23,8 @@ pub struct RunSpec<'a> {
     pub prompt: &'a str,
     pub dir: &'a Path,
     pub read_only: bool,
+    /// Continue this conversation of the same CLI instead of starting a new one.
+    pub resume: Option<&'a str>,
 }
 
 #[derive(Default)]
@@ -36,6 +38,10 @@ pub struct RunOut {
     pub no_models: bool,
     /// The models that actually answered, from copilot's usage file.
     pub models_used: Vec<String>,
+    /// The CLI's id for this conversation, to continue it later.
+    pub session: Option<String>,
+    /// How many tools the agent started.
+    pub tools: u32,
 }
 
 pub struct CmdLine {
@@ -43,6 +49,49 @@ pub struct CmdLine {
     pub args: Vec<String>,
     /// Where copilot writes its usage statistics when it exits.
     pub usage_file: Option<PathBuf>,
+    /// The conversation id, when it is known before the run (claude and copilot take one; codex reports its own).
+    pub session: Option<String>,
+}
+
+/// A random version 4 UUID, for the CLIs that let the caller name the conversation.
+pub fn new_uuid() -> String {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    let read = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
+    if read.is_err() {
+        // No /dev/urandom: time and process id are unique enough for a session name.
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        b = (t ^ ((std::process::id() as u128) << 64)).to_le_bytes();
+    }
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{:02x}", x)).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
+/// `codex exec resume` takes no `--sandbox`; the same setting goes in as a config override. Any
+/// other argument it may not take makes the conversation impossible to continue: None.
+fn codex_resume_args(extra: &[String]) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut it = extra.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--sandbox" | "-s" => out.extend(["-c".to_string(), format!("sandbox_mode=\"{}\"", it.next()?)]),
+            "-c" | "--config" | "-m" | "--model" => out.extend([a.clone(), it.next()?.clone()]),
+            "--skip-git-repo-check" | "--json" => out.push(a.clone()),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Whether this agent's conversation can be continued with the configured arguments.
+pub fn can_resume(cfg: &Config, exec: &Exec, read_only: bool) -> bool {
+    let a = cfg.agents.get(exec.cli);
+    match exec.cli {
+        AgentKind::Codex => codex_resume_args(&if read_only { a.review_args } else { a.write_args }.unwrap_or_default()).is_some(),
+        AgentKind::Claude | AgentKind::Copilot => true,
+    }
 }
 
 /// What one line of agent output means for the display.
@@ -59,21 +108,32 @@ pub enum Parsed {
     ModelRejected(String),
     /// The account has no model it may use at all.
     NoModels(String),
+    /// The CLI named the conversation (codex does so in its first event).
+    Session(String),
     Nothing,
 }
 
 /// The prompt is not part of the command line: it is written to the agent's stdin, so its size
 /// and its first character (a leading `-` would read as an option) do not matter.
-pub fn command_line(hub: &Hub, spec: &RunSpec) -> CmdLine {
+pub fn command_line(cfg: &Config, spec: &RunSpec) -> CmdLine {
     let e = spec.exec;
-    let a = hub.cfg.agents.get(e.cli);
+    let a = cfg.agents.get(e.cli);
     let cmd = a.cmd.unwrap_or_else(|| e.cli.name().to_string());
     let extra = if spec.read_only { a.review_args } else { a.write_args }.unwrap_or_default();
     let mut args: Vec<String> = Vec::new();
     let mut usage_file = None;
+    let mut session = spec.resume.map(String::from);
     match e.cli {
         AgentKind::Claude => {
             args.extend(["-p", "--output-format", "stream-json", "--verbose"].map(String::from));
+            match spec.resume {
+                Some(id) => args.extend(["--resume".to_string(), id.to_string()]),
+                None => {
+                    let id = new_uuid();
+                    args.extend(["--session-id".to_string(), id.clone()]);
+                    session = Some(id);
+                }
+            }
             if !e.model.is_empty() {
                 args.extend(["--model".to_string(), e.model.clone()]);
             }
@@ -83,25 +143,47 @@ pub fn command_line(hub: &Hub, spec: &RunSpec) -> CmdLine {
             args.extend(extra);
         }
         AgentKind::Codex => {
-            args.extend(["exec", "--json", "--skip-git-repo-check"].map(String::from));
+            let resume = spec.resume.zip(codex_resume_args(&extra));
+            args.push("exec".to_string());
+            if resume.is_some() {
+                args.push("resume".to_string());
+            }
+            args.extend(["--json", "--skip-git-repo-check"].map(String::from));
             if !e.model.is_empty() {
                 args.extend(["--model".to_string(), e.model.clone()]);
             }
             if !e.effort.is_empty() {
                 args.extend(["-c".to_string(), format!("model_reasoning_effort=\"{}\"", e.effort)]);
             }
-            args.extend(extra);
+            match resume {
+                Some((id, x)) => {
+                    args.extend(x);
+                    args.push(id.to_string());
+                }
+                None => {
+                    args.extend(extra);
+                    session = None;
+                }
+            }
             // "-" makes codex read the prompt from stdin.
             args.push("-".to_string());
         }
         AgentKind::Copilot => {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let f = std::env::temp_dir().join(format!("forkdeck-copilot-usage-{}-{}.json", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-            args = copilot_args(&hub.cfg, e, spec.read_only, &f);
+            args = copilot_args(cfg, e, spec.read_only, &f);
+            match spec.resume {
+                Some(id) => args.extend(["--resume".to_string(), id.to_string()]),
+                None => {
+                    let id = new_uuid();
+                    args.extend(["--session-id".to_string(), id.clone()]);
+                    session = Some(id);
+                }
+            }
             usage_file = Some(f);
         }
     }
-    CmdLine { cmd, args, usage_file }
+    CmdLine { cmd, args, usage_file, session }
 }
 
 /// Arguments for one copilot run. The prompt goes to stdin, so it never needs `-p`. Tokens are not
@@ -228,6 +310,7 @@ pub fn parse_codex(line: &str) -> Vec<Parsed> {
                 _ => Parsed::Nothing,
             }
         }
+        "thread.started" if !s("/thread_id").is_empty() => Parsed::Session(s("/thread_id")),
         "turn.completed" => {
             let n = |k: &str| v.pointer(&format!("/usage/{}", k)).and_then(|x| x.as_u64()).unwrap_or(0);
             Parsed::Usage { tokens_in: n("input_tokens"), tokens_out: n("output_tokens") }
@@ -267,7 +350,7 @@ pub fn parse_copilot(line: &str) -> Vec<Parsed> {
 }
 
 pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
-    let line = command_line(hub, &spec);
+    let line = command_line(&hub.cfg, &spec);
     let start = Instant::now();
     let e = spec.exec;
     let stage = |f: &mut dyn FnMut(&mut Stage)| {
@@ -351,6 +434,7 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, kind: AgentKind, line: 
     let mut finished = false;
     let mut error = String::new();
     let mut tools_seen = 0u32;
+    let mut session = line.session.clone();
     let mut rejected: Option<String> = None;
     let mut no_models = false;
     let mut status: Option<std::io::Result<std::process::ExitStatus>> = None;
@@ -410,12 +494,13 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, kind: AgentKind, line: 
                     }
                     Parsed::Error(e) | Parsed::NoModels(e) => s.push(format!("error: {}", e)),
                     Parsed::ModelRejected(m) => s.push(format!("error: model {} is not available to this account", m)),
-                    Parsed::Nothing => {}
+                    Parsed::Session(_) | Parsed::Nothing => {}
                 }
             });
             match p {
                 Parsed::Text(t) => last_text = t,
                 Parsed::Tool(_) => tools_seen += 1,
+                Parsed::Session(id) => session = Some(id),
                 // Only a refusal before anything was done can be retried with another model.
                 Parsed::ModelRejected(m) if tools_seen == 0 => rejected = Some(m),
                 Parsed::NoModels(e) => {
@@ -482,7 +567,7 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, kind: AgentKind, line: 
         };
     }
     let text = final_text.filter(|t| !t.is_empty()).unwrap_or(last_text);
-    RunOut { ok, text, error, rejected_model: rejected, no_models, models_used }
+    RunOut { ok, text, error, rejected_model: rejected, no_models, models_used, session, tools: tools_seen }
 }
 
 pub async fn on_path(cmd: &str) -> bool {
@@ -614,6 +699,52 @@ mod tests {
         assert_eq!((i, o, m), (251, 15, vec!["claude-sonnet-4.5".to_string(), "gpt-5.4".to_string()]));
         assert_eq!(read_usage(&dir.join("missing.json")), (0, 0, vec![]));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn exec_for(cli: AgentKind, model: &str) -> Exec {
+        Exec { asked: crate::state::AgentRef::Kind(cli), cli, family: cli, via: None, model: model.into(), effort: String::new(), vendor: crate::pick::Vendor::Unknown }
+    }
+
+    #[test]
+    fn sessions_are_named_and_continued() {
+        let cfg: Config = toml::from_str("").unwrap();
+        let dir = Path::new("/tmp");
+        let line = |cli, read_only, resume| {
+            let e = exec_for(cli, "m");
+            command_line(&cfg, &RunSpec { exec: &e, prompt: "p", dir, read_only, resume })
+        };
+        let after = |l: &CmdLine, flag: &str| l.args.iter().position(|a| a == flag).map(|i| l.args[i + 1].clone());
+
+        let c = line(AgentKind::Claude, false, None);
+        let id = after(&c, "--session-id").expect("claude gets a session id");
+        assert_eq!(c.session.as_deref(), Some(id.as_str()));
+        let c = line(AgentKind::Claude, false, Some("abc"));
+        assert_eq!((after(&c, "--resume").as_deref(), after(&c, "--session-id")), (Some("abc"), None));
+
+        let x = line(AgentKind::Codex, false, None);
+        assert_eq!((&x.args[..2], x.session.clone()), (&["exec".to_string(), "--json".to_string()][..], None), "codex names its own");
+        let x = line(AgentKind::Codex, false, Some("t1"));
+        assert_eq!(&x.args[..2], ["exec", "resume"]);
+        assert_eq!(&x.args[x.args.len() - 2..], ["t1", "-"]);
+        assert!(x.args.contains(&"sandbox_mode=\"workspace-write\"".to_string()) && !x.args.contains(&"--sandbox".to_string()), "{:?}", x.args);
+        assert_eq!(x.session.as_deref(), Some("t1"));
+
+        let p = line(AgentKind::Copilot, true, None);
+        assert!(after(&p, "--session-id").is_some() && p.session.is_some());
+        assert_eq!(after(&line(AgentKind::Copilot, true, Some("s9")), "--resume").as_deref(), Some("s9"));
+
+        let odd: Config = toml::from_str("[agents.codex]\nwrite_args = [\"--full-auto\"]").unwrap();
+        assert!(!can_resume(&odd, &exec_for(AgentKind::Codex, ""), false), "an argument resume does not take");
+        assert!(can_resume(&cfg, &exec_for(AgentKind::Codex, ""), false) && can_resume(&cfg, &exec_for(AgentKind::Claude, ""), true));
+    }
+
+    #[test]
+    fn codex_names_its_thread_and_uuids_are_v4() {
+        assert_eq!(parse_codex(r#"{"type":"thread.started","thread_id":"01a1-x"}"#), vec![Parsed::Session("01a1-x".into())]);
+        let u = new_uuid();
+        assert_eq!((u.len(), &u[14..15], u.matches('-').count()), (36, "4", 4), "{}", u);
+        assert!(matches!(&u[19..20], "8" | "9" | "a" | "b"), "{}", u);
+        assert_ne!(u, new_uuid());
     }
 
     #[test]

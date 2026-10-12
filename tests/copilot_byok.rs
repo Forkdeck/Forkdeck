@@ -22,8 +22,17 @@ enum Answer {
     Refuse,
 }
 
+type Seen = Arc<Mutex<Vec<Value>>>;
+
 /// Serves chat completions on a free port until the test ends. Returns the base URL.
 fn fake_server(answer: Answer) -> String {
+    fake_server_seeing(answer).0
+}
+
+/// The same, also returning every chat request it was sent.
+fn fake_server_seeing(answer: Answer) -> (String, Seen) {
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let keep = seen.clone();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let calls = Arc::new(Mutex::new(0u32));
@@ -53,6 +62,7 @@ fn fake_server(answer: Answer) -> String {
                 let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", b.len(), b);
                 continue;
             }
+            keep.lock().unwrap().push(req.clone());
             let n = {
                 let mut c = calls.lock().unwrap();
                 *c += 1;
@@ -88,7 +98,7 @@ fn fake_server(answer: Answer) -> String {
             }
         }
     });
-    url
+    (url, seen)
 }
 
 struct Run {
@@ -98,10 +108,15 @@ struct Run {
 }
 
 fn copilot(url: &str, dir: &Path, prompt: &str, role_args: &[&str]) -> Run {
+    copilot_with(url, dir, prompt, role_args, &[])
+}
+
+fn copilot_with(url: &str, dir: &Path, prompt: &str, role_args: &[&str], more: &[&str]) -> Run {
     let usage = dir.join("usage.json");
     let mut args: Vec<String> = ["--output-format", "json", "--no-ask-user", "--no-auto-update", "--usage-output-file"].iter().map(|s| s.to_string()).collect();
     args.push(usage.display().to_string());
     args.extend(role_args.iter().map(|s| s.to_string()));
+    args.extend(more.iter().map(|s| s.to_string()));
     let home = dir.join("home");
     std::fs::create_dir_all(&home).unwrap();
     let mut child = Command::new(std::env::var("COPILOT_BIN").unwrap_or_else(|_| "copilot".into()))
@@ -221,3 +236,21 @@ fn a_refused_model_is_reported_before_anything_runs() {
     assert_eq!((last["type"].as_str(), last["exitCode"].as_u64()), (Some("result"), Some(1)), "{}", last);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+#[ignore]
+fn a_named_conversation_continues_where_it_left_off() {
+    let dir = workspace("session");
+    // No such tool: the model answers with text straight away.
+    let (url, seen) = fake_server_seeing(Answer::ToolThenText("none", json!({})));
+    let id = "6f1c0b4e-2d3a-4c5b-9e8f-0a1b2c3d4e5f";
+    let first = copilot_with(&url, &dir, "Remember the word pelican.", WRITE_ARGS, &["--session-id", id]);
+    assert!(first.exit_ok, "{:?}", first.events);
+    let second = copilot_with(&url, &dir, "Which word was it?", WRITE_ARGS, &["--resume", id]);
+    assert!(second.exit_ok, "{:?}", second.events);
+    let last = seen.lock().unwrap().last().cloned().unwrap();
+    let said = last["messages"].to_string();
+    assert!(said.contains("pelican") && said.contains("Which word was it?"), "the resumed request carries the first exchange: {}", said);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

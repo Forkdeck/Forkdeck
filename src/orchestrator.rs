@@ -123,6 +123,7 @@ impl Hub {
                 claim: None,
                 released: false,
                 turns: vec![Turn { ask: prompt, answer: String::new() }],
+                session: None,
             });
             if stopping {
                 // Shutting down: the job exists so the caller has an id, but it never starts and claims nothing.
@@ -400,9 +401,9 @@ fn avail(hub: &Hub) -> AvailOwned {
 /// Run an agent. When copilot refuses the model before doing anything, remember that and run the
 /// same part with the next model the account may use. Each pass rules one model out, so this ends.
 #[allow(clippy::too_many_arguments)]
-async fn run_agent(hub: &Hub, id: u32, slot: Slot, mut exec: Exec, tier: Tier, prompt: &str, dir: &Path, read_only: bool) -> (RunOut, Exec) {
+async fn run_agent(hub: &Hub, id: u32, slot: Slot, mut exec: Exec, tier: Tier, prompt: &str, dir: &Path, read_only: bool, mut resume: Option<String>) -> (RunOut, Exec) {
     loop {
-        let out = agents::run(hub, id, slot, RunSpec { exec: &exec, prompt, dir, read_only }).await;
+        let out = agents::run(hub, id, slot, RunSpec { exec: &exec, prompt, dir, read_only, resume: resume.as_deref() }).await;
         if out.no_models {
             hub.state.lock().unwrap().copilot.seat = Some(false);
             hub.log("agents", format!("copilot has no model this account may use: {}", out.error));
@@ -413,7 +414,11 @@ async fn run_agent(hub: &Hub, id: u32, slot: Slot, mut exec: Exec, tier: Tier, p
         hub.state.lock().unwrap().rejected_models.insert(m.clone());
         hub.log("agents", format!("#{} {} is not available to this copilot account, skipping it", id, m));
         match pick::resolve(&hub.cfg, &avail(hub).borrow(), &exec.asked, tier) {
-            Some(next) if next.model != exec.model => exec = next,
+            Some(next) if next.model != exec.model => {
+                // Another model is another conversation.
+                resume = None;
+                exec = next;
+            }
             _ => return (out, exec),
         }
     }
@@ -579,9 +584,30 @@ impl Refined {
     }
 }
 
-/// Run the worker once and take a snapshot of what it did.
-async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, cancel: &Cancel) -> Result<String, Finish> {
-    let (out, ran) = run_agent(hub, id, Slot::Worker, w.worker.clone(), w.d.tier, prompt, w.dir, false).await;
+/// The worker's conversation, when the agent about to run can continue it.
+fn resumable(hub: &Hub, id: u32, exec: &Exec) -> Option<String> {
+    if hub.cfg.demo || !agents::can_resume(&hub.cfg, exec, false) {
+        return None;
+    }
+    hub.job(id, |j| j.session.clone()).flatten().filter(|s| s.cli == exec.cli && s.model == exec.model).map(|s| s.id)
+}
+
+/// Run the worker once and take a snapshot of what it did. The worker continues its own
+/// conversation when it can; `fresh` is the prompt for a new one, when it differs from `prompt`.
+async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, fresh: Option<&str>, cancel: &Cancel) -> Result<String, Finish> {
+    let resume = resumable(hub, id, w.worker);
+    let mut used = if resume.is_some() { prompt } else { fresh.unwrap_or(prompt) };
+    let (mut out, mut ran) = run_agent(hub, id, Slot::Worker, w.worker.clone(), w.d.tier, used, w.dir, false, resume.clone()).await;
+    if resume.is_some() && !out.ok && out.tools == 0 && !cancel.is_set() {
+        // The CLI no longer has the conversation: start a new one, told the whole story.
+        hub.log("agents", format!("#{} could not continue the earlier conversation ({}), starting a new one", id, clip(&out.error, 120)));
+        hub.job(id, |j| j.session = None);
+        used = fresh.unwrap_or(prompt);
+        (out, ran) = run_agent(hub, id, Slot::Worker, w.worker.clone(), w.d.tier, used, w.dir, false, None).await;
+    }
+    if let Some(sid) = &out.session {
+        hub.job(id, |j| j.session = Some(Session { cli: ran.cli, id: sid.clone(), model: ran.model.clone() }));
+    }
     if cancel.is_set() {
         return Err(cancelled());
     }
@@ -624,7 +650,7 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
             set_status(hub, id, JobStatus::Reviewing);
             let base = hub.job(id, |j| j.base_sha.clone()).flatten();
             let rp = review_prompt(w.prompt, base.as_deref(), w.followup);
-            let (rev, ran) = run_agent(hub, id, Slot::Reviewer, w.reviewer.clone(), w.d.tier.up(), &rp, w.dir, true).await;
+            let (rev, ran) = run_agent(hub, id, Slot::Reviewer, w.reviewer.clone(), w.d.tier.up(), &rp, w.dir, true, None).await;
             if cancel.is_set() {
                 return Err(cancelled());
             }
@@ -659,7 +685,7 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
             "{}\n\nYour previous attempt is in this working tree and was sent back. Address the points below, then summarise what you changed.\n\n{}",
             w.prompt, fb
         );
-        summary = work_once(hub, id, w, &fp, cancel).await?;
+        summary = work_once(hub, id, w, &fp, None, cancel).await?;
     }
     let good = checks_ok != Some(false) && (!w.d.review || passed == Some(true));
     Ok(Refined { summary, good, checks_ok, passed, reasons })
@@ -710,7 +736,7 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
 
     // 2. Work, then 3. checks and review
     set_status(hub, id, JobStatus::Working);
-    let summary = match work_once(hub, id, &w, &prompt, cancel).await {
+    let summary = match work_once(hub, id, &w, &prompt, None, cancel).await {
         Ok(s) => s,
         Err(f) => return f,
     };
@@ -777,7 +803,7 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
         );
         let short_log = cicd::tail_chars(&log, 4000);
         let wf = Work { followup: Some(&short_log), ..Work { prompt: &prompt, dir: &dir, d: &d, worker: &worker, reviewer: &reviewer, checks: &checks, is_issue, followup: None } };
-        let summary = match work_once(hub, id, &wf, &fp, cancel).await {
+        let summary = match work_once(hub, id, &wf, &fp, None, cancel).await {
             Ok(s) => s,
             Err(f) if f.status == JobStatus::Cancelled => return stopped(),
             Err(f) => return ci_gave_up(hub, id, format!("the pull request is open and its CI failed. {}", f.outcome)).await,
@@ -816,6 +842,11 @@ fn record_answer(hub: &Hub, id: u32, text: &str) {
 /// How many earlier exchanges a reply carries along, and how much of each answer.
 const CHAT_TURNS: usize = 8;
 const CHAT_ANSWER_CHARS: usize = 3000;
+
+/// A new message in a conversation the agent still has.
+fn reply_prompt(text: &str) -> String {
+    format!("The user now says:\n{}\n\nDo what they ask in this working tree, then summarise what you changed or answer their question.", text)
+}
 
 /// The prompt for the latest turn: the conversation so far, then what the user says now.
 fn chat_prompt(turns: &[Turn]) -> String {
@@ -875,7 +906,9 @@ async fn followup(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     }
     let w = Work { prompt: &task, dir: &dir, d: &d, worker: &worker, reviewer: &reviewer, checks: &checks, is_issue: false, followup: None };
     set_status(hub, id, JobStatus::Working);
-    let summary = match work_once(hub, id, &w, &chat_prompt(&turns), cancel).await {
+    // With the agent's own conversation, only the new message is needed.
+    let now = turns.last().map(|t| t.ask.clone()).unwrap_or_default();
+    let summary = match work_once(hub, id, &w, &reply_prompt(&now), Some(&chat_prompt(&turns)), cancel).await {
         Ok(s) => s,
         Err(f) => return f,
     };
@@ -947,10 +980,10 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     }
     set_status(hub, id, JobStatus::Reviewing);
     let prompt = pr_review_prompt(number, &title, &body, &base);
-    let first = run_agent(hub, id, Slot::Worker, reviewers[0].clone(), tier, &prompt, &dir, true);
+    let first = run_agent(hub, id, Slot::Worker, reviewers[0].clone(), tier, &prompt, &dir, true, None);
     let second = async {
         match reviewers.get(1) {
-            Some(e) => Some(run_agent(hub, id, Slot::Reviewer, e.clone(), tier, &prompt, &dir, true).await),
+            Some(e) => Some(run_agent(hub, id, Slot::Reviewer, e.clone(), tier, &prompt, &dir, true, None).await),
             None => {
                 hub.job(id, |j| j.reviewer.state = StageState::Skipped);
                 None

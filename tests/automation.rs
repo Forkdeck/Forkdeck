@@ -8,6 +8,7 @@ use std::process::Command;
 
 const CLAUDE: &str = r#"#!/bin/sh
 [ "$1" = "--version" ] && { echo stand-in; exit 0; }
+[ -n "$FAKE_ARGS" ] && echo "$*" >> "$FAKE_ARGS"
 prompt=$(cat)
 [ -n "$FAKE_PROMPTS" ] && printf '%s\n-----\n' "$prompt" >> "$FAKE_PROMPTS"
 case "$prompt" in
@@ -1467,3 +1468,25 @@ fn a_copilot_review_that_stops_early_is_not_a_pass() {
     assert!(calls.contains("--add-label review:ready"), "{}\n{}", calls, out);
     assert!(out.contains("exited before reporting a result"), "it failed for the missing closing line: {}", out);
 }
+
+fn arg_after<'a>(line: &'a str, flag: &str) -> Option<&'a str> {
+    let mut it = line.split(' ');
+    it.find(|a| *a == flag)?;
+    it.next()
+}
+
+#[test]
+fn a_fix_round_continues_the_workers_own_conversation() {
+    let rig = Rig::new("session", "", "");
+    rig.issue();
+    let log = rig.root.join("args.log");
+    let (_, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_ARGS", log.to_str().unwrap())]);
+    let runs: Vec<String> = fs::read_to_string(&log).unwrap().lines().map(String::from).collect();
+    let workers: Vec<&String> = runs.iter().filter(|r| r.contains("acceptEdits")).collect();
+    let reviews: Vec<&String> = runs.iter().filter(|r| r.contains("--permission-mode plan")).collect();
+    assert_eq!((workers.len(), reviews.len()), (2, 2), "work, review, fix, review: {:?}\n{}", runs, out);
+    let first = arg_after(workers[0], "--session-id").expect("the first run names its conversation");
+    assert_eq!(arg_after(workers[1], "--resume"), Some(first), "the fix continues it: {:?}", workers);
+    assert!(reviews.iter().all(|r| arg_after(r, "--resume").is_none()), "reviews start fresh: {:?}", reviews);
+}
+

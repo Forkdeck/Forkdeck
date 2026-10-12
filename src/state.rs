@@ -284,6 +284,14 @@ impl Cancel {
     }
 }
 
+/// The worker's own conversation in its CLI, continued on later turns instead of retelling it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Session {
+    pub cli: AgentKind,
+    pub id: String,
+    pub model: String,
+}
+
 /// One exchange in a typed task's conversation: what the user asked and what the agent said back.
 #[derive(Clone, Debug)]
 pub struct Turn {
@@ -323,6 +331,8 @@ pub struct Job {
     pub released: bool,
     /// The conversation so far. The first turn is the task itself; each reply adds one.
     pub turns: Vec<Turn>,
+    /// The worker's conversation, once its CLI has named it.
+    pub session: Option<Session>,
 }
 
 pub struct LogLine {
