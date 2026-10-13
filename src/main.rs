@@ -60,7 +60,8 @@ enum Cmd {
         plan: bool,
         task: Vec<String>,
     },
-    /// Continue the typed tasks that were cut off when forkdeck last stopped, without the interface
+    /// Continue the typed tasks that were cut off when forkdeck last stopped, without the interface.
+    /// Lines typed on stdin go to them as in `run` ("#N text" to pick one)
     Resume,
     /// List the jobs kept from earlier runs, or clear them
     History {
@@ -397,12 +398,33 @@ async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentRef
     let title = state::clip(&task, 80);
     // Without --plan nobody may be there to choose, so a plan is never waited for.
     let id = hub.submit(title, task, Source::Manual, cwd, forced, if plan { state::Planning::Always } else { state::Planning::Never });
-    // Lines typed while it runs go to the task: queued for the agent, or at once with a leading "!".
+    read_messages(hub, vec![id]);
+    wait_for(hub, &[id]).await
+}
+
+/// Continue every typed task that was cut off, and wait for them.
+/// Lines typed while jobs run go to them: queued for the agent, or at once with a leading "!". With
+/// several jobs, "#N text" picks one; otherwise a job waiting for a choice of plan gets it, else the
+/// first one still running.
+fn read_messages(hub: &Hub, ids: Vec<u32>) {
     let h = hub.clone();
     std::thread::spawn(move || {
         for line in std::io::stdin().lines() {
             let Ok(line) = line else { break };
-            let text = line.trim();
+            let mut text = line.trim();
+            let picked = text.strip_prefix('#').and_then(|r| r.split_once(' ')).and_then(|(n, rest)| n.parse::<u32>().ok().filter(|n| ids.contains(n)).map(|n| (n, rest.trim())));
+            let id = match picked {
+                Some((n, rest)) => {
+                    text = rest;
+                    n
+                }
+                None => {
+                    let st = h.state.lock().unwrap();
+                    let mine = || st.jobs.iter().filter(|j| ids.contains(&j.id));
+                    let Some(id) = mine().find(|j| j.status == JobStatus::Choosing).or_else(|| mine().find(|j| !j.status.finished())).map(|j| j.id) else { continue };
+                    id
+                }
+            };
             let sent = match text.strip_prefix('!') {
                 Some(now) if !now.trim().is_empty() => h.steer_now(id, now.trim().to_string()),
                 _ if !text.is_empty() => h.reply(id, text.to_string()),
@@ -413,10 +435,8 @@ async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentRef
             }
         }
     });
-    wait_for(hub, &[id]).await
 }
 
-/// Continue every typed task that was cut off, and wait for them.
 async fn resume_cmd(hub: &Hub) -> i32 {
     let mut ids = Vec::new();
     for id in hub.restore() {
@@ -430,6 +450,8 @@ async fn resume_cmd(hub: &Hub) -> i32 {
         say!("nothing to resume");
         return 0;
     }
+    // A task stopped while planning or choosing asks again, and the answer is typed here.
+    read_messages(hub, ids.clone());
     wait_for(hub, &ids).await
 }
 

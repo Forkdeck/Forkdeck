@@ -447,6 +447,11 @@ pub struct Job {
     pub plan: Option<Plan>,
     /// Woken when the user chooses.
     pub chose: Arc<tokio::sync::Notify>,
+    /// The worker and reviewer as they last ran, when that differs from the first choice (a model
+    /// the account refused was replaced). Later turns use these, so the refused model is not asked
+    /// again and the conversation they started can continue.
+    pub worker_ran: Option<crate::pick::Exec>,
+    pub reviewer_ran: Option<crate::pick::Exec>,
 }
 
 impl Job {

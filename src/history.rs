@@ -275,6 +275,8 @@ impl JobRecord {
             planning: self.planning,
             plan: self.plan,
             chose: Default::default(),
+            worker_ran: None,
+            reviewer_ran: None,
             peer: None,
             used: Default::default(),
             findings: Vec::new(),
@@ -529,6 +531,8 @@ mod tests {
             planning: Planning::Always,
             plan: Some(Plan { options: vec![crate::state::PlanOption { title: "a".into(), summary: "b".into(), recommended: true }], text: "t".into(), chosen: Some(crate::state::Choice::Own("mine".into())) }),
             chose: Default::default(),
+            worker_ran: None,
+            reviewer_ran: None,
         }
     }
 

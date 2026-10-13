@@ -14,6 +14,8 @@ prompt=$(cat)
 [ -n "$FAKE_PROMPTS" ] && printf '%s\n-----\n' "$prompt" >> "$FAKE_PROMPTS"
 case "$prompt" in
   *"<options>"*)
+    # FAKE_PLAN_WAIT: the first plan takes until it is stopped (the marker says it started).
+    if [ -n "$FAKE_PLAN_WAIT" ] && [ ! -f "$FAKE_PLAN_WAIT" ]; then touch "$FAKE_PLAN_WAIT"; sleep 600; fi
     printf '%s\n' '{"type":"result","is_error":false,"result":"Two ways.\n<options>{\"options\": [{\"title\": \"Patch it\", \"summary\": \"small\"}, {\"title\": \"Rewrite it\", \"summary\": \"clean\", \"recommended\": true}]}</options>"}'
     ;;
   *"Write at most three short rules"*)
@@ -26,6 +28,8 @@ case "$prompt" in
     # list), FAKE_REVIEW_CRASH=1 crashes the first review (=always: every one), and
     # FAKE_REVIEW_NOVERDICT=1 leaves the verdict out of the first.
     n=$(cat "$FAKE_GH/reviews" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_GH/reviews"
+    # FAKE_REVIEW_RESUME_FAILS: a review that tries to continue an earlier one finds it gone.
+    if [ -n "$FAKE_REVIEW_RESUME_FAILS" ]; then case "$*" in *--resume*) echo "No conversation found with session ID" >&2; exit 1 ;; esac; fi
     [ "$FAKE_REVIEW_CRASH" = always ] && { echo "reviewer crashed" >&2; exit 1; }
     [ "$n" = 1 ] && [ -n "$FAKE_REVIEW_CRASH" ] && { echo "reviewer crashed" >&2; exit 1; }
     if [ "$n" = 1 ] && [ -n "$FAKE_REVIEW_NOVERDICT" ]; then
@@ -33,7 +37,7 @@ case "$prompt" in
       exit 0
     fi
     v=${FAKE_VERDICT:-PASS}
-    [ -n "$FAKE_VERDICTS" ] && { v=$(echo "$FAKE_VERDICTS" | cut -d' ' -f"$n"); [ -n "$v" ] || v=PASS; }
+    [ -n "$FAKE_VERDICTS" ] && { v=$(echo "$FAKE_VERDICTS" | awk -v n="$n" '{print $n}'); [ -n "$v" ] || v=PASS; }
     printf '%s\n' "{\"type\":\"result\",\"is_error\":false,\"result\":\"Looked at it.\\nVERDICT: $v\"}"
     ;;
   *)
@@ -2373,4 +2377,130 @@ fn a_task_another_forkdeck_is_running_is_not_resumed_by_a_second_one() {
     let (ok, out) = rig.run(&["resume"], &[("FAKE_ARGS", args.to_str().unwrap())]);
     assert!(ok, "{}", out);
     assert_eq!(workers(&rig).len(), 2);
+}
+
+#[test]
+fn a_reviewer_whose_earlier_review_is_gone_starts_a_new_one_told_what_it_said() {
+    let rig = Rig::new("re-review-gone", "", "");
+    rig.issue();
+    let (args, prompts) = (rig.root.join("args.log"), rig.root.join("prompts.log"));
+    let (ok, out) = rig.once(&[("FAKE_VERDICTS", "FAIL"), ("FAKE_REVIEW_RESUME_FAILS", "1"), ("FAKE_ARGS", args.to_str().unwrap()), ("FAKE_PROMPTS", prompts.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    let runs = fs::read_to_string(&args).unwrap();
+    let reviews: Vec<&str> = runs.lines().filter(|l| l.contains("--permission-mode plan")).collect();
+    assert_eq!(reviews.len(), 3, "first review, the resume that failed, a new review: {:?}", reviews);
+    assert!(arg_after(reviews[1], "--resume").is_some() && arg_after(reviews[2], "--resume").is_none(), "{:?}", reviews);
+    let p = fs::read_to_string(&prompts).unwrap();
+    assert!(p.contains("----- BEGIN EARLIER REVIEW -----\nLooked at it.\nVERDICT: FAIL"), "the new review is told what the first said: {}", p);
+    assert!(p.contains("The task, with everything the user has asked for since:"), "{}", p);
+}
+
+#[test]
+fn a_refused_model_is_not_asked_again_on_the_next_turn() {
+    let rig = Rig::with_agents("copilot-fallback-kept", &format!("{}[review]\nmax_fix_rounds = 1", NO_REAL_CLIS), "", &[("copilot", COPILOT)]);
+    rig.issue();
+    let (_, out) = rig.once(&[("FAKE_COPILOT_REJECT", "claude-sonnet-5.5 gpt-5.5"), ("FAKE_VERDICT", "FAIL")]);
+    let runs = copilot_runs(&rig);
+    let workers: Vec<&String> = runs.iter().filter(|r| r.contains("--allow-tool write")).collect();
+    assert_eq!(workers.len(), 3, "refused, fallback, fix: {:?}\n{}", workers, out);
+    assert_eq!(model_of(workers[2]), model_of(workers[1]), "the fix uses the model that worked: {:?}", workers);
+    assert!(workers[2].contains("--resume"), "and continues its conversation: {:?}", workers);
+}
+
+#[test]
+fn a_message_that_stops_the_planning_is_taken_into_the_plan() {
+    let rig = Rig::new("plan-steered", "", "");
+    let (args, prompts, marker) = (rig.root.join("args.log"), rig.root.join("prompts.log"), rig.root.join("planning"));
+    let mut child = rig
+        .bare(&[("FAKE_ARGS", args.to_str().unwrap()), ("FAKE_PROMPTS", prompts.to_str().unwrap()), ("FAKE_PLAN_WAIT", marker.to_str().unwrap())])
+        .args(["run", "--plan", "add a change file"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..600 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let seen = tee(&mut child);
+    child.stdin.as_mut().unwrap().write_all(b"!only touch one file\n").unwrap();
+    wait_until_said(&seen, "interrupted with a message");
+    child.stdin.as_mut().unwrap().write_all(b"1\n").unwrap();
+    let status = child.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let said = seen.lock().unwrap().clone();
+    assert!(status.success(), "the task goes on instead of failing: {}", said);
+    let runs = fs::read_to_string(&args).unwrap();
+    let plans: Vec<&str> = runs.lines().filter(|l| l.contains("--permission-mode plan")).collect();
+    assert!(arg_after(plans[1], "--resume") == arg_after(plans[0], "--session-id"), "planned again in the same conversation: {:?}", plans);
+    let p = fs::read_to_string(&prompts).unwrap();
+    assert!(p.contains("The user says: only touch one file"), "{}", p);
+    assert!(p.contains("Go ahead with this: Option 1: Patch it"), "{}", p);
+}
+
+
+/// Stop `run --plan` while the first plan is still being made. The job is saved as interrupted there.
+fn plan_stopped_while_planning(rig: &Rig) {
+    let marker = rig.root.join("planning");
+    let child = rig
+        .bare(&[("FAKE_PLAN_WAIT", marker.to_str().unwrap())])
+        .args(["run", "--plan", "add a change file"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..600 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(marker.exists(), "the plan never started");
+    Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    let _ = child.wait_with_output();
+}
+
+fn resume_typing(rig: &Rig, typed: &str) -> (bool, String) {
+    let prompts = rig.root.join("prompts.log");
+    let mut child = rig
+        .bare(&[("FAKE_PROMPTS", prompts.to_str().unwrap())])
+        .arg("resume")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(typed.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+}
+
+#[test]
+fn a_task_stopped_while_planning_takes_its_choice_from_resume() {
+    let rig = Rig::new("resume-plan-choice", "", "");
+    plan_stopped_while_planning(&rig);
+    let (ok, out) = resume_typing(&rig, "2\n");
+    assert!(ok, "{}", out);
+    let p = fs::read_to_string(rig.root.join("prompts.log")).unwrap();
+    assert!(p.contains("Go ahead with this: Option 2: Rewrite it"), "{}", p);
+}
+
+#[test]
+fn a_planned_task_stopped_before_it_started_still_plans_first() {
+    let rig = Rig::new("resume-queued-plan", "", "");
+    plan_stopped_while_planning(&rig);
+    // As if it had been stopped while still waiting in the queue.
+    let db = rusqlite::Connection::open(rig.root.join("home/.local/state/forkdeck/forkdeck.db")).unwrap();
+    db.execute("UPDATE jobs SET resume_from = 'queued'", []).unwrap();
+    drop(db);
+    let (ok, out) = resume_typing(&rig, "1\n");
+    assert!(ok, "{}", out);
+    let p = fs::read_to_string(rig.root.join("prompts.log")).unwrap();
+    let plan_at = p.find("Before anything is changed, propose how to do the task").expect("it planned");
+    let work_at = p.find("Go ahead with this: Option 1: Patch it").expect("then worked as chosen");
+    assert!(plan_at < work_at, "{}", p);
 }
