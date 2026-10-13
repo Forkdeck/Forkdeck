@@ -165,8 +165,13 @@ impl Hub {
         };
         let mut resumable = Vec::new();
         let mut st = self.state.lock().unwrap();
+        let me = crate::history::owner_token();
         for r in records {
             if st.jobs.iter().any(|j| j.id == r.id) {
+                continue;
+            }
+            // Still running in another forkdeck: it is that one's, not an interrupted job.
+            if !r.status.finished() && r.owner.as_deref().is_some_and(|o| o != me && crate::history::owner_alive(o)) {
                 continue;
             }
             let j = r.job();
@@ -182,6 +187,14 @@ impl Hub {
 
     /// Continue an interrupted typed task from the stage it had reached. Err says why not.
     pub fn resume(&self, id: u32) -> Result<(), String> {
+        // Taken over in the database first: two forkdecks starting at once must not both run it.
+        if let Some(h) = &self.history {
+            match h.claim(id) {
+                Ok(true) => {}
+                Ok(false) => return Err("another forkdeck that is still running has it".into()),
+                Err(e) => return Err(format!("could not take it over: {}", e)),
+            }
+        }
         {
             let mut st = self.state.lock().unwrap();
             if st.stopping {
@@ -231,8 +244,10 @@ impl Hub {
         let id = {
             let mut st = self.state.lock().unwrap();
             let stopping = st.stopping;
-            let id = from_db.unwrap_or(st.next_id).max(st.next_id);
-            st.next_id = id + 1;
+            // The id the database reserved is used as it is: two submissions can reach this lock in
+            // either order, and a different number would be one nobody reserved.
+            let id = from_db.unwrap_or(st.next_id);
+            st.next_id = st.next_id.max(id + 1);
             st.jobs.push(Job {
                 id,
                 title: title.clone(),
@@ -1098,6 +1113,8 @@ async fn tree_state(hub: &Hub, id: u32, w: &Work<'_>) -> Option<String> {
     }
     let status = issues::sh("git", &["status", "--porcelain", "--untracked-files=all"], Some(w.dir)).await.ok()?;
     let diff = issues::sh("git", &["diff", "HEAD"], Some(w.dir)).await.ok()?;
+    // A worker that commits its fix leaves no diff behind: the committed tree counts as well.
+    let head = issues::sh("git", &["rev-parse", "HEAD^{tree}"], Some(w.dir)).await.unwrap_or_default();
     // Untracked files show by name only; their content counts too.
     let mut untracked = String::new();
     for f in status.lines().filter_map(|l| l.strip_prefix("?? ")) {
@@ -1105,7 +1122,7 @@ async fn tree_state(hub: &Hub, id: u32, w: &Work<'_>) -> Option<String> {
     }
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (status, diff, untracked).hash(&mut h);
+    (status, diff, untracked, head).hash(&mut h);
     Some(format!("{:x}", h.finish()))
 }
 

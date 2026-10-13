@@ -46,7 +46,40 @@ const MIGRATIONS: &[&str] = &["
 ", "
     ALTER TABLE jobs ADD COLUMN planning TEXT;
     ALTER TABLE jobs ADD COLUMN plan TEXT;
+", "
+    ALTER TABLE jobs ADD COLUMN inbox TEXT;
+    ALTER TABLE jobs ADD COLUMN owner TEXT;
 "];
+
+/// Who is running: this process, told apart from a later process that reuses its id by its start time.
+pub fn owner_token() -> String {
+    let pid = std::process::id();
+    format!("{}:{}", pid, start_time(pid).unwrap_or_default())
+}
+
+/// The kernel's start time of a process (field 22 of /proc/<pid>/stat), or None where there is no /proc.
+fn start_time(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // The command name is in parentheses and may hold spaces; the fields after it are plain.
+    let rest = &stat[stat.rfind(')')? + 2..];
+    rest.split_whitespace().nth(19).map(String::from)
+}
+
+/// Whether the process that wrote this owner token is still running.
+pub fn owner_alive(token: &str) -> bool {
+    let Some((pid, start)) = token.split_once(':') else { return false };
+    // 0 is not a process (kill(0, ..) would ask about our own process group).
+    let Ok(pid) = pid.parse::<u32>() else { return false };
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    match start_time(pid) {
+        // Same id, same start: the same process.
+        Some(now) => start.is_empty() || now == start,
+        // No /proc: ask the kernel whether the id is in use.
+        None => unsafe { libc::kill(pid as i32, 0) == 0 },
+    }
+}
 
 pub fn path() -> PathBuf {
     crate::cicd::state_dir().join("forkdeck.db")
@@ -163,6 +196,10 @@ pub struct JobRecord {
     pub turns: Vec<Turn>,
     pub planning: Planning,
     pub plan: Option<Plan>,
+    /// Messages accepted for the agent and not taken yet.
+    pub inbox: Vec<String>,
+    /// The forkdeck process that runs the job, as `owner_token` wrote it.
+    pub owner: Option<String>,
 }
 
 impl JobRecord {
@@ -192,6 +229,8 @@ impl JobRecord {
             turns: j.turns.clone(),
             planning: j.planning,
             plan: j.plan.clone(),
+            inbox: j.inbox.iter().cloned().collect(),
+            owner: Some(owner_token()),
         }
     }
 
@@ -231,7 +270,7 @@ impl JobRecord {
             turns: self.turns,
             session: self.session,
             resume_from,
-            inbox: Default::default(),
+            inbox: self.inbox.into(),
             steer: crate::state::Cancel::new(),
             planning: self.planning,
             plan: self.plan,
@@ -298,14 +337,14 @@ impl History {
         let tx = db.transaction().map_err(|e| e.to_string())?;
         let json = |v: &dyn erased::Json| v.json();
         tx.execute(
-            "INSERT INTO jobs (id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+            "INSERT INTO jobs (id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan, inbox, owner)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
              ON CONFLICT(id) DO UPDATE SET title = excluded.title, prompt = excluded.prompt, source = excluded.source, workdir = excluded.workdir,
                branch = excluded.branch, base_sha = excluded.base_sha, status = excluded.status, resume_from = excluded.resume_from,
                outcome = excluded.outcome, decision = excluded.decision, forced = excluded.forced, session = excluded.session,
                pr_url = excluded.pr_url, rounds = excluded.rounds, verdict = excluded.verdict, checks = excluded.checks,
                created = excluded.created, finished = excluded.finished, worker = excluded.worker, reviewer = excluded.reviewer,
-               planning = excluded.planning, plan = excluded.plan",
+               planning = excluded.planning, plan = excluded.plan, inbox = excluded.inbox, owner = excluded.owner",
             params![
                 r.id,
                 r.title,
@@ -330,6 +369,8 @@ impl History {
                 json(&r.reviewer),
                 json(&r.planning),
                 r.plan.as_ref().map(|p| json(p)),
+                json(&r.inbox),
+                r.owner,
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -346,7 +387,7 @@ impl History {
         let e = |e: rusqlite::Error| e.to_string();
         let mut q = db
             .prepare(
-                "SELECT id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan
+                "SELECT id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan, inbox, owner
                  FROM jobs WHERE source != 'null' ORDER BY id DESC LIMIT ?1",
             )
             .map_err(e)?;
@@ -378,6 +419,8 @@ impl History {
                     turns: Vec::new(),
                     planning: serde_json::from_str(&text(21)?).unwrap_or_default(),
                     plan: r.get::<_, Option<String>>(22)?.and_then(|p| serde_json::from_str(&p).ok()),
+                    inbox: r.get::<_, Option<String>>(23)?.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default(),
+                    owner: r.get(24)?,
                 })
             })
             .map_err(e)?;
@@ -388,6 +431,23 @@ impl History {
         }
         out.reverse();
         Ok(out)
+    }
+
+    /// Take a job over for this process, unless another forkdeck that is still running owns it.
+    /// One transaction, so two processes starting at once cannot both take it.
+    pub fn claim(&self, id: u32) -> Result<bool, String> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let owner: Option<Option<String>> = tx.query_row("SELECT owner FROM jobs WHERE id = ?1", params![id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        let me = owner_token();
+        match owner {
+            None => return Ok(false),
+            Some(Some(o)) if o != me && owner_alive(&o) => return Ok(false),
+            _ => {}
+        }
+        tx.execute("UPDATE jobs SET owner = ?1 WHERE id = ?2", params![me, id]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
     }
 
     /// Keep the newest `keep` jobs.
@@ -460,7 +520,7 @@ mod tests {
             turns: vec![Turn { ask: "fix it".into(), answer: "fixed".into() }, Turn { ask: "and the test".into(), answer: String::new() }],
             session: Some(Session { cli: AgentKind::Claude, id: "s1".into(), model: "sonnet".into() }),
             resume_from: None,
-            inbox: Default::default(),
+            inbox: vec!["and the docs too".to_string()].into(),
             steer: Cancel::new(),
             peer: None,
             used: Default::default(),
@@ -497,6 +557,7 @@ mod tests {
         let j = back[0].clone().job();
         assert_eq!((j.turns.len(), j.worker.tail.len(), j.worker.via.as_str(), j.forced.map(|f| f.name())), (2, 2, "copilot", Some("copilot:second".to_string())));
         assert_eq!(j.decision.unwrap().tier, Tier::Heavy);
+        assert_eq!(j.inbox.iter().collect::<Vec<_>>(), ["and the docs too"], "a queued message survives a restart");
     }
 
     #[test]
@@ -509,6 +570,26 @@ mod tests {
         let back = h.load(10).unwrap().remove(0).job();
         assert_eq!((back.status, back.resume_from, back.reviewer.state), (JobStatus::Interrupted, Some(JobStatus::Reviewing), StageState::Failed));
         assert!(back.outcome.contains("ok") || back.outcome.contains("interrupted"));
+    }
+
+    #[test]
+    fn a_job_is_claimed_only_from_an_owner_that_is_gone() {
+        let h = History::in_memory();
+        let id = h.new_id().unwrap();
+        let mut r = JobRecord::of(&job(id, Source::Manual, JobStatus::Interrupted));
+        // A process that cannot exist: beyond any pid_max.
+        r.owner = Some("999999999:1".into());
+        h.save(&r).unwrap();
+        assert!(h.claim(id).unwrap(), "the owner is gone");
+        assert_eq!(h.load(10).unwrap()[0].owner.as_deref(), Some(owner_token().as_str()));
+        assert!(h.claim(id).unwrap(), "claiming again from this process is fine");
+        // Owned by a live process that is not this one: init (pid 1) is always running.
+        let other = format!("1:{}", start_time(1).unwrap_or_default());
+        r.owner = Some(other.clone());
+        h.save(&r).unwrap();
+        assert!(owner_alive(&other));
+        assert!(!h.claim(id).unwrap(), "a running forkdeck keeps its job");
+        assert!(!h.claim(9999).unwrap(), "no such job");
     }
 
     #[test]

@@ -2346,3 +2346,31 @@ fn copilot_usage_is_recorded_separately_and_counts_toward_limits() {
     assert!(ok && out.contains("token limit reached: 24 of 20 in the last 24 h"), "{}", out);
     assert_eq!(rig.calls(), before);
 }
+
+#[test]
+fn a_fix_that_is_committed_counts_as_a_change() {
+    let rig = Rig::new("fix-committed", "", "");
+    // Each attempt commits a different change, so nothing is left uncommitted between rounds.
+    let work = "date +%s%N >> committed.txt && git add committed.txt && git commit -qm attempt";
+    let out = rig.bare(&[("FAKE_VERDICTS", "FAIL FAIL PASS"), ("FAKE_WORK", work)]).args(["run", "add a change file"]).output().unwrap();
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{}", said);
+    assert!(!said.contains("changed nothing"), "{}", said);
+    assert_eq!(reviews_run(&rig), 3, "{}", said);
+}
+
+#[test]
+fn a_task_another_forkdeck_is_running_is_not_resumed_by_a_second_one() {
+    let rig = Rig::new("resume-live-owner", "", "");
+    let mut child = run_with_slow_first_attempt(&rig, "sleep 600");
+    let (ok, out) = rig.run(&["resume"], &[]);
+    assert!(ok && out.contains("nothing to resume"), "the running job is the other process's:\n{}", out);
+    assert_eq!(workers(&rig).len(), 1, "no second worker was started");
+    Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    let _ = child.wait();
+    // Once that forkdeck is gone, its interrupted task can be taken over.
+    let args = rig.root.join("args.log");
+    let (ok, out) = rig.run(&["resume"], &[("FAKE_ARGS", args.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    assert_eq!(workers(&rig).len(), 2);
+}
