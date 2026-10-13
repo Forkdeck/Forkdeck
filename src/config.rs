@@ -743,6 +743,30 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
     Ok((Config::default(), None))
 }
 
+impl RepoCfg {
+    /// The repository as forkdeck tells it apart from others: "group/project@host" on a
+    /// self-hosted GitLab, where the same path may exist on another host; otherwise the name alone,
+    /// as it always was.
+    pub fn qualified(&self) -> String {
+        if self.provider == Provider::Gitlab && !self.host.is_empty() && self.host != "gitlab.com" {
+            format!("{}@{}", self.repo, self.host)
+        } else {
+            self.repo.clone()
+        }
+    }
+}
+
+/// Renames from old names to new ones, kept only where an old name has exactly one new owner and
+/// actually changes. Several owners mean nobody can tell whose the old file was.
+pub fn unambiguous_moves<T: Eq + std::hash::Hash + Clone>(pairs: impl IntoIterator<Item = (T, T)>) -> Vec<(T, T)> {
+    let mut owners: HashMap<T, Vec<T>> = HashMap::new();
+    for (old, new) in pairs {
+        let v = owners.entry(old).or_default();
+        if !v.contains(&new) { v.push(new); }
+    }
+    owners.into_iter().filter(|(old, new)| new.len() == 1 && new[0] != *old).map(|(old, mut new)| (old, new.remove(0))).collect()
+}
+
 /// The host a clone's origin names, or "" when there is none to read.
 pub fn origin_host(clone: &Path) -> String {
     std::process::Command::new("git").args(["-C"]).arg(clone).args(["remote", "get-url", "origin"]).stderr(std::process::Stdio::null()).output().ok()
@@ -818,7 +842,7 @@ impl Config {
         let mut targets = std::collections::HashSet::new();
         for r in &self.repos {
             if let Some(d) = &r.deploy {
-                let key = format!("{:?}:{}:{}", r.provider, r.repo, d.environment).to_lowercase();
+                let key = format!("{:?}:{}:{}", r.provider, r.qualified(), d.environment).to_lowercase();
                 anyhow::ensure!(targets.insert(key), "repos: {} has more than one deploy stage for {:?}", r.repo, d.environment);
             }
         }
@@ -951,6 +975,13 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_old_name_moves_only_to_its_one_owner() {
+        let mut got = unambiguous_moves([("a", "a@one"), ("a", "a@one"), ("b", "b@one"), ("b", "b@two"), ("c", "c@one"), ("c", "c"), ("d", "d")]);
+        got.sort();
+        assert_eq!(got, [("a", "a@one")], "two environments on one host are one owner; two hosts, or gitlab.com too, are ambiguous; unchanged names stay");
+    }
 
     #[test]
     fn automation_labels_cannot_broaden_the_filter_or_conflict() {

@@ -204,6 +204,13 @@ fn main() -> anyhow::Result<()> {
         eprintln!("note: ./forkdeck.toml is not read. Move it to {} or pass --config.", config::user_path().display());
     }
     cfg.demo = cli.demo;
+    if !cfg.demo {
+        // Files saved under a repository's name from before its host was part of it.
+        knowledge::migrate_names(&cfg.repos);
+        if let Err(e) = cicd::migrate_keys(&cfg.repos) {
+            eprintln!("note: the deployment state was not moved to its new names: {}", e);
+        }
+    }
     if cfg.demo {
         cfg.automation.enabled = true;
         if cfg.repos.is_empty() {

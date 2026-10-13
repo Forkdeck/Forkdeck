@@ -27,14 +27,22 @@ pub fn path(r: &RepoCfg) -> PathBuf {
         Provider::Github => "github",
         Provider::Gitlab => "gitlab",
     };
-    let dir = crate::cicd::state_dir().join("notes").join(forge);
-    let p = dir.join(format!("{}.md", issues::repo_slug(r)));
-    // Notes kept under the name from before the host was part of it move to the new name once.
-    let legacy = dir.join(format!("{}.md", issues::legacy_slug(r)));
-    if legacy != p && !p.exists() && legacy.exists() {
-        let _ = std::fs::rename(&legacy, &p);
+    crate::cicd::state_dir().join("notes").join(forge).join(format!("{}.md", issues::repo_slug(r)))
+}
+
+/// Notes and waiting rules kept under the name from before the host was part of a self-hosted
+/// GitLab repository's name move to the new one, but only where one configured repository can own
+/// them: with the same path on two hosts (or also on gitlab.com) they stay where they are.
+pub fn migrate_names(repos: &[RepoCfg]) {
+    let moves = crate::config::unambiguous_moves(repos.iter().map(|r| { let new = path(r); (new.with_file_name(format!("{}.md", issues::legacy_slug(r))), new) }));
+    for (old, new) in moves {
+        for ext in ["md", "pending"] {
+            let (from, to) = (old.with_extension(ext), new.with_extension(ext));
+            if from.exists() && !to.exists() {
+                let _ = std::fs::rename(&from, &to);
+            }
+        }
     }
-    p
 }
 
 /// Rules that were learned but could not be proposed yet. They wait here, where no job reads
