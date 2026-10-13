@@ -207,11 +207,14 @@ fn a_reviewer_cannot_edit_or_run_commands() {
 
 #[test]
 #[ignore]
-fn a_reviewer_reads_the_checkout_from_outside_it() {
-    // Reviewers start in an empty directory, so a checkout's own configuration is not loaded, and are
-    // given the checkout's absolute path. That only works if reading outside the directory is allowed.
+fn a_reviewer_cannot_read_a_checkout_outside_its_directory() {
+    // Why a Copilot reviewer is given a copy of the checkout in its own directory: a checkout
+    // elsewhere (worktrees live under ~/.cache) cannot be read, and the ways to allow it load that
+    // directory's skills and agents (--add-dir) or open the whole disk (--allow-all-paths). Outside
+    // the system temp directory, which Copilot allows on its own.
     let dir = workspace("review-outside");
-    let checkout = dir.join("checkout");
+    let home = PathBuf::from(std::env::var("HOME").unwrap());
+    let checkout = home.join(".cache").join(format!("forkdeck-byok-outside-{}", std::process::id()));
     std::fs::create_dir_all(&checkout).unwrap();
     let notes = checkout.join("notes.txt");
     std::fs::write(&notes, "hello\n").unwrap();
@@ -219,9 +222,9 @@ fn a_reviewer_reads_the_checkout_from_outside_it() {
     let mut args = REVIEW_ARGS.to_vec();
     args.extend(["--no-custom-instructions", "--disable-builtin-mcps"]);
     let r = copilot(&url, &dir, "Review the change. Do not modify any file.", &args);
-    assert!(r.exit_ok, "{:?}", r.events);
     let done = of_type(&r, "tool.execution_complete");
-    assert!(done.iter().any(|e| e["data"]["success"] == true), "the checkout could not be read: {:?}", done);
+    assert!(!done.iter().any(|e| e["data"]["success"] == true), "read outside its directory: {:?}", done);
+    let _ = std::fs::remove_dir_all(&checkout);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
