@@ -280,6 +280,7 @@ impl JobRecord {
             chose: Default::default(),
             worker_ran: None,
             reviewer_ran: None,
+            in_history: true,
             peer: None,
             used: Default::default(),
             findings: Vec::new(),
@@ -554,6 +555,7 @@ mod tests {
             chose: Default::default(),
             worker_ran: None,
             reviewer_ran: None,
+            in_history: true,
         }
     }
 

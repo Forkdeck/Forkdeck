@@ -60,6 +60,10 @@ while [ $# -gt 0 ]; do
 done
 prompt=$(cat)
 [ -n "$FAKE_PROMPTS" ] && printf '%s\n-----\n' "$prompt" >> "$FAKE_PROMPTS"
+# FAKE_COPILOT_REJECT_LATER: this model works the first time and is refused from then on.
+if [ -n "$FAKE_COPILOT_REJECT_LATER" ] && [ "$model" = "$FAKE_COPILOT_REJECT_LATER" ]; then
+  if [ -f "$FAKE_GH/used-$model" ]; then FAKE_COPILOT_REJECT="$FAKE_COPILOT_REJECT $model"; else touch "$FAKE_GH/used-$model"; fi
+fi
 for m in $FAKE_COPILOT_REJECT; do
   if [ "$m" = "$model" ]; then
     printf '%s\n' "{\"type\":\"model.call_failure\",\"data\":{\"model\":\"$model\",\"statusCode\":400,\"errorCode\":\"model_not_supported\"}}"
@@ -2524,4 +2528,66 @@ fn a_fix_to_a_binary_file_counts_as_a_change() {
     let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success() && !said.contains("changed nothing"), "{}", said);
     assert_eq!(reviews_run(&rig), 2);
+}
+
+#[test]
+fn a_crash_during_the_first_run_still_continues_that_conversation() {
+    let rig = Rig::new("crash-session", "", "");
+    let mut child = run_with_slow_first_attempt(&rig, "sleep 600");
+    // Past an autosave, then killed outright: no shutdown, nothing written on the way out.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    Command::new("kill").args(["-KILL", &child.id().to_string()]).status().unwrap();
+    let _ = child.wait();
+    // The agent it left behind belongs to nobody now.
+    let _ = Command::new("pkill").args(["-f", rig.root.join("first-attempt").to_str().unwrap()]).status();
+    let args = rig.root.join("args.log");
+    let (ok, out) = rig.run(&["resume"], &[("FAKE_ARGS", args.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    let w = workers(&rig);
+    assert_eq!(w.len(), 2, "{:?}", w);
+    assert_eq!(arg_after(&w[1], "--resume"), arg_after(&w[0], "--session-id"), "{:?}", w);
+}
+
+#[test]
+fn a_model_refused_on_a_resumed_turn_hands_its_successor_the_whole_story() {
+    let rig = Rig::with_agents("copilot-refused-on-resume", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    let marker = rig.root.join("first-attempt");
+    let work = format!("if [ -f {m} ]; then echo change >> by_agent.txt; else touch {m}; sleep 600; fi", m = marker.display());
+    let child = rig.bare(&[("FAKE_WORK", &work)]).args(["run", "add a change file"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    for _ in 0..600 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    let _ = child.wait_with_output();
+    let first = copilot_runs(&rig)[0].clone();
+    let model = model_of(&first).to_string();
+    let prompts = rig.root.join("prompts.log");
+    // The model that started the task is refused when the task continues.
+    fs::write(rig.root.join(format!("gh/used-{}", model)), "").unwrap();
+    let (ok, out) = rig.run(&["resume"], &[("FAKE_WORK", &work), ("FAKE_COPILOT_REJECT_LATER", &model), ("FAKE_PROMPTS", prompts.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    let after: Vec<&String> = runs.iter().skip(1).filter(|r| r.contains("--allow-tool write")).collect();
+    assert!(after[0].contains("--resume") && model_of(after[0]) == model, "it first tried to continue: {:?}", after);
+    assert!(model_of(after[1]) != model && !after[1].contains("--resume"), "then a new model in a new conversation: {:?}", after);
+    let p = fs::read_to_string(&prompts).unwrap();
+    assert!(p.contains("add a change file\n\nAn earlier attempt at this was interrupted"), "the new conversation is told everything: {}", p);
+}
+
+
+#[test]
+fn a_choice_waiting_after_a_restart_shows_its_options_again() {
+    let rig = Rig::new("resume-shows-options", "", "");
+    // Planned, then stopped while it waited for a choice.
+    let mut child = rig.bare(&[]).args(["run", "--plan", "add a change file"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let seen = tee(&mut child);
+    wait_until_said(&seen, "pick 1–2 or type your own");
+    Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    let _ = child.wait();
+    let (ok, out) = resume_typing(&rig, "1\n");
+    assert!(ok, "{}", out);
+    assert!(out.contains("1) Patch it — small") && out.contains("2) Rewrite it (recommended) — clean"), "the options are shown before the choice: {}", out);
 }

@@ -57,6 +57,15 @@ pub struct CmdLine {
     pub session: Option<String>,
 }
 
+/// A typed task's worker conversation is recorded on the job as soon as its CLI has an id for it,
+/// so the next save keeps it: a crash while the agent works can still be continued afterwards.
+fn note_worker_session(j: &mut crate::state::Job, slot: Slot, cli: AgentKind, id: &str) {
+    if slot == Slot::Worker && j.source.is_manual() {
+        let model = j.worker.model.clone();
+        j.session = Some(crate::state::Session { cli, id: id.to_string(), model });
+    }
+}
+
 /// A random version 4 UUID, for the CLIs that let the caller name the conversation.
 pub fn new_uuid() -> String {
     use std::io::Read;
@@ -373,6 +382,9 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
         s.started = Some(start);
         s.last = "starting".into();
     });
+    if let Some(id) = &line.session {
+        hub.job(job, |j| note_worker_session(j, slot, e.cli, id));
+    }
     // A fresh steer for this run: one fired while nothing ran has already left its message in the inbox.
     let Some((cancel, steer)) = hub.job(job, |j| {
         j.steer = crate::state::Cancel::new();
@@ -528,7 +540,10 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, kind: AgentKind, line: 
                 Parsed::Text(t) => last_text = t,
                 Parsed::Tool(_) => tools_seen += 1,
                 Parsed::Session(id) => {
-                    hub.job(job, |j| j.stage(slot).session = Some(id.clone()));
+                    hub.job(job, |j| {
+                        j.stage(slot).session = Some(id.clone());
+                        note_worker_session(j, slot, kind, &id);
+                    });
                     session = Some(id)
                 }
                 // Only a refusal before anything was done can be retried with another model.

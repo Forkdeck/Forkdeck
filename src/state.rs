@@ -452,6 +452,9 @@ pub struct Job {
     /// again and the conversation they started can continue.
     pub worker_ran: Option<crate::pick::Exec>,
     pub reviewer_ran: Option<crate::pick::Exec>,
+    /// The database reserved this job's id, so it may be saved there. A job whose id could not be
+    /// reserved is never saved: its number may belong to another job in the history.
+    pub in_history: bool,
 }
 
 impl Job {

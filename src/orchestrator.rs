@@ -128,7 +128,7 @@ impl Hub {
     /// Write the job as it is now to the history.
     pub fn save(&self, id: u32) {
         let Some(h) = &self.history else { return };
-        let Some(rec) = self.job(id, |j| crate::history::JobRecord::of(j)) else { return };
+        let Some(rec) = self.job(id, |j| j.in_history.then(|| crate::history::JobRecord::of(j))).flatten() else { return };
         if let Err(e) = h.save(&rec) {
             if !self.history_failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 self.log("history", format!("could not save job #{}: {}", id, e));
@@ -188,7 +188,8 @@ impl Hub {
     /// Continue an interrupted typed task from the stage it had reached. Err says why not.
     pub fn resume(&self, id: u32) -> Result<(), String> {
         // Taken over in the database first: two forkdecks starting at once must not both run it.
-        if let Some(h) = &self.history {
+        let saved = self.job(id, |j| j.in_history).unwrap_or(false);
+        if let (Some(h), true) = (&self.history, saved) {
             match h.claim(id) {
                 Ok(true) => {}
                 Ok(false) => return Err("another forkdeck that is still running has it".into()),
@@ -240,7 +241,16 @@ impl Hub {
         planning: Planning,
     ) -> u32 {
         // The database hands out ids, so jobs from another forkdeck sharing it never collide.
-        let from_db = self.history.as_ref().and_then(|h| h.new_id().ok());
+        let from_db = match &self.history {
+            Some(h) => match h.new_id() {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    self.log("history", format!("could not reserve a job id ({}); this job is not kept across restarts", e));
+                    None
+                }
+            },
+            None => None,
+        };
         let id = {
             let mut st = self.state.lock().unwrap();
             let stopping = st.stopping;
@@ -283,6 +293,7 @@ impl Hub {
                 chose: Default::default(),
             worker_ran: None,
             reviewer_ran: None,
+            in_history: from_db.is_some(),
                 peer: None,
                 used: Default::default(),
                 findings: Vec::new(),
@@ -310,7 +321,7 @@ impl Hub {
     pub fn reply(&self, id: u32, text: String) -> Result<(), String> {
         // A finished task starts working again: take it over first, as `resume` does, so a second
         // forkdeck that restored the same task cannot run it at the same time.
-        let finished_typed = self.job(id, |j| j.source.is_manual() && j.status.finished()).unwrap_or(false);
+        let finished_typed = self.job(id, |j| j.source.is_manual() && j.status.finished() && j.in_history).unwrap_or(false);
         if let (true, Some(h)) = (finished_typed, &self.history) {
             match h.claim(id) {
                 Ok(true) => {}
@@ -726,9 +737,12 @@ pub fn avail(hub: &Hub) -> AvailOwned {
 /// Run an agent. When copilot refuses the model before doing anything, remember that and run the
 /// same part with the next model the account may use. Each pass rules one model out, so this ends.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_agent(hub: &Hub, id: u32, slot: Slot, mut exec: Exec, tier: Tier, prompt: &str, dir: &Path, read_only: bool, mut resume: Option<String>) -> (RunOut, Exec) {
+/// `resume`: the conversation to continue, and the prompt for a new one should it have to be
+/// dropped (another model is another conversation, and then the short prompt says too little).
+pub async fn run_agent(hub: &Hub, id: u32, slot: Slot, mut exec: Exec, tier: Tier, prompt: &str, dir: &Path, read_only: bool, mut resume: Option<(String, String)>) -> (RunOut, Exec) {
+    let mut prompt = prompt.to_string();
     loop {
-        let out = agents::run(hub, id, slot, RunSpec { exec: &exec, prompt, dir, read_only, resume: resume.as_deref() }).await;
+        let out = agents::run(hub, id, slot, RunSpec { exec: &exec, prompt: &prompt, dir, read_only, resume: resume.as_ref().map(|(sid, _)| sid.as_str()) }).await;
         if out.no_models {
             hub.state.lock().unwrap().copilot.seat = Some(false);
             hub.log("agents", format!("copilot has no model this account may use: {}", out.error));
@@ -740,8 +754,10 @@ pub async fn run_agent(hub: &Hub, id: u32, slot: Slot, mut exec: Exec, tier: Tie
         hub.log("agents", format!("#{} {} is not available to this copilot account, skipping it", id, m));
         match pick::resolve(&hub.cfg, &avail(hub).borrow(), &exec.asked, tier) {
             Some(next) if next.model != exec.model => {
-                // Another model is another conversation.
-                resume = None;
+                // Another model is another conversation: it is told everything.
+                if let Some((_, fresh)) = resume.take() {
+                    prompt = fresh;
+                }
                 exec = next;
             }
             _ => return (out, exec),
@@ -940,7 +956,8 @@ async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, fresh: Option
         let worker = hub.job(id, |j| j.worker_ran.clone()).flatten().unwrap_or_else(|| w.worker.clone());
         let resume = resumable(hub, id, &worker);
         let used = if resume.is_some() { prompt.clone() } else { fresh.clone().unwrap_or_else(|| prompt.clone()) };
-        let (mut out, mut ran) = run_agent(hub, id, Slot::Worker, worker.clone(), w.d.tier, &used, w.dir, false, resume.clone()).await;
+        let fresh_prompt = fresh.clone().unwrap_or_else(|| prompt.clone());
+        let (mut out, mut ran) = run_agent(hub, id, Slot::Worker, worker.clone(), w.d.tier, &used, w.dir, false, resume.clone().map(|r| (r, fresh_prompt))).await;
         // Only a run that did nothing can have failed for want of the conversation; one that ran out
         // of time, or had already started tools, is not done again from scratch.
         if resume.is_some() && !out.ok && !out.interrupted && out.tools == 0 && !out.error.starts_with("timed out") && !cancel.is_set() {
@@ -1008,7 +1025,9 @@ fn choice_text(plan: &Plan, c: &Choice) -> String {
 /// agent go ahead (in the conversation it planned in) and the one for a new conversation. None:
 /// no usable plan, work from the task as written.
 async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool, cancel: &Cancel) -> Result<Option<(String, String)>, Finish> {
-    let plan = match hub.job(id, |j| j.plan.clone()).flatten() {
+    let saved = hub.job(id, |j| j.plan.clone()).flatten();
+    let from_before = saved.is_some();
+    let plan = match saved {
         // Planned before forkdeck was stopped: not again.
         Some(p) => p,
         None => {
@@ -1017,7 +1036,8 @@ async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool
             let mut resume: Option<String> = None;
             let (out, ran) = loop {
                 let worker = hub.job(id, |j| j.worker_ran.clone()).flatten().unwrap_or_else(|| w.worker.clone());
-                let (out, ran) = run_agent(hub, id, Slot::Worker, worker.clone(), w.d.tier, &prompt, w.dir, true, resume.clone()).await;
+                let again = format!("{}\n\n{}", plan_prompt(task), prompt);
+                let (out, ran) = run_agent(hub, id, Slot::Worker, worker.clone(), w.d.tier, &prompt, w.dir, true, resume.clone().map(|r| (r, again))).await;
                 if let Some(sid) = &out.session {
                     hub.job(id, |j| j.session = Some(Session { cli: ran.cli, id: sid.clone(), model: ran.model.clone() }));
                 }
@@ -1061,6 +1081,15 @@ async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool
             plan
         }
     };
+    // Planned before a restart, still to be chosen: what was shown then is gone, so the options are
+    // shown again, whichever way the choice is about to be made.
+    if from_before && plan.chosen.is_none() {
+        hub.job(id, |j| {
+            for (i, o) in plan.options.iter().enumerate() {
+                j.worker.push(format!("{}) {}{} — {}", i + 1, o.title, if o.recommended { " (recommended)" } else { "" }, o.summary));
+            }
+        });
+    }
     let choice = match plan.chosen.clone() {
         Some(c) => c,
         None if !ask_user => {
@@ -1226,7 +1255,7 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
             });
             // Resumed, it still gets the task as it stands, with what the user has asked for since.
             let mut used = if resume.is_some() { re_review_prompt(None, Some(&task)) } else { fresh.clone() };
-            let (mut rev, mut ran) = run_agent(hub, id, Slot::Reviewer, reviewer.clone(), w.d.tier.up(), &used, w.dir, true, resume.clone()).await;
+            let (mut rev, mut ran) = run_agent(hub, id, Slot::Reviewer, reviewer.clone(), w.d.tier.up(), &used, w.dir, true, resume.clone().map(|r| (r, fresh.clone()))).await;
             // A review that crashed, timed out or ended without a verdict says nothing about the change: ask once more.
             let unanswered = |r: &RunOut| !r.interrupted && (!r.ok || parse_verdict(&r.text).is_none());
             if unanswered(&rev) && !cancel.is_set() {
@@ -1238,7 +1267,7 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
                     used = fresh.clone();
                 }
                 let again = if rev.ok { format!("{}\n\nYour previous review ended without a verdict. Finish with VERDICT: PASS or VERDICT: FAIL alone on the last line.", used) } else { used.clone() };
-                (rev, ran) = run_agent(hub, id, Slot::Reviewer, ran.clone(), w.d.tier.up(), &again, w.dir, true, again_resume).await;
+                (rev, ran) = run_agent(hub, id, Slot::Reviewer, ran.clone(), w.d.tier.up(), &again, w.dir, true, again_resume.map(|r| (r, fresh.clone()))).await;
             }
             if ran != reviewer {
                 hub.job(id, |j| j.reviewer_ran = Some(ran.clone()));
@@ -1292,9 +1321,12 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
         set_status(hub, id, JobStatus::Fixing);
         hub.log("review", format!("#{} sent back, fix round {} of {}", id, round, hub.cfg.review.max_fix_rounds));
         let again = if round > 1 { format!(" This is fix round {}: the problems are not all solved yet. Address every point below, not only the new ones.", round) } else { String::new() };
+        // The task as it stands, with what the user asked for since: a worker that starts a new
+        // conversation has nothing else to go on.
+        let task_now = hub.job(id, |j| with_later_requests(w.prompt, &j.turns)).unwrap_or_else(|| w.prompt.to_string());
         let fp = format!(
             "{}\n\nYour previous attempt is in this working tree and was sent back.{} Address the points below, then summarise what you changed.\n\n{}",
-            w.prompt, again, fb
+            task_now, again, fb
         );
         let before = tree_state(hub, id, w).await;
         summary = work_once(hub, id, w, &fp, None, cancel).await?;
