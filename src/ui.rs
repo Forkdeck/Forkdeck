@@ -6,7 +6,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 use std::path::PathBuf;
 
@@ -41,24 +41,28 @@ pub struct Ui {
     pub demo: bool,
     /// Show what teammates are working on in place of the agent tree.
     pub team: bool,
-    /// Enter starts a new task even though a typed job is selected (Ctrl-N).
+    /// Enter starts a new task even though a typed job is selected (Ctrl-T or Ctrl-N).
     pub new_task: bool,
     /// The next new task proposes approaches first (Ctrl-P).
     pub plan_next: bool,
+    /// The factory board in place of the agent tree (F2).
+    pub factory: bool,
+    /// Explicit reply destination, pinned even when selection changes (Ctrl-R).
+    pub reply_to: Option<u32>,
+    pub choices: Option<crate::choices::Picker>,
+    pub issue_panel: Option<crate::plan_ui::Panel>,
+    /// Answers already looked at for choices: (job, turns at the time).
+    pub seen_choices: std::collections::HashSet<(u32, usize)>,
     /// The daily limits, to show next to what has been used. 0: none.
     pub jobs_per_day: u32,
     pub tokens_per_day: u64,
 }
 
-/// The selected job, when Enter would send what is typed to it as a reply.
+/// The typed task Enter sends to: the one pinned with Ctrl-R, else the selected one. The input
+/// box's title says which, so this is never a surprise.
 pub fn reply_target(st: &State, ui: &Ui) -> Option<u32> {
-    if ui.new_task {
-        return None;
-    }
-    let id = ui.selected?;
-    let j = st.jobs.iter().find(|j| j.id == id && j.source.is_manual())?;
-    // Following along, typing starts a new task, except that a task showing its options takes the choice.
-    (!ui.follow || j.status == JobStatus::Choosing).then_some(j.id)
+    if ui.new_task { return None; }
+    ui.reply_to.or_else(|| st.jobs.iter().find(|j| Some(j.id) == ui.selected && j.source.is_manual()).map(|j| j.id))
 }
 
 fn fg(c: Color) -> Style {
@@ -125,14 +129,17 @@ pub fn draw(f: &mut Frame, st: &State, ui: &Ui) {
         Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Min(8),
-        Constraint::Length(7),
-        Constraint::Length(1),
+        Constraint::Length(5),
+        Constraint::Length(3),
         Constraint::Length(1),
     ])
     .split(area);
 
     title_bar(f, rows[0], ui);
     header(f, rows[1], st);
+    if ui.factory && !ui.team {
+        factory(f, rows[2], st, ui);
+    } else {
     let cols = Layout::horizontal([Constraint::Length(34), Constraint::Min(40)]).split(rows[2]);
     left_panel(f, cols[0], st, ui);
     let job = ui.selected.and_then(|id| st.jobs.iter().find(|j| j.id == id));
@@ -141,10 +148,112 @@ pub fn draw(f: &mut Frame, st: &State, ui: &Ui) {
         Some(j) => tree(f, cols[1], j),
         None => empty_tree(f, cols[1]),
     }
+    }
     log_panel(f, rows[3], st);
-    let target = reply_target(st, ui).map(|id| (id, st.jobs.iter().any(|j| j.id == id && !j.status.finished())));
-    prompt(f, rows[4], ui, target);
+    prompt(f, rows[4], ui, reply_target(st, ui).and_then(|id| st.jobs.iter().find(|j| j.id == id)));
     status(f, rows[5], st);
+    if let Some(picker) = &ui.choices { choice_panel(f, area, picker); }
+    if let Some(panel) = &ui.issue_panel { crate::plan_ui::draw(f, st, panel); }
+}
+
+fn choice_panel(f: &mut Frame, area: Rect, picker: &crate::choices::Picker) {
+    let width = area.width.saturating_sub(2).min(100);
+    let height = area.height.saturating_sub(2).min(picker.options.len() as u16 + 13);
+    let area = Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height);
+    let block = boxed(&format!("Planning options · task #{}", picker.job), PURPLE);
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block.style(Style::new().bg(BG)), area);
+    let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(2), Constraint::Length(6), Constraint::Length(1)]).split(inner);
+    f.render_widget(Paragraph::new(" Choose an option or write your own response."), rows[0]);
+    let room = rows[1].height.max(1) as usize;
+    let start = picker.selected.saturating_sub(room - 1);
+    let labels = picker.options.iter().map(|o| o.label.as_str()).chain(std::iter::once("Other / custom response"));
+    let lines: Vec<Line> = labels.enumerate().skip(start).take(room).map(|(index, label)| {
+        let selected = picker.selected == index;
+        Line::from(Span::styled(format!(" {} {}", if selected { "▸" } else { " " }, clip(label, width.saturating_sub(6) as usize)),
+            if selected { bold(BRIGHT).bg(SEL) } else { fg(TEXT) }))
+    }).collect();
+    f.render_widget(Paragraph::new(lines), rows[1]);
+    let detail = match picker.options.get(picker.selected) {
+        Some(option) => format!("{}\n{}", option.label, option.detail),
+        None => "Write your own answer in the message field, then press Enter. It will reply to this same task.".into(),
+    };
+    f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }).block(Block::new().padding(Padding::horizontal(1))), rows[2]);
+    f.render_widget(Paragraph::new(" ↑↓ choose · Enter send · c custom · Esc close").style(fg(DIM)), rows[3]);
+}
+
+fn lane(status: JobStatus) -> usize {
+    match status {
+        JobStatus::Queued | JobStatus::Routing | JobStatus::Planning | JobStatus::Choosing => 0,
+        JobStatus::Working | JobStatus::Fixing => 1,
+        JobStatus::Reviewing => 2,
+        JobStatus::Publishing | JobStatus::Ci | JobStatus::Deploying => 3,
+        JobStatus::Done => 4,
+        JobStatus::Failed | JobStatus::Cancelled | JobStatus::Interrupted | JobStatus::RollingBack => 5,
+    }
+}
+
+fn factory(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
+    let narrow = area.width < 120;
+    let rows = Layout::vertical([Constraint::Length(if narrow { 14 } else { 9 }), Constraint::Min(4)]).split(area);
+    let board_rows = Layout::vertical(vec![Constraint::Ratio(1, if narrow { 2 } else { 1 }); if narrow { 2 } else { 1 }]).split(rows[0]);
+    let names = ["QUEUE", "BUILD", "REVIEW", "DELIVERY", "DONE", "ATTENTION"];
+    let colors = [PURPLE, ORANGE, PURPLE, ORANGE, GREEN, RED];
+    for (index, name) in names.iter().enumerate() {
+        let count = if narrow { 3 } else { 6 };
+        let columns = Layout::horizontal(vec![Constraint::Ratio(1, count as u32); count]).split(board_rows[index / count]);
+        let cell = columns[index % count];
+        let jobs: Vec<_> = st.jobs.iter().filter(|j| {
+            let status = if j.status == JobStatus::Done && j.issue_plan.as_ref().is_some_and(|p| p.build_job.is_none()) { JobStatus::Planning } else { j.status };
+            lane(status) == index
+        }).collect();
+        // Keep the selected card visible, even when browsing older completed jobs.
+        let room = cell.height.saturating_sub(3) as usize / 2;
+        let room = room.max(1);
+        let start = jobs.iter().position(|j| Some(j.id) == ui.selected)
+            .map(|pos| pos.saturating_sub(room - 1)).unwrap_or(jobs.len().saturating_sub(room));
+        let mut lines = Vec::new();
+        for job in jobs.iter().skip(start).take(room) {
+            let selected = ui.selected == Some(job.id);
+            let style = if selected { bold(BRIGHT).bg(SEL) } else { fg(TEXT) };
+            lines.push(Line::from(Span::styled(clip(&format!("{}#{} {}", if selected { "◆" } else { " " }, job.id, job.title), cell.width.saturating_sub(2) as usize), style)));
+            let agent = if job.status == JobStatus::Reviewing { job.reviewer.agent } else { job.worker.agent };
+            lines.push(Line::from(Span::styled(clip(&format!(" {} · {}", job.status.name(), agent.map(|a| a.name()).unwrap_or("unassigned")), cell.width.saturating_sub(2) as usize), fg(colors[index]))));
+        }
+        if jobs.is_empty() { lines.push(Line::from(Span::styled(" —", fg(DIM)))); }
+        if jobs.len() > room { lines.push(Line::from(Span::styled(format!(" {} more · Alt↑↓", jobs.len() - room), fg(DIM)))); }
+        f.render_widget(Paragraph::new(lines).block(boxed(&format!("{} {}", name, jobs.len()), colors[index])), cell);
+    }
+    match ui.selected.and_then(|id| st.jobs.iter().find(|j| j.id == id)) {
+        Some(job) => {
+            let detail = Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).split(rows[1]);
+            let checks = match job.checks { Some(true) => "passed", Some(false) => "failed", None => "pending / not configured" };
+            let review = match job.verdict { Some(true) => "passed", Some(false) => "changes requested", None => "pending / not requested" };
+            let queued = job.inbox.front().map(|next| format!("{} queued · next: {}", job.inbox.len(), clip(next, 100)));
+            let outcome = if let Some(ref queued) = queued { queued.as_str() } else if job.outcome.is_empty() { job.pr_url.as_deref().unwrap_or("Work is in progress") } else { &job.outcome };
+            let summary = job.issue_plan.as_ref().map(|p| p.status(st.automation)).unwrap_or_else(|| format!("Checks: {} · Review: {} · {}", checks, review, job.workdir.display()));
+            let lines = vec![
+                Line::from(Span::styled(format!(" {summary}"), fg(TEXT))),
+                Line::from(Span::styled(format!(" {}", outcome), fg(status_color(job.status)))),
+            ];
+            f.render_widget(Paragraph::new(lines).block(boxed(&format!("#{} {} · {}", job.id, job.title, job.status.name()), status_color(job.status))), detail[0]);
+            let outputs = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(detail[1]);
+            for (rect, role, stage) in [(outputs[0], "worker", &job.worker), (outputs[1], "reviewer", &job.reviewer)] {
+                let agent = stage.agent.map(|a| a.name()).unwrap_or("waiting");
+                output_panel(f, rect, &format!("{} · {} · {} tools", role, agent, stage.tools), stage, stage.agent.map(agent_color).unwrap_or(DIM));
+            }
+        }
+        None => {
+            let lines = vec![
+                Line::from(Span::styled("Ready for work", bold(BRIGHT))),
+                Line::from("Type a task and press Enter. Jobs move through the board as they run."),
+                Line::from(format!("{} repositories configured · issue intake {} (Ctrl-A)", st.repos.len(), if st.automation { "on" } else { "paused" })),
+                Line::from("Alt↑↓ selects a job · F2 opens the agent tree · F4 shows the team"),
+            ];
+            f.render_widget(Paragraph::new(lines).alignment(Alignment::Center).block(boxed("dispatch", PURPLE)), rows[1]);
+        }
+    }
 }
 
 fn title_bar(f: &mut Frame, area: Rect, ui: &Ui) {
@@ -161,7 +270,9 @@ fn title_bar(f: &mut Frame, area: Rect, ui: &Ui) {
 
 fn header(f: &mut Frame, area: Rect, st: &State) {
     let chip = |k: AgentKind, own: Color| -> Span {
-        let (word, color) = if st.has(k) && (k != AgentKind::Copilot || st.copilot_usable()) {
+        let (word, color) = if st.has(k) && !st.agent_ready(k) {
+            ("LIMITED", DIM)
+        } else if st.has(k) && (k != AgentKind::Copilot || st.copilot_usable()) {
             ("ON CALL", own)
         } else if k == AgentKind::Copilot && st.has(k) {
             ("NO ACCESS", RED)
@@ -178,7 +289,7 @@ fn header(f: &mut Frame, area: Rect, st: &State) {
         (k, _) => k.to_uppercase(),
     };
     let top = Line::from(vec![
-        Span::styled("  FORKDECK AGENT TREE", bold(BRIGHT)),
+        Span::styled("  FORKDECK SOFTWARE FACTORY", bold(BRIGHT)),
         Span::styled("   ·   ", fg(DIM)),
         chip(AgentKind::Claude, ORANGE),
         Span::styled("   ·   ", fg(DIM)),
@@ -189,16 +300,12 @@ fn header(f: &mut Frame, area: Rect, st: &State) {
         Span::styled(jev, bold(PURPLE)),
     ]);
     let legend = Line::from(vec![
-        Span::styled("      ■ ", fg(ORANGE)),
-        Span::styled("claude", fg(DIM)),
-        Span::styled("    ■ ", fg(GREEN)),
-        Span::styled("codex", fg(DIM)),
-        Span::styled("    ■ ", fg(BLUE)),
-        Span::styled("copilot", fg(DIM)),
-        Span::styled("    ■ ", fg(PURPLE)),
-        Span::styled("fork layer", fg(DIM)),
-        Span::styled("    ■ ", fg(RED)),
-        Span::styled("failed", fg(DIM)),
+        Span::styled(format!("  INTAKE {}", if st.automation { "ON" } else { "PAUSED" }), fg(if st.automation { GREEN } else { DIM })),
+        Span::styled(format!(" · {} repos · {} active · {} queued · 24h: {} jobs / {} tokens",
+            st.repos.len(),
+            st.jobs.iter().filter(|j| !j.status.finished() && j.status != JobStatus::Queued).count(),
+            st.jobs.iter().filter(|j| j.status == JobStatus::Queued).count(),
+            st.spent.jobs, kilo(st.spent.tokens)), fg(DIM)),
     ]);
     f.render_widget(Paragraph::new(vec![top, legend]), area);
 }
@@ -480,21 +587,25 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
         } else {
             ("worker".to_string(), &j.worker)
         };
-        let r = rows[7];
-        let h = r.height.saturating_sub(2) as usize;
-        let w = r.width.saturating_sub(4) as usize;
-        let lines: Vec<Line> = s
-            .tail
-            .iter()
-            .skip(s.tail.len().saturating_sub(h))
-            .map(|l| {
-                let c = if l.starts_with('▸') { DIM } else if l.starts_with("error") { RED } else { TEXT };
-                Line::from(Span::styled(format!(" {}", clip(l, w)), fg(c)))
-            })
-            .collect();
         let who = s.agent.map(|a| if s.via.is_empty() { a.name().to_string() } else { format!("{} via {}", a.name(), s.via) }).unwrap_or_else(|| "idle".into());
-        f.render_widget(Paragraph::new(lines).block(boxed(&format!("{} output · {}", name, who), DIM)), r);
+        output_panel(f, rows[7], &format!("{} output · {}", name, who), s, DIM);
     }
+}
+
+/// Follow the last screenful of rendered rows, including wrapped continuations.
+fn output_panel(f: &mut Frame, area: Rect, title: &str, stage: &Stage, color: Color) {
+    let block = boxed(title, color);
+    let inner = block.inner(area);
+    let lines: Vec<Line> = stage.tail.iter().flat_map(|entry| {
+        entry.split('\n').map(|line| {
+            let color = if line.starts_with('▸') { DIM } else if line.starts_with("error") { RED } else { TEXT };
+            Line::from(Span::styled(line, fg(color)))
+        })
+    }).collect();
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // Use the widget's own wrapping calculation so Unicode and word boundaries agree.
+    let scroll = paragraph.line_count(inner.width).saturating_sub(inner.height as usize).min(u16::MAX as usize) as u16;
+    f.render_widget(paragraph.scroll((scroll, 0)).block(block), area);
 }
 
 fn stage_box(f: &mut Frame, area: Rect, role: &str, s: &Stage) {
@@ -564,29 +675,24 @@ fn log_panel(f: &mut Frame, area: Rect, st: &State) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// `reply`: the job Enter would send to, and whether it is still running.
-fn prompt(f: &mut Frame, area: Rect, ui: &Ui, reply: Option<(u32, bool)>) {
-    let dir = ui.cwd.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let forced = match (reply, &ui.forced) {
-        (Some((id, true)), _) => Span::styled(format!("[message #{}] ", id), fg(GREEN)),
-        (Some((id, false)), _) => Span::styled(format!("[reply to #{}] ", id), fg(GREEN)),
-        (None, None) => Span::styled("[agent: auto] ", fg(DIM)),
-        (None, Some(a)) => Span::styled(format!("[agent: {}] ", a.name()), fg(agent_color(a.kind()))),
+fn prompt(f: &mut Frame, area: Rect, ui: &Ui, target: Option<&Job>) {
+    let title = match target {
+        Some(j) if j.status == JobStatus::Choosing => format!("Choose for #{} · a number, or your own approach · F5 options · Ctrl-T new task", j.id),
+        Some(j) if j.status == JobStatus::Interrupted => format!("Reply to #{} · Enter with nothing typed resumes it · Ctrl-T new task", j.id),
+        Some(j) if !j.status.finished() => format!("Message #{} · {} queued · Enter to queue · Ctrl-S now · Ctrl-T new task", j.id, j.inbox.len()),
+        Some(j) => format!("Reply to #{} · {} queued · Enter to send · Ctrl-T new task", j.id, j.inbox.len()),
+        None => format!("{} · {} · Enter to start", if ui.plan_next { "New task, planned first" } else { "Quick task" }, ui.forced.as_ref().map(|a| a.name()).unwrap_or_else(|| "auto".into())),
     };
-    let room = (area.width as usize).saturating_sub(dir.len() + 28);
-    let shown: String = {
-        let n = ui.input.chars().count();
-        ui.input.chars().skip(n.saturating_sub(room)).collect()
+    let room = area.width.saturating_sub(5) as usize;
+    let count = ui.input.chars().count();
+    let shown: String = ui.input.chars().skip(count.saturating_sub(room)).collect();
+    let content = if ui.input.is_empty() {
+        Span::styled(if target.is_some() { "Type a follow-up…" } else { "Type a short task, e.g. fix the typo in README…" }, fg(DIM))
+    } else {
+        Span::styled(shown, fg(BRIGHT))
     };
-    let line = Line::from(vec![
-        Span::styled(format!(" ~/{} ", dir), fg(GREEN)),
-        Span::styled("$ ", fg(BRIGHT)),
-        Span::styled(if ui.plan_next && reply.is_none() { "[plan first] " } else { "" }, fg(PURPLE)),
-        forced,
-        Span::styled(shown, fg(BRIGHT)),
-        Span::styled("█", fg(PURPLE)),
-    ]);
-    f.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), area);
+    let line = Line::from(vec![Span::styled(" › ", fg(GREEN)), content, Span::styled("█", fg(PURPLE))]);
+    f.render_widget(Paragraph::new(line).block(boxed(&title, if target.is_some() { GREEN } else { PURPLE })), area);
 }
 
 fn status(f: &mut Frame, area: Rect, st: &State) {
@@ -600,8 +706,12 @@ fn status(f: &mut Frame, area: Rect, st: &State) {
         Span::styled("  issues: ", fg(DIM)),
         Span::styled(if st.automation { "[on]" } else { "[off]" }, fg(if st.automation { GREEN } else { DIM })),
     ]);
-    f.render_widget(Paragraph::new(left), area);
-    let keys = "⏎ run · Tab agent · ↑↓ job · ^A issues · ^T team · ^X stop · ^C quit ";
+    if area.width > 155 { f.render_widget(Paragraph::new(left), area); }
+    let keys = if area.width < 110 {
+        "⏎ send · ↑↓ history · ^T new · F5 choices · F6 issue plan · ^C quit"
+    } else {
+        "⏎ send · ↑↓ history · Alt↑↓ job · F2 view · F5 choices · F6 issue plan · Tab agent · ^T new · ^P plan · ^R reply · ^S now · ^X stop · ^C quit "
+    };
     f.render_widget(Paragraph::new(Span::styled(keys, fg(DIM))).alignment(Alignment::Right), area);
 }
 
@@ -653,4 +763,104 @@ pub fn to_text(buf: &Buffer) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sending_to_a_busy_task_clears_the_draft_and_displays_its_queue() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = crate::orchestrator::Hub::new(crate::config::Config::default(), rt.handle().clone());
+        let mut ui = crate::new_ui(&hub, ".".into());
+        let mut history = crate::input::History::default();
+        // Jobs stay queued: the task is busy for as long as the test needs.
+        let _slots = rt.block_on(hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel as u32)).unwrap();
+        let id = rt.block_on(hub.submit("task".into(), "original".into(), Source::Manual, ".".into(), None, Planning::Never)).unwrap();
+        ui.selected = Some(id);
+        ui.input = "Follow up while busy".into();
+        crate::submit_input(&hub, &mut ui, &mut history);
+        assert!(ui.input.is_empty());
+        assert_eq!(history.messages(), &["Follow up while busy"]);
+        assert_eq!(hub.state.lock().unwrap().jobs.len(), 1);
+        // Empty Enter while busy must not queue a spurious resume request.
+        crate::submit_input(&hub, &mut ui, &mut history);
+        assert_eq!(hub.job(id, |j| j.inbox.len()), Some(1));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        term.draw(|f| draw(f, &hub.state.lock().unwrap(), &ui)).unwrap();
+        let text = to_text(term.backend().buffer());
+        assert!(text.contains("1 queued"), "{text}");
+        assert!(text.contains("next: Follow up while busy"), "{text}");
+        assert!(text.contains("Enter to queue"), "{text}");
+    }
+
+    #[test]
+    fn output_wraps_and_follows_newest_rendered_rows_on_resize() {
+        let mut stage = Stage::default();
+        stage.push("first second third fourth fifth sixth seventh eighth");
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(22, 8)).unwrap();
+        term.draw(|f| output_panel(f, f.area(), "worker", &stage, GREEN)).unwrap();
+        let text = to_text(term.backend().buffer());
+        assert!(text.contains("first second third"), "{text}");
+        assert!(text.contains("fourth fifth sixth"), "{text}");
+        assert!(text.contains("seventh eighth"), "{text}");
+        stage.push("OLD\n日本語 日本語 日本語 日本語\nlast message wraps across several rows with FINAL at the end");
+        for width in [18, 30, 60] {
+            term.backend_mut().resize(width, 5);
+            term.resize(Rect::new(0, 0, width, 5)).unwrap();
+            term.draw(|f| output_panel(f, f.area(), "reviewer", &stage, GREEN)).unwrap();
+            let text = to_text(term.backend().buffer());
+            assert!(text.contains("FINAL"), "{text}");
+            assert!(!text.contains("first second"), "{text}");
+            assert!(!text.contains('…'), "{text}");
+        }
+    }
+
+    #[test]
+    fn agent_output_survives_ingestion_and_wrapping() {
+        for role in ["worker", "reviewer"] {
+            for kind in 0..3 {
+                let text = format!("{} END_SENTINEL", "日本語 paragraph ".repeat(60));
+                let event = match kind {
+                    0 => crate::agents::Parsed::Text(text.clone()),
+                    1 => crate::agents::Parsed::Note(text.clone()),
+                    _ => crate::agents::Parsed::Tool(text.clone()),
+                };
+                let mut stage = Stage::default();
+                crate::agents::record_event(&mut stage, &event);
+                let expected = if kind == 2 { format!("▸ {text}") } else { text };
+                assert_eq!(stage.tail.back(), Some(&expected));
+                for width in [22, 40, 80] {
+                    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 6)).unwrap();
+                    term.draw(|f| output_panel(f, f.area(), role, &stage, GREEN)).unwrap();
+                    let visible = to_text(term.backend().buffer());
+                    assert!(visible.contains("END_SENTINEL"), "{visible}");
+                    assert!(!visible.contains('…'), "{visible}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn board_keeps_selected_older_job_visible_and_renders_small_terminals() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = crate::orchestrator::Hub::new(crate::config::Config::default(), rt.handle().clone());
+        let mut ui = crate::new_ui(&hub, PathBuf::from("."));
+        let _slots = rt.block_on(hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel as u32)).unwrap();
+        for index in 0..15 {
+            let id = rt.block_on(hub.submit(format!("TASK-{}", index), "task".into(), Source::Manual, PathBuf::from("."), None, Planning::Never)).unwrap();
+            hub.job(id, |j| j.status = JobStatus::Done);
+            if index == 0 { ui.selected = Some(id); }
+        }
+        for (width, height) in [(180, 50), (120, 40), (80, 30), (40, 12)] {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            term.draw(|f| draw(f, &hub.state.lock().unwrap(), &ui)).unwrap();
+            if width >= 80 {
+                let text = to_text(term.backend().buffer());
+                assert!(text.contains("◆#1 TASK-0"), "{text}");
+                assert!(text.contains("DONE 15"), "{text}");
+            }
+        }
+    }
 }

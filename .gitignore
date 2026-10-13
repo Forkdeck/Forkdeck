@@ -2,3 +2,4 @@
 /forkdeck.toml
 /dist
 *.cdx.json
+/.local/

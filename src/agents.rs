@@ -104,6 +104,45 @@ pub fn can_resume(cfg: &Config, exec: &Exec, read_only: bool) -> bool {
     }
 }
 
+/// A usage or rate limit, from the error a run ended with. Only terminal failures are looked at,
+/// never model text that happens to mention limits.
+pub fn quota_error(error: &str) -> bool {
+    let error = error.to_lowercase().replace('\u{2019}', "'");
+    ["you've hit your session limit", "you've hit your limit", "you have hit your usage limit",
+     "you've hit your usage limit", "usage limit reached", "rate limit reached",
+     "rate limit exceeded", "rate_limit_exceeded", "insufficient_quota"]
+        .iter().any(|phrase| error.contains(phrase))
+}
+
+/// One parsed event into the stage it is shown in. Lines are kept whole (the view wraps them),
+/// up to a size no screen would show.
+pub(crate) fn record_event(s: &mut crate::state::Stage, p: &Parsed) {
+    const LINE: usize = 20_000;
+    match p {
+        Parsed::Text(t) | Parsed::Note(t) => {
+            for l in t.lines().filter(|l| !l.trim().is_empty()) {
+                s.push(clip(l, LINE));
+            }
+        }
+        Parsed::Tool(t) => {
+            s.tools += 1;
+            s.push(format!("▸ {}", clip(t, LINE)));
+        }
+        Parsed::Final { tokens_in, tokens_out, cost, .. } => {
+            s.tokens_in = *tokens_in;
+            s.tokens_out = *tokens_out;
+            s.cost = *cost;
+        }
+        Parsed::Usage { tokens_in, tokens_out } => {
+            s.tokens_in += *tokens_in;
+            s.tokens_out += *tokens_out;
+        }
+        Parsed::Error(e) | Parsed::NoModels(e) => s.push(format!("error: {}", e)),
+        Parsed::ModelRejected(m) => s.push(format!("error: model {} is not available to this account", m)),
+        Parsed::Session(_) | Parsed::Nothing => {}
+    }
+}
+
 /// What one line of agent output means for the display.
 #[derive(Debug, PartialEq)]
 pub enum Parsed {
@@ -434,6 +473,11 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     if out.tools == 0 {
         out.tools = hub.job(job, |j| j.stage(slot).tools).unwrap_or(0);
     }
+    // A usage limit rests this CLI for a while, so the next run picks another (`State::agent_ready`).
+    if !out.ok && quota_error(&out.error) && !cancel.is_set() && !hub.cfg.demo {
+        hub.state.lock().unwrap_or_else(|e| e.into_inner()).agent_cooldowns[crate::journal::slot(e.cli)] = Some(Instant::now() + Duration::from_secs(15 * 60));
+        hub.log("agents", format!("{} reported a usage limit; passed over for 15 minutes: {}", e.cli.name(), clip(&out.error, 200)));
+    }
     // What this run used goes on the job's account, by the CLI that ran, whichever box it was shown in.
     hub.job(job, |j| {
         let s = j.stage(slot);
@@ -561,32 +605,7 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
             AgentKind::Copilot => parse_copilot(line),
         };
         for p in parsed {
-            hub.job(job, |j| {
-                let s = j.stage(slot);
-                match &p {
-                    Parsed::Text(t) | Parsed::Note(t) => {
-                        for l in t.lines().filter(|l| !l.trim().is_empty()) {
-                            s.push(clip(l, 400));
-                        }
-                    }
-                    Parsed::Tool(t) => {
-                        s.tools += 1;
-                        s.push(format!("▸ {}", clip(t, 160)));
-                    }
-                    Parsed::Final { tokens_in, tokens_out, cost, .. } => {
-                        s.tokens_in = *tokens_in;
-                        s.tokens_out = *tokens_out;
-                        s.cost = *cost;
-                    }
-                    Parsed::Usage { tokens_in, tokens_out } => {
-                        s.tokens_in += *tokens_in;
-                        s.tokens_out += *tokens_out;
-                    }
-                    Parsed::Error(e) | Parsed::NoModels(e) => s.push(format!("error: {}", e)),
-                    Parsed::ModelRejected(m) => s.push(format!("error: model {} is not available to this account", m)),
-                    Parsed::Session(_) | Parsed::Nothing => {}
-                }
-            });
+            hub.job(job, |j| record_event(j.stage(slot), &p));
             match p {
                 Parsed::Text(t) => last_text = t,
                 Parsed::Tool(_) => tools_seen += 1,
@@ -786,6 +805,15 @@ mod tests {
         assert_eq!(program_for("claude", true), "claude", "a bare name is looked up on PATH");
         assert_eq!(program_for("/usr/bin/claude", true), "/usr/bin/claude");
         assert_eq!(program_for("./scripts/claude", false), "./scripts/claude");
+    }
+
+    #[test]
+    fn quota_messages_are_specific() {
+        assert!(quota_error("You've hit your session limit · resets 2pm (Europe/Berlin)"));
+        assert!(quota_error("You’ve hit your limit"));
+        assert!(quota_error("rate_limit_exceeded"));
+        assert!(!quota_error("connection refused"));
+        assert!(!quota_error("token limit for this prompt"));
     }
 
     #[test]

@@ -460,6 +460,9 @@ pub struct Job {
     /// Has its run slot and is under way, though its status may still read Queued while the item
     /// is claimed and prepared. Not saved: a restored job starts over.
     pub admitted: bool,
+    /// Planning tied to an issue on the forge: the plan is reviewed, then published to the issue
+    /// and marked ready for build only when the user says so.
+    pub issue_plan: Option<crate::planning::Plan>,
     /// The worker's conversation, once its CLI has named it.
     pub session: Option<Session>,
     /// Set on an interrupted typed task that is to continue: the stage it had reached.
@@ -579,6 +582,8 @@ pub struct State {
     pub unrecorded: Vec<crate::journal::Entry>,
     /// Used in the last 24 hours, as of the last poll.
     pub spent: crate::journal::Spent,
+    /// A CLI that reported a usage limit is passed over until then: claude, codex, copilot.
+    pub agent_cooldowns: [Option<Instant>; 3],
 }
 
 /// What teammates are working on, as last read from the forge.
@@ -602,6 +607,10 @@ impl Source {
 impl State {
     pub fn has(&self, k: AgentKind) -> bool {
         self.installed.contains(&k)
+    }
+    /// Installed and not resting after a usage limit.
+    pub fn agent_ready(&self, k: AgentKind) -> bool {
+        self.has(k) && self.agent_cooldowns[crate::journal::slot(k)].is_none_or(|until| Instant::now() >= until)
     }
     /// Copilot is installed and the account was not found unable to use it.
     pub fn copilot_usable(&self) -> bool {
