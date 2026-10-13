@@ -527,6 +527,8 @@ pub struct RepoStatus {
     pub hold: Option<String>,
     /// Rules waiting to be proposed are not retried before this.
     pub notes_retry: Option<Instant>,
+    /// Where the next poll goes on asking about seen items a full listing left out.
+    pub recheck_from: usize,
 }
 
 /// (repo index, is a pull request, number)
@@ -606,7 +608,7 @@ impl State {
         self.has(AgentKind::Copilot) && self.copilot.seat != Some(false)
     }
 
-    fn active(&self, key: Key) -> bool {
+    pub fn active(&self, key: Key) -> bool {
         self.jobs.iter().any(|j| !j.status.finished() && j.source.key() == Some(key))
     }
 

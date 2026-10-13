@@ -424,6 +424,18 @@ fn budget(hub: &Hub) -> Budget {
             spent.tokens += j.used.iter().map(|u| u.tokens()).sum::<u64>();
             spent.jobs += matches!(j.source, Source::Issue { .. } | Source::Pr { .. }) as u32;
         }
+        // Typed tasks cut off by a stop are in neither: their usage is in the saved history until
+        // they are resumed and journalled whole.
+        if let Some(h) = hub.history.as_ref().filter(|_| lim.tokens_per_day > 0) {
+            let running: Vec<u32> = st.jobs.iter().filter(|j| !j.status.finished()).map(|j| j.id).collect();
+            drop(st);
+            if let Ok(saved) = h.load(crate::history::KEEP) {
+                for r in saved.iter().filter(|r| r.status == crate::state::JobStatus::Interrupted && !running.contains(&r.id) && r.finished.is_none_or(|f| f as i64 >= now - window)) {
+                    spent.tokens += r.used.iter().map(|u| u.tokens()).sum::<u64>();
+                }
+            }
+            st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+        }
         st.spent = spent;
     }
     let stop = (lim.tokens_per_day > 0 && spent.tokens >= lim.tokens_per_day)
@@ -470,6 +482,7 @@ pub async fn poll_once(hub: &Hub) {
                 for pr in [false, true] {
                     let mut complete = true;
                     let mut unlisted: Vec<(u32, u64)> = Vec::new();
+                    let mut absent: Vec<u64> = Vec::new();
                     let found = if hub.cfg.demo {
                         Ok(demo_items(hub, idx, pr))
                     } else if pr {
@@ -500,6 +513,9 @@ pub async fn poll_once(hub: &Hub) {
                                 // Removing the label and applying it again is how a person asks for another go.
                                 if complete {
                                     st.forget_unlisted(idx, pr, &listed);
+                                } else {
+                                    absent = st.seen.iter().filter(|k| k.0 == idx && k.1 == pr && !listed.contains(&k.2)).filter(|k| !st.active(**k)).map(|k| k.2).collect();
+                                    absent.sort_unstable();
                                 }
                                 // Only jobs still waiting for a slot: one under way has already moved the label itself.
                                 unlisted = st.jobs.iter().filter(|j| j.status == crate::state::JobStatus::Queued && !j.admitted).filter_map(|j| j.source.key().filter(|&(i, p, n)| i == idx && p == pr && !listed.contains(&n)).map(|(_, _, n)| (j.id, n))).collect();
@@ -544,6 +560,19 @@ pub async fn poll_once(hub: &Hub) {
                     };
                     // A queued job whose item was not listed: cancelled when the item has gone, which a
                     // full page cannot tell, so then the item itself is asked.
+                    // Seen items a full page left out may have lost their label, which is how a person
+                    // asks for another go. A few are asked about per poll, in turn.
+                    if !absent.is_empty() {
+                        const PER_POLL: usize = 10;
+                        let from = hub.state.lock().unwrap_or_else(|e| e.into_inner()).repos[idx].recheck_from % absent.len();
+                        for &n in absent.iter().cycle().skip(from).take(PER_POLL.min(absent.len())) {
+                            if matches!(still_requested(r, pr, n).await, Err(e) if e.starts_with(team::TAKEN)) {
+                                let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+                                if !st.active((idx, pr, n)) { st.forget((idx, pr, n)); }
+                            }
+                        }
+                        hub.state.lock().unwrap_or_else(|e| e.into_inner()).repos[idx].recheck_from = from + PER_POLL;
+                    }
                     for (id, n) in unlisted {
                         let gone = complete || matches!(still_requested(r, pr, n).await, Err(e) if e.starts_with(team::TAKEN));
                         if gone {
