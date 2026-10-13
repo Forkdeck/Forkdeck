@@ -282,16 +282,16 @@ async fn still_requested(r: &RepoCfg, pr: bool, n: u64) -> Result<(), String> {
         (Provider::Gitlab, true) => sh("glab", &["mr", "view", &num, "-R", &r.repo, "--output", "json"], Some(&r.path)).await?,
     };
     let label = if pr { &r.pr_label } else { &r.label };
-    if requested(&out, label)? { Ok(()) } else { Err(format!("{}the item is no longer open with its request label", team::TAKEN)) }
+    if requested(&out, label, r.provider == Provider::Github)? { Ok(()) } else { Err(format!("{}the item is no longer open with its request label", team::TAKEN)) }
 }
 
 /// Reads `gh … view --json state,labels` (state OPEN, labels as objects) or `glab … view --output
-/// json` (state opened, labels as names).
-fn requested(view: &str, label: &str) -> Result<bool, String> {
+/// json` (state opened, labels as names). GitHub label names ignore case; GitLab's do not.
+fn requested(view: &str, label: &str, any_case: bool) -> Result<bool, String> {
     let v: Value = serde_json::from_str(view).map_err(|e| format!("unreadable item: {}", e))?;
     let state = v.get("state").and_then(|s| s.as_str()).ok_or("the item has no state")?;
     let labels = v.get("labels").and_then(|l| l.as_array()).ok_or("the item has no labels")?;
-    let has = labels.iter().any(|l| l.as_str().or_else(|| l.get("name").and_then(|n| n.as_str())).is_some_and(|n| n == label));
+    let has = labels.iter().any(|l| l.as_str().or_else(|| l.get("name").and_then(|n| n.as_str())).is_some_and(|n| if any_case { n.eq_ignore_ascii_case(label) } else { n == label }));
     Ok(matches!(state.to_ascii_lowercase().as_str(), "open" | "opened") && has)
 }
 
@@ -636,12 +636,24 @@ fn slug_of(safe: &str, id: &str) -> String {
 }
 
 fn worktree_dir(hub: &Hub, r: &RepoCfg, kind: &str, n: u64) -> PathBuf {
-    let safe = repo_slug(r);
     let host = match r.provider {
         Provider::Github => "github",
         Provider::Gitlab => "gitlab",
     };
-    hub.cfg.automation.root().join(host).join(safe).join(format!("{}-{}", kind, n))
+    let at = |slug: String| hub.cfg.automation.root().join(host).join(slug).join(format!("{}-{}", kind, n));
+    let dir = at(repo_slug(r));
+    // A worktree from before the host was part of the name still holds the item's branch (and
+    // perhaps unfinished work): git will not check the branch out a second time. Moved, with git,
+    // when one configured repository can own the old name and nothing is using it.
+    let legacy = at(legacy_slug(r));
+    let owned = crate::config::unambiguous_moves(hub.cfg.repos.iter().map(|o| (legacy_slug(o), repo_slug(o)))).iter().any(|(old, new)| *old == legacy_slug(r) && *new == repo_slug(r));
+    if owned && !dir.exists() && legacy.is_dir() {
+        if let Ok(_held) = crate::proc::FileLock::take(&legacy.with_extension("lock")) {
+            if let Some(parent) = dir.parent() { let _ = std::fs::create_dir_all(parent); }
+            let _ = std::process::Command::new("git").arg("-C").arg(&r.path).args(["worktree", "move"]).arg(&legacy).arg(&dir).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+        }
+    }
+    dir
 }
 
 fn repo_index(hub: &Hub, id: u32) -> Option<usize> {
@@ -1353,13 +1365,15 @@ mod tests {
 
     #[test]
     fn an_item_is_requested_while_open_with_its_label() {
-        assert!(requested(r#"{"state":"OPEN","labels":[{"name":"bug"},{"name":"agent:ready"}]}"#, "agent:ready").unwrap());
-        assert!(requested(r#"{"state":"opened","labels":["agent:ready"]}"#, "agent:ready").unwrap(), "glab");
-        assert!(!requested(r#"{"state":"CLOSED","labels":[{"name":"agent:ready"}]}"#, "agent:ready").unwrap());
-        assert!(!requested(r#"{"state":"MERGED","labels":[{"name":"review:ready"}]}"#, "review:ready").unwrap());
-        assert!(!requested(r#"{"state":"OPEN","labels":[{"name":"agent:working"}]}"#, "agent:ready").unwrap());
-        assert!(requested(r#"{"labels":[]}"#, "agent:ready").is_err(), "no state is not a no");
-        assert!(requested("HTTP 502", "agent:ready").is_err());
+        assert!(requested(r#"{"state":"OPEN","labels":[{"name":"bug"},{"name":"agent:ready"}]}"#, "agent:ready", true).unwrap());
+        assert!(requested(r#"{"state":"opened","labels":["agent:ready"]}"#, "agent:ready", false).unwrap(), "glab");
+        assert!(!requested(r#"{"state":"CLOSED","labels":[{"name":"agent:ready"}]}"#, "agent:ready", true).unwrap());
+        assert!(!requested(r#"{"state":"MERGED","labels":[{"name":"review:ready"}]}"#, "review:ready", true).unwrap());
+        assert!(!requested(r#"{"state":"OPEN","labels":[{"name":"agent:working"}]}"#, "agent:ready", true).unwrap());
+        assert!(requested(r#"{"labels":[]}"#, "agent:ready", true).is_err(), "no state is not a no");
+        assert!(requested(r#"{"state":"OPEN","labels":[{"name":"Agent:Ready"}]}"#, "agent:ready", true).unwrap(), "GitHub ignores case");
+        assert!(!requested(r#"{"state":"opened","labels":["Agent:Ready"]}"#, "agent:ready", false).unwrap(), "GitLab does not");
+        assert!(requested("HTTP 502", "agent:ready", true).is_err());
         assert!(whole_page(20) && !whole_page(19));
     }
 
