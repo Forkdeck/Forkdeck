@@ -137,7 +137,8 @@ fn append_file(p: &std::path::Path, e: &Entry) -> Result<(), String> {
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {}", d.display(), e))?;
     }
-    let _lock = crate::proc::FileLock::take(&p.with_extension("lock"))?;
+    // Another job, here or in another forkdeck, may be appending at this moment: wait for it.
+    let _lock = crate::proc::FileLock::wait(&p.with_extension("lock"), std::time::Duration::from_secs(10))?;
     let mut line = serde_json::to_string(e).map_err(|e| e.to_string())?;
     line.push('\n');
     let mut f = std::fs::OpenOptions::new().create(true).read(true).append(true).open(p).map_err(|e| format!("{}: {}", p.display(), e))?;
@@ -462,6 +463,18 @@ mod tests {
         append_file(&p, &e(1, "issue", "o/r", "failed")).unwrap();
         assert_eq!(read_file(&p, 10_000).unwrap().len(), 1);
         assert_eq!(read_file(&p, 0).unwrap().iter().map(|e| e.ts).collect::<Vec<_>>(), [1, 100_000]);
+    }
+
+    #[test]
+    fn an_append_waits_for_another_writer() {
+        let d = crate::proc::Scratch::new().unwrap();
+        let p = d.0.join("journal.jsonl");
+        let held = crate::proc::FileLock::take(&p.with_extension("lock")).unwrap();
+        let writer = { let p = p.clone(); std::thread::spawn(move || append_file(&p, &e(5, "issue", "o/r", "done"))) };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(held);
+        writer.join().unwrap().unwrap();
+        assert_eq!(read_file(&p, 0).unwrap().len(), 1);
     }
 
     #[test]

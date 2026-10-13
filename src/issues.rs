@@ -256,6 +256,14 @@ fn lock_worktree(hub: &Hub, id: u32, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// No job was made for an item admitted in this poll: forget that it was seen, so the next poll
+/// tries again rather than passing over an item that is still labelled.
+fn submission_failed(hub: &Hub, key: crate::state::Key, why: &str) {
+    let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+    st.seen.remove(&key);
+    st.log("queue", format!("submission failed, to be tried again on the next poll: {}", why));
+}
+
 /// Is the item still open and still carrying its request label? Asked about the item itself: a
 /// listing is one page and can leave out an item that is still waiting. An Err starting with
 /// `team::TAKEN` is a definite no; any other Err is a forge that could not say.
@@ -369,21 +377,7 @@ fn budget(hub: &Hub) -> Budget {
     let window = journal::DAY.max((lim.pause_mins * 60) as i64);
     let counted = lim.jobs_per_day > 0 || lim.tokens_per_day > 0 || lim.pause_after_failures > 0 || hub.cfg.repos.iter().any(|r| r.jobs_per_day > 0);
     // Jobs that ended while the journal could not be written are owed to it first.
-    let owed: Vec<journal::Entry> = std::mem::take(&mut hub.state.lock().unwrap_or_else(|e| e.into_inner()).unrecorded);
-    let mut broken: Option<String> = None;
-    let mut still_owed = Vec::new();
-    for e in owed {
-        if broken.is_some() { still_owed.push(e); continue; }
-        match (&broken, journal::append(&e)) {
-            (None, Ok(())) => {}
-            (None, Err(err)) => {
-                broken = Some(err);
-                still_owed.push(e);
-            }
-            (Some(_), _) => still_owed.push(e),
-        }
-    }
-    hub.state.lock().unwrap_or_else(|e| e.into_inner()).unrecorded.extend(still_owed);
+    let mut broken = hub.record_owed().err();
     if broken.is_none() {
         broken = journal::writable().err();
     }
@@ -540,7 +534,7 @@ pub async fn poll_once(hub: &Hub) {
                                 r.path.clone(),
                                 None,
                                 Planning::IfRouted,
-                            ).await { hub.log("queue", format!("submission failed: {}", e)); }
+                            ).await { submission_failed(hub, (idx, pr, i.number), &e); }
                         } else {
                             if let Err(e) = hub.submit(
                                 format!("{}#{} {}", r.repo, i.number, i.title),
@@ -549,7 +543,7 @@ pub async fn poll_once(hub: &Hub) {
                                 r.path.clone(),
                                 None,
                                 Planning::IfRouted,
-                            ).await { hub.log("queue", format!("submission failed: {}", e)); }
+                            ).await { submission_failed(hub, (idx, pr, i.number), &e); }
                         }
                     }
                 }
@@ -1278,6 +1272,18 @@ fn demo_items(hub: &Hub, idx: usize, pr: bool) -> Vec<Issue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_item_whose_submission_failed_is_taken_again_on_the_next_poll() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = Hub::new(crate::config::Config::default(), rt.handle().clone());
+        let key = (0, false, 7);
+        let now = Instant::now();
+        assert!(hub.state.lock().unwrap().should_take(key, now));
+        assert!(!hub.state.lock().unwrap().should_take(key, now), "seen, and nothing is running for it");
+        submission_failed(&hub, key, "database is locked");
+        assert!(hub.state.lock().unwrap().should_take(key, now), "the next poll takes it");
+    }
 
     #[test]
     fn an_item_is_requested_while_open_with_its_label() {

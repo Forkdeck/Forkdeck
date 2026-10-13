@@ -69,7 +69,7 @@ pub fn command(cmd: &str) -> Command {
 /// Run to completion with a time limit, returning (success, stdout, stderr). Standard output is
 /// read whole, for parsing; more than `WHOLE_LIMIT` of it is an error, not a fragment.
 pub async fn output(c: Command, limit: Duration) -> Result<(bool, String, String), String> {
-    output_code(c, limit).await.map(|(code, out, err)| (code == Some(0), out, err))
+    run(c, limit, None, true).await.map(|(code, out, err)| (code == Some(0), out, err))
 }
 
 /// As `output`, but with the exit code: `None` means the process was ended by a signal rather than
@@ -180,6 +180,16 @@ impl FileLock {
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 { return Err(format!("{} is locked by another operation", path.display())); }
         Ok(FileLock(f))
     }
+    /// As `take`, waiting up to `limit` for whoever holds it: for locks held only for a moment.
+    pub fn wait(path: &std::path::Path, limit: Duration) -> Result<FileLock, String> {
+        let until = std::time::Instant::now() + limit;
+        loop {
+            match Self::take(path) {
+                Err(_) if std::time::Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+                other => return other,
+            }
+        }
+    }
 }
 
 impl Drop for FileLock {
@@ -241,7 +251,7 @@ mod tests {
     async fn output_that_is_parsed_is_whole_or_an_error() {
         let mut cmd = command("sh");
         cmd.args(["-c", "head -c 2097152 /dev/zero | tr '\\0' a; printf END"]);
-        let (_, out, _) = output_input(cmd, Duration::from_secs(10), None).await.unwrap();
+        let (_, out, _) = output(cmd, Duration::from_secs(10)).await.unwrap();
         assert_eq!(out.len(), 2 * 1024 * 1024 + 3, "a forge answer over the log limit is kept whole");
         let mut cmd = command("sh");
         cmd.args(["-c", &format!("head -c {} /dev/zero", WHOLE_LIMIT + 1)]);

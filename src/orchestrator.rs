@@ -254,6 +254,25 @@ impl Hub {
         Ok(())
     }
 
+    /// Write the journal entries of jobs that ended while it could not be written. Err: the first
+    /// failure; what is still owed stays owed.
+    pub fn record_owed(&self) -> Result<(), String> {
+        let owed: Vec<crate::journal::Entry> = std::mem::take(&mut self.state.lock().unwrap_or_else(|e| e.into_inner()).unrecorded);
+        let mut broken: Option<String> = None;
+        let mut still_owed = Vec::new();
+        for e in owed {
+            if broken.is_none() {
+                match crate::journal::append(&e) {
+                    Ok(()) => continue,
+                    Err(err) => broken = Some(err),
+                }
+            }
+            still_owed.push(e);
+        }
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).unrecorded.extend(still_owed);
+        broken.map_or(Ok(()), Err)
+    }
+
     pub fn log(&self, who: &str, msg: impl Into<String>) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).log(who, msg);
     }

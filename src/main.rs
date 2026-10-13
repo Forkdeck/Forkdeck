@@ -460,7 +460,17 @@ async fn resume_cmd(hub: &Hub) -> i32 {
 
 /// Print progress until the jobs are finished: 0 when all are done.
 async fn wait_for(hub: &Hub, ids: &[u32]) -> i32 {
-    tokio::select! { result = wait_for_inner(hub, ids) => result, _ = stop_and_wait(hub) => 1 }
+    let code = tokio::select! { result = wait_for_inner(hub, ids) => result, _ = stop_and_wait(hub) => 1 };
+    record_owed(hub);
+    code
+}
+
+/// Before exiting: a job that ended while the journal was busy or unwritable is written now, or the
+/// limits would not count it next time.
+fn record_owed(hub: &Hub) {
+    if let Err(e) = hub.record_owed() {
+        warn!("{} finished job(s) could not be written to the journal: {}", hub.state.lock().unwrap_or_else(|e| e.into_inner()).unrecorded.len(), e);
+    }
 }
 
 async fn stop_and_wait(hub: &Hub) {
@@ -520,7 +530,9 @@ fn print_progress(hub: &Hub) {
 /// One pass over the repositories, for cron and for tests: take what is labelled now, finish it, exit.
 /// Exits 1 if any job failed.
 async fn once(hub: &Hub) -> i32 {
-    tokio::select! { result = once_inner(hub) => result, _ = stop_and_wait(hub) => 1 }
+    let code = tokio::select! { result = once_inner(hub) => result, _ = stop_and_wait(hub) => 1 };
+    record_owed(hub);
+    code
 }
 
 async fn once_inner(hub: &Hub) -> i32 {
@@ -984,6 +996,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
     if left > 0 {
         warn!("{} job(s) did not finish in time; check their issues for a stale working label", left);
     }
+    record_owed(hub);
     proc::kill_all();
     res
 }
