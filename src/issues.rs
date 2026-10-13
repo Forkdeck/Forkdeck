@@ -187,13 +187,20 @@ pub fn parse_list(provider: Provider, json: &str) -> Result<Vec<Issue>, String> 
         .collect())
 }
 
+/// How many items one listing asks for. A full page may have left some out.
+const PAGE: &str = "20";
+
+fn whole_page(listed: usize) -> bool {
+    PAGE.parse::<usize>().is_ok_and(|p| listed >= p)
+}
+
 async fn list(r: &RepoCfg) -> Result<Vec<Issue>, String> {
     let out = match r.provider {
         Provider::Github => {
-            sh("gh", &["issue", "list", "-R", &r.repo, "--label", &r.label, "--state", "open", "--limit", "20", "--json", "number,title,body,url,author"], None).await?
+            sh("gh", &["issue", "list", "-R", &r.repo, "--label", &r.label, "--state", "open", "--limit", PAGE, "--json", "number,title,body,url,author"], None).await?
         }
         Provider::Gitlab => {
-            sh("glab", &["issue", "list", "-R", &r.repo, "--label", &r.label, "--per-page", "20", "--output", "json"], Some(&r.path)).await?
+            sh("glab", &["issue", "list", "-R", &r.repo, "--label", &r.label, "--per-page", PAGE, "--output", "json"], Some(&r.path)).await?
         }
     };
     parse_list(r.provider, &out)
@@ -202,10 +209,10 @@ async fn list(r: &RepoCfg) -> Result<Vec<Issue>, String> {
 async fn list_prs(r: &RepoCfg) -> Result<Vec<Issue>, String> {
     let out = match r.provider {
         Provider::Github => {
-            sh("gh", &["pr", "list", "-R", &r.repo, "--label", &r.pr_label, "--state", "open", "--limit", "20", "--json", "number,title,body,url,author,headRefName,baseRefName"], None).await?
+            sh("gh", &["pr", "list", "-R", &r.repo, "--label", &r.pr_label, "--state", "open", "--limit", PAGE, "--json", "number,title,body,url,author,headRefName,baseRefName"], None).await?
         }
         Provider::Gitlab => {
-            sh("glab", &["mr", "list", "-R", &r.repo, "--label", &r.pr_label, "--per-page", "20", "--output", "json"], Some(&r.path)).await?
+            sh("glab", &["mr", "list", "-R", &r.repo, "--label", &r.pr_label, "--per-page", PAGE, "--output", "json"], Some(&r.path)).await?
         }
     };
     parse_list(r.provider, &out)
@@ -249,9 +256,29 @@ fn lock_worktree(hub: &Hub, id: u32, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Is the item still open and still carrying its request label? Asked about the item itself: a
+/// listing is one page and can leave out an item that is still waiting. An Err starting with
+/// `team::TAKEN` is a definite no; any other Err is a forge that could not say.
 async fn still_requested(r: &RepoCfg, pr: bool, n: u64) -> Result<(), String> {
-    let listed = if pr { list_prs(r).await? } else { list(r).await? };
-    if listed.iter().any(|i| i.number == n) { Ok(()) } else { Err(format!("{}the item is no longer open with its request label", team::TAKEN)) }
+    let num = n.to_string();
+    let out = match (r.provider, pr) {
+        (Provider::Github, false) => sh("gh", &["issue", "view", &num, "-R", &r.repo, "--json", "state,labels"], None).await?,
+        (Provider::Github, true) => sh("gh", &["pr", "view", &num, "-R", &r.repo, "--json", "state,labels"], None).await?,
+        (Provider::Gitlab, false) => sh("glab", &["issue", "view", &num, "-R", &r.repo, "--output", "json"], Some(&r.path)).await?,
+        (Provider::Gitlab, true) => sh("glab", &["mr", "view", &num, "-R", &r.repo, "--output", "json"], Some(&r.path)).await?,
+    };
+    let label = if pr { &r.pr_label } else { &r.label };
+    if requested(&out, label)? { Ok(()) } else { Err(format!("{}the item is no longer open with its request label", team::TAKEN)) }
+}
+
+/// Reads `gh … view --json state,labels` (state OPEN, labels as objects) or `glab … view --output
+/// json` (state opened, labels as names).
+fn requested(view: &str, label: &str) -> Result<bool, String> {
+    let v: Value = serde_json::from_str(view).map_err(|e| format!("unreadable item: {}", e))?;
+    let state = v.get("state").and_then(|s| s.as_str()).ok_or("the item has no state")?;
+    let labels = v.get("labels").and_then(|l| l.as_array()).ok_or("the item has no labels")?;
+    let has = labels.iter().any(|l| l.as_str().or_else(|| l.get("name").and_then(|n| n.as_str())).is_some_and(|n| n == label));
+    Ok(matches!(state.to_ascii_lowercase().as_str(), "open" | "opened") && has)
 }
 
 async fn review_labels(r: &RepoCfg, n: u64, to: &str) -> Result<(), String> {
@@ -422,8 +449,9 @@ pub async fn poll_once(hub: &Hub) {
                 crate::knowledge::retry_pending(hub, idx).await;
                 // What a limit held back in this repository on this poll: the reason, and how many items.
                 let mut repo_hold: Option<(String, u32)> = None;
-                let mut taken_this_poll = 0;
                 for pr in [false, true] {
+                    let mut complete = true;
+                    let mut unlisted: Vec<(u32, u64)> = Vec::new();
                     let found = if hub.cfg.demo {
                         Ok(demo_items(hub, idx, pr))
                     } else if pr {
@@ -448,9 +476,14 @@ pub async fn poll_once(hub: &Hub) {
                                 }
                                 let mut fresh = Vec::new();
                                 let listed: Vec<u64> = list.iter().map(|i| i.number).collect();
+                                // A full page may have left out items still waiting: then only what was
+                                // listed is known, and the rest is asked about one by one below.
+                                complete = hub.cfg.demo || !whole_page(listed.len());
                                 // Removing the label and applying it again is how a person asks for another go.
-                                st.forget_unlisted(idx, pr, &listed);
-                                for j in st.jobs.iter_mut().filter(|j| j.status == crate::state::JobStatus::Queued && j.source.key().is_some_and(|(i, p, n)| i == idx && p == pr && !listed.contains(&n))) { j.cancel.fire(); }
+                                if complete {
+                                    st.forget_unlisted(idx, pr, &listed);
+                                }
+                                unlisted = st.jobs.iter().filter(|j| j.status == crate::state::JobStatus::Queued).filter_map(|j| j.source.key().filter(|&(i, p, n)| i == idx && p == pr && !listed.contains(&n)).map(|(_, _, n)| (j.id, n))).collect();
                                 let now = Instant::now();
                                 let mut held = 0;
                                 let mut why: Option<String> = None;
@@ -461,7 +494,8 @@ pub async fn poll_once(hub: &Hub) {
                                     // Asked before the item is taken note of: what a limit holds back stays
                                     // labelled and untouched, and is picked up when there is room again.
                                     drop(st);
-                                    let hold = hold_for(hub, &budget, r, taken_this_poll + fresh.len() as u32);
+                                    // Items picked in an earlier pass were submitted and are among the running jobs.
+                                    let hold = hold_for(hub, &budget, r, fresh.len() as u32);
                                     st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
                                     if let Some(h) = hold {
                                         held += 1;
@@ -489,7 +523,14 @@ pub async fn poll_once(hub: &Hub) {
                             }
                         }
                     };
-                    taken_this_poll += fresh.len() as u32;
+                    // A queued job whose item was not listed: cancelled when the item has gone, which a
+                    // full page cannot tell, so then the item itself is asked.
+                    for (id, n) in unlisted {
+                        let gone = complete || matches!(still_requested(r, pr, n).await, Err(e) if e.starts_with(team::TAKEN));
+                        if gone {
+                            hub.job(id, |j| if j.status == crate::state::JobStatus::Queued { j.cancel.fire() });
+                        }
+                    }
                     for i in fresh {
                         if pr {
                             if let Err(e) = hub.submit(
@@ -1231,6 +1272,18 @@ fn demo_items(hub: &Hub, idx: usize, pr: bool) -> Vec<Issue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_item_is_requested_while_open_with_its_label() {
+        assert!(requested(r#"{"state":"OPEN","labels":[{"name":"bug"},{"name":"agent:ready"}]}"#, "agent:ready").unwrap());
+        assert!(requested(r#"{"state":"opened","labels":["agent:ready"]}"#, "agent:ready").unwrap(), "glab");
+        assert!(!requested(r#"{"state":"CLOSED","labels":[{"name":"agent:ready"}]}"#, "agent:ready").unwrap());
+        assert!(!requested(r#"{"state":"MERGED","labels":[{"name":"review:ready"}]}"#, "review:ready").unwrap());
+        assert!(!requested(r#"{"state":"OPEN","labels":[{"name":"agent:working"}]}"#, "agent:ready").unwrap());
+        assert!(requested(r#"{"labels":[]}"#, "agent:ready").is_err(), "no state is not a no");
+        assert!(requested("HTTP 502", "agent:ready").is_err());
+        assert!(whole_page(20) && !whole_page(19));
+    }
 
     #[test]
     fn parses_github_and_gitlab_lists() {

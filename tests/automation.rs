@@ -158,8 +158,16 @@ if [ "$1" = "api" ]; then
 fi
 if [ -n "$FAKE_GH_FAIL_CMD" ] && [ "$1 $2" = "$FAKE_GH_FAIL_CMD" ]; then echo "HTTP 503: service unavailable" >&2; exit 1; fi
 case "$1 $2" in
-  "issue view"|"pr view") cat "$FAKE_GH/view-$3.json" 2>/dev/null || echo '{"labels":[]}' ;;
-  "issue list") cat "$FAKE_GH/issues.json" ;;
+  "issue view"|"pr view")
+    # An item nobody relabelled is still open and asked for.
+    if [ -f "$FAKE_GH/view-$3.json" ]; then cat "$FAKE_GH/view-$3.json"
+    elif [ "$1" = issue ]; then echo '{"state":"OPEN","labels":[{"name":"agent:ready"}]}'
+    else echo '{"state":"OPEN","labels":[{"name":"review:ready"}]}'
+    fi ;;
+  "issue list")
+    cat "$FAKE_GH/issues.json"
+    # Later listings leave the item out, as a page filled by newer requests would.
+    [ -n "$FAKE_LIST_ONCE" ] && echo '[]' > "$FAKE_GH/issues.json" ;;
   "pr list")
     # With a label: what is waiting for a review. Without: every open pull request.
     case " $* " in
@@ -171,6 +179,14 @@ case "$1 $2" in
     case " $* " in *" --body-file - "*) cat | tr '\n' ' ' >> "$FAKE_GH/calls.log" ;; esac
     echo >> "$FAKE_GH/calls.log"
     [ "$1 $2" = "pr create" ] && echo https://example.invalid/o/r/pull/12
+    # A label move is what a later view shows.
+    if [ "$2" = edit ]; then
+      num=$3; shift 3
+      while [ $# -gt 0 ]; do
+        if [ "$1" = --add-label ]; then printf '{"state":"OPEN","labels":[{"name":"%s"}]}' "$2" > "$FAKE_GH/view-$num.json"; break; fi
+        shift
+      done
+    fi
     ;;
 esac
 exit 0
@@ -472,6 +488,7 @@ fn a_failed_attempt_survives_a_retry() {
     assert_ne!(first, git(&rig.clone(), &["rev-parse", "origin/main"]), "the attempt was committed locally");
 
     // The issue is labelled again; this attempt fails as well.
+    rig.labelled(7, "agent:ready");
     let (_, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_WORK", "echo second >> other.txt")]);
     let holding = git(&rig.clone(), &["branch", "--contains", &first, "--format=%(refname:short)"]);
     assert!(holding.contains("forkdeck/attempts/issue-7-"), "first attempt must stay on a branch, got {:?}\n{}", holding, out);
@@ -482,6 +499,7 @@ fn a_failed_attempt_survives_a_retry() {
     // Work left uncommitted in the worktree (a crash) is kept too.
     let wt = rig.worktrees().join("issue-7");
     fs::write(wt.join("half-done.txt"), "wip\n").unwrap();
+    rig.labelled(7, "agent:ready");
     rig.once(&[("FAKE_VERDICT", "FAIL")]);
     let kept = git(&rig.clone(), &["log", "--all", "--format=%s", "--", "half-done.txt"]);
     assert!(kept.contains("Unfinished attempt at #7"), "{:?}", kept);
@@ -1095,7 +1113,7 @@ impl Rig {
 
     /// The labels `gh issue view` / `gh pr view` reports for an item.
     fn labelled(&self, n: u64, label: &str) {
-        fs::write(self.root.join(format!("gh/view-{}.json", n)), format!(r#"{{"labels":[{{"name":"{}"}}]}}"#, label)).unwrap();
+        fs::write(self.root.join(format!("gh/view-{}.json", n)), format!(r#"{{"state":"OPEN","labels":[{{"name":"{}"}}]}}"#, label)).unwrap();
     }
 
     /// A script the stand-in agent can run mid-job: `$1` posts a release naming the running job's
@@ -1247,7 +1265,6 @@ fn nothing_is_claimed_when_the_claims_cannot_be_read() {
 fn a_teammates_release_stops_the_job_before_anything_is_pushed() {
     let rig = Rig::new("team-release", TEAM, "");
     rig.issue();
-    rig.labelled(7, "agent:working");
     // While Alice's agent is working, Bob hands the issue back to the queue from his machine.
     let release = format!("echo change >> by_agent.txt; FAKE_LOGIN=bob {} team release o/r#7 --force > {}/release.out 2>&1", env!("CARGO_BIN_EXE_forkdeck"), rig.root.display());
     let (ok, out) = rig.once(&[("FAKE_WORK", &release)]);
@@ -1462,7 +1479,6 @@ fn a_claim_that_expired_while_the_agent_ran_publishes_nothing() {
 fn a_job_that_fails_after_it_was_released_leaves_the_labels_to_the_new_holder() {
     let rig = Rig::new("team-fail-released", "[team]\nenabled = true\n[review]\nmax_fix_rounds = 0", "");
     rig.issue();
-    rig.labelled(7, "agent:working");
     let release = format!("echo change >> by_agent.txt; FAKE_LOGIN=bob {} team release o/r#7 --force > {}/release.out 2>&1", env!("CARGO_BIN_EXE_forkdeck"), rig.root.display());
     let (ok, out) = rig.once(&[("FAKE_WORK", &release), ("FAKE_VERDICT", "FAIL")]);
     assert!(!ok, "{}", out);
@@ -1664,6 +1680,32 @@ fn the_daily_job_limit_leaves_the_rest_labelled_and_untouched() {
     let (_, out) = rig.once(&[]);
     assert!(out.contains("job limit for this repository reached"), "{}", out);
     assert!(!rig.calls().contains("issue edit 8 "), "{}", rig.calls());
+}
+
+#[test]
+fn a_per_repository_limit_counts_each_job_once() {
+    // One issue and one pull request against a limit of two: the issue, once submitted, is a
+    // running job and must not also count as picked in this poll.
+    let rig = Rig::new("limit-once", "", "jobs_per_day = 2");
+    rig.issue();
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(!out.contains("job limit for this repository reached"), "{}", out);
+    let calls = rig.calls();
+    assert!(calls.contains("issue edit 7 ") && calls.contains("pr edit 5 "), "both are taken:\n{}", calls);
+}
+
+#[test]
+fn an_item_left_off_a_later_listing_is_still_taken() {
+    // The recheck before claiming asks about the item itself, not a listing that may not show it.
+    let rig = Rig::new("recheck-direct", "", "");
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_LIST_ONCE", "1")]);
+    assert!(ok, "{}", out);
+    let calls = rig.calls();
+    assert!(calls.contains("issue edit 7 ") && calls.contains("pr create"), "{}\n{}", calls, out);
 }
 
 #[test]
@@ -2659,6 +2701,7 @@ fn a_detached_failed_attempt_keeps_its_uncommitted_files_on_retry() {
     rig.issue();
     let (ok, out) = rig.once(&[("FAKE_WORK", "git checkout --detach; echo precious > valuable.txt")]);
     assert!(!ok && out.contains("no longer on"), "{}", out);
+    rig.labelled(7, "agent:ready");
     let (ok, out) = rig.once(&[]);
     assert!(ok, "{}", out);
     let branches = git(&rig.clone(), &["for-each-ref", "--format=%(refname)", "refs/heads/forkdeck/attempts/"]);
