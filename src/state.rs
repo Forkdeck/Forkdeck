@@ -528,7 +528,7 @@ pub struct RepoStatus {
     /// Rules waiting to be proposed are not retried before this.
     pub notes_retry: Option<Instant>,
     /// Where the next poll goes on asking about seen items a full listing left out.
-    pub recheck_from: usize,
+    pub recheck_from: [usize; 2],
 }
 
 /// (repo index, is a pull request, number)

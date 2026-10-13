@@ -258,26 +258,8 @@ fn lock_worktree(hub: &Hub, id: u32, dir: &Path) -> Result<(), String> {
 
 /// Another entry for the same repository on the same forge already polls it (entries per deploy
 /// environment). GitLab paths repeat across hosts, so the host each clone's origin names counts too.
-pub async fn polled_before(earlier: &[RepoCfg], r: &RepoCfg) -> bool {
-    for o in earlier.iter().filter(|o| o.provider == r.provider && o.repo.eq_ignore_ascii_case(&r.repo)) {
-        if r.provider == Provider::Github || origin_host(o).await == origin_host(r).await {
-            return true;
-        }
-    }
-    false
-}
-
-async fn origin_host(r: &RepoCfg) -> Option<String> {
-    sh("git", &["remote", "get-url", "origin"], Some(&r.path)).await.ok().and_then(|u| host_of(&u))
-}
-
-/// "git@host:group/p.git", "ssh://git@host:22/group/p", "https://user@host/group/p" -> "host".
-fn host_of(url: &str) -> Option<String> {
-    let rest = url.trim().split_once("://").map(|(_, r)| r).unwrap_or(url.trim());
-    let authority = rest.split('/').next()?;
-    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
-    let host = authority.split(':').next()?.to_ascii_lowercase();
-    (!host.is_empty()).then_some(host)
+pub fn polled_before(earlier: &[RepoCfg], r: &RepoCfg) -> bool {
+    earlier.iter().any(|o| o.provider == r.provider && o.repo.eq_ignore_ascii_case(&r.repo) && (r.provider == Provider::Github || o.host == r.host))
 }
 
 /// No job was made for an item admitted in this poll: forget that it was seen, so the next poll
@@ -430,7 +412,10 @@ fn budget(hub: &Hub) -> Budget {
             let running: Vec<u32> = st.jobs.iter().filter(|j| !j.status.finished()).map(|j| j.id).collect();
             drop(st);
             if let Ok(saved) = h.load(crate::history::KEEP) {
-                for r in saved.iter().filter(|r| r.status == crate::state::JobStatus::Interrupted && !running.contains(&r.id) && r.finished.is_none_or(|f| f as i64 >= now - window)) {
+                // Interrupted, or left unfinished by a forkdeck that died without saying so.
+                let cut_off = |r: &crate::history::JobRecord| r.status == crate::state::JobStatus::Interrupted
+                    || (!r.status.finished() && r.owner.as_deref().is_none_or(|o| !crate::history::owner_alive(o)));
+                for r in saved.iter().filter(|r| cut_off(r) && !running.contains(&r.id) && r.finished.is_none_or(|f| f as i64 >= now - window)) {
                     spent.tokens += r.used.iter().map(|u| u.tokens()).sum::<u64>();
                 }
             }
@@ -475,7 +460,7 @@ pub async fn poll_once(hub: &Hub) {
     {
         {
             for (idx, r) in hub.cfg.repos.iter().enumerate() {
-                if polled_before(&hub.cfg.repos[..idx], r).await { continue; }
+                if polled_before(&hub.cfg.repos[..idx], r) { continue; }
                 crate::knowledge::retry_pending(hub, idx).await;
                 // What a limit held back in this repository on this poll: the reason, and how many items.
                 let mut repo_hold: Option<(String, u32)> = None;
@@ -564,14 +549,14 @@ pub async fn poll_once(hub: &Hub) {
                     // asks for another go. A few are asked about per poll, in turn.
                     if !absent.is_empty() {
                         const PER_POLL: usize = 10;
-                        let from = hub.state.lock().unwrap_or_else(|e| e.into_inner()).repos[idx].recheck_from % absent.len();
+                        let from = hub.state.lock().unwrap_or_else(|e| e.into_inner()).repos[idx].recheck_from[pr as usize] % absent.len();
                         for &n in absent.iter().cycle().skip(from).take(PER_POLL.min(absent.len())) {
                             if matches!(still_requested(r, pr, n).await, Err(e) if e.starts_with(team::TAKEN)) {
                                 let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
                                 if !st.active((idx, pr, n)) { st.forget((idx, pr, n)); }
                             }
                         }
-                        hub.state.lock().unwrap_or_else(|e| e.into_inner()).repos[idx].recheck_from = from + PER_POLL;
+                        hub.state.lock().unwrap_or_else(|e| e.into_inner()).repos[idx].recheck_from[pr as usize] = from + PER_POLL;
                     }
                     for (id, n) in unlisted {
                         let gone = complete || matches!(still_requested(r, pr, n).await, Err(e) if e.starts_with(team::TAKEN));
@@ -624,9 +609,26 @@ pub fn repo_slug(r: &RepoCfg) -> String {
         Provider::Github => "github",
         Provider::Gitlab => "gitlab",
     };
+    // A self-hosted GitLab names its host: the same group/project may be on two of them. GitHub and
+    // gitlab.com keep the names they always had.
+    let id = if r.provider == Provider::Gitlab && !r.host.is_empty() && r.host != "gitlab.com" { format!("{}:{}:{}", forge, r.host, r.repo) } else { format!("{}:{}", forge, r.repo) };
+    slug_of(&safe, &id)
+}
+
+/// The name a repository's files had before the host was part of it.
+pub fn legacy_slug(r: &RepoCfg) -> String {
+    let safe: String = r.repo.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect();
+    let forge = match r.provider {
+        Provider::Github => "github",
+        Provider::Gitlab => "gitlab",
+    };
+    slug_of(&safe, &format!("{}:{}", forge, r.repo))
+}
+
+fn slug_of(safe: &str, id: &str) -> String {
     // FNV-1a: small, and the same on every machine and in every version, which a path has to be.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in format!("{}:{}", forge, r.repo).bytes() {
+    for b in id.bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -1329,6 +1331,7 @@ mod tests {
 
     #[test]
     fn the_forge_host_is_read_from_any_remote_form() {
+        use crate::config::host_of;
         assert_eq!(host_of("git@gitlab.example.com:group/p.git").as_deref(), Some("gitlab.example.com"));
         assert_eq!(host_of("ssh://git@Gitlab.Example.com:2222/group/p.git").as_deref(), Some("gitlab.example.com"));
         assert_eq!(host_of("https://oauth2:token@gitlab.other.org/group/p").as_deref(), Some("gitlab.other.org"));

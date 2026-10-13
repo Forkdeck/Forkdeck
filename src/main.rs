@@ -226,6 +226,7 @@ fn main() -> anyhow::Result<()> {
                 jobs_per_day: 0,
                 ci: None,
                 deploy: None,
+                host: String::new(),
             });
         }
     }

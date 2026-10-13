@@ -27,7 +27,14 @@ pub fn path(r: &RepoCfg) -> PathBuf {
         Provider::Github => "github",
         Provider::Gitlab => "gitlab",
     };
-    crate::cicd::state_dir().join("notes").join(forge).join(format!("{}.md", issues::repo_slug(r)))
+    let dir = crate::cicd::state_dir().join("notes").join(forge);
+    let p = dir.join(format!("{}.md", issues::repo_slug(r)));
+    // Notes kept under the name from before the host was part of it move to the new name once.
+    let legacy = dir.join(format!("{}.md", issues::legacy_slug(r)));
+    if legacy != p && !p.exists() && legacy.exists() {
+        let _ = std::fs::rename(&legacy, &p);
+    }
+    p
 }
 
 /// Rules that were learned but could not be proposed yet. They wait here, where no job reads
@@ -554,6 +561,17 @@ mod tests {
         assert_eq!(path(&a), path(&repo("gitlab", "acme/foo_bar")));
         assert_eq!(issues::repo_slug(&repo("github", "o/r")), "o_r-f85ac294", "the name must not change between versions");
         assert_eq!(pending_path(&a).extension().unwrap(), "pending");
+    }
+
+    #[test]
+    fn the_same_gitlab_path_on_two_hosts_is_two_repositories() {
+        let on = |host: &str| -> RepoCfg { let mut r: RepoCfg = toml::from_str("provider = \"gitlab\"\nrepo = \"g/p\"\npath = \".\"").unwrap(); r.host = host.into(); r };
+        let (a, b) = (on("gitlab.one.example"), on("gitlab.two.example"));
+        assert_ne!(issues::repo_slug(&a), issues::repo_slug(&b));
+        assert_eq!(issues::repo_slug(&on("gitlab.com")), issues::repo_slug(&on("")), "gitlab.com keeps its old name");
+        assert_eq!(issues::repo_slug(&on("gitlab.com")), issues::legacy_slug(&a));
+        assert!(!issues::polled_before(std::slice::from_ref(&a), &b));
+        assert!(issues::polled_before(std::slice::from_ref(&a), &on("gitlab.one.example")));
     }
 
     #[test]

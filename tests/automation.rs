@@ -1710,7 +1710,9 @@ fn an_item_left_off_a_later_listing_is_still_taken() {
 
 #[test]
 fn a_typed_task_stopped_midway_still_counts_toward_the_token_limit() {
-    let rig = Rig::new("limit-interrupted", "[limits]\ntokens_per_day = 1000", "");
+    for signal in ["-TERM", "-KILL"] {
+    // -KILL: nothing marks it interrupted; it is left as it was, by a forkdeck that is gone.
+    let rig = Rig::new(&format!("limit-interrupted{}", signal), "[limits]\ntokens_per_day = 1000", "");
     // The worker spends the day's tokens; forkdeck is stopped while the reviewer looks.
     let reviewing = rig.root.join("reviewing");
     let during = format!("touch {}; sleep 30", reviewing.display());
@@ -1720,12 +1722,13 @@ fn a_typed_task_stopped_midway_still_counts_toward_the_token_limit() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(reviewing.exists(), "the review never started");
-    Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    Command::new("kill").args([signal, &child.id().to_string()]).status().unwrap();
     let _ = child.wait();
     rig.issue();
     let (ok, out) = rig.once(&[]);
     assert!(ok && out.contains("token limit reached"), "the interrupted task's tokens were not counted:\n{}", out);
     assert!(!rig.calls().contains("issue edit 7 "), "nothing is claimed:\n{}", rig.calls());
+    }
 }
 
 #[test]

@@ -434,7 +434,7 @@ async fn write_access(r: &RepoCfg, by: &str) -> Result<bool, String> {
 /// Can anyone on the internet read this repository? Asked once per repository. When the forge
 /// does not answer, the repository is treated as public: the cautious side for what gets posted.
 pub async fn is_public(hub: &Hub, r: &RepoCfg) -> bool {
-    let key = format!("{}:{}", tool(r), r.repo);
+    let key = format!("{}:{}:{}", tool(r), r.host, r.repo);
     if let Some(p) = hub.team_public.lock().unwrap().get(&key) {
         return *p;
     }
@@ -923,7 +923,7 @@ pub async fn gather(hub: &Hub, all: bool) -> (Vec<Row>, Vec<String>) {
     let stale = (hub.cfg.team.stale_mins * 60) as i64;
     for (idx, r) in hub.cfg.repos.iter().enumerate() {
         // Two entries for the same repository (two environments) are one repository here.
-        if issues::polled_before(&hub.cfg.repos[..idx], r).await {
+        if issues::polled_before(&hub.cfg.repos[..idx], r) {
             continue;
         }
         let who = me(hub, r).await.unwrap_or_default();

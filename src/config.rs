@@ -667,6 +667,10 @@ pub struct RepoCfg {
     pub ci: Option<CiCfg>,
     #[serde(default)]
     pub deploy: Option<DeployCfg>,
+    /// The forge host the clone's origin names, read when the config is loaded. GitLab paths
+    /// repeat across hosts, so it is part of what makes two entries the same repository.
+    #[serde(skip)]
+    pub host: String,
 }
 
 fn d_base() -> String {
@@ -728,6 +732,7 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
                 toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {}", c.display(), e))?;
             for r in &mut cfg.repos {
                 r.path = expand(&r.path);
+                r.host = origin_host(&r.path);
             }
             cfg.validate()?;
             return Ok((cfg, Some(c)));
@@ -736,6 +741,21 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
         }
     }
     Ok((Config::default(), None))
+}
+
+/// The host a clone's origin names, or "" when there is none to read.
+pub fn origin_host(clone: &Path) -> String {
+    std::process::Command::new("git").args(["-C"]).arg(clone).args(["remote", "get-url", "origin"]).stderr(std::process::Stdio::null()).output().ok()
+        .filter(|o| o.status.success()).and_then(|o| host_of(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default()
+}
+
+/// "git@host:group/p.git", "ssh://git@host:22/group/p", "https://user@host/group/p" -> "host".
+pub fn host_of(url: &str) -> Option<String> {
+    let rest = url.trim().split_once("://").map(|(_, r)| r).unwrap_or(url.trim());
+    let authority = rest.split('/').next()?;
+    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = authority.split(':').next()?.to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
 }
 
 impl Config {
