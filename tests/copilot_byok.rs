@@ -205,6 +205,26 @@ fn a_reviewer_cannot_edit_or_run_commands() {
     }
 }
 
+#[test]
+#[ignore]
+fn a_reviewer_reads_the_checkout_from_outside_it() {
+    // Reviewers start in an empty directory, so a checkout's own configuration is not loaded, and are
+    // given the checkout's absolute path. That only works if reading outside the directory is allowed.
+    let dir = workspace("review-outside");
+    let checkout = dir.join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let notes = checkout.join("notes.txt");
+    std::fs::write(&notes, "hello\n").unwrap();
+    let url = fake_server(Answer::ToolThenText("view", json!({"path": notes})));
+    let mut args = REVIEW_ARGS.to_vec();
+    args.extend(["--no-custom-instructions", "--disable-builtin-mcps"]);
+    let r = copilot(&url, &dir, "Review the change. Do not modify any file.", &args);
+    assert!(r.exit_ok, "{:?}", r.events);
+    let done = of_type(&r, "tool.execution_complete");
+    assert!(done.iter().any(|e| e["data"]["success"] == true), "the checkout could not be read: {:?}", done);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Copilot refused a tool on permission grounds (it does not ask: --no-ask-user, no allow rule).
 fn denied(r: &Run) -> bool {
     of_type(r, "tool.execution_complete").iter().any(|e| e["data"]["success"] == false && e["data"]["error"]["code"] == "denied")

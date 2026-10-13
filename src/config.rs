@@ -865,6 +865,12 @@ impl Config {
             if !r.path.is_absolute() {
                 anyhow::bail!("repos: path for {} must be absolute or start with ~/, got {}", r.repo, r.path.display());
             }
+            for labels in [[&r.label, &r.working_label, &r.done_label, &r.failed_label], [&r.pr_label, &r.pr_working_label, &r.pr_pass_label, &r.pr_fail_label]] {
+                let mut seen = std::collections::HashSet::new();
+                for label in labels {
+                    anyhow::ensure!(!label.trim().is_empty() && !label.contains(',') && seen.insert(label), "repos: {} labels must be nonempty, comma-free and distinct within each kind", r.repo);
+                }
+            }
             for (name, v) in [("repo", &r.repo), ("base", &r.base)] {
                 if v.is_empty() || v.starts_with('-') || v.contains(char::is_whitespace) {
                     anyhow::bail!("repos: {} {:?} is not a valid name", name, v);
@@ -925,6 +931,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automation_labels_cannot_broaden_the_filter_or_conflict() {
+        for bad in ["label = ''", "pr_label = 'a,b'", "working_label = 'agent:ready'", "pr_pass_label = 'review:ready'"] {
+            let c: Config = toml::from_str(&format!("[[repos]]\nprovider = 'github'\nrepo = 'o/r'\npath = '/tmp/repo'\n{}", bad)).unwrap();
+            assert!(c.validate().is_err(), "{}", bad);
+        }
+    }
 
     #[test]
     fn example_config_parses() {

@@ -262,7 +262,7 @@ pub fn rules(cfg: &Config, task: &str, is_issue: bool) -> Decision {
     } else {
         0.6
     };
-    let review_sharp = (rv - 0.5).abs() >= 0.09;
+    let review_sharp = (rv - 0.5).abs() >= (th - 0.5).max(0.05);
     // Same rule as the Jev path: any unsure answer buys a review.
     let review = rv >= 0.5 || !review_sharp || !agent_sharp || !effort_sharp;
     Decision {
@@ -284,6 +284,15 @@ pub fn rules(cfg: &Config, task: &str, is_issue: bool) -> Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rules_review_confidence_obeys_the_threshold() {
+        let mut cfg = Config::default();
+        cfg.router.threshold = 0.9;
+        let d = rules(&cfg, "fix bug test typo rename wording", false);
+        assert!(d.review);
+        assert!(!d.gates.iter().find(|g| g.name == "needs review").unwrap().sharp);
+    }
 
     #[test]
     fn parses_documented_response_shape() {

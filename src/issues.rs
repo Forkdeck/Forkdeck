@@ -87,6 +87,7 @@ pub fn quiet(s: &str) -> String {
     let mut it = s.chars().peekable();
     while let Some(c) = it.next() {
         out.push(c);
+        if c == ':' && it.peek() == Some(&'/') { out.push('\u{200b}'); }
         if c == '@' || (c == '#' && it.peek().is_some_and(|n| n.is_ascii_digit())) {
             out.push('\u{200b}');
         }
@@ -192,7 +193,7 @@ async fn list(r: &RepoCfg) -> Result<Vec<Issue>, String> {
             sh("gh", &["issue", "list", "-R", &r.repo, "--label", &r.label, "--state", "open", "--limit", "20", "--json", "number,title,body,url,author"], None).await?
         }
         Provider::Gitlab => {
-            sh("glab", &["issue", "list", "-R", &r.repo, "--label", &r.label, "--per-page", "20", "--output", "json"], None).await?
+            sh("glab", &["issue", "list", "-R", &r.repo, "--label", &r.label, "--per-page", "20", "--output", "json"], Some(&r.path)).await?
         }
     };
     parse_list(r.provider, &out)
@@ -204,7 +205,7 @@ async fn list_prs(r: &RepoCfg) -> Result<Vec<Issue>, String> {
             sh("gh", &["pr", "list", "-R", &r.repo, "--label", &r.pr_label, "--state", "open", "--limit", "20", "--json", "number,title,body,url,author,headRefName,baseRefName"], None).await?
         }
         Provider::Gitlab => {
-            sh("glab", &["mr", "list", "-R", &r.repo, "--label", &r.pr_label, "--per-page", "20", "--output", "json"], None).await?
+            sh("glab", &["mr", "list", "-R", &r.repo, "--label", &r.pr_label, "--per-page", "20", "--output", "json"], Some(&r.path)).await?
         }
     };
     parse_list(r.provider, &out)
@@ -216,8 +217,8 @@ pub async fn relabel(r: &RepoCfg, pr: bool, n: u64, from: &str, to: &str) -> Res
     match (r.provider, pr) {
         (Provider::Github, false) => sh("gh", &["issue", "edit", &n, "-R", &r.repo, "--remove-label", from, "--add-label", to], None).await,
         (Provider::Github, true) => sh("gh", &["pr", "edit", &n, "-R", &r.repo, "--remove-label", from, "--add-label", to], None).await,
-        (Provider::Gitlab, false) => sh("glab", &["issue", "update", &n, "-R", &r.repo, "--unlabel", from, "--label", to], None).await,
-        (Provider::Gitlab, true) => sh("glab", &["mr", "update", &n, "-R", &r.repo, "--unlabel", from, "--label", to], None).await,
+        (Provider::Gitlab, false) => sh("glab", &["issue", "update", &n, "-R", &r.repo, "--unlabel", from, "--label", to], Some(&r.path)).await,
+        (Provider::Gitlab, true) => sh("glab", &["mr", "update", &n, "-R", &r.repo, "--unlabel", from, "--label", to], Some(&r.path)).await,
     }
     .map(|_| ())
 }
@@ -225,12 +226,37 @@ pub async fn relabel(r: &RepoCfg, pr: bool, n: u64, from: &str, to: &str) -> Res
 pub async fn comment(r: &RepoCfg, pr: bool, n: u64, text: &str) -> Result<(), String> {
     let n = n.to_string();
     match (r.provider, pr) {
-        (Provider::Github, false) => sh("gh", &["issue", "comment", &n, "-R", &r.repo, "--body", text], None).await,
-        (Provider::Github, true) => sh("gh", &["pr", "comment", &n, "-R", &r.repo, "--body", text], None).await,
-        (Provider::Gitlab, false) => sh("glab", &["issue", "note", &n, "-R", &r.repo, "--message", text], None).await,
-        (Provider::Gitlab, true) => sh("glab", &["mr", "note", &n, "-R", &r.repo, "--message", text], None).await,
-    }
-    .map(|_| ())
+        (Provider::Github, false) => sh_in("gh", &["issue", "comment", &n, "-R", &r.repo, "--body-file", "-"], None, text).await,
+        (Provider::Github, true) => sh_in("gh", &["pr", "comment", &n, "-R", &r.repo, "--body-file", "-"], None, text).await,
+        (Provider::Gitlab, _) => {
+            let endpoint = format!("projects/{}/{}/{}/notes", r.repo.replace('/', "%2F"), if pr { "merge_requests" } else { "issues" }, n);
+            sh_in("glab", &["api", "-X", "POST", &endpoint, "--input", "-", "-H", "Content-Type: application/json"], Some(&r.path), &serde_json::json!({"body": text}).to_string()).await
+        }
+    }.map(|_| ())
+}
+
+async fn write_guard(hub: &Hub, id: u32) -> Result<(), String> {
+    let stopped = || hub.job(id, |j| j.cancel.is_set()).unwrap_or(true);
+    if stopped() { return Err("cancelled before writing".into()); }
+    team::guard(hub, id).await?;
+    if stopped() { return Err("cancelled before writing".into()); }
+    Ok(())
+}
+
+fn lock_worktree(hub: &Hub, id: u32, dir: &Path) -> Result<(), String> {
+    let lock = crate::proc::FileLock::take(&dir.with_extension("lock")).map_err(|e| format!("{}{}", team::TAKEN, e))?;
+    hub.job(id, |j| j.worktree_lock = Some(std::sync::Arc::new(lock)));
+    Ok(())
+}
+
+async fn still_requested(r: &RepoCfg, pr: bool, n: u64) -> Result<(), String> {
+    let listed = if pr { list_prs(r).await? } else { list(r).await? };
+    if listed.iter().any(|i| i.number == n) { Ok(()) } else { Err(format!("{}the item is no longer open with its request label", team::TAKEN)) }
+}
+
+async fn review_labels(r: &RepoCfg, n: u64, to: &str) -> Result<(), String> {
+    let from = [&r.pr_label, &r.pr_working_label, &r.pr_pass_label, &r.pr_fail_label].into_iter().filter(|l| l.as_str() != to).map(|l| l.as_str()).collect::<Vec<_>>().join(",");
+    relabel(r, true, n, &from, to).await
 }
 
 fn pr_of(hub: &Hub, id: u32) -> Option<(RepoCfg, u64, String, String)> {
@@ -273,7 +299,7 @@ pub async fn poll_loop(hub: Hub) {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     loop {
-        let on = hub.state.lock().unwrap().automation;
+        let on = hub.state.lock().unwrap_or_else(|e| e.into_inner()).automation;
         if on {
             poll_once(&hub).await;
         }
@@ -281,7 +307,7 @@ pub async fn poll_loop(hub: Hub) {
         // Wake early when automation is switched on so the first poll is immediate.
         for _ in 0..wait * 2 {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            if !on && hub.state.lock().unwrap().automation {
+            if !on && hub.state.lock().unwrap_or_else(|e| e.into_inner()).automation {
                 break;
             }
         }
@@ -316,10 +342,11 @@ fn budget(hub: &Hub) -> Budget {
     let window = journal::DAY.max((lim.pause_mins * 60) as i64);
     let counted = lim.jobs_per_day > 0 || lim.tokens_per_day > 0 || lim.pause_after_failures > 0 || hub.cfg.repos.iter().any(|r| r.jobs_per_day > 0);
     // Jobs that ended while the journal could not be written are owed to it first.
-    let owed: Vec<journal::Entry> = std::mem::take(&mut hub.state.lock().unwrap().unrecorded);
+    let owed: Vec<journal::Entry> = std::mem::take(&mut hub.state.lock().unwrap_or_else(|e| e.into_inner()).unrecorded);
     let mut broken: Option<String> = None;
     let mut still_owed = Vec::new();
     for e in owed {
+        if broken.is_some() { still_owed.push(e); continue; }
         match (&broken, journal::append(&e)) {
             (None, Ok(())) => {}
             (None, Err(err)) => {
@@ -329,7 +356,7 @@ fn budget(hub: &Hub) -> Budget {
             (Some(_), _) => still_owed.push(e),
         }
     }
-    hub.state.lock().unwrap().unrecorded.extend(still_owed);
+    hub.state.lock().unwrap_or_else(|e| e.into_inner()).unrecorded.extend(still_owed);
     if broken.is_none() {
         broken = journal::writable().err();
     }
@@ -347,7 +374,7 @@ fn budget(hub: &Hub) -> Budget {
     let mut spent = journal::spent(&entries, None, now);
     {
         // Jobs still running are not in the journal yet.
-        let mut st = hub.state.lock().unwrap();
+        let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
         for j in st.jobs.iter().filter(|j| !j.status.finished()) {
             spent.tokens += j.used.iter().map(|u| u.tokens()).sum::<u64>();
             spent.jobs += matches!(j.source, Source::Issue { .. } | Source::Pr { .. }) as u32;
@@ -371,11 +398,15 @@ fn hold_for(hub: &Hub, b: &Budget, r: &RepoCfg, taken_here: u32) -> Option<Strin
         return Some(format!("job limit reached: {} in the last 24 h", lim.jobs_per_day));
     }
     if r.jobs_per_day > 0 {
-        let running = hub.state.lock().unwrap().jobs.iter().filter(|j| !j.status.finished() && matches!(&j.source, Source::Issue { repo, .. } | Source::Pr { repo, .. } if repo == &r.repo)).count() as u32;
+        let running = hub.state.lock().unwrap_or_else(|e| e.into_inner()).jobs.iter().filter(|j| !j.status.finished() && matches!(&j.source, Source::Issue { repo, .. } | Source::Pr { repo, .. } if repo == &r.repo)).count() as u32;
         // `taken_here`: picked in this pass and not yet among the running jobs.
         if journal::spent(&b.entries, Some(&r.repo), b.now).jobs + running + taken_here >= r.jobs_per_day {
             return Some(format!("job limit for this repository reached: {} in the last 24 h", r.jobs_per_day));
         }
+    }
+    let recovering = journal::paused_until(&b.entries, &r.repo, lim.pause_after_failures, i64::MAX / 2, b.now).is_some();
+    if recovering && (taken_here > 0 || hub.state.lock().unwrap_or_else(|e| e.into_inner()).jobs.iter().any(|j| !j.status.finished() && matches!(&j.source, Source::Issue { repo, .. } | Source::Pr { repo, .. } if repo == &r.repo))) {
+        return Some("waiting for the single recovery probe".into());
     }
     journal::paused_until(&b.entries, &r.repo, lim.pause_after_failures, (lim.pause_mins * 60) as i64, b.now)
         .map(|until| format!("paused until {} after {} failed jobs in a row", clock(until), lim.pause_after_failures))
@@ -387,9 +418,11 @@ pub async fn poll_once(hub: &Hub) {
     {
         {
             for (idx, r) in hub.cfg.repos.iter().enumerate() {
+                if hub.cfg.repos[..idx].iter().any(|o| o.provider == r.provider && o.repo.eq_ignore_ascii_case(&r.repo)) { continue; }
                 crate::knowledge::retry_pending(hub, idx).await;
                 // What a limit held back in this repository on this poll: the reason, and how many items.
                 let mut repo_hold: Option<(String, u32)> = None;
+                let mut taken_this_poll = 0;
                 for pr in [false, true] {
                     let found = if hub.cfg.demo {
                         Ok(demo_items(hub, idx, pr))
@@ -399,7 +432,7 @@ pub async fn poll_once(hub: &Hub) {
                         list(r).await
                     };
                     let fresh = {
-                        let mut st = hub.state.lock().unwrap();
+                        let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
                         st.repos[idx].last_poll = Some(Instant::now());
                         match found {
                             Err(e) => {
@@ -417,6 +450,7 @@ pub async fn poll_once(hub: &Hub) {
                                 let listed: Vec<u64> = list.iter().map(|i| i.number).collect();
                                 // Removing the label and applying it again is how a person asks for another go.
                                 st.forget_unlisted(idx, pr, &listed);
+                                for j in st.jobs.iter_mut().filter(|j| j.status == crate::state::JobStatus::Queued && j.source.key().is_some_and(|(i, p, n)| i == idx && p == pr && !listed.contains(&n))) { j.cancel.fire(); }
                                 let now = Instant::now();
                                 let mut held = 0;
                                 let mut why: Option<String> = None;
@@ -427,8 +461,8 @@ pub async fn poll_once(hub: &Hub) {
                                     // Asked before the item is taken note of: what a limit holds back stays
                                     // labelled and untouched, and is picked up when there is room again.
                                     drop(st);
-                                    let hold = hold_for(hub, &budget, r, fresh.len() as u32);
-                                    st = hub.state.lock().unwrap();
+                                    let hold = hold_for(hub, &budget, r, taken_this_poll + fresh.len() as u32);
+                                    st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
                                     if let Some(h) = hold {
                                         held += 1;
                                         why = Some(h);
@@ -455,30 +489,31 @@ pub async fn poll_once(hub: &Hub) {
                             }
                         }
                     };
+                    taken_this_poll += fresh.len() as u32;
                     for i in fresh {
                         if pr {
-                            hub.submit(
+                            if let Err(e) = hub.submit(
                                 format!("{}!{} {}", r.repo, i.number, i.title),
                                 i.body.clone(),
                                 Source::Pr { repo_idx: idx, repo: r.repo.clone(), number: i.number, url: i.url.clone(), head: i.head.clone(), base: if i.base.is_empty() { r.base.clone() } else { i.base.clone() } },
                                 r.path.clone(),
                                 None,
                                 Planning::IfRouted,
-                            );
+                            ).await { hub.log("queue", format!("submission failed: {}", e)); }
                         } else {
-                            hub.submit(
+                            if let Err(e) = hub.submit(
                                 format!("{}#{} {}", r.repo, i.number, i.title),
                                 task_prompt(r, &i),
                                 Source::Issue { repo_idx: idx, repo: r.repo.clone(), number: i.number, url: i.url.clone() },
                                 r.path.clone(),
                                 None,
                                 Planning::IfRouted,
-                            );
+                            ).await { hub.log("queue", format!("submission failed: {}", e)); }
                         }
                     }
                 }
                 // Said once when it starts and once when it ends, not on every poll.
-                let mut st = hub.state.lock().unwrap();
+                let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
                 let was = st.repos[idx].hold.clone();
                 match (&repo_hold, &was) {
                     (Some((why, _)), w) if w.as_deref().map(|x| x.split(" · ").next().unwrap_or("")) != Some(why.as_str()) => st.log("limits", format!("{}: {}", r.repo, why)),
@@ -580,6 +615,9 @@ pub async fn prepare(hub: &Hub, id: u32) -> Result<(), String> {
         hub.job(id, |j| j.branch = Some(branch.clone()));
         return Ok(());
     }
+    lock_worktree(hub, id, &dir)?;
+    still_requested(&r, false, n).await?;
+    write_guard(hub, id).await?;
     let held = claim_first(hub, &r, Target::Issue(n), "issue").await?;
     if let Err(e) = relabel(&r, false, n, &r.label, &r.working_label).await {
         if let Some(h) = &held {
@@ -631,26 +669,33 @@ pub async fn prepare(hub: &Hub, id: u32) -> Result<(), String> {
 /// Returns the name of the branch it was kept on, if there was anything to keep.
 async fn keep_earlier_attempt(repo: &Path, dir: &Path, branch: &str, base: &str, n: u64) -> Result<Option<String>, String> {
     let full = format!("refs/heads/{}", branch);
-    if sh("git", &["rev-parse", "--verify", "--quiet", &full], Some(repo)).await.is_err() {
-        return Ok(None);
+    let mut kept = None;
+    if dir.exists() {
+        let head = sh("git", &["rev-parse", "--verify", "HEAD^{commit}"], Some(dir)).await?;
+        let dirty = sh("git", &["status", "--porcelain", "--untracked-files=all"], Some(dir)).await?;
+        let sha = if !dirty.is_empty() {
+            let scratch = crate::proc::Scratch::new()?;
+            let env = [("GIT_INDEX_FILE", scratch.0.join("index").display().to_string())];
+            sh_env("git", &["read-tree", &head], Some(dir), &env).await?;
+            sh_env("git", &["add", "-A"], Some(dir), &env).await?;
+            let tree = sh_env("git", &["write-tree"], Some(dir), &env).await?;
+            sh("git", &["commit-tree", &tree, "-p", &head, "-m", &format!("Unfinished attempt at #{}", n)], Some(dir)).await?
+        } else { head };
+        let name = format!("forkdeck/attempts/issue-{}-{}", n, &sha[..10]);
+        sh("git", &["branch", "--force", &name, &sha], Some(repo)).await?;
+        kept = Some(name);
     }
-    // Uncommitted work in the old worktree, if that worktree is still on this branch.
-    if dir.join(".git").exists() {
-        let on = sh("git", &["symbolic-ref", "--quiet", "HEAD"], Some(dir)).await.unwrap_or_default();
-        if on.trim() == full && !sh("git", &["status", "--porcelain"], Some(dir)).await.unwrap_or_default().is_empty() {
-            sh("git", &["add", "-A"], Some(dir)).await?;
-            sh("git", &["commit", "-m", &format!("Unfinished attempt at #{}", n)], Some(dir)).await?;
+    let exists = sh("git", &["for-each-ref", "--format=%(objectname)", &full], Some(repo)).await?;
+    if !exists.is_empty() {
+        let ahead = sh("git", &["rev-list", "--count", &format!("origin/{}..{}", base, full)], Some(repo)).await?;
+        if ahead.trim().parse::<u64>().map_err(|e| e.to_string())? > 0 {
+            let sha = sh("git", &["rev-parse", "--verify", &format!("{}^{{commit}}", full)], Some(repo)).await?;
+            let name = format!("forkdeck/attempts/issue-{}-{}", n, &sha[..10]);
+            sh("git", &["branch", "--force", &name, &sha], Some(repo)).await?;
+            kept = Some(name);
         }
     }
-    let ahead = sh("git", &["rev-list", "--count", &format!("origin/{}..{}", base, full)], Some(repo)).await?;
-    if ahead.trim().parse::<u64>().unwrap_or(0) == 0 {
-        return Ok(None);
-    }
-    let sha = sh("git", &["rev-parse", "--verify", &format!("{}^{{commit}}", full)], Some(repo)).await?;
-    let kept = format!("forkdeck/attempts/issue-{}-{}", n, &sha[..sha.len().min(10)]);
-    // Named after the commit, so keeping the same attempt twice is harmless.
-    sh("git", &["branch", "--force", &kept, &sha], Some(repo)).await?;
-    Ok(Some(kept))
+    Ok(kept)
 }
 
 /// Where the job's worktree is and what it has to look like.
@@ -796,11 +841,12 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
     let d = Some(dir.as_path());
     let msg = commit_message(&title, n);
     // Last look before anything leaves this machine: a teammate may have taken the issue over.
-    team::guard(hub, id).await?;
+    write_guard(hub, id).await?;
     if !commit_snapshot(&tree_of(hub, id)?, &msg).await? {
         return Err("the agent finished without changing any file".into());
     }
     // No --force: prepare() refused to start if this branch already existed on the remote.
+    write_guard(hub, id).await?;
     sh("git", &["push", "-u", "origin", &format!("HEAD:refs/heads/{}", branch)], d).await?;
     // Later work on this job (a CI fix) starts from what is now on the remote.
     let pushed = sh("git", &["rev-parse", "HEAD"], d).await?;
@@ -840,28 +886,30 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
         verdict
     );
     let body = clip(&body, BODY_LIMIT);
+    write_guard(hub, id).await?;
     let out = match r.provider {
         Provider::Github => {
-            let mut a = vec!["pr", "create", "-R", &r.repo, "--head", &branch, "--base", &r.base, "--title", &msg, "--body", &body];
+            let mut a = vec!["pr", "create", "-R", &r.repo, "--head", &branch, "--base", &r.base, "--title", &msg, "--body-file", "-"];
             if draft {
                 a.push("--draft");
             }
-            sh("gh", &a, d).await
+            sh_in("gh", &a, d, &body).await
         }
         Provider::Gitlab => {
-            let mut a = vec!["mr", "create", "-R", &r.repo, "--source-branch", &branch, "--target-branch", &r.base, "--title", &msg, "--description", &body, "--yes"];
-            if draft {
-                a.push("--draft");
-            }
-            sh("glab", &a, d).await
+            let title = if draft { format!("Draft: {}", msg) } else { msg.clone() };
+            let body = serde_json::json!({"source_branch": branch, "target_branch": r.base, "title": title, "description": body}).to_string();
+            let out = sh_in("glab", &["api", "-X", "POST", &format!("projects/{}/merge_requests", r.repo.replace('/', "%2F")), "--input", "-", "-H", "Content-Type: application/json"], d, &body).await?;
+            serde_json::from_str::<serde_json::Value>(&out).map_err(|e| e.to_string())?.get("web_url").and_then(|v| v.as_str()).map(String::from).ok_or_else(|| "merge request response has no URL".into())
         }
     }
     .map_err(|e| format!("the branch {} was pushed, but opening the pull request failed: {}", branch, e))?;
     let url = first_url(&out).unwrap_or(out);
     hub.job(id, |j| j.pr_url = Some(url.clone()));
+    write_guard(hub, id).await?;
     if let Err(e) = comment(&r, false, n, &format!("forkdeck opened {} for this issue.", url)).await {
         hub.log("issues", e);
     }
+    write_guard(hub, id).await?;
     if let Err(e) = relabel(&r, false, n, &r.working_label, &r.done_label).await {
         hub.log("issues", e);
     }
@@ -877,11 +925,12 @@ pub async fn push_followup(hub: &Hub, id: u32, round: u32, summary: &str) -> Res
     let t = tree_of(hub, id)?;
     let d = Some(t.dir.as_path());
     let msg = format!("Fix CI failure (#{})", n);
-    team::guard(hub, id).await?;
+    write_guard(hub, id).await?;
     if !commit_snapshot(&t, &msg).await? {
         return Err("the agent changed nothing".into());
     }
     // A plain push: it only succeeds as a fast-forward, so nobody else's commits are overwritten.
+    write_guard(hub, id).await?;
     sh("git", &["push", "origin", &format!("HEAD:refs/heads/{}", t.branch)], d).await?;
     let pushed = sh("git", &["rev-parse", "HEAD"], d).await?;
     let pr = hub.job(id, |j| {
@@ -890,7 +939,8 @@ pub async fn push_followup(hub: &Hub, id: u32, round: u32, summary: &str) -> Res
     });
     if let Some(num) = pr.flatten().as_deref().and_then(pr_number) {
         let text = format!("CI failed, so forkdeck pushed a fix (round {}): `{}`.\n\n{}", round, &pushed[..pushed.len().min(12)], clip(&quiet(summary), 4000));
-        if let Err(e) = comment(&r, true, num, &text).await {
+        write_guard(hub, id).await?;
+    if let Err(e) = comment(&r, true, num, &text).await {
             hub.log("issues", e);
         }
     }
@@ -940,8 +990,11 @@ pub async fn pr_prepare(hub: &Hub, id: u32) -> Result<String, String> {
     if base.is_empty() || base.starts_with('-') || base.contains(char::is_whitespace) {
         return Err(format!("unusable base branch name {:?}", base));
     }
+    lock_worktree(hub, id, &worktree_dir(hub, &r, "pr", n))?;
+    still_requested(&r, true, n).await?;
+    write_guard(hub, id).await?;
     let held = claim_first(hub, &r, Target::Pr(n), "pull request").await?;
-    if let Err(e) = relabel(&r, true, n, &r.pr_label, &r.pr_working_label).await {
+    if let Err(e) = review_labels(&r, n, &r.pr_working_label).await {
         if let Some(h) = &held {
             team::abandon(h, "failed").await;
         }
@@ -1010,6 +1063,7 @@ pub async fn pr_stale(hub: &Hub, id: u32, reviewed: &str, head: &str, next: &str
     );
     team::guard(hub, id).await?;
     comment(&r, true, n, &text).await?;
+    write_guard(hub, id).await?;
     relabel(&r, true, n, &r.pr_working_label, &r.pr_label).await
 }
 
@@ -1025,12 +1079,13 @@ pub async fn pr_withdraw(hub: &Hub, id: u32, reviewed: &str, head: &str, next: &
         let num = n.to_string();
         match r.provider {
             Provider::Github => sh("gh", &["pr", "edit", &num, "-R", &r.repo, "--remove-label", &r.pr_pass_label], None).await?,
-            Provider::Gitlab => sh("glab", &["mr", "update", &num, "-R", &r.repo, "--unlabel", &r.pr_pass_label], None).await?,
+            Provider::Gitlab => sh("glab", &["mr", "update", &num, "-R", &r.repo, "--unlabel", &r.pr_pass_label], Some(&r.path)).await?,
         };
         return Err(e);
     }
     // Label first: that is the part something else may be acting on.
-    let moved = relabel(&r, true, n, &r.pr_pass_label, &r.pr_label).await;
+    write_guard(hub, id).await?;
+    relabel(&r, true, n, &r.pr_pass_label, &r.pr_label).await?;
     let text = format!(
         "### forkdeck review: pass withdrawn\n\nThe review above passed `{}`, but the head changed to `{}` as it was posted. The `{}` label has been removed. {}",
         &reviewed[..reviewed.len().min(12)],
@@ -1038,8 +1093,8 @@ pub async fn pr_withdraw(hub: &Hub, id: u32, reviewed: &str, head: &str, next: &
         r.pr_pass_label,
         next
     );
-    comment(&r, true, n, &text).await?;
-    moved
+    write_guard(hub, id).await?;
+    comment(&r, true, n, &text).await
 }
 
 /// Instruction files for the agents that the pull request adds or changes.
@@ -1047,7 +1102,7 @@ pub async fn agent_files_changed(hub: &Hub, dir: &Path, base: &str) -> Vec<Strin
     if hub.cfg.demo {
         return vec![];
     }
-    match sh("git", &["diff", "--name-only", &format!("origin/{}...HEAD", base)], Some(dir)).await {
+    match sh("git", &["diff", "--name-only", "-z", &format!("origin/{}...HEAD", base)], Some(dir)).await {
         Ok(out) => steering_files(&out),
         // Not knowing is reported as a warning too, rather than as "nothing to worry about".
         Err(_) => vec!["the list of changed files could not be read".to_string()],
@@ -1056,8 +1111,7 @@ pub async fn agent_files_changed(hub: &Hub, dir: &Path, base: &str) -> Vec<Strin
 
 pub fn steering_files(names: &str) -> Vec<String> {
     names
-        .lines()
-        .map(|l| l.trim())
+        .split(if names.contains('\0') { '\0' } else { '\n' })
         .filter(|l| {
             let lower = l.to_lowercase();
             let file = lower.rsplit('/').next().unwrap_or("");
@@ -1077,7 +1131,7 @@ pub fn review_comment(rep: &Report, check_cmds: &[String]) -> String {
     let mut out = format!("### forkdeck review: {}\n\nReviewed commit `{}`.\n\n", rep.overall.words(), &rep.sha[..rep.sha.len().min(12)]);
     if !rep.steering.is_empty() {
         out.push_str(&format!(
-            "**Read these reviews with care.** This pull request changes files that the reviewing agents load as instructions (`{}`), so it may have influenced what they concluded.\n\n",
+            "**Read these reviews with care.** This pull request changes agent instruction or configuration files (`{}`). Reviewers inspect them as untrusted content from an isolated session directory.\n\n",
             rep.steering.iter().take(10).map(|f| clip(f, 120).replace('`', "'")).collect::<Vec<_>>().join("`, `")
         ));
     }
@@ -1117,10 +1171,8 @@ pub async fn pr_post(hub: &Hub, id: u32, rep: &Report<'_>) -> Result<(), String>
         Overall::Changes => &r.pr_fail_label,
         Overall::Incomplete => &r.pr_label,
     };
-    if let Err(e) = relabel(&r, true, n, &r.pr_working_label, to).await {
-        hub.log("issues", e);
-    }
-    Ok(())
+    write_guard(hub, id).await?;
+    review_labels(&r, n, to).await.map_err(|e| format!("comment posted but label transition unconfirmed: {}", e))
 }
 
 /// Tell the issue or pull request what happened and hand it back to a person.
@@ -1148,7 +1200,8 @@ pub async fn report_failure(hub: &Hub, id: u32, why: &str) {
             hub.log("issues", e);
         }
         // Put the request label back so a later session can retry.
-        if let Err(e) = relabel(&r, true, n, &r.pr_working_label, &r.pr_label).await {
+        let to = if hub.job(id, |j| j.over_time).unwrap_or(false) { &r.pr_fail_label } else { &r.pr_label };
+        if let Err(e) = review_labels(&r, n, to).await {
             hub.log("issues", e);
         }
     }
@@ -1158,7 +1211,7 @@ fn demo_items(hub: &Hub, idx: usize, pr: bool) -> Vec<Issue> {
     if idx != 0 {
         return vec![];
     }
-    let n = hub.state.lock().unwrap().repos[0].picked;
+    let n = hub.state.lock().unwrap_or_else(|e| e.into_inner()).repos[0].picked;
     let blank = |number: u64, title: &str| Issue {
         number,
         title: title.into(),

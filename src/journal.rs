@@ -3,7 +3,7 @@
 //! limits count from, so both survive a restart.
 //!
 //! The file never leaves the machine. It holds what a job was and how it went (item, agents,
-//! durations, rounds, tokens, the one-line outcome), not prompts and not agent output.
+//! durations, rounds, tokens, the outcome category), not prompts and not agent output.
 //!
 //! Because the limits are counted from it, the journal failing is not a detail: when it cannot be
 //! read or written, nothing more is picked up until it can.
@@ -105,7 +105,7 @@ pub fn entry(j: &Job, status: JobStatus, outcome: &str, learned: u32) -> Entry {
         tier: j.decision.as_ref().map(|d| d.tier.name().to_string()).unwrap_or_default(),
         reviewer: j.reviewer.agent.map(|a| a.name().to_string()).unwrap_or_default(),
         status: status.name().into(),
-        secs: j.created.elapsed().as_secs(),
+        secs: j.active_secs + j.finished.unwrap_or_else(std::time::Instant::now).saturating_duration_since(j.active_started).as_secs(),
         rounds: j.rounds,
         verdict: j.verdict,
         checks: j.checks,
@@ -115,7 +115,7 @@ pub fn entry(j: &Job, status: JobStatus, outcome: &str, learned: u32) -> Entry {
         pr: j.pr_url.clone().unwrap_or_default(),
         rolled_back: kind == "deploy" && outcome.contains("Rolled back to"),
         learned,
-        outcome: if kind == "task" { status.name().to_string() } else { clip(&outcome.replace('\n', " "), 300) },
+        outcome: status.name().to_string(),
     }
 }
 
@@ -128,15 +128,29 @@ pub fn slot(a: AgentKind) -> usize {
     }
 }
 
-/// Add one line. Appends are single writes, so several forkdecks can share the file.
+/// Repair any incomplete tail and append under the shared file lock.
 pub fn append(e: &Entry) -> Result<(), String> {
-    let p = path();
+    append_file(&path(), e)
+}
+
+fn append_file(p: &std::path::Path, e: &Entry) -> Result<(), String> {
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {}", d.display(), e))?;
     }
+    let _lock = crate::proc::FileLock::take(&p.with_extension("lock"))?;
     let mut line = serde_json::to_string(e).map_err(|e| e.to_string())?;
     line.push('\n');
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| format!("{}: {}", p.display(), e))?;
+    let mut f = std::fs::OpenOptions::new().create(true).read(true).append(true).open(p).map_err(|e| format!("{}: {}", p.display(), e))?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    let mut end = len;
+    let mut byte = [0];
+    while end > 0 {
+        f.seek(SeekFrom::Start(end - 1)).map_err(|e| e.to_string())?;
+        f.read_exact(&mut byte).map_err(|e| e.to_string())?;
+        if byte[0] == b'\n' { break; }
+        end -= 1;
+    }
+    if end != len { f.set_len(end).map_err(|e| e.to_string())?; }
     f.write_all(line.as_bytes()).map_err(|e| format!("{}: {}", p.display(), e))
 }
 
@@ -149,14 +163,9 @@ pub fn read(since: i64) -> Result<Vec<Entry>, String> {
     read_file(&path(), since)
 }
 
-/// Read from the end of the file backwards, a block at a time, and stop once the entries are older
-/// than asked for. However much history there is, only the part that matters is read, and all of
-/// that part is: there is no size after which a busy day gets cut short.
+/// Read in bounded blocks and filter by completion time: recovered entries may arrive out of order.
 pub fn read_file(p: &std::path::Path, since: i64) -> Result<Vec<Entry>, String> {
     const BLOCK: u64 = 256 * 1024;
-    // Entries are appended as jobs end, so they are in time order unless the clock was set back.
-    // Reading goes on a little past the cutoff to allow for that.
-    const SLACK: i64 = 3600;
     let mut f = match std::fs::File::open(p) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -167,8 +176,7 @@ pub fn read_file(p: &std::path::Path, since: i64) -> Result<Vec<Entry>, String> 
     let mut out: Vec<Entry> = Vec::new();
     // The start of the block read last: the tail of a line whose head is in the block before it.
     let mut carry: Vec<u8> = Vec::new();
-    let mut done = false;
-    while pos > 0 && !done {
+    while pos > 0 {
         let take = BLOCK.min(pos);
         pos -= take;
         f.seek(SeekFrom::Start(pos)).map_err(fail)?;
@@ -180,16 +188,12 @@ pub fn read_file(p: &std::path::Path, since: i64) -> Result<Vec<Entry>, String> 
         carry = buf[..cut].to_vec();
         for line in String::from_utf8_lossy(&buf[cut..]).lines().rev() {
             let Ok(e) = serde_json::from_str::<Entry>(line) else { continue };
-            if e.ts < since - SLACK {
-                done = true;
-                break;
-            }
             if e.ts >= since {
                 out.push(e);
             }
         }
     }
-    out.reverse();
+    out.sort_by_key(|e| e.ts);
     Ok(out)
 }
 
@@ -447,6 +451,17 @@ mod tests {
 
     fn e(ts: i64, kind: &str, repo: &str, status: &str) -> Entry {
         Entry { ts, kind: kind.into(), repo: repo.into(), status: status.into(), ..Entry::default() }
+    }
+
+    #[test]
+    fn partial_appends_are_repaired_and_replayed_old_entries_do_not_hide_usage() {
+        let d = crate::proc::Scratch::new().unwrap();
+        let p = d.0.join("journal.jsonl");
+        append_file(&p, &e(100_000, "issue", "o/r", "done")).unwrap();
+        std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(b"{\"ts\":").unwrap();
+        append_file(&p, &e(1, "issue", "o/r", "failed")).unwrap();
+        assert_eq!(read_file(&p, 10_000).unwrap().len(), 1);
+        assert_eq!(read_file(&p, 0).unwrap().iter().map(|e| e.ts).collect::<Vec<_>>(), [1, 100_000]);
     }
 
     #[test]

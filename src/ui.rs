@@ -52,7 +52,7 @@ pub struct Ui {
 
 /// The selected job, when Enter would send what is typed to it as a reply.
 pub fn reply_target(st: &State, ui: &Ui) -> Option<u32> {
-    if ui.new_task {
+    if ui.new_task || ui.follow {
         return None;
     }
     let id = ui.selected?;

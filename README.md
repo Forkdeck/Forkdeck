@@ -600,8 +600,8 @@ of the box; the other three are yours to choose.
 Every finished job is one line in `~/.local/state/forkdeck/journal.jsonl`: what
 it was, which CLIs ran and how often, how long it took, how many times the
 work was sent back, the verdict, tokens and cost as the CLIs reported them,
-the pull request, and the one-line outcome. No prompts and no agent output,
-and for a typed task not even the title. The file stays on your machine.
+the pull request, and the outcome category (done, failed or cancelled). No prompts and no agent output,
+and for a typed task not even the title. Interrupted typed tasks are recorded once when they finish, excluding time spent stopped. The file stays on your machine.
 
 ```
 $ forkdeck stats --days 30
@@ -691,6 +691,10 @@ machine only. `learn` is off by default either way. A job that went
 well teaches nothing and costs no extra run. Reviewers of labelled pull
 requests are not given the notes yet.
 
+Repository labels must be nonempty, contain no commas, and be distinct within each issue or review label set. If several `[[repos]]` entries name the same provider and repository (for separate deployment environments), issue and review polling uses the first entry only. Active worktrees are locked across processes for the duration of their jobs.
+
+Stdio MCP servers receive their configured `env` plus basic process settings (`PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TMPDIR`, `SYSTEMROOT`). Other credentials are not inherited; add required variables explicitly. A deployment whose status is unrecognizable is not triggered. A revision already reported failed or reverted is not triggered again on retry.
+
 ## Before you leave it unattended
 
 Issue text is input from other people, and an agent that reads it can be
@@ -703,7 +707,11 @@ talked into things. The defaults are set with that in mind:
   `--sandbox workspace-write` and `copilot` with `--allow-tool write
   --deny-tool shell`: all can edit files in the worktree, none gets an
   unrestricted shell. A copilot reviewer has write and shell denied and no
-  skills. Reviewers are read-only. Loosen `write_args`
+  skills. Reviewers are read-only and start in an empty private directory, with
+  the checkout supplied as an explicit inspection path. Claude loads user settings
+  only and an empty strict MCP configuration; Copilot disables custom instructions
+  and built-in MCP servers. Checkout hooks and agent configuration are not loaded
+  on startup, including when a worker has edited them. Loosen `write_args`
   only for repositories you trust.
 - Work happens in a worktree on its own branch and arrives as a draft.
 
@@ -722,7 +730,7 @@ back by hand, or with `forkdeck team release`.
 
 | | |
 |---|---|
-| `Enter` | with a typed task selected, send what you typed to it: a follow-up once it has finished, a message for the agent while it works, your choice while it waits for one; otherwise run it as a new task in the current directory |
+| `Enter` | after selecting a typed task with ↑/↓, send what you typed to it: a follow-up once it has finished, a message for the agent while it works, your choice while it waits for one; otherwise run it as a new task in the current directory |
 | `Ctrl-S` | send what you typed to the selected task now: its agent stops and continues with the message |
 | `Ctrl-N` | make the next `Enter` start a new task instead of replying |
 | `Ctrl-P` | the next new task proposes approaches first, and you pick one |
@@ -750,7 +758,7 @@ nothing is sent twice. When a CLI no longer has the conversation, the agent
 starts a new one with the exchanges so far.
 
 Jobs are kept in `~/.local/state/forkdeck/forkdeck.db` (SQLite, the newest 200).
-They come back when forkdeck starts. A typed task that was cut off by quitting,
+The directory is private (0700), and the database is owner-readable and writable only (0600). They come back when forkdeck starts. A typed task that was cut off by quitting,
 Ctrl-C or SIGTERM is marked interrupted and continues by itself from the stage it
 had reached; `Ctrl-R` retries one by hand. Issue and pull request jobs come back
 for reference only: their labels already put them back in the queue. Several
@@ -762,12 +770,16 @@ interrupted typed tasks without the interface.
 
 With `Ctrl-P` before `Enter` (or `forkdeck run --plan`), the agent first looks at
 the code without changing anything and proposes two to four approaches, marking
-the one it recommends. Pick one with its number, or type how you want it done
+the one it recommends. Type a number and press Enter, or type how you want it done
 instead; the same agent then does it, in the conversation it planned in. With a
 decision server, the fork layer can also ask for a plan on open-ended tasks
 (`router.plan = "auto"`, the default; `"never"` turns that off). Issue jobs
 have nobody to ask, so they take the recommended option, and the pull request
 says which one and what else was proposed.
+
+A number sent during planning is saved as an early choice; other messages remain guidance for the worker. When headless input closes, a waiting plan takes its recommended option.
+
+New tasks leave the interface following progress; another Enter starts another task. Use ↑/↓ to explicitly select a conversation for replies.
 
 Typed tasks share the current directory, so they run one at a time. Issue and
 review jobs each have a worktree and run `automation.max_parallel` at once.
@@ -796,8 +808,7 @@ its login and model probe against a real account without a Copilot seat. It
 has not run against Copilot's own models yet.
 
 Not there yet: feeding review comments on an open pull request back to the
-worker for another round; resuming a job that was in flight when forkdeck
-stopped (the journal records finished jobs, it does not restart unfinished ones).
+worker for another round. Interrupted typed tasks already resume as described above.
 
 ## License
 
