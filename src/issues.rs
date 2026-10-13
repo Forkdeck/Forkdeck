@@ -415,7 +415,7 @@ fn budget(hub: &Hub) -> Budget {
                 // Interrupted, or left unfinished by a forkdeck that died without saying so.
                 let cut_off = |r: &crate::history::JobRecord| r.status == crate::state::JobStatus::Interrupted
                     || (!r.status.finished() && r.owner.as_deref().is_none_or(|o| !crate::history::owner_alive(o)));
-                for r in saved.iter().filter(|r| cut_off(r) && !running.contains(&r.id) && r.finished.is_none_or(|f| f as i64 >= now - window)) {
+                for r in saved.iter().filter(|r| cut_off(r) && !running.contains(&r.id) && r.finished.unwrap_or(r.created) as i64 >= now - window) {
                     spent.tokens += r.used.iter().map(|u| u.tokens()).sum::<u64>();
                 }
             }

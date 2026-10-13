@@ -520,7 +520,35 @@ fn update_saved(key: &str, change: impl FnOnce(&mut Saved)) -> Result<Saved, Str
 }
 
 fn saved_key(r: &RepoCfg, d: &DeployCfg) -> String {
-    format!("{:?}:{}:{}", r.provider, r.repo, d.environment).to_lowercase()
+    format!("{:?}:{}:{}", r.provider, r.qualified(), d.environment).to_lowercase()
+}
+
+/// State saved before the host was part of a self-hosted GitLab repository's key moves to the new
+/// key, but only where one configured repository can own it: with the same path on two hosts (or
+/// also on gitlab.com), nobody can tell whose it was, and it stays where it is.
+pub fn migrate_keys(repos: &[RepoCfg]) -> Result<(), String> {
+    let moves = crate::config::unambiguous_moves(repos.iter().filter_map(|r| r.deploy.as_ref().map(|d| (format!("{:?}:{}:{}", r.provider, r.repo, d.environment).to_lowercase(), saved_key(r, d)))));
+    if moves.is_empty() || !state_path().exists() {
+        return Ok(());
+    }
+    let _file_lock = crate::proc::FileLock::wait(&state_path().with_extension("write-lock"), std::time::Duration::from_secs(10))?;
+    let mut all = load_saved()?;
+    let mut changed = false;
+    for (old, new) in moves {
+        if !all.contains_key(&new) {
+            if let Some(s) = all.remove(&old) {
+                all.insert(new, s);
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    let path = state_path();
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_string_pretty(&all).map_err(|e| e.to_string())?).map_err(|e| format!("cannot write {}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("cannot write {}: {}", path.display(), e))
 }
 
 /// Say something once, not on every poll.
