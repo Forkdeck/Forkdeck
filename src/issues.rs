@@ -256,6 +256,30 @@ fn lock_worktree(hub: &Hub, id: u32, dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Another entry for the same repository on the same forge already polls it (entries per deploy
+/// environment). GitLab paths repeat across hosts, so the host each clone's origin names counts too.
+pub async fn polled_before(earlier: &[RepoCfg], r: &RepoCfg) -> bool {
+    for o in earlier.iter().filter(|o| o.provider == r.provider && o.repo.eq_ignore_ascii_case(&r.repo)) {
+        if r.provider == Provider::Github || origin_host(o).await == origin_host(r).await {
+            return true;
+        }
+    }
+    false
+}
+
+async fn origin_host(r: &RepoCfg) -> Option<String> {
+    sh("git", &["remote", "get-url", "origin"], Some(&r.path)).await.ok().and_then(|u| host_of(&u))
+}
+
+/// "git@host:group/p.git", "ssh://git@host:22/group/p", "https://user@host/group/p" -> "host".
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.trim().split_once("://").map(|(_, r)| r).unwrap_or(url.trim());
+    let authority = rest.split('/').next()?;
+    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = authority.split(':').next()?.to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
 /// No job was made for an item admitted in this poll: forget that it was seen, so the next poll
 /// tries again rather than passing over an item that is still labelled.
 fn submission_failed(hub: &Hub, key: crate::state::Key, why: &str) {
@@ -439,7 +463,7 @@ pub async fn poll_once(hub: &Hub) {
     {
         {
             for (idx, r) in hub.cfg.repos.iter().enumerate() {
-                if hub.cfg.repos[..idx].iter().any(|o| o.provider == r.provider && o.repo.eq_ignore_ascii_case(&r.repo)) { continue; }
+                if polled_before(&hub.cfg.repos[..idx], r).await { continue; }
                 crate::knowledge::retry_pending(hub, idx).await;
                 // What a limit held back in this repository on this poll: the reason, and how many items.
                 let mut repo_hold: Option<(String, u32)> = None;
@@ -1272,6 +1296,15 @@ fn demo_items(hub: &Hub, idx: usize, pr: bool) -> Vec<Issue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_forge_host_is_read_from_any_remote_form() {
+        assert_eq!(host_of("git@gitlab.example.com:group/p.git").as_deref(), Some("gitlab.example.com"));
+        assert_eq!(host_of("ssh://git@Gitlab.Example.com:2222/group/p.git").as_deref(), Some("gitlab.example.com"));
+        assert_eq!(host_of("https://oauth2:token@gitlab.other.org/group/p").as_deref(), Some("gitlab.other.org"));
+        assert_eq!(host_of("https://github.com/o/r.git").as_deref(), Some("github.com"));
+        assert_eq!(host_of(""), None);
+    }
 
     #[test]
     fn an_item_whose_submission_failed_is_taken_again_on_the_next_poll() {

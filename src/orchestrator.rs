@@ -141,11 +141,13 @@ impl Hub {
             // Snapshot and persistence have one ordering; an older autosave cannot follow completion.
             let mut saved = hub.saved.lock().unwrap();
             let Some(rec) = hub.job(id, |j| j.in_history.then(|| crate::history::JobRecord::of(j))).flatten() else { return };
+            // Elapsed time alone changes every tick: compared by the minute, a long quiet run is
+            // still saved about once a minute, and nothing more often than that.
             let mut comparable = rec.clone();
-            comparable.worker.secs = 0;
-            comparable.reviewer.secs = 0;
+            comparable.worker.secs /= 60;
+            comparable.reviewer.secs /= 60;
             comparable.created = 0;
-            comparable.active_secs = 0;
+            comparable.active_secs /= 60;
             if saved.get(&id) == Some(&comparable) { return; }
             if let Err(e) = h.save(&rec) {
                 if !hub.history_failed.swap(true, std::sync::atomic::Ordering::SeqCst) { hub.log("history", format!("could not save job #{}: {}", id, e)); }

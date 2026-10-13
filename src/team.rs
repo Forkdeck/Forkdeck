@@ -921,10 +921,9 @@ pub async fn gather(hub: &Hub, all: bool) -> (Vec<Row>, Vec<String>) {
     let mut rows = Vec::new();
     let mut errors = Vec::new();
     let stale = (hub.cfg.team.stale_mins * 60) as i64;
-    let mut done_repos: HashSet<(bool, &str)> = HashSet::new();
-    for r in &hub.cfg.repos {
+    for (idx, r) in hub.cfg.repos.iter().enumerate() {
         // Two entries for the same repository (two environments) are one repository here.
-        if !done_repos.insert((r.provider == Provider::Github, r.repo.as_str())) {
+        if issues::polled_before(&hub.cfg.repos[..idx], r).await {
             continue;
         }
         let who = me(hub, r).await.unwrap_or_default();
