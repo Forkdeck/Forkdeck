@@ -690,11 +690,30 @@ fn configures_an_agent(path: &str) -> bool {
 /// saying where it points, as does a file too big to be worth reading.
 fn mirror_checkout(from: &Path, to: &Path) -> Result<(), String> {
     const MAX_FILE: u64 = 8 * 1024 * 1024;
+    const MAX_FILES: usize = 200_000;
     let out = std::process::Command::new("git").arg("-C").arg(from).args(["ls-files", "-z", "-co", "--exclude-standard"]).stderr(Stdio::null()).output().map_err(|e| e.to_string())?;
-    if !out.status.success() { return Err("not a git checkout".into()); }
+    let listed: Vec<String> = if out.status.success() {
+        out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()).map(|p| String::from_utf8_lossy(p).to_string()).collect()
+    } else {
+        // Not a git checkout (a typed task in a plain directory): everything in it.
+        let mut found = Vec::new();
+        let mut dirs = vec![PathBuf::new()];
+        while let Some(rel) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(from.join(&rel)) else { continue };
+            for e in entries.flatten() {
+                let r = rel.join(e.file_name());
+                match e.file_type() {
+                    Ok(t) if t.is_dir() => dirs.push(r),
+                    Ok(_) => found.push(r.to_string_lossy().to_string()),
+                    Err(_) => {}
+                }
+                if found.len() > MAX_FILES { return Err(format!("more than {} files", MAX_FILES)); }
+            }
+        }
+        found
+    };
     std::fs::create_dir_all(to).map_err(|e| e.to_string())?;
-    for rel in out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-        let rel = String::from_utf8_lossy(rel).to_string();
+    for rel in listed {
         if Path::new(&rel).components().any(|c| !matches!(c, std::path::Component::Normal(_))) { continue; }
         let dest = if configures_an_agent(&rel) { to.join(NOT_LOADED).join(&rel) } else { to.join(&rel) };
         let src = from.join(&rel);
