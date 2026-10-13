@@ -20,6 +20,10 @@ env:
   CARGO_TERM_COLOR: always
   RUST_VERSION: "1.96.0"
   RUST_SBOM_VERSION: "0.5.9"
+  # Bundled SQLite and ring compile C. The cc crate looks for x86_64-linux-musl-gcc and
+  # aarch64-linux-musl-gcc; musl-tools on a native runner provides musl-gcc.
+  CC_x86_64_unknown_linux_musl: musl-gcc
+  CC_aarch64_unknown_linux_musl: musl-gcc
 
 jobs:
   build:
