@@ -19,6 +19,20 @@ can be a server on your own machine.
 cargo install --git https://github.com/forkdeck/forkdeck
 ```
 
+Or take a static Linux binary (amd64 or arm64) from the
+[releases](https://github.com/forkdeck/forkdeck/releases). Each archive comes
+with a `.sha256` checksum and a CycloneDX SBOM (`.cdx.json`, also inside the
+archive as `SBOM.cdx.json`) listing every crate built into the binary:
+
+```
+sha256sum --check forkdeck-v0.1.0-linux-amd64.tar.gz.sha256
+tar -xzf forkdeck-v0.1.0-linux-amd64.tar.gz
+```
+
+A release is cut by pushing a tag `vX.Y.Z` that matches the version in
+`Cargo.toml`; `.github/workflows/release.yaml` tests, builds, writes the SBOMs
+and publishes the release.
+
 You need at least one of `claude`, `codex` and `copilot` on your PATH. With
 `copilot` alone, it plays both of the others (see below). With only one of
 `claude` and `codex` and no `copilot`, that one also reviews its own work. Issue
