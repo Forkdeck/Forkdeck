@@ -874,12 +874,23 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
     }
     let mut term = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste);
+    // What was typed and then refused (a reply to a job another forkdeck holds, say) comes back to
+    // the input line rather than being lost.
+    let bounced: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let bounce = |text: String| {
+        let b = bounced.clone();
+        move || b.lock().unwrap_or_else(|e| e.into_inner()).push(text)
+    };
     let res = (|| -> anyhow::Result<()> {
         loop {
             if stopping.load(std::sync::atomic::Ordering::SeqCst) {
                 // The signal task owns the shutdown and will exit the process; just stay out of its way.
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
+            }
+            for text in std::mem::take(&mut *bounced.lock().unwrap_or_else(|e| e.into_inner())) {
+                // In front of anything typed since, which stays as it is.
+                u.input = if u.input.trim().is_empty() { text } else { format!("{} {}", text, u.input) };
             }
             sync_selection(hub, &mut u);
             term.draw(|f| ui::draw(f, &hub.state.lock().unwrap_or_else(|e| e.into_inner()), &u))?;
@@ -922,8 +933,8 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                             let target = ui::reply_target(&hub.state.lock().unwrap_or_else(|e| e.into_inner()), &u);
                             if let (Some(id), false) = (target, text.is_empty()) {
                                 u.input.clear();
-                                let h = hub.clone();
-                                rt.spawn(async move { if let Err(why) = h.steer_now(id, text).await { h.log("queue", format!("#{} not sent: {}", id, why)); } });
+                                let (h, back) = (hub.clone(), bounce(text.clone()));
+                                rt.spawn(async move { if let Err(why) = h.steer_now(id, text).await { h.log("queue", format!("#{} not sent: {}", id, why)); back(); } });
                             }
                         }
                         KeyCode::Char('u') if ctrl => u.input.clear(),
@@ -962,14 +973,14 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                                     // A typed job is selected: carry on its conversation.
                                     Some(id) => {
                                         u.input.clear();
-                                        let h = hub.clone();
-                                        rt.spawn(async move { if let Err(why) = h.reply(id, task).await { h.log("queue", format!("#{} not sent: {}", id, why)); } });
+                                        let (h, back) = (hub.clone(), bounce(task.clone()));
+                                        rt.spawn(async move { if let Err(why) = h.reply(id, task).await { h.log("queue", format!("#{} not sent: {}", id, why)); back(); } });
                                     }
                                     None => {
                                         u.input.clear();
                                         let planning = if u.plan_next { state::Planning::Always } else { state::Planning::IfRouted };
-                                        let (h, dir, forced) = (hub.clone(), cwd.clone(), u.forced.clone());
-                                        rt.spawn(async move { if let Err(e) = h.submit(state::clip(&task, 80), task, Source::Manual, dir, forced, planning).await { h.log("queue", e); } });
+                                        let (h, dir, forced, back) = (hub.clone(), cwd.clone(), u.forced.clone(), bounce(task.clone()));
+                                        rt.spawn(async move { if let Err(e) = h.submit(state::clip(&task, 80), task, Source::Manual, dir, forced, planning).await { h.log("queue", e); back(); } });
                                         u.plan_next = false;
                                         u.selected = None;
                                         u.follow = true;

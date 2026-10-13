@@ -349,6 +349,7 @@ impl Hub {
                 used: Default::default(),
                 findings: Vec::new(),
                 over_time: false,
+                admitted: false,
             });
             if stopping {
                 // Shutting down: the job exists so the caller has an id, but it never starts and claims nothing.
@@ -614,6 +615,7 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
         };
         tokio::select! {
             _held = wait => {
+                hub.job(id, |j| j.admitted = true);
                 // One issue or review may only run so long. A deployment has its own time limits,
                 // and stopping one halfway is worse than letting it finish.
                 let limit = hub.cfg.limits.job_mins;

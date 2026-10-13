@@ -501,7 +501,8 @@ pub async fn poll_once(hub: &Hub) {
                                 if complete {
                                     st.forget_unlisted(idx, pr, &listed);
                                 }
-                                unlisted = st.jobs.iter().filter(|j| j.status == crate::state::JobStatus::Queued).filter_map(|j| j.source.key().filter(|&(i, p, n)| i == idx && p == pr && !listed.contains(&n)).map(|(_, _, n)| (j.id, n))).collect();
+                                // Only jobs still waiting for a slot: one under way has already moved the label itself.
+                                unlisted = st.jobs.iter().filter(|j| j.status == crate::state::JobStatus::Queued && !j.admitted).filter_map(|j| j.source.key().filter(|&(i, p, n)| i == idx && p == pr && !listed.contains(&n)).map(|(_, _, n)| (j.id, n))).collect();
                                 let now = Instant::now();
                                 let mut held = 0;
                                 let mut why: Option<String> = None;
@@ -546,7 +547,7 @@ pub async fn poll_once(hub: &Hub) {
                     for (id, n) in unlisted {
                         let gone = complete || matches!(still_requested(r, pr, n).await, Err(e) if e.starts_with(team::TAKEN));
                         if gone {
-                            hub.job(id, |j| if j.status == crate::state::JobStatus::Queued { j.cancel.fire() });
+                            hub.job(id, |j| if j.status == crate::state::JobStatus::Queued && !j.admitted { j.cancel.fire() });
                         }
                     }
                     for i in fresh {

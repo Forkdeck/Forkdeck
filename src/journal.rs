@@ -194,6 +194,9 @@ pub fn read_file(p: &std::path::Path, since: i64) -> Result<Vec<Entry>, String> 
             }
         }
     }
+    // Read from the end: back into file order first, so entries within one second keep the order
+    // they were written in (the stable sort only moves late recoveries).
+    out.reverse();
     out.sort_by_key(|e| e.ts);
     Ok(out)
 }
@@ -463,6 +466,17 @@ mod tests {
         append_file(&p, &e(1, "issue", "o/r", "failed")).unwrap();
         assert_eq!(read_file(&p, 10_000).unwrap().len(), 1);
         assert_eq!(read_file(&p, 0).unwrap().iter().map(|e| e.ts).collect::<Vec<_>>(), [1, 100_000]);
+    }
+
+    #[test]
+    fn entries_within_one_second_keep_their_order() {
+        let d = crate::proc::Scratch::new().unwrap();
+        let p = d.0.join("journal.jsonl");
+        for status in ["done", "failed", "failed"] {
+            append_file(&p, &e(7, "issue", "o/r", status)).unwrap();
+        }
+        let got: Vec<String> = read_file(&p, 0).unwrap().into_iter().map(|e| e.status).collect();
+        assert_eq!(got, ["done", "failed", "failed"]);
     }
 
     #[test]

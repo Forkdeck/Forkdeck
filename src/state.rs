@@ -457,6 +457,9 @@ pub struct Job {
     pub findings: Vec<String>,
     /// Stopped by `limits.job_mins`.
     pub over_time: bool,
+    /// Has its run slot and is under way, though its status may still read Queued while the item
+    /// is claimed and prepared. Not saved: a restored job starts over.
+    pub admitted: bool,
     /// The worker's conversation, once its CLI has named it.
     pub session: Option<Session>,
     /// Set on an interrupted typed task that is to continue: the stage it had reached.

@@ -634,6 +634,7 @@ pub async fn deploy_poll(hub: &Hub) {
                     hub.log("deploy", format!("{}: the deployment of {} was started and never finished (was forkdeck stopped?). Its state in {} is unknown; deploying {} now (try {} of {})", r.repo, short(&p), d.environment, short(&head), n, MAX_TRIES));
                 }
                 // Record first: if this cannot be written, a crash would lose track of a running deployment.
+                let before = saved.as_ref().map(|s| (s.in_progress.clone(), s.tries)).unwrap_or_default();
                 if let Err(e) = update_saved(&key, |s| {
                     s.in_progress = Some(head.clone());
                     s.tries = n;
@@ -648,7 +649,13 @@ pub async fn deploy_poll(hub: &Hub) {
                     r.path.clone(),
                     None,
                     crate::state::Planning::Never,
-                ).await { hub.log("queue", format!("submission failed: {}", e)); }
+                ).await {
+                    // Nothing was started: this was not a try, and the next poll makes it again.
+                    hub.log("queue", format!("submission failed: {}", e));
+                    if let Err(e) = update_saved(&key, |s| (s.in_progress, s.tries) = before) {
+                        note_once(hub, format!("{}: {}", r.repo, e));
+                    }
+                }
             }
         }
     }
