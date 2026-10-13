@@ -563,4 +563,11 @@ mod tests {
         assert_eq!(percentile(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 90), 10);
         assert_eq!(percentile(&[5], 50), 5);
     }
+
+    #[test]
+    fn older_journal_entries_default_copilot_usage_to_zero() {
+        let entry: Entry = serde_json::from_str(r#"{"ts":1,"claude":{"runs":1,"tokens_in":10},"codex":{"runs":1,"tokens_out":5}}"#).unwrap();
+        assert_eq!(entry.copilot, Usage::default());
+        assert_eq!(entry.tokens(), 15);
+    }
 }

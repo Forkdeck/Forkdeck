@@ -55,6 +55,7 @@ while [ $# -gt 0 ]; do
   case "$1" in --model) model=$2; shift 2 ;; --usage-output-file) usage=$2; shift 2 ;; *) shift ;; esac
 done
 prompt=$(cat)
+[ -n "$FAKE_PROMPTS" ] && printf '%s\n-----\n' "$prompt" >> "$FAKE_PROMPTS"
 for m in $FAKE_COPILOT_REJECT; do
   if [ "$m" = "$model" ]; then
     printf '%s\n' "{\"type\":\"model.call_failure\",\"data\":{\"model\":\"$model\",\"statusCode\":400,\"errorCode\":\"model_not_supported\"}}"
@@ -65,6 +66,10 @@ for m in $FAKE_COPILOT_REJECT; do
 done
 [ -n "$usage" ] && printf '{"modelMetrics":{"%s":{"usage":{"inputTokens":10,"outputTokens":2}}}}' "$model" > "$usage"
 case "$prompt" in
+  *"Write at most three short rules"*)
+    [ -n "$FAKE_LESSONS_SEEN" ] && printf '%s' "$prompt" > "$FAKE_LESSONS_SEEN"
+    printf '%s\n' "{\"type\":\"assistant.message\",\"data\":{\"content\":\"${FAKE_LESSONS:-NONE}\",\"model\":\"$model\"}}"
+    ;;
   *"Do not modify any file"*)
     verdict=${FAKE_VERDICT:-PASS}
     [ -n "$model" ] && [ "$model" = "$FAKE_COPILOT_FAIL_MODEL" ] && verdict=FAIL
@@ -2299,4 +2304,45 @@ fn the_second_review_continues_the_first_and_checks_its_own_points() {
     assert_eq!(arg_after(reviews[1], "--resume"), Some(first), "the second review continues it: {:?}", reviews);
     let p = fs::read_to_string(&prompts).unwrap();
     assert!(p.contains("For each point you raised, check whether it is fixed."), "{}", p);
+}
+
+#[test]
+fn copilot_receives_notes_and_learns_from_failed_reviews() {
+    let extra = format!("{}[review]\nmax_fix_rounds = 0\n[knowledge]\nlearn = true\nshare = false", NO_REAL_CLIS);
+    let rig = Rig::with_agents("copilot-notes", &extra, "", &[("copilot", COPILOT)]);
+    let (ok, out) = rig.run(&["notes", "o/r", "add", "Money is integer cents."], &[]);
+    assert!(ok, "{}", out);
+    rig.issue();
+    let prompts = rig.root.join("prompts.txt");
+    let asked = rig.root.join("asked.txt");
+    let (ok, out) = rig.once(&[("FAKE_PROMPTS", prompts.to_str().unwrap()), ("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", "- Run make fmt before finishing the work."), ("FAKE_LESSONS_SEEN", asked.to_str().unwrap())]);
+    assert!(!ok && out.contains("1 rule(s) added to the notes for o/r"), "{}", out);
+    assert!(fs::read_to_string(prompts).unwrap().contains("<notes>\n- Money is integer cents.\n</notes>"));
+    assert!(fs::read_to_string(asked).unwrap().contains("A reviewer did not pass the change:\nLooked at it."));
+    assert!(fs::read_to_string(rig.notes_file()).unwrap().contains("Run make fmt"));
+    let entries = rig.journal();
+    assert_eq!(entries[0]["learned"], 1);
+    assert_eq!(entries[0]["copilot"]["runs"], 3);
+}
+#[test]
+fn copilot_usage_is_recorded_separately_and_counts_toward_limits() {
+    let extra = format!("{}[limits]\ntokens_per_day = 20", NO_REAL_CLIS);
+    let rig = Rig::with_agents("copilot-journal-limit", &extra, "", &[("copilot", COPILOT)]);
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let entries = rig.journal();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["copilot"]["runs"], 2);
+    assert_eq!(entries[0]["copilot"]["tokens_in"], 20);
+    assert_eq!(entries[0]["copilot"]["tokens_out"], 4);
+    assert_eq!(entries[0]["claude"]["runs"], 0);
+    assert_eq!(entries[0]["codex"]["runs"], 0);
+    let (ok, out) = rig.run(&["stats"], &[]);
+    assert!(ok && out.contains("copilot      2 run(s) · 20 tokens in · 4 out"), "{}", out);
+    rig.issues(&[8]);
+    let before = rig.calls();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok && out.contains("token limit reached: 24 of 20 in the last 24 h"), "{}", out);
+    assert_eq!(rig.calls(), before);
 }
