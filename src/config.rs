@@ -15,6 +15,7 @@ pub struct Config {
     pub team: TeamCfg,
     pub limits: LimitsCfg,
     pub knowledge: KnowledgeCfg,
+    pub remote: RemoteCfg,
     /// MCP servers by name. CI and deployment stages call tools on these.
     pub mcp: HashMap<String, McpServerCfg>,
     pub repos: Vec<RepoCfg>,
@@ -434,6 +435,33 @@ impl Default for LimitsCfg {
     }
 }
 
+/// Control from a paired phone on the local network, over mutual TLS.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct RemoteCfg {
+    pub enabled: bool,
+    /// Address and port to listen on.
+    pub listen: String,
+    /// Refuse every connection from outside the subnets of this machine's interfaces, not only pairing.
+    pub lan_only: bool,
+    /// Where the certificate authority, the paired devices and pending pairing codes are kept.
+    pub dir: PathBuf,
+    /// Working directory for tasks sent from a phone. Default: the directory forkdeck was started in.
+    pub workdir: Option<PathBuf>,
+}
+
+impl Default for RemoteCfg {
+    fn default() -> Self {
+        RemoteCfg {
+            enabled: false,
+            listen: "0.0.0.0:7443".into(),
+            lan_only: true,
+            dir: PathBuf::from("~/.config/forkdeck/remote"),
+            workdir: None,
+        }
+    }
+}
+
 /// Notes about each repository that are given to the worker with every issue.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
@@ -734,6 +762,8 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
                 r.path = expand(&r.path);
                 r.host = origin_host(&r.path);
             }
+            cfg.remote.dir = expand(&cfg.remote.dir);
+            cfg.remote.workdir = cfg.remote.workdir.as_deref().map(expand);
             cfg.validate()?;
             return Ok((cfg, Some(c)));
         } else if explicit.is_some() {
@@ -920,6 +950,16 @@ impl Config {
             for (name, v) in [("repo", &r.repo), ("base", &r.base)] {
                 if v.is_empty() || v.starts_with('-') || v.contains(char::is_whitespace) {
                     anyhow::bail!("repos: {} {:?} is not a valid name", name, v);
+                }
+            }
+        }
+        if self.remote.listen.parse::<std::net::SocketAddr>().is_err() {
+            anyhow::bail!("remote.listen must be an address and port such as 0.0.0.0:7443, got {:?}", self.remote.listen);
+        }
+        if self.remote.enabled {
+            if let Some(w) = &self.remote.workdir {
+                if !w.is_dir() {
+                    anyhow::bail!("remote.workdir {} is not a directory", w.display());
                 }
             }
         }

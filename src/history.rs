@@ -165,6 +165,7 @@ impl StageRecord {
         };
         Stage {
             unprinted: 0,
+            pushed: 0,
             agent: self.agent,
             via: self.via,
             session: None,
@@ -185,7 +186,7 @@ impl StageRecord {
 }
 
 /// Everything about a job that outlives the process.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct JobRecord {
     pub active_secs: u64,
     pub used: [crate::journal::Usage; 3],
