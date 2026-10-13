@@ -1855,6 +1855,7 @@ fn learned_rules_are_proposed_to_the_team_as_a_pull_request() {
     assert_eq!(git(&rig.origin(), &["rev-list", "--count", &format!("main..{}", branch)]), "2");
     let calls = rig.calls();
     assert_eq!(calls.matches("--title Notes for agents").count(), 1, "one pull request, not two:\n{}", calls);
+    assert!(calls.contains("--body-file - forkdeck distilled these"), "the body goes on stdin:\n{}", calls);
     assert!(calls.contains("pr comment 12 -R o/r --body-file - forkdeck added 1 more rule(s)"), "{}", calls);
     let notes = git(&rig.origin(), &["show", &format!("{}:.forkdeck/notes.md", branch)]);
     assert_eq!(notes.matches("Run make fmt").count(), 1, "{}", notes);

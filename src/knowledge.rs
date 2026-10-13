@@ -470,11 +470,7 @@ async fn propose(hub: &Hub, idx: usize, r: &RepoCfg, items: &[(String, String)])
          While it is open, rules learned later are added to it.",
         tag, listed, SHARED
     );
-    let out = match r.provider {
-        Provider::Github => issues::sh("gh", &["pr", "create", "-R", &r.repo, "--head", &branch, "--base", &r.base, "--title", title, "--body", &body], repo).await,
-        Provider::Gitlab => issues::sh("glab", &["mr", "create", "-R", &r.repo, "--source-branch", &branch, "--target-branch", &r.base, "--title", title, "--description", &body, "--yes"], repo).await,
-    }
-    ;
+    let out = issues::open_pr(r, &branch, title, &body, false, repo).await;
     let out = match out {
         Ok(o) => o,
         Err(e) => {

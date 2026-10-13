@@ -928,22 +928,8 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
     );
     let body = clip(&body, BODY_LIMIT);
     write_guard(hub, id).await?;
-    let out = match r.provider {
-        Provider::Github => {
-            let mut a = vec!["pr", "create", "-R", &r.repo, "--head", &branch, "--base", &r.base, "--title", &msg, "--body-file", "-"];
-            if draft {
-                a.push("--draft");
-            }
-            sh_in("gh", &a, d, &body).await
-        }
-        Provider::Gitlab => {
-            let title = if draft { format!("Draft: {}", msg) } else { msg.clone() };
-            let body = serde_json::json!({"source_branch": branch, "target_branch": r.base, "title": title, "description": body}).to_string();
-            let out = sh_in("glab", &["api", "-X", "POST", &format!("projects/{}/merge_requests", r.repo.replace('/', "%2F")), "--input", "-", "-H", "Content-Type: application/json"], d, &body).await?;
-            serde_json::from_str::<serde_json::Value>(&out).map_err(|e| e.to_string())?.get("web_url").and_then(|v| v.as_str()).map(String::from).ok_or_else(|| "merge request response has no URL".into())
-        }
-    }
-    .map_err(|e| format!("the branch {} was pushed, but opening the pull request failed: {}", branch, e))?;
+    let out = open_pr(&r, &branch, &msg, &body, draft, d).await
+        .map_err(|e| format!("the branch {} was pushed, but opening the pull request failed: {}", branch, e))?;
     let url = first_url(&out).unwrap_or(out);
     hub.job(id, |j| j.pr_url = Some(url.clone()));
     write_guard(hub, id).await?;
@@ -955,6 +941,26 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
         hub.log("issues", e);
     }
     Ok(format!("{}pull request opened: {}", if draft { "draft " } else { "" }, url))
+}
+
+/// Open a pull (merge) request. The body goes on standard input: a long one would not fit in the
+/// arguments. Returns what the CLI printed, which has the URL in it.
+pub async fn open_pr(r: &RepoCfg, branch: &str, title: &str, body: &str, draft: bool, dir: Option<&Path>) -> Result<String, String> {
+    match r.provider {
+        Provider::Github => {
+            let mut a = vec!["pr", "create", "-R", &r.repo, "--head", branch, "--base", &r.base, "--title", title, "--body-file", "-"];
+            if draft {
+                a.push("--draft");
+            }
+            sh_in("gh", &a, dir, body).await
+        }
+        Provider::Gitlab => {
+            let title = if draft { format!("Draft: {}", title) } else { title.to_string() };
+            let input = serde_json::json!({"source_branch": branch, "target_branch": r.base, "title": title, "description": body}).to_string();
+            let out = sh_in("glab", &["api", "-X", "POST", &format!("projects/{}/merge_requests", r.repo.replace('/', "%2F")), "--input", "-", "-H", "Content-Type: application/json"], dir, &input).await?;
+            serde_json::from_str::<Value>(&out).map_err(|e| e.to_string())?.get("web_url").and_then(|v| v.as_str()).map(String::from).ok_or_else(|| "merge request response has no URL".into())
+        }
+    }
 }
 
 /// Commit a fix made after the pull request was opened and push it as a further commit on the same branch.
