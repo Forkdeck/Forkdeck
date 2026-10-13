@@ -11,7 +11,7 @@
 //! Each machine also has a file of its own (`~/.local/state/forkdeck/notes/<forge>/<repo>.md`) for
 //! notes that are nobody else's business, and as the place learned rules go when sharing is off.
 
-use crate::agents::{self, RunSpec, Slot};
+use crate::agents::Slot;
 use crate::config::RepoCfg;
 use crate::issues;
 use crate::orchestrator::Hub;
@@ -250,7 +250,8 @@ pub async fn learn(hub: &Hub, id: u32) -> u32 {
     let Some(exec) = crate::pick::worker_for(&hub.cfg, &crate::orchestrator::avail(hub).borrow(), &wanted, Tier::Light) else { return 0 };
     let dir = if dir.is_dir() { dir } else { r.path.clone() };
     let prompt = ask(&r.repo, &findings);
-    let out = agents::run(hub, id, Slot::Reviewer, RunSpec { exec: &exec, prompt: &prompt, dir: &dir, read_only: true, resume: None }).await;
+    // Through the runner that moves on to the next model when the account refuses one.
+    let (out, _) = crate::orchestrator::run_agent(hub, id, Slot::Reviewer, exec, Tier::Light, &prompt, &dir, true, None).await;
     if !out.ok {
         hub.log("notes", format!("#{} nothing learned: {}", id, clip(&out.error, 120)));
         return 0;

@@ -2504,3 +2504,24 @@ fn a_planned_task_stopped_before_it_started_still_plans_first() {
     let work_at = p.find("Go ahead with this: Option 1: Patch it").expect("then worked as chosen");
     assert!(plan_at < work_at, "{}", p);
 }
+
+#[test]
+fn notes_are_still_learned_when_copilot_refuses_the_first_model() {
+    let extra = format!("{}[review]\nmax_fix_rounds = 0\n[knowledge]\nlearn = true\nshare = false", NO_REAL_CLIS);
+    let rig = Rig::with_agents("copilot-notes-fallback", &extra, "", &[("copilot", COPILOT)]);
+    rig.issue();
+    // The first light model of both families is refused; learning runs on the light tier.
+    let (ok, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", "- Keep money in integer cents."), ("FAKE_COPILOT_REJECT", "claude-haiku-5.5 gpt-5.4-mini")]);
+    assert!(!ok && out.contains("1 rule(s) added to the notes for o/r"), "{}", out);
+}
+
+#[test]
+fn a_fix_to_a_binary_file_counts_as_a_change() {
+    let rig = Rig::new("fix-binary", "", "");
+    // Each attempt writes new random bytes (not valid UTF-8) to a file git does not track yet.
+    let work = "head -c 64 /dev/urandom > 'blob one.bin'";
+    let out = rig.bare(&[("FAKE_VERDICTS", "FAIL PASS"), ("FAKE_WORK", work)]).args(["run", "add a change file"]).output().unwrap();
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && !said.contains("changed nothing"), "{}", said);
+    assert_eq!(reviews_run(&rig), 2);
+}

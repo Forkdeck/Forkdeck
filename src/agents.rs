@@ -402,6 +402,10 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     if out.session.is_none() {
         out.session = hub.job(job, |j| j.stage(slot).session.clone()).flatten();
     }
+    // Nor did the work it did before it was stopped vanish: what it started is counted.
+    if out.tools == 0 {
+        out.tools = hub.job(job, |j| j.stage(slot).tools).unwrap_or(0);
+    }
     // What this run used goes on the job's account, by the CLI that ran, whichever box it was shown in.
     hub.job(job, |j| {
         let s = j.stage(slot).clone();

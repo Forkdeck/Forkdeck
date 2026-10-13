@@ -49,6 +49,9 @@ const MIGRATIONS: &[&str] = &["
 ", "
     ALTER TABLE jobs ADD COLUMN inbox TEXT;
     ALTER TABLE jobs ADD COLUMN owner TEXT;
+", "
+    CREATE TABLE ids (last INTEGER NOT NULL);
+    INSERT INTO ids SELECT COALESCE(MAX(id), 0) FROM jobs;
 "];
 
 /// Who is running: this process, told apart from a later process that reuses its id by its start time.
@@ -328,10 +331,18 @@ impl History {
     }
 
     /// A new job id, reserved with an empty row so another forkdeck cannot take it.
+    /// Ids only ever go up, also across `clear`: a forkdeck that is still open keeps jobs with the
+    /// old ids, and a new job must never get one of them.
     pub fn new_id(&self) -> Result<u32, String> {
-        let db = self.db.lock().unwrap();
-        db.execute("INSERT INTO jobs (created) VALUES (?1)", params![now_secs() as i64]).map_err(|e| e.to_string())?;
-        Ok(db.last_insert_rowid() as u32)
+        let mut db = self.db.lock().unwrap();
+        let e = |e: rusqlite::Error| e.to_string();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(e)?;
+        let last: i64 = tx.query_row("SELECT MAX((SELECT last FROM ids), COALESCE((SELECT MAX(id) FROM jobs), 0))", [], |r| r.get(0)).map_err(e)?;
+        let id = last + 1;
+        tx.execute("INSERT INTO jobs (id, created) VALUES (?1, ?2)", params![id, now_secs() as i64]).map_err(e)?;
+        tx.execute("UPDATE ids SET last = ?1", params![id]).map_err(e)?;
+        tx.commit().map_err(e)?;
+        Ok(id as u32)
     }
 
     pub fn save(&self, r: &JobRecord) -> Result<(), String> {
@@ -385,16 +396,21 @@ impl History {
 
     /// The newest `limit` jobs, oldest first. Rows that were reserved but never saved are skipped.
     pub fn load(&self, limit: usize) -> Result<Vec<JobRecord>, String> {
+        self.load_where("1 = ?1", 1, limit)
+    }
+
+    fn load_where(&self, filter: &str, arg: i64, limit: usize) -> Result<Vec<JobRecord>, String> {
         let db = self.db.lock().unwrap();
         let e = |e: rusqlite::Error| e.to_string();
         let mut q = db
-            .prepare(
+            .prepare(&format!(
                 "SELECT id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan, inbox, owner
-                 FROM jobs WHERE source != 'null' ORDER BY id DESC LIMIT ?1",
-            )
+                 FROM jobs WHERE source != 'null' AND {} ORDER BY id DESC LIMIT ?2",
+                filter
+            ))
             .map_err(e)?;
         let rows = q
-            .query_map(params![limit as i64], |r| {
+            .query_map(params![arg, limit as i64], |r| {
                 let text = |i: usize| r.get::<_, Option<String>>(i).map(|v| v.unwrap_or_default());
                 Ok(JobRecord {
                     id: r.get(0)?,
@@ -450,6 +466,11 @@ impl History {
         tx.execute("UPDATE jobs SET owner = ?1 WHERE id = ?2", params![me, id]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(true)
+    }
+
+    /// One saved job, as it is in the database now.
+    pub fn get(&self, id: u32) -> Result<Option<JobRecord>, String> {
+        Ok(self.load_where("id = ?1", id as i64, 1)?.into_iter().next())
     }
 
     /// Keep the newest `keep` jobs.
@@ -594,6 +615,8 @@ mod tests {
         assert!(owner_alive(&other));
         assert!(!h.claim(id).unwrap(), "a running forkdeck keeps its job");
         assert!(!h.claim(9999).unwrap(), "no such job");
+        assert_eq!(h.get(id).unwrap().map(|r| r.id), Some(id));
+        assert!(h.get(9999).unwrap().is_none());
     }
 
     #[test]
@@ -609,6 +632,7 @@ mod tests {
         assert_eq!(h.load(10).unwrap().iter().map(|r| r.id).collect::<Vec<_>>(), vec![3, 4, 5]);
         assert_eq!(h.load(2).unwrap().iter().map(|r| r.id).collect::<Vec<_>>(), vec![4, 5], "the newest, oldest first");
         assert_eq!(h.clear().unwrap(), 3);
+        assert_eq!(h.new_id().unwrap(), 6, "clearing never hands an old id out again");
     }
 
     #[test]

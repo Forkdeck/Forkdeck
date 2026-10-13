@@ -308,6 +308,27 @@ impl Hub {
     /// Send a follow-up message to a finished typed task. The agent picks up in the same working
     /// tree and is given the conversation so far. Err says why it was not taken.
     pub fn reply(&self, id: u32, text: String) -> Result<(), String> {
+        // A finished task starts working again: take it over first, as `resume` does, so a second
+        // forkdeck that restored the same task cannot run it at the same time.
+        let finished_typed = self.job(id, |j| j.source.is_manual() && j.status.finished()).unwrap_or(false);
+        if let (true, Some(h)) = (finished_typed, &self.history) {
+            match h.claim(id) {
+                Ok(true) => {}
+                Ok(false) => return Err("another forkdeck that is still running has it".into()),
+                Err(e) => return Err(format!("could not take it over: {}", e)),
+            }
+            // What the forkdeck that had it last saved is newer than what this one restored.
+            if let Ok(Some(saved)) = h.get(id) {
+                self.job(id, |j| {
+                    if saved.turns.len() > j.turns.len() {
+                        j.turns = saved.turns.clone();
+                    }
+                    if saved.session.is_some() {
+                        j.session = saved.session.clone();
+                    }
+                });
+            }
+        }
         {
             let mut st = self.state.lock().unwrap();
             if st.stopping {
@@ -705,7 +726,7 @@ pub fn avail(hub: &Hub) -> AvailOwned {
 /// Run an agent. When copilot refuses the model before doing anything, remember that and run the
 /// same part with the next model the account may use. Each pass rules one model out, so this ends.
 #[allow(clippy::too_many_arguments)]
-async fn run_agent(hub: &Hub, id: u32, slot: Slot, mut exec: Exec, tier: Tier, prompt: &str, dir: &Path, read_only: bool, mut resume: Option<String>) -> (RunOut, Exec) {
+pub async fn run_agent(hub: &Hub, id: u32, slot: Slot, mut exec: Exec, tier: Tier, prompt: &str, dir: &Path, read_only: bool, mut resume: Option<String>) -> (RunOut, Exec) {
     loop {
         let out = agents::run(hub, id, slot, RunSpec { exec: &exec, prompt, dir, read_only, resume: resume.as_deref() }).await;
         if out.no_models {
@@ -920,7 +941,9 @@ async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, fresh: Option
         let resume = resumable(hub, id, &worker);
         let used = if resume.is_some() { prompt.clone() } else { fresh.clone().unwrap_or_else(|| prompt.clone()) };
         let (mut out, mut ran) = run_agent(hub, id, Slot::Worker, worker.clone(), w.d.tier, &used, w.dir, false, resume.clone()).await;
-        if resume.is_some() && !out.ok && !out.interrupted && out.tools == 0 && !cancel.is_set() {
+        // Only a run that did nothing can have failed for want of the conversation; one that ran out
+        // of time, or had already started tools, is not done again from scratch.
+        if resume.is_some() && !out.ok && !out.interrupted && out.tools == 0 && !out.error.starts_with("timed out") && !cancel.is_set() {
             // The CLI no longer has the conversation: start a new one, told the whole story.
             hub.log("agents", format!("#{} could not continue the earlier conversation ({}), starting a new one", id, clip(&out.error, 120)));
             hub.job(id, |j| j.session = None);
@@ -1139,18 +1162,19 @@ async fn tree_state(hub: &Hub, id: u32, w: &Work<'_>) -> Option<String> {
     if w.is_issue {
         return hub.job(id, |j| j.staged_tree.clone()).flatten();
     }
-    let status = issues::sh("git", &["status", "--porcelain", "--untracked-files=all"], Some(w.dir)).await.ok()?;
+    // -z: names as they are, not quoted or escaped.
+    let status = issues::sh("git", &["status", "--porcelain", "-z", "--untracked-files=all"], Some(w.dir)).await.ok()?;
     let diff = issues::sh("git", &["diff", "HEAD"], Some(w.dir)).await.ok()?;
     // A worker that commits its fix leaves no diff behind: the committed tree counts as well.
     let head = issues::sh("git", &["rev-parse", "HEAD^{tree}"], Some(w.dir)).await.unwrap_or_default();
-    // Untracked files show by name only; their content counts too.
-    let mut untracked = String::new();
-    for f in status.lines().filter_map(|l| l.strip_prefix("?? ")) {
-        untracked.push_str(&std::fs::read_to_string(w.dir.join(f)).unwrap_or_default());
-    }
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (status, diff, untracked, head).hash(&mut h);
+    (&status, &diff, &head).hash(&mut h);
+    // Untracked files show by name only; their bytes count too. One that cannot be read means the
+    // state cannot be told, and then nothing is cut short.
+    for f in status.split('\0').filter_map(|e| e.strip_prefix("?? ")) {
+        std::fs::read(w.dir.join(f)).ok()?.hash(&mut h);
+    }
     Some(format!("{:x}", h.finish()))
 }
 
