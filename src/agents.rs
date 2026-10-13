@@ -194,7 +194,15 @@ pub fn command_line(cfg: &Config, spec: &RunSpec) -> CmdLine {
     }
     if spec.read_only {
         match e.cli {
-            AgentKind::Claude => args.extend(["--setting-sources", "user", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}"].map(String::from)),
+            AgentKind::Claude => {
+                args.extend(["--setting-sources", "user", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}"].map(String::from));
+                // The checkout is outside the run's own directory. Granted as an additional directory
+                // in settings, it is readable even where user settings block reads outside the
+                // working directories, and none of its configuration is loaded (`--add-dir` would load
+                // its skills and commands).
+                let checkout = spec.dir.canonicalize().unwrap_or_else(|_| spec.dir.to_path_buf());
+                args.extend(["--settings".to_string(), serde_json::json!({"permissions": {"additionalDirectories": [checkout]}}).to_string()]);
+            }
             AgentKind::Copilot => args.extend(["--no-custom-instructions", "--disable-builtin-mcps"].map(String::from)),
             AgentKind::Codex => {}
         }

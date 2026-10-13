@@ -912,7 +912,9 @@ impl Config {
             for labels in [[&r.label, &r.working_label, &r.done_label, &r.failed_label], [&r.pr_label, &r.pr_working_label, &r.pr_pass_label, &r.pr_fail_label]] {
                 let mut seen = std::collections::HashSet::new();
                 for label in labels {
-                    anyhow::ensure!(!label.trim().is_empty() && !label.contains(',') && seen.insert(label), "repos: {} labels must be nonempty, comma-free and distinct within each kind", r.repo);
+                    // GitHub label names ignore case: "Agent:Ready" and "agent:ready" are one label there.
+                    let key = if r.provider == Provider::Github { label.to_lowercase() } else { label.to_string() };
+                    anyhow::ensure!(!label.trim().is_empty() && !label.contains(',') && seen.insert(key), "repos: {} labels must be nonempty, comma-free and distinct within each kind", r.repo);
                 }
             }
             for (name, v) in [("repo", &r.repo), ("base", &r.base)] {

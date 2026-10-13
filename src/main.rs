@@ -987,8 +987,9 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                                     None => {
                                         u.input.clear();
                                         let planning = if u.plan_next { state::Planning::Always } else { state::Planning::IfRouted };
-                                        let (h, dir, forced, back) = (hub.clone(), cwd.clone(), u.forced.clone(), bounce(task.clone()));
-                                        rt.spawn(async move { if let Err(e) = h.submit(state::clip(&task, 80), task, Source::Manual, dir, forced, planning).await { h.log("queue", e); back(); } });
+                                        // Held from now: quitting straight away waits for the task to be saved.
+                                        let (h, dir, forced, back, busy) = (hub.clone(), cwd.clone(), u.forced.clone(), bounce(task.clone()), hub.busy());
+                                        rt.spawn(async move { let _busy = busy; if let Err(e) = h.submit(state::clip(&task, 80), task, Source::Manual, dir, forced, planning).await { h.log("queue", e); back(); } });
                                         u.plan_next = false;
                                         u.selected = None;
                                         u.follow = true;

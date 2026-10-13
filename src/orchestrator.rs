@@ -45,7 +45,7 @@ pub struct Hub {
 }
 
 /// Counts a `run_job` from its start until it returns, whichever way it does.
-struct Busy(Arc<std::sync::atomic::AtomicUsize>);
+pub struct Busy(Arc<std::sync::atomic::AtomicUsize>);
 
 impl Busy {
     fn enter(n: &Arc<std::sync::atomic::AtomicUsize>) -> Busy {
@@ -127,6 +127,12 @@ impl Hub {
     }
 
     /// No job is in the middle of its last steps.
+    /// Held while something that may still add a job is under way (a submission typed just before
+    /// quitting, say): shutdown waits for it.
+    pub fn busy(&self) -> Busy {
+        Busy::enter(&self.busy)
+    }
+
     pub fn settled(&self) -> bool {
         self.busy.load(std::sync::atomic::Ordering::SeqCst) == 0
     }
@@ -293,6 +299,7 @@ impl Hub {
         forced: Option<AgentRef>,
         planning: Planning,
     ) -> Result<u32, String> {
+        let _busy = Busy::enter(&self.busy);
         // The database hands out ids, so jobs from another forkdeck sharing it never collide.
         let from_db = match self.history.clone() {
             Some(h) => Some(self.rt.spawn_blocking(move || h.new_id()).await.map_err(|e| e.to_string())??),
@@ -352,11 +359,16 @@ impl Hub {
                 admitted: false,
             });
             if stopping {
-                // Shutting down: the job exists so the caller has an id, but it never starts and claims nothing.
+                // Shutting down: the job exists so the caller has an id, but it never starts and claims
+                // nothing. A typed task was accepted all the same: it is kept, to start on resume.
+                let keep = st.jobs.last().is_some_and(|j| j.source.is_manual() && j.in_history);
                 if let Some(j) = st.jobs.last_mut() {
-                    j.status = JobStatus::Cancelled;
+                    j.status = if keep { JobStatus::Interrupted } else { JobStatus::Cancelled };
+                    j.resume_from = keep.then_some(JobStatus::Queued);
                     j.finished = Some(Instant::now());
                 }
+                drop(st);
+                if keep { self.save(id); }
                 return Ok(id);
             }
             st.log("queue", format!("#{} {}", id, clip(&title, 90)));
