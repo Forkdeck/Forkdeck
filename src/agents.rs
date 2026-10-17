@@ -730,6 +730,11 @@ fn plain_git(dir: &Path, args: &[&str], env: &[(&str, &Path)], input: Option<&Pa
 /// clean filter is a command, and the worker could have defined one), links as links, and
 /// submodules as the index has them. `git add` would run the filters.
 pub(crate) fn snapshot_tree(dir: &Path) -> Result<String, String> {
+    // From the top of the repository: started in a subdirectory, git would list only that part, and
+    // the rest would look deleted against a base commit that has all of it.
+    let top = plain_git(dir, &["rev-parse", "--show-toplevel"], &[], None)?;
+    let top = PathBuf::from(String::from_utf8_lossy(&top).trim());
+    let dir = top.as_path();
     let scratch = proc::Scratch::new()?;
     let (index, paths, entries) = (scratch.0.join("index"), scratch.0.join("paths"), scratch.0.join("entries"));
     let staged = plain_git(dir, &["ls-files", "-s", "-z"], &[], None)?;
@@ -930,6 +935,10 @@ mod tests {
         write_changes(&from, &to, "Inspect everything with `git diff HEAD`.", None).unwrap();
         // Through the linked directory, nothing outside gets into the diff either.
         assert!(!std::fs::read_to_string(to.join(CHANGES)).unwrap().contains("PRIVATE KEY"));
+        // Taken from a subdirectory, the snapshot is still of the whole repository.
+        let whole = snapshot_tree(&from).unwrap();
+        std::fs::create_dir_all(from.join("sub")).unwrap();
+        assert_eq!(snapshot_tree(&from.join("sub")).unwrap(), whole);
         // No `git diff` in the prompt (a review asked again): the job's starting commit.
         write_changes(&from, &to, "Look again.", Some("HEAD")).unwrap();
         assert!(std::fs::read_to_string(to.join(CHANGES)).unwrap().contains("+changed"));

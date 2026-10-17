@@ -134,7 +134,9 @@ async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::
                         // A bounded number at once: a client that only sends could otherwise grow this without end.
                         if calls.len() >= MAX_CALLS {
                             let busy = Reply::Err { msg: "too many calls at once".into() };
-                            let _ = out.send(OutboundServerMessage::Unary(Response { request_id: req.id, message: Ok(busy) }, None)).await;
+                            // Never waited on here: a phone that stops reading would hold this loop, and
+                            // with it the revocation check. One whose queue is full is dropped.
+                            if out.try_send(OutboundServerMessage::Unary(Response { request_id: req.id, message: Ok(busy) }, None)).is_err() { break; }
                             continue;
                         }
                         let (ctx, out, device) = (ctx.clone(), out.clone(), device.clone());
@@ -158,7 +160,7 @@ async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::
                             }
                             _ => {
                                 let error = StreamError::new(std::io::ErrorKind::PermissionDenied, "no such stream");
-                                let _ = out.send(OutboundServerMessage::Stream(StreamServerMessage::Error { stream_id, error }, None)).await;
+                                if out.try_send(OutboundServerMessage::Stream(StreamServerMessage::Error { stream_id, error }, None)).is_err() { break; }
                             }
                         }
                     }
