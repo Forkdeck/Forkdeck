@@ -322,10 +322,18 @@ pub fn parse_comments(text: &str) -> Result<Vec<Comment>, String> {
     Ok(out)
 }
 
+/// `api`, the repository's host when `gh` needs telling (`RepoCfg::host_args`), then `rest`.
+fn with_host<'a>(r: &'a RepoCfg, rest: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["api"];
+    if r.provider == Provider::Github && !r.host_args().is_empty() { args.extend(["--hostname", r.host.as_str()]); }
+    args.extend(rest);
+    args
+}
+
 pub async fn comments(r: &RepoCfg, t: &Target) -> Result<Vec<Comment>, String> {
     let path = list_path(r, t).ok_or("this forge has no editable comments there")?;
     let path = format!("{}?per_page=100", path);
-    let out = issues::sh(tool(r), &["api", "--paginate", &path], dir(r)).await?;
+    let out = issues::sh(tool(r), &with_host(r, &["--paginate", &path]), dir(r)).await?;
     let mut all = parse_comments(&out)?;
     if r.provider == Provider::Gitlab {
         // GitLab does not say it with the note, so ask about each account that wrote a marker.
@@ -379,7 +387,7 @@ fn body_json(text: &str) -> String {
 
 async fn post(r: &RepoCfg, t: &Target, text: &str) -> Result<u64, String> {
     let path = list_path(r, t).ok_or("this forge has no editable comments there")?;
-    let out = issues::sh_in(tool(r), &["api", "-X", "POST", &path, "--input", "-", "-H", "Content-Type: application/json"], dir(r), &body_json(text)).await?;
+    let out = issues::sh_in(tool(r), &with_host(r, &["-X", "POST", &path, "--input", "-", "-H", "Content-Type: application/json"]), dir(r), &body_json(text)).await?;
     serde_json::from_str::<Value>(&out)
         .ok()
         .and_then(|v| v.get("id").and_then(|x| x.as_u64()))
@@ -388,7 +396,7 @@ async fn post(r: &RepoCfg, t: &Target, text: &str) -> Result<u64, String> {
 
 async fn edit(r: &RepoCfg, t: &Target, id: u64, text: &str) -> Result<(), String> {
     let (method, path) = edit_path(r, t, id).ok_or("this forge has no editable comments there")?;
-    issues::sh_in(tool(r), &["api", "-X", method, &path, "--input", "-", "-H", "Content-Type: application/json"], dir(r), &body_json(text)).await.map(|_| ())
+    issues::sh_in(tool(r), &with_host(r, &["-X", method, &path, "--input", "-", "-H", "Content-Type: application/json"]), dir(r), &body_json(text)).await.map(|_| ())
 }
 
 /// The account the forge CLI is logged in as.
@@ -419,7 +427,7 @@ async fn write_access(r: &RepoCfg, by: &str) -> Result<bool, String> {
         Provider::Github => format!("repos/{}/collaborators/{}/permission", r.repo, by),
         Provider::Gitlab => format!("{}/members/all?query={}", gitlab_project(r), by),
     };
-    let out = issues::sh(tool(r), &["api", &endpoint], dir(r)).await?;
+    let out = issues::sh(tool(r), &with_host(r, &[&endpoint]), dir(r)).await?;
     let v: Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
     match r.provider {
         Provider::Github => Ok(matches!(v.get("permission").and_then(|v| v.as_str()).ok_or("permission response has no permission")?, "admin" | "maintain" | "write")),

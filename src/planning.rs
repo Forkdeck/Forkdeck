@@ -117,6 +117,13 @@ pub async fn prepare(hub: &Hub, id: u32) -> Result<(), String> {
     let p = plan(hub, id)?;
     if p.pending.is_some() { return Err("Reconcile the pending publication with Accept / retry before refining.".into()); }
     let r = repo(hub, &p)?;
+    // One plan per issue: intake waits while any plan for the issue is unready, so a second would hold
+    // it up for good.
+    if let Some(i) = &p.issue {
+        if let Some(other) = hub.state.lock().unwrap().jobs.iter().find(|j| j.id != id && j.issue_plan.as_ref().is_some_and(|o| o.is_for(&r) && o.issue.as_ref().is_some_and(|oi| oi.key == i.key))).map(|j| j.id) {
+            return Err(format!("Task #{other} already plans this issue; continue there."));
+        }
+    }
     if let Some(i) = &p.issue {
         let remote = tracker::read_ref(&r, i).await?;
         guard(hub, &r, &remote).await?;
@@ -144,6 +151,9 @@ pub async fn publish(hub: &Hub, id: u32) -> Result<String, String> {
                 tracker::find_created(&r, &format!("<!-- forkdeck:revision {} -->", op.token)).await?
                     .ok_or("The previous create may still be in flight. Retry reconciliation later; no second issue was created.")?
             } else {
+                // The forge answers now, so a failure after this is one the create may have survived,
+                // and one before it (not logged in, CLI missing) never sent anything.
+                tracker::reachable(&r).await?;
                 edit(hub, id, |p| p.pending.as_mut().unwrap().create_attempted = true);
                 if let Err(e) = durable(hub, id) {
                     edit(hub, id, |p| p.pending.as_mut().unwrap().create_attempted = false);
@@ -187,6 +197,7 @@ pub async fn publish(hub: &Hub, id: u32) -> Result<String, String> {
     let comments = tracker::history(&r, &remote.reference.key).await?;
     if !comments.iter().any(|c| c.body.contains(&marker)) {
         if op.comment_attempted { return Err("The previous history comment may still be in flight. Retry reconciliation later; no duplicate was posted.".into()); }
+        tracker::reachable(&r).await?;
         edit(hub, id, |p| p.pending.as_mut().unwrap().comment_attempted = true);
         if let Err(e) = durable(hub, id) {
             edit(hub, id, |p| p.pending.as_mut().unwrap().comment_attempted = false);

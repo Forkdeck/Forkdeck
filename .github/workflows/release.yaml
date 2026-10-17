@@ -29,7 +29,8 @@ jobs:
   build:
     name: Build ${{ matrix.asset }}
     strategy:
-      fail-fast: true
+      # Every platform reports, so one failing does not hide whether the others build.
+      fail-fast: false
       matrix:
         include:
           # Linux: static musl binaries, built natively on each architecture.

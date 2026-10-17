@@ -488,11 +488,22 @@ impl Hub {
             if !j.status.finished() { return Err("wait for the current turn to finish".into()); }
             let queued = !j.inbox.is_empty();
             let p = j.issue_plan.as_mut().ok_or("select an issue plan")?;
+            let before = p.clone();
             match action {
                 crate::planning::Action::Publish => p.accept(queued)?,
                 crate::planning::Action::Ready => p.request_ready(queued)?,
                 crate::planning::Action::Draft => return Err("use a reply to refine the plan".into()),
             }
+            // Saved while the task is still finished: if the save fails, the plan goes back to how it
+            // was and nothing is left queued without a run to take it.
+            drop(st);
+            if let Err(e) = self.persist(id) {
+                self.job(id, |j| j.issue_plan = Some(before));
+                return Err(e);
+            }
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.stopping { return Err("shutting down".into()); }
+            let j = st.jobs.iter_mut().find(|j| j.id == id).ok_or("select an issue plan")?;
             j.status = JobStatus::Queued;
             j.resume_from = None;
             j.finished = None;
@@ -502,7 +513,6 @@ impl Hub {
             j.active_started = Instant::now();
             j.created = Instant::now();
         }
-        self.persist(id)?;
         let hub = self.clone();
         self.rt.spawn(async move { run_job(hub, id).await });
         Ok(())
@@ -1388,12 +1398,9 @@ async fn tree_state(hub: &Hub, id: u32, w: &Work<'_>) -> Option<String> {
     if w.is_issue {
         return hub.job(id, |j| j.staged_tree.clone()).flatten();
     }
-    let scratch = proc::Scratch::new().ok()?;
-    let env = [("GIT_INDEX_FILE", scratch.0.join("index").display().to_string())];
-    issues::sh_env("git", &["read-tree", "HEAD"], Some(w.dir), &env).await.ok()?;
-    issues::sh_env("git", &["add", "-A"], Some(w.dir), &env).await.ok()?;
-    issues::sh_env("git", &["write-tree"], Some(w.dir), &env).await.ok()
-
+    // Without `git add`, which would run any clean filter the worker defined in the checkout.
+    let dir = w.dir.to_path_buf();
+    tokio::task::spawn_blocking(move || agents::snapshot_tree(&dir)).await.ok()?.ok()
 }
 
 async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &Cancel) -> Result<Refined, Finish> {

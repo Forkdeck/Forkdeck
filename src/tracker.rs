@@ -86,9 +86,16 @@ pub fn key(r: &RepoCfg, input: &str) -> Result<String, String> {
 
 async fn api(r: &RepoCfg, method: &str, path: &str, data: Option<Value>) -> Result<String, String> {
     let dir = if r.path.is_dir() { Some(r.path.as_path()) } else { None };
+    let host = r.host_args();
+    let mut args: Vec<&str> = vec!["api"];
+    args.extend(host.iter().map(String::as_str));
     if let Some(data) = data {
-        issues::sh_in(tool(r), &["api", "-X", method, path, "--input", "-", "-H", "Content-Type: application/json"], dir, &data.to_string()).await
-    } else { issues::sh(tool(r), &["api", path], dir).await }
+        args.extend(["-X", method, path, "--input", "-", "-H", "Content-Type: application/json"]);
+        issues::sh_in(tool(r), &args, dir, &data.to_string()).await
+    } else {
+        args.push(path);
+        issues::sh(tool(r), &args, dir).await
+    }
 }
 
 fn parse(r: &RepoCfg, v: &Value) -> Result<RemoteIssue, String> {
@@ -123,6 +130,11 @@ pub async fn read_ref(r: &RepoCfg, reference: &IssueRef) -> Result<RemoteIssue, 
     Ok(remote)
 }
 
+/// The forge answers and the CLI is logged in, right before a write whose outcome could be uncertain.
+pub async fn reachable(r: &RepoCfg) -> Result<(), String> {
+    api(r, "GET", "user", None).await.map(|_| ()).map_err(|e| format!("The forge cannot be reached, so nothing was sent: {e}"))
+}
+
 pub async fn create(r: &RepoCfg, title: &str, body: &str) -> Result<RemoteIssue, String> {
     let data = if r.provider == Provider::Github { json!({"title":title,"body":body}) } else { json!({"title":title,"description":body}) };
     let out = api(r, "POST", &root(r), Some(data)).await?;
@@ -132,7 +144,11 @@ pub async fn create(r: &RepoCfg, title: &str, body: &str) -> Result<RemoteIssue,
 /// Find an uncertain create by its durable marker, including closed issues and all pages.
 pub async fn find_created(r: &RepoCfg, marker: &str) -> Result<Option<RemoteIssue>, String> {
     let dir = if r.path.is_dir() { Some(r.path.as_path()) } else { None };
-    let out = issues::sh(tool(r), &["api", "--paginate", &format!("{}?state=all&per_page=100", root(r))], dir).await?;
+    let (host, path) = (r.host_args(), format!("{}?state=all&per_page=100", root(r)));
+    let mut args: Vec<&str> = vec!["api"];
+    args.extend(host.iter().map(String::as_str));
+    args.extend(["--paginate", &path]);
+    let out = issues::sh(tool(r), &args, dir).await?;
     let mut found = None;
     for page in serde_json::Deserializer::from_str(&out).into_iter::<Value>() {
         let page = page.map_err(|e| e.to_string())?;

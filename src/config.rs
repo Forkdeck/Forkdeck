@@ -774,6 +774,17 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
 }
 
 impl RepoCfg {
+    /// The `gh api` arguments that send a request to this repository's host. `gh` uses its default
+    /// host otherwise; `glab` takes the host from the clone it runs in. An origin naming an SSH alias
+    /// (no dot) or github.com needs nothing.
+    pub fn host_args(&self) -> Vec<String> {
+        if self.provider == Provider::Github && self.host.contains('.') && self.host != "github.com" {
+            vec!["--hostname".into(), self.host.clone()]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// The repository as forkdeck tells it apart from others: "group/project@host" on a
     /// self-hosted GitLab, where the same path may exist on another host; otherwise the name alone,
     /// as it always was.
@@ -1017,6 +1028,15 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gh_is_told_the_host_only_for_github_enterprise() {
+        let on = |provider: &str, host: &str| { let mut r: RepoCfg = toml::from_str(&format!("provider = \"{provider}\"\nrepo = \"o/r\"\npath = \"/tmp\"")).unwrap(); r.host = host.into(); r.host_args() };
+        assert_eq!(on("github", "github.example.com"), ["--hostname", "github.example.com"]);
+        assert!(on("github", "github.com").is_empty());
+        assert!(on("github", "github-work").is_empty(), "an SSH alias is not a host gh knows");
+        assert!(on("gitlab", "gitlab.example.com").is_empty(), "glab takes the host from the clone");
+    }
 
     #[test]
     fn an_old_name_moves_only_to_its_one_owner() {

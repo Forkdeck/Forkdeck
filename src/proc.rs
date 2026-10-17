@@ -229,7 +229,8 @@ mod tests {
     async fn escaped_descendants_cannot_hold_command_pipes_forever() {
         let mut cmd = command("sh");
         let scratch = Scratch::new().unwrap();
-        let script = format!("setsid sh -c 'touch {0}/ready; sleep 7' & while [ ! -f {0}/ready ]; do sleep 0.01; done; printf done", scratch.0.display());
+        // A child in a session of its own, out of the process group (macOS has no setsid command).
+        let script = format!("python3 -c 'import os, sys, time; os.setsid(); open(sys.argv[1], \"w\").close(); time.sleep(7)' {0}/ready & while [ ! -f {0}/ready ]; do sleep 0.01; done; printf done", scratch.0.display());
         cmd.args(["-c", &script]);
         let start = std::time::Instant::now();
         let (code, out, _) = output_code(cmd, Duration::from_secs(10)).await.unwrap();

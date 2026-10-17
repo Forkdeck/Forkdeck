@@ -152,7 +152,7 @@ impl Client {
             }
             let _ = sink.close().await;
         });
-        let (p, s, c) = (pending.clone(), streams.clone(), closed.clone());
+        let (p, s, c, cancel) = (pending.clone(), streams.clone(), closed.clone(), out.clone());
         tokio::spawn(async move {
             while let Some(Ok(msg)) = rx.next().await {
                 match msg {
@@ -169,6 +169,8 @@ impl Client {
                         if let Some(tx) = streams.get(&stream_id) {
                             if tx.try_send((seq, event)).is_err() {
                                 streams.remove(&stream_id);
+                                // And the server stops sending it, or each catch-up would add a stream.
+                                let _ = cancel.try_send(OutboundClientMessage::Stream(StreamClientMessage::Cancel { stream_id }, None));
                             }
                         }
                     }

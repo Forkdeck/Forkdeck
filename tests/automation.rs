@@ -2946,7 +2946,7 @@ fn a_claude_error_result_and_nonzero_exit_cannot_become_success() {
 
 #[test]
 fn a_final_agent_event_does_not_wait_forever_for_the_cli_or_escaped_pipes() {
-    let cli = "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\ncat >/dev/null\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}'\nsetsid sh -c 'sleep 8' &\nsleep 600\n";
+    let cli = "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\ncat >/dev/null\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}'\npython3 -c 'import os, time; os.setsid(); time.sleep(8)' &\nsleep 600\n";
     let rig = Rig::with_agents("agent-drain", "", "", &[("claude", cli)]);
     let start = std::time::Instant::now();
     let (ok, out) = rig.run(&["run", "--agent", "claude", "fix typo"], &[]);
