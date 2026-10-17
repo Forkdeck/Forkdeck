@@ -476,6 +476,10 @@ impl Hub {
     pub async fn plan_action(&self, id: u32, action: crate::planning::Action) -> Result<(), String> {
         if self.cfg.demo { return Err("issue publication is disabled in demo mode".into()); }
         let _admission = self.admission.lock().await;
+        // Checked before the takeover: taking over reloads the saved job, and a job running here
+        // would come back looking interrupted, so the check after it would let a second run start.
+        let eligible = self.job(id, |j| j.status.finished() && j.issue_plan.is_some()).unwrap_or(false);
+        if !eligible { return Err("wait for the current turn to finish".into()); }
         if self.job(id, |j| j.in_history).unwrap_or(false) { self.take_over(id, false).await?; }
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -507,12 +511,20 @@ impl Hub {
     /// Tie a finished typed task's conversation to an issue and refine it into an issue plan.
     pub async fn link_plan(&self, id: u32, plan: crate::planning::Plan, request: String) -> Result<(), String> {
         let workdir = crate::planning::repo(self, &plan)?.path;
+        let eligible = |j: &mut Job| j.source.is_manual() && j.status.finished() && j.issue_plan.is_none();
+        if !self.job(id, eligible).unwrap_or(false) { return Err("finish the local planning turn before linking an issue".into()); }
+        // Taken over first: a takeover reloads the saved job, which would drop a link made before it.
+        if self.job(id, |j| j.in_history).unwrap_or(false) {
+            let _admission = self.admission.lock().await;
+            self.take_over(id, false).await?;
+        }
         self.job(id, |j| -> Result<(), String> {
-            if !j.source.is_manual() || !j.status.finished() || j.issue_plan.is_some() { return Err("finish the local planning turn before linking an issue".into()); }
+            if !eligible(j) { return Err("finish the local planning turn before linking an issue".into()); }
             j.issue_plan = Some(plan);
             j.workdir = workdir;
             Ok(())
         }).ok_or("task missing")??;
+        if self.history.is_some() { self.persist(id)?; }
         self.reply(id, format!("{request}\n\nRefine this into a complete issue implementation plan and submit it for plan review.")).await
     }
 

@@ -162,10 +162,13 @@ impl Client {
                         }
                     }
                     InboundClientMessage::Stream(StreamServerMessage::Data { stream_id, message: Reply::Event { seq, event } }, _) => {
-                        let tx = s.lock().unwrap().get(&stream_id).cloned();
-                        if let Some(tx) = tx {
-                            if tx.send((seq, event)).await.is_err() {
-                                s.lock().unwrap().remove(&stream_id);
+                        // Never wait on a subscriber here: this task reads every reply. One that has
+                        // fallen a channel's worth behind (or gone) loses its stream, which ends; it
+                        // subscribes again from the last sequence number it saw to catch up.
+                        let mut streams = s.lock().unwrap();
+                        if let Some(tx) = streams.get(&stream_id) {
+                            if tx.try_send((seq, event)).is_err() {
+                                streams.remove(&stream_id);
                             }
                         }
                     }
@@ -237,7 +240,8 @@ impl Client {
         }
     }
 
-    /// Events after `since` (0: only new ones). The receiver ends when the connection does.
+    /// Events after `since` (0: only new ones). The receiver ends when the connection does, or
+    /// when it falls a channel's worth of events behind: subscribe again from the last one seen.
     pub async fn subscribe(&self, since: u64) -> Result<mpsc::Receiver<(u64, Event)>, Error> {
         // Stream ids live apart from call ids.
         let stream_id = (1u64 << 62) | self.next.fetch_add(1, Ordering::SeqCst);

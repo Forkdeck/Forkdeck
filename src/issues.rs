@@ -511,7 +511,7 @@ pub async fn poll_once(hub: &Hub) {
                                     // A conversation planning this issue owns it until the user marks the
                                     // published revision ready. Not marked seen, so it is taken once ready.
                                     if !pr && st.jobs.iter().any(|j| j.issue_plan.as_ref().is_some_and(|p| {
-                                        p.provider == r.provider && p.repo == r.repo && p.issue.as_ref().is_some_and(|linked| linked.key == i.number.to_string()) &&
+                                        p.is_for(r) && p.issue.as_ref().is_some_and(|linked| linked.key == i.number.to_string()) &&
                                         (!p.ready_for_intake() || !j.inbox.is_empty() || !j.status.finished())
                                     })) { continue; }
                                     if st.jobs.iter().any(|j| !j.status.finished() && j.source.key() == Some((idx, pr, i.number))) {
@@ -595,7 +595,7 @@ pub async fn poll_once(hub: &Hub) {
                                     let mut planners = Vec::new();
                                     for j in &mut hub.state.lock().unwrap_or_else(|e| e.into_inner()).jobs {
                                         if let Some(p) = &mut j.issue_plan {
-                                            if p.provider == r.provider && p.repo == r.repo && p.issue.as_ref().is_some_and(|linked| linked.key == i.number.to_string()) {
+                                            if p.is_for(r) && p.issue.as_ref().is_some_and(|linked| linked.key == i.number.to_string()) {
                                                 p.build_job = Some(build);
                                                 planners.push(j.id);
                                             }

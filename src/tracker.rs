@@ -47,6 +47,18 @@ pub fn managed(plan: &str, token: &str, revision: u64) -> String {
     format!("{OPEN}\n<!-- forkdeck:revision {token} -->\n## Implementation plan · revision {revision}\n\n{plan}\n{CLOSE}")
 }
 
+/// The forge refused the request outright (a 4xx answer), so it did nothing. A timeout (408), a
+/// rate limit (429), a server error or no answer at all may still have taken effect.
+pub fn refused(err: &str) -> bool {
+    static STATUS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\(HTTP (\d{3})\)").unwrap());
+    STATUS.captures(err).and_then(|c| c[1].parse::<u16>().ok()).is_some_and(|s| (400..500).contains(&s) && s != 408 && s != 429)
+}
+
+/// Does the issue carry `label`? GitHub label names ignore case; GitLab's do not.
+pub fn has_label(r: &RepoCfg, labels: &[String], label: &str) -> bool {
+    labels.iter().any(|l| if r.provider == Provider::Github { l.eq_ignore_ascii_case(label) } else { l == label })
+}
+
 fn tool(r: &RepoCfg) -> &'static str { if r.provider == Provider::Github { "gh" } else { "glab" } }
 fn root(r: &RepoCfg) -> String {
     if r.provider == Provider::Github { format!("repos/{}/issues", r.repo) }
@@ -165,6 +177,24 @@ pub async fn readiness(r: &RepoCfg, key: &str, ready: bool) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_a_definite_refusal_counts_as_nothing_written() {
+        assert!(refused("gh api: Resource not accessible by integration (HTTP 403)"));
+        assert!(refused("glab api: glab: 422 Unprocessable Entity (HTTP 422)"));
+        assert!(!refused("gh api: Server Error (HTTP 502)"));
+        assert!(!refused("gh api: API rate limit exceeded (HTTP 429)"));
+        assert!(!refused("gh api: timed out"));
+    }
+
+    #[test]
+    fn github_labels_match_whatever_their_case() {
+        for (provider, matches) in [("github", true), ("gitlab", false)] {
+            let cfg: crate::config::Config = toml::from_str(&format!("[[repos]]\nprovider='{provider}'\nrepo='a/b'\npath='/tmp'\n")).unwrap();
+            assert_eq!(has_label(&cfg.repos[0], &["Agent:Working".into()], "agent:working"), matches, "{provider}");
+            assert!(has_label(&cfg.repos[0], &["agent:working".into()], "agent:working"));
+        }
+    }
+
     #[test]
     fn preserve_human_text_and_detect_conflicts() {
         let old = managed("old", "a", 1);

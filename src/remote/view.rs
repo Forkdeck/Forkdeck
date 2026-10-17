@@ -63,8 +63,16 @@ pub fn summary(j: &Job, stopping: bool, created_unix: u64) -> p::JobSummary {
         verdict: tri(j.verdict),
         pr_url: j.pr_url.clone().unwrap_or_default(),
         rounds: j.rounds,
-        can_reply: j.source.is_manual() && j.status.finished() && !stopping,
-        outcome: j.outcome.clone(),
+        // A plan waiting for its choice takes a reply too: a number picks an option, anything else is
+        // the user's own approach. The app knows no such state, so the options go in the outcome.
+        can_reply: j.source.is_manual() && (j.status.finished() || j.status == JobStatus::Choosing) && !stopping,
+        outcome: match (&j.plan, j.status) {
+            (Some(p), JobStatus::Choosing) if p.chosen.is_none() => format!(
+                "Waiting for your choice: reply with a number, or your own approach. {}",
+                p.options.iter().enumerate().map(|(i, o)| format!("{}) {}{}", i + 1, o.title, if o.recommended { " (recommended)" } else { "" })).collect::<Vec<_>>().join(" · ")
+            ),
+            _ => j.outcome.clone(),
+        },
     }
 }
 

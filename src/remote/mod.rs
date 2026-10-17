@@ -304,14 +304,10 @@ async fn pairing(ctx: &Ctx, peer: IpAddr, c: Call) -> Reply {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 return Reply::Err { msg };
             }
-            let name = ctx.devices.free_name(&device);
-            let cert = match ctx.ca.sign_client(&csr, &name) {
-                Ok(c) => c,
-                Err(e) => return Reply::Err { msg: e.to_string() },
+            let (name, cert) = match ctx.devices.pair(&device, |name| Ok(ctx.ca.sign_client(&csr, name)?.to_vec())) {
+                Ok(x) => x,
+                Err(e) => return Reply::Err { msg: format!("could not pair the phone: {}", e) },
             };
-            if let Err(e) = ctx.devices.add(&name, &pki::sha256_hex(&cert)) {
-                return Reply::Err { msg: format!("could not record the phone: {}", e) };
-            }
             hub.log("remote", format!("paired {} from {}", name, peer));
             Reply::Paired { cert: cert.to_vec(), ca: ctx.ca.der.to_vec() }
         }

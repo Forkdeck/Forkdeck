@@ -20,6 +20,9 @@ pub struct Publication {
 pub struct Plan {
     pub provider: Provider,
     pub repo: String,
+    /// The forge host of the repository's clone: the same group/project may be on two GitLab hosts.
+    #[serde(default)]
+    pub host: String,
     pub issue: Option<tracker::IssueRef>,
     pub identity: String,
     pub revision: u64,
@@ -42,10 +45,14 @@ impl Plan {
             Some(tracker::IssueRef { provider: r.provider, repo: r.repo.clone(), key: tracker::key(r, link)?, url: if link.contains("://") { link.trim().into() } else { String::new() } })
         };
         let identity = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos());
-        Ok(Self { provider: r.provider, repo: r.repo.clone(), issue, identity, revision: 0, draft: String::new(), review: String::new(), reviewed: None, accepted: None, published: None, base: None, remote_context: String::new(), pending: None, action: Action::Draft, ready: false, build_job: None })
+        Ok(Self { provider: r.provider, repo: r.repo.clone(), host: r.host.clone(), issue, identity, revision: 0, draft: String::new(), review: String::new(), reviewed: None, accepted: None, published: None, base: None, remote_context: String::new(), pending: None, action: Action::Draft, ready: false, build_job: None })
     }
 
     pub fn invalidate(&mut self) { self.reviewed = None; }
+    /// Planned for this configured repository: same forge, name and host.
+    pub fn is_for(&self, r: &RepoCfg) -> bool {
+        self.provider == r.provider && self.repo == r.repo && self.host == r.host
+    }
     pub fn ready_for_intake(&self) -> bool {
         self.ready && self.pending.is_none() && self.reviewed == Some(self.revision) && self.accepted == Some(self.revision) && self.published == Some(self.revision)
     }
@@ -81,7 +88,7 @@ impl Plan {
 }
 
 pub fn repo(hub: &Hub, p: &Plan) -> Result<RepoCfg, String> {
-    hub.cfg.repos.iter().find(|r| r.provider == p.provider && r.repo == p.repo).cloned().ok_or_else(|| "The plan's repository is no longer configured.".into())
+    hub.cfg.repos.iter().find(|r| p.is_for(r)).cloned().ok_or_else(|| "The plan's repository is no longer configured.".into())
 }
 fn plan(hub: &Hub, id: u32) -> Result<Plan, String> { hub.job(id, |j| j.issue_plan.clone()).flatten().ok_or_else(|| "Issue plan missing".into()) }
 fn edit(hub: &Hub, id: u32, f: impl FnOnce(&mut Plan)) { hub.job(id, |j| { if let Some(p) = &mut j.issue_plan { f(p); } }); }
@@ -95,7 +102,7 @@ fn durable(hub: &Hub, id: u32) -> Result<(), String> {
 async fn guard(hub: &Hub, r: &RepoCfg, remote: &tracker::RemoteIssue) -> Result<(), String> {
     if !remote.open { return Err("This issue is closed. Reopen it before refining or publishing.".into()); }
     let n = tracker::number(&remote.reference.key)?;
-    if remote.labels.contains(&r.working_label) || remote.labels.contains(&r.done_label) || hub.state.lock().unwrap().jobs.iter().any(|j| !j.status.finished() && matches!(&j.source, Source::Issue { repo_idx, repo, number, .. } if repo == &r.repo && *number == n && hub.cfg.repos.get(*repo_idx).is_some_and(|configured| configured.provider == r.provider))) {
+    if tracker::has_label(r, &remote.labels, &r.working_label) || tracker::has_label(r, &remote.labels, &r.done_label) || hub.state.lock().unwrap().jobs.iter().any(|j| !j.status.finished() && matches!(&j.source, Source::Issue { repo_idx, repo, number, .. } if repo == &r.repo && *number == n && hub.cfg.repos.get(*repo_idx).is_some_and(|configured| configured.provider == r.provider && configured.host == r.host))) {
         return Err("This issue is already claimed, building or awaiting delivery.".into());
     }
     let comments = tracker::history(r, &remote.reference.key).await?;
@@ -115,7 +122,7 @@ pub async fn prepare(hub: &Hub, id: u32) -> Result<(), String> {
         guard(hub, &r, &remote).await?;
         // The pending Draft action and link are durable before touching the intake label.
         durable(hub, id)?;
-        if remote.labels.contains(&r.label) { tracker::readiness(&r, &i.key, false).await?; }
+        if tracker::has_label(&r, &remote.labels, &r.label) { tracker::readiness(&r, &i.key, false).await?; }
         let remote = tracker::read(&r, &i.key).await?;
         guard(hub, &r, &remote).await?;
         let base = tracker::section(&remote.body)?;
@@ -143,14 +150,23 @@ pub async fn publish(hub: &Hub, id: u32) -> Result<String, String> {
                     return Err(e);
                 }
                 let title = hub.job(id, |j| j.title.clone()).unwrap_or_else(|| "Implementation plan".into());
-                tracker::create(&r, &title, &op.section).await?
+                match tracker::create(&r, &title, &op.section).await {
+                    Ok(issue) => issue,
+                    // Refused outright: nothing was created, so the next retry may create it.
+                    Err(e) if tracker::refused(&e) => {
+                        edit(hub, id, |p| p.pending.as_mut().unwrap().create_attempted = false);
+                        hub.persist(id)?;
+                        return Err(e);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
     };
     edit(hub, id, |p| p.issue = Some(remote.reference.clone()));
     durable(hub, id)?;
     guard(hub, &r, &remote).await?;
-    if remote.labels.contains(&r.label) { tracker::readiness(&r, &remote.reference.key, false).await?; }
+    if tracker::has_label(&r, &remote.labels, &r.label) { tracker::readiness(&r, &remote.reference.key, false).await?; }
     let remote = tracker::read(&r, &remote.reference.key).await?;
     guard(hub, &r, &remote).await?;
     let current = tracker::section(&remote.body)?;
@@ -176,7 +192,14 @@ pub async fn publish(hub: &Hub, id: u32) -> Result<String, String> {
             edit(hub, id, |p| p.pending.as_mut().unwrap().comment_attempted = false);
             return Err(e);
         }
-        tracker::comment(&r, &remote.reference.key, &format!("{marker}\nPlan revision {} accepted after agent review. {}\n\nThe full plan is in the issue description. Build readiness requires a separate action.", op.revision, op.summary)).await?;
+        if let Err(e) = tracker::comment(&r, &remote.reference.key, &format!("{marker}\nPlan revision {} accepted after agent review. {}\n\nThe full plan is in the issue description. Build readiness requires a separate action.", op.revision, op.summary)).await {
+            // Refused outright: nothing was posted, so the next retry may post it.
+            if tracker::refused(&e) {
+                edit(hub, id, |p| p.pending.as_mut().unwrap().comment_attempted = false);
+                hub.persist(id)?;
+            }
+            return Err(e);
+        }
     }
     // A managed-section edit during publication cannot be mistaken for a successful sync.
     let latest = tracker::read(&r, &remote.reference.key).await?;
@@ -196,7 +219,7 @@ pub async fn ready(hub: &Hub, id: u32) -> Result<String, String> {
     // Recheck after I/O: queued feedback invalidates a readiness request.
     hub.job(id, |j| j.issue_plan.as_mut().unwrap().request_ready(!j.inbox.is_empty())).ok_or("Task missing")??;
     durable(hub, id)?;
-    if !remote.labels.contains(&r.label) { tracker::readiness(&r, &issue.key, true).await?; }
+    if !tracker::has_label(&r, &remote.labels, &r.label) { tracker::readiness(&r, &issue.key, true).await?; }
     edit(hub, id, |p| { p.ready = true; p.action = Action::Draft; });
     hub.persist(id)?;
     Ok(if hub.state.lock().unwrap().automation { "Ready for build — waiting for issue intake." } else { "Ready — intake paused. Ctrl-A enables intake when you choose." }.into())

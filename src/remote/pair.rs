@@ -68,6 +68,12 @@ fn load(dir: &Path) -> Vec<Pending> {
     std::fs::read(pending_path(dir)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
+/// Codes are made and used up under one lock shared with other processes: a code is used once,
+/// and making a code never brings back one that was used meanwhile.
+fn lock(dir: &Path) -> Result<crate::proc::FileLock, String> {
+    crate::proc::FileLock::wait(&dir.join("pending.lock"), std::time::Duration::from_secs(10))
+}
+
 fn save(dir: &Path, all: &[Pending]) -> anyhow::Result<()> {
     super::pki::write_private(&pending_path(dir), serde_json::to_string(all)?.as_bytes())
 }
@@ -82,6 +88,7 @@ pub fn issue(dir: &Path, iface: &Iface, ttl_secs: u64) -> anyhow::Result<String>
     getrandom::getrandom(&mut raw).map_err(|e| anyhow::anyhow!("no randomness: {}", e))?;
     let token: String = raw.iter().map(|b| format!("{:02x}", b)).collect();
     let now = chrono::Utc::now().timestamp();
+    let _lock = lock(dir).map_err(anyhow::Error::msg)?;
     let mut all: Vec<Pending> = load(dir).into_iter().filter(|p| p.expires > now).collect();
     all.push(Pending { token_sha256: hash(&token), expires: now + ttl_secs as i64, ip: iface.ip, prefix: iface.prefix });
     save(dir, &all)?;
@@ -92,6 +99,7 @@ pub fn issue(dir: &Path, iface: &Iface, ttl_secs: u64) -> anyhow::Result<String>
 /// somewhere it should not have been.
 pub fn redeem(dir: &Path, token: &str, peer: IpAddr) -> Result<(), String> {
     let now = chrono::Utc::now().timestamp();
+    let _lock = lock(dir)?;
     let all = load(dir);
     let h = hash(token);
     let found = all.iter().find(|p| p.token_sha256 == h).cloned();
@@ -162,6 +170,21 @@ mod tests {
 
         let t = issue(&dir, &wlan, 0).unwrap();
         assert!(redeem(&dir, &t, ip("192.168.1.77")).unwrap_err().contains("expired"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_code_redeemed_at_once_by_many_works_for_one() {
+        let dir = std::env::temp_dir().join(format!("forkdeck-pair-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = issue(&dir, &pick(&lan(), None).unwrap(), 120).unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let tries: Vec<_> = (0..8).map(|_| {
+            let (dir, t, start) = (dir.clone(), t.clone(), start.clone());
+            std::thread::spawn(move || { start.wait(); redeem(&dir, &t, ip("192.168.1.77")).is_ok() })
+        }).collect();
+        let won = tries.into_iter().map(|h| h.join().unwrap()).filter(|ok| *ok).count();
+        assert_eq!(won, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -370,6 +370,14 @@ fn main() -> anyhow::Result<()> {
             RemoteCmd::Serve => {
                 anyhow::ensure!(hub.cfg.remote.enabled, "[remote] enabled = false in the config");
                 rt.block_on(hub.detect_agents());
+                // As the interface does: earlier tasks come back for the phone to see and reply to,
+                // cut-off ones continue, and running ones are saved as they go.
+                hub.start_autosave();
+                for id in hub.restore() {
+                    if let Err(e) = rt.block_on(hub.resume(id)) {
+                        hub.log("queue", format!("#{} not resumed: {}", id, e));
+                    }
+                }
                 rt.spawn(issues::poll_loop(hub.clone()));
                 rt.spawn(team::watch_loop(hub.clone()));
                 let stopped = rt.block_on(async {
@@ -379,6 +387,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 });
                 rt.block_on(hub.shutdown(Duration::from_secs(45)));
+                record_owed(&hub);
                 proc::kill_all();
                 stopped
             }
