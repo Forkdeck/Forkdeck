@@ -1201,8 +1201,8 @@ const MACHINE: &str = "0123456789abcdef";
 
 /// Seconds since the epoch as the forge would print them.
 fn forge_time(ago_secs: i64) -> String {
-    let out = Command::new("date").args(["-u", "-d", &format!("@{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - ago_secs), "+%Y-%m-%dT%H:%M:%SZ"]).output().unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    // Not `date -d`: that is GNU date only, and macOS has BSD date.
+    (chrono::Utc::now() - chrono::Duration::seconds(ago_secs)).format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 impl Rig {
@@ -1497,7 +1497,8 @@ fn this_host() -> String {
 fn no_hostname_is_posted_on_a_public_repository() {
     let host = this_host();
     assert!(!host.is_empty());
-    let named = format!(r#""host":"{}""#, host);
+    // The start of it: a long hostname (CI machines have them) is shortened in the claim.
+    let named = format!(r#""host":"{}"#, host.chars().take(40).collect::<String>());
 
     // Private: teammates see which machine it is.
     let rig = Rig::new("team-private", TEAM, "");
@@ -1596,7 +1597,8 @@ fn a_job_that_fails_after_it_was_released_leaves_the_labels_to_the_new_holder() 
     let release = format!("echo change >> by_agent.txt; FAKE_LOGIN=bob {} team release o/r#7 --force > {}/release.out 2>&1", env!("CARGO_BIN_EXE_forkdeck"), rig.root.display());
     let (ok, out) = rig.once(&[("FAKE_WORK", &release), ("FAKE_VERDICT", "FAIL")]);
     assert!(!ok, "{}", out);
-    assert!(out.contains("not reported on the forge: bob has taken this over"), "{}", out);
+    // The failure path or the heartbeat may notice the release first; either way nothing is said.
+    assert!(out.contains("not reported on the forge: bob has taken this over") || out.contains("stopped: bob has taken this over"), "{}", out);
     let calls = rig.calls();
     assert!(!calls.contains("agent:needs-human") && !calls.contains("issue comment"), "the failure label would overwrite the next holder's:\n{}", calls);
     assert_eq!(calls.matches("--remove-label").count(), 2, "one label move to claim, one by the release, none after:\n{}", calls);
@@ -1836,6 +1838,14 @@ fn a_typed_task_stopped_midway_still_counts_toward_the_token_limit() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(reviewing.exists(), "the review never started");
+    // A hard kill counts what forkdeck had saved: wait until the worker's usage is in the history.
+    let db = rig.root.join("home/.local/state/forkdeck/forkdeck.db");
+    let saved = || rusqlite::Connection::open(&db).ok().and_then(|c| c.query_row("SELECT used FROM jobs WHERE used LIKE '%5000%'", [], |r| r.get::<_, String>(0)).ok()).is_some();
+    for _ in 0..300 {
+        if saved() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(saved(), "the worker's usage was never saved");
     Command::new("kill").args([signal, &child.id().to_string()]).status().unwrap();
     let _ = child.wait();
     rig.issue();
@@ -2098,12 +2108,13 @@ fn a_typed_task_cut_off_by_a_stop_continues_its_own_conversation_later() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("forkdeck starts");
-    for _ in 0..100 {
-        if fs::read_to_string(&log).map(|l| l.contains("acceptEdits")).unwrap_or(false) {
-            break;
-        }
+    // Up to 30 s for the agent to start: a loaded machine is slow to get there.
+    let started = || fs::read_to_string(&log).map(|l| l.contains("acceptEdits")).unwrap_or(false);
+    for _ in 0..300 {
+        if started() { break; }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    assert!(started(), "the agent never started");
     Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
     let out = child.wait_with_output().unwrap();
     let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -2284,7 +2295,7 @@ fn run_planned(rig: &Rig, typed: &str) -> (bool, String) {
         .expect("forkdeck starts");
     let seen = tee(&mut child);
     if typed.trim().parse::<usize>().is_err() {
-        for _ in 0..200 {
+        for _ in 0..600 {
             if seen.lock().unwrap().contains("pick 1") { break; }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -2820,7 +2831,8 @@ fn two_processes_cannot_replace_an_active_issue_worktree() {
     let release = rig.root.join("release");
     let work = format!("echo original > valuable.txt; touch {}; i=0; while [ ! -f {} ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done", marker.display(), release.display());
     let first = rig.command(&[("FAKE_WORK", &work)]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
-    for _ in 0..200 {
+    // Up to 30 s for its agent to start: a loaded machine is slow to get there.
+    for _ in 0..1200 {
         if marker.exists() { break; }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -2946,7 +2958,7 @@ fn a_claude_error_result_and_nonzero_exit_cannot_become_success() {
 
 #[test]
 fn a_final_agent_event_does_not_wait_forever_for_the_cli_or_escaped_pipes() {
-    let cli = "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\ncat >/dev/null\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}'\nsetsid sh -c 'sleep 8' &\nsleep 600\n";
+    let cli = "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\ncat >/dev/null\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}'\npython3 -c 'import os, time; os.setsid(); time.sleep(8)' &\nsleep 600\n";
     let rig = Rig::with_agents("agent-drain", "", "", &[("claude", cli)]);
     let start = std::time::Instant::now();
     let (ok, out) = rig.run(&["run", "--agent", "claude", "fix typo"], &[]);

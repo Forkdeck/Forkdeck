@@ -48,7 +48,15 @@ impl Plan {
         Ok(Self { provider: r.provider, repo: r.repo.clone(), host: r.host.clone(), issue, identity, revision: 0, draft: String::new(), review: String::new(), reviewed: None, accepted: None, published: None, base: None, remote_context: String::new(), pending: None, action: Action::Draft, ready: false, build_job: None })
     }
 
-    pub fn invalidate(&mut self) { self.reviewed = None; }
+    /// Feedback arrived: this revision is no longer reviewed, nor ready for build.
+    pub fn invalidate(&mut self) { self.reviewed = None; self.ready = false; }
+    /// Another task's plan for the same issue, which this one must not be attached beside: intake
+    /// waits while any plan for an issue is unready, so a second would hold it up for good.
+    pub fn taken_by(&self, jobs: &[Job], except: Option<u32>) -> Option<u32> {
+        let i = self.issue.as_ref()?;
+        jobs.iter().find(|j| Some(j.id) != except && j.issue_plan.as_ref().is_some_and(|o| o.provider == self.provider && o.repo == self.repo && o.host == self.host && o.issue.as_ref().is_some_and(|oi| oi.key == i.key))).map(|j| j.id)
+    }
+
     /// Planned for this configured repository: same forge, name and host.
     pub fn is_for(&self, r: &RepoCfg) -> bool {
         self.provider == r.provider && self.repo == r.repo && self.host == r.host
@@ -144,6 +152,9 @@ pub async fn publish(hub: &Hub, id: u32) -> Result<String, String> {
                 tracker::find_created(&r, &format!("<!-- forkdeck:revision {} -->", op.token)).await?
                     .ok_or("The previous create may still be in flight. Retry reconciliation later; no second issue was created.")?
             } else {
+                // The forge answers now, so a failure after this is one the create may have survived,
+                // and one before it (not logged in, CLI missing) never sent anything.
+                tracker::reachable(&r).await?;
                 edit(hub, id, |p| p.pending.as_mut().unwrap().create_attempted = true);
                 if let Err(e) = durable(hub, id) {
                     edit(hub, id, |p| p.pending.as_mut().unwrap().create_attempted = false);
@@ -181,12 +192,19 @@ pub async fn publish(hub: &Hub, id: u32) -> Result<String, String> {
             }
         };
         durable(hub, id)?;
+        // The forges have no conditional update for an issue body: read it once more right before
+        // writing, so a person's edit made meanwhile is not overwritten. A retry starts from it.
+        let latest = tracker::read(&r, &remote.reference.key).await?;
+        if latest.body != remote.body {
+            return Err("The issue was edited while the plan was being published; retry to publish against the latest text.".into());
+        }
         tracker::update(&r, &remote.reference.key, &body).await?;
     }
     let marker = format!("<!-- forkdeck:history {} -->", op.token);
     let comments = tracker::history(&r, &remote.reference.key).await?;
     if !comments.iter().any(|c| c.body.contains(&marker)) {
         if op.comment_attempted { return Err("The previous history comment may still be in flight. Retry reconciliation later; no duplicate was posted.".into()); }
+        tracker::reachable(&r).await?;
         edit(hub, id, |p| p.pending.as_mut().unwrap().comment_attempted = true);
         if let Err(e) = durable(hub, id) {
             edit(hub, id, |p| p.pending.as_mut().unwrap().comment_attempted = false);

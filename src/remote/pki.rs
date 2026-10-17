@@ -39,7 +39,10 @@ pub fn private_dir(dir: &Path) -> anyhow::Result<()> {
 pub fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("tmp");
+    // A name of its own: `ca.der` and `ca.key` would otherwise both be written through `ca.tmp`.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{}.{}.{}.tmp", path.file_name().and_then(|f| f.to_str()).unwrap_or("file"), std::process::id(), n));
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;
@@ -50,6 +53,8 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 impl Ca {
     pub fn load_or_create(dir: &Path) -> anyhow::Result<Ca> {
         private_dir(dir)?;
+        // A forkdeck starting and `forkdeck remote pair` at once must not make two authorities.
+        let _lock = crate::proc::FileLock::wait(&dir.join("ca.lock"), std::time::Duration::from_secs(10)).map_err(anyhow::Error::msg)?;
         let (cert_path, key_path) = (dir.join("ca.der"), dir.join("ca.key"));
         if cert_path.exists() && key_path.exists() {
             let der = CertificateDer::from(std::fs::read(&cert_path)?);

@@ -92,6 +92,9 @@ pub async fn serve(hub: Hub) -> anyhow::Result<()> {
     }
 }
 
+/// Calls one connection may have under way at once.
+const MAX_CALLS: usize = 32;
+
 async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::Result<()> {
     let local = tcp.local_addr()?.ip();
     let same = pair::same_subnet(local, peer.ip(), &pair::interfaces());
@@ -118,6 +121,8 @@ async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::
         let _ = sink.close().await;
     });
     let mut streams: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
+    // Calls under way: each holds a sender to the writer, so they end with the connection.
+    let mut calls = tokio::task::JoinSet::new();
     let mut recheck = tokio::time::interval(RECHECK);
     let mut revoked = false;
     loop {
@@ -126,8 +131,16 @@ async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::
                 let Some(Ok(msg)) = msg else { break };
                 match msg {
                     InboundServerMessage::Unary(ClientMessage::Request(req), _) => {
+                        // A bounded number at once: a client that only sends could otherwise grow this without end.
+                        if calls.len() >= MAX_CALLS {
+                            let busy = Reply::Err { msg: "too many calls at once".into() };
+                            // Never waited on here: a phone that stops reading would hold this loop, and
+                            // with it the revocation check. One whose queue is full is dropped.
+                            if out.try_send(OutboundServerMessage::Unary(Response { request_id: req.id, message: Ok(busy) }, None)).is_err() { break; }
+                            continue;
+                        }
                         let (ctx, out, device) = (ctx.clone(), out.clone(), device.clone());
-                        tokio::spawn(async move {
+                        calls.spawn(async move {
                             let reply = match &device {
                                 Some(d) => call(&ctx, d, req.message).await,
                                 None => pairing(&ctx, peer.ip(), req.message).await,
@@ -139,11 +152,15 @@ async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::
                     InboundServerMessage::Stream(StreamClientMessage::Open { stream_id, method_id, message, .. }, _) => {
                         match (method_id, message, device.is_some()) {
                             (SUBSCRIBE, Call::Subscribe { since }, true) => {
-                                streams.insert(stream_id, tokio::spawn(subscribe(ctx.clone(), out.clone(), stream_id, since)));
+                                // An id used again replaces its stream: the old one stops, or it would
+                                // run on where nothing can reach it, revocation included.
+                                if let Some(old) = streams.insert(stream_id, tokio::spawn(subscribe(ctx.clone(), out.clone(), stream_id, since))) {
+                                    old.abort();
+                                }
                             }
                             _ => {
                                 let error = StreamError::new(std::io::ErrorKind::PermissionDenied, "no such stream");
-                                let _ = out.send(OutboundServerMessage::Stream(StreamServerMessage::Error { stream_id, error }, None)).await;
+                                if out.try_send(OutboundServerMessage::Stream(StreamServerMessage::Error { stream_id, error }, None)).is_err() { break; }
                             }
                         }
                     }
@@ -155,6 +172,8 @@ async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::
                     InboundServerMessage::Stream(StreamClientMessage::Data { .. }, _) => {}
                 }
             }
+            // Finished calls are collected as they end.
+            Some(_) = calls.join_next(), if !calls.is_empty() => {}
             _ = recheck.tick(), if fp.is_some() => {
                 if fp.as_deref().and_then(|fp| ctx.devices.lookup(fp)).is_none() {
                     revoked = true;
@@ -166,8 +185,14 @@ async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::
     for (_, h) in streams {
         h.abort();
     }
+    calls.abort_all();
     drop(out);
-    let _ = writer.await;
+    if revoked {
+        // Closed at once: nothing more goes to a phone that is no longer paired.
+        writer.abort();
+    } else {
+        let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
+    }
     if revoked {
         ctx.hub.log("remote", format!("{} revoked, disconnected", device.unwrap_or_default()));
     }

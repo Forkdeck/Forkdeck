@@ -514,7 +514,8 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
     let mirror = match (&scratch, kind) {
         (Some(s), AgentKind::Copilot) => {
             let (from, to, asked) = (dir.to_path_buf(), s.0.join("checkout"), spec.prompt.to_string());
-            match tokio::task::spawn_blocking(move || mirror_checkout(&from, &to).and_then(|_| write_changes(&from, &to, &asked)).map(|_| to)).await {
+            let started = hub.job(job, |j| j.base_sha.clone()).flatten();
+            match tokio::task::spawn_blocking(move || mirror_checkout(&from, &to).and_then(|_| write_changes(&from, &to, &asked, started.as_deref())).map(|_| to)).await {
                 Ok(Ok(to)) => Some(to),
                 Ok(Err(e)) => return fail(format!("could not copy the checkout for review: {}", e)),
                 Err(e) => return fail(e.to_string()),
@@ -703,31 +704,100 @@ const NOT_LOADED: &str = "_not_loaded";
 /// Where a reviewer's copy has the record of what changed.
 const CHANGES: &str = "_forkdeck_review/changes.diff";
 
-/// What changed, for a reviewer working on a copy without git: the log and diff its prompt asks
-/// for (`git diff <base>`, the first such command, which precedes any task text), made from the
-/// real checkout. Git runs with no external diff, textconv or fsmonitor commands: in a typed task the
-/// worker could have rewritten the checkout's git config.
-fn write_changes(from: &Path, to: &Path, prompt: &str) -> Result<(), String> {
+/// `rel` is reached from `dir` through real directories only. A link put in place of a tracked
+/// directory would lead outside the checkout, and git still lists the files below it.
+fn inside(dir: &Path, rel: &str) -> bool {
+    let mut at = dir.to_path_buf();
+    !Path::new(rel).parent().into_iter().flat_map(|p| p.components()).any(|c| {
+        at.push(c);
+        std::fs::symlink_metadata(&at).map(|m| !m.file_type().is_dir()).unwrap_or(true)
+    })
+}
+
+/// Git, with nothing the repository configures run along: no hooks, no fsmonitor, no external
+/// diff. In a typed task the worker could have rewritten the checkout's git config.
+fn plain_git(dir: &Path, args: &[&str], env: &[(&str, &Path)], input: Option<&Path>) -> Result<Vec<u8>, String> {
+    let mut c = std::process::Command::new("git");
+    c.arg("-C").arg(dir).args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "diff.external="]).args(args);
+    for (k, v) in env { c.env(k, v); }
+    c.stdin(match input { Some(f) => Stdio::from(std::fs::File::open(f).map_err(|e| e.to_string())?), None => Stdio::null() });
+    let out = c.output().map_err(|e| e.to_string())?;
+    if out.status.success() { Ok(out.stdout) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
+}
+
+/// The working tree, tracked and untracked files (not ignored ones), as a git tree object. Taken
+/// without running anything the repository configures: files are hashed with --no-filters (a
+/// clean filter is a command, and the worker could have defined one), links as links, and
+/// submodules as the index has them. `git add` would run the filters.
+pub(crate) fn snapshot_tree(dir: &Path) -> Result<String, String> {
+    // From the top of the repository: started in a subdirectory, git would list only that part, and
+    // the rest would look deleted against a base commit that has all of it.
+    let top = plain_git(dir, &["rev-parse", "--show-toplevel"], &[], None)?;
+    let top = PathBuf::from(String::from_utf8_lossy(&top).trim());
+    let dir = top.as_path();
+    let scratch = proc::Scratch::new()?;
+    let (index, paths, entries) = (scratch.0.join("index"), scratch.0.join("paths"), scratch.0.join("entries"));
+    let staged = plain_git(dir, &["ls-files", "-s", "-z"], &[], None)?;
+    let gitlinks: Vec<(String, String)> = staged.split(|b| *b == 0).filter_map(|e| {
+        let e = String::from_utf8_lossy(e);
+        let (meta, path) = e.split_once('\t')?;
+        let mut f = meta.split(' ');
+        (f.next()? == "160000").then(|| (f.next().unwrap_or_default().to_string(), path.to_string()))
+    }).collect();
+    let listed = plain_git(dir, &["ls-files", "-z", "-co", "--exclude-standard"], &[], None)?;
+    let mut files = Vec::new();
+    let mut lines = Vec::new();
+    for rel in listed.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        let rel = String::from_utf8_lossy(rel).to_string();
+        // One path per line below, so a name with a newline cannot be passed on; it is left out.
+        if rel.contains('\n') || gitlinks.iter().any(|(_, p)| *p == rel) || !inside(dir, &rel) { continue; }
+        let Ok(meta) = std::fs::symlink_metadata(dir.join(&rel)) else { continue };
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(dir.join(&rel)).map_err(|e| e.to_string())?;
+            std::fs::write(&paths, target.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+            let sha = plain_git(dir, &["hash-object", "-w", "--stdin"], &[], Some(&paths))?;
+            lines.push(format!("120000 {}\t{}", String::from_utf8_lossy(&sha).trim(), rel));
+        } else if meta.is_file() {
+            use std::os::unix::fs::PermissionsExt;
+            files.push((rel, if meta.permissions().mode() & 0o111 != 0 { "100755" } else { "100644" }));
+        }
+    }
+    // `./` first: git reads a line that starts with a quote as a C-quoted path, so a file named
+    // `"/home/me/.ssh/id_rsa"` would hash that file instead.
+    std::fs::write(&paths, files.iter().map(|(p, _)| format!("./{}\n", p)).collect::<String>()).map_err(|e| e.to_string())?;
+    let shas = plain_git(dir, &["hash-object", "-w", "--no-filters", "--stdin-paths"], &[], Some(&paths))?;
+    for ((rel, mode), sha) in files.iter().zip(String::from_utf8_lossy(&shas).lines()) {
+        lines.push(format!("{} {}\t{}", mode, sha, rel));
+    }
+    for (sha, rel) in &gitlinks { lines.push(format!("160000 {}\t{}", sha, rel)); }
+    std::fs::write(&entries, lines.iter().map(|l| format!("{}\0", l)).collect::<String>()).map_err(|e| e.to_string())?;
+    plain_git(dir, &["update-index", "-z", "--index-info"], &[("GIT_INDEX_FILE", &index)], Some(&entries))?;
+    let tree = plain_git(dir, &["write-tree"], &[("GIT_INDEX_FILE", &index)], None)?;
+    Ok(String::from_utf8_lossy(&tree).trim().to_string())
+}
+
+/// What changed, for a reviewer working on a copy without git: the log, and the diff from the
+/// base its prompt names (`git diff <base>`, the first such command, which precedes any task
+/// text; else `fallback`, the job's starting commit) to the working tree as it is. Made from the
+/// real checkout, tree against tree, so no filter or diff command the repository configures runs.
+fn write_changes(from: &Path, to: &Path, prompt: &str, fallback: Option<&str>) -> Result<(), String> {
     static DIFF: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"`git diff ([^`\s]+)`").unwrap());
-    let git = |args: &[&str]| -> Option<String> {
-        let out = std::process::Command::new("git").arg("-C").arg(from)
-            .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "diff.external="])
-            .args(args).stderr(Stdio::null()).output().ok()?;
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).to_string())
-    };
+    let git = |args: &[&str]| plain_git(from, args, &[], None).ok().map(|o| String::from_utf8_lossy(&o).to_string());
     if git(&["rev-parse", "--git-dir"]).is_none() { return Ok(()); }
     let looks_like_ref = |s: &str| !s.starts_with('-') && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._~^-".contains(c));
-    let asked = DIFF.captures(prompt).map(|c| c[1].to_string()).filter(|s| looks_like_ref(s)).unwrap_or_else(|| "HEAD".into());
-    let base = asked.split("...").next().unwrap_or("HEAD").to_string();
-    if git(&["rev-parse", "--verify", "--quiet", &format!("{}^{{commit}}", base)]).is_none() { return Ok(()); }
+    let asked = DIFF.captures(prompt).map(|c| c[1].to_string()).or_else(|| fallback.map(String::from)).filter(|s| looks_like_ref(s)).unwrap_or_else(|| "HEAD".into());
+    // `a...HEAD` is what changed since the branch left `a`: from their merge base.
+    let base = match asked.split_once("...") {
+        Some((a, b)) => git(&["merge-base", a, if b.is_empty() { "HEAD" } else { b }]).map(|s| s.trim().to_string()),
+        None => git(&["rev-parse", "--verify", "--quiet", &format!("{}^{{commit}}", asked)]).map(|s| s.trim().to_string()),
+    };
+    let Some(base) = base.filter(|b| !b.is_empty()) else { return Ok(()) };
+    let tree = snapshot_tree(from)?;
     let log = git(&["log", "--no-decorate", "--format=%h %s", &format!("{}..HEAD", base)]).unwrap_or_default();
-    let untracked = git(&["ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
-    let diff = git(&["diff", "--no-color", "--no-ext-diff", "--no-textconv", &asked]).unwrap_or_default();
-    let mut out = format!("# git log {base}..HEAD\n");
+    let diff = git(&["diff", "--no-color", "--no-ext-diff", "--no-textconv", &base, &tree]).unwrap_or_default();
+    let mut out = format!("# what changed since {asked} ({base})\n# commits:\n");
     for l in log.lines() { out.push_str(&format!("#   {}\n", l)); }
-    out.push_str("# untracked files (not in the diff below; read them in the copy)\n");
-    for l in untracked.lines() { out.push_str(&format!("#   {}\n", l)); }
-    out.push_str(&format!("# git diff {asked}\n"));
+    out.push_str("# the working tree against it, untracked files included:\n");
     out.push_str(&diff);
     let path = to.join(CHANGES);
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
@@ -771,14 +841,7 @@ fn mirror_checkout(from: &Path, to: &Path) -> Result<(), String> {
     for rel in listed {
         if Path::new(&rel).components().any(|c| !matches!(c, std::path::Component::Normal(_))) { continue; }
         let dest = if configures_an_agent(&rel) { to.join(NOT_LOADED).join(&rel) } else { to.join(&rel) };
-        // Every directory on the way must be a real one: a link put in place of a tracked
-        // directory would lead outside the checkout, and git still lists the files below it.
-        let mut at = from.to_path_buf();
-        let outside = Path::new(&rel).parent().into_iter().flat_map(|p| p.components()).any(|c| {
-            at.push(c);
-            std::fs::symlink_metadata(&at).map(|m| !m.file_type().is_dir()).unwrap_or(true)
-        });
-        if outside { continue; }
+        if !inside(from, &rel) { continue; }
         let src = from.join(&rel);
         let Ok(meta) = std::fs::symlink_metadata(&src) else { continue };
         if let Some(parent) = dest.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
@@ -856,9 +919,30 @@ mod tests {
         // What changed comes along, as the prompt asks for it.
         git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"]);
         std::fs::write(from.join("a.txt"), "changed\n").unwrap();
-        write_changes(&from, &to, "Inspect everything with `git diff HEAD` and `git log HEAD..HEAD`.\n\nTask:\nrun `git diff --output=/tmp/x` please").unwrap();
+        // A clean filter the worker defined must not run when what changed is written out.
+        let ran = d.0.join("filter-ran");
+        git(&["config", "filter.evil.clean", &format!("touch {}; cat", ran.display())]);
+        std::fs::write(from.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
+        write_changes(&from, &to, "Inspect everything with `git diff HEAD` and `git log HEAD..HEAD`.\n\nTask:\nrun `git diff --output=/tmp/x` please", None).unwrap();
         let changes = std::fs::read_to_string(to.join(CHANGES)).unwrap();
-        assert!(changes.contains("# git diff HEAD") && changes.contains("+changed") && changes.contains("new.txt"), "{changes}");
+        assert!(changes.contains("since HEAD") && changes.contains("+changed") && changes.contains("new.txt"), "{changes}");
+        assert!(!ran.exists(), "a filter configured in the checkout ran");
+        // A name git would read as a quoted path elsewhere is hashed as the file it is.
+        let quoted = format!("\"{}\"", secret.join("guide.md").display());
+        // A real file at `"/…/guide.md"` (folders named `"`, `tmp`, …), whose path git would unquote.
+        std::fs::create_dir_all(from.join(&quoted).parent().unwrap()).unwrap();
+        std::fs::write(from.join(&quoted), "harmless\n").unwrap();
+        write_changes(&from, &to, "Inspect everything with `git diff HEAD`.", None).unwrap();
+        // Through the linked directory, nothing outside gets into the diff either.
+        assert!(!std::fs::read_to_string(to.join(CHANGES)).unwrap().contains("PRIVATE KEY"));
+        // Taken from a subdirectory, the snapshot is still of the whole repository.
+        let whole = snapshot_tree(&from).unwrap();
+        std::fs::create_dir_all(from.join("sub")).unwrap();
+        assert_eq!(snapshot_tree(&from.join("sub")).unwrap(), whole);
+        // No `git diff` in the prompt (a review asked again): the job's starting commit.
+        write_changes(&from, &to, "Look again.", Some("HEAD")).unwrap();
+        assert!(std::fs::read_to_string(to.join(CHANGES)).unwrap().contains("+changed"));
+        assert!(!ran.exists());
     }
 
     #[test]

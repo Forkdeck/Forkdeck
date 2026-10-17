@@ -19,20 +19,15 @@ can be a server on your own machine.
 cargo install --git https://github.com/forkdeck/forkdeck
 ```
 
-Or take a binary from the [releases](https://github.com/forkdeck/forkdeck/releases):
-static Linux builds (`linux-amd64`, `linux-arm64`) and macOS builds
-(`macos-arm64` for Apple silicon, `macos-amd64` for Intel). Each archive comes
+Or take a static Linux binary (`linux-amd64` or `linux-arm64`) from the
+[releases](https://github.com/forkdeck/forkdeck/releases). Each archive comes
 with a `.sha256` checksum and a CycloneDX SBOM (`.cdx.json`, also inside the
 archive as `SBOM.cdx.json`) listing every crate built into the binary:
 
 ```
-sha256sum --check forkdeck-v0.1.0-linux-amd64.tar.gz.sha256    # macOS: shasum -a 256 --check
+sha256sum --check forkdeck-v0.1.0-linux-amd64.tar.gz.sha256
 tar -xzf forkdeck-v0.1.0-linux-amd64.tar.gz
 ```
-
-The macOS binaries are not signed. Downloaded with a browser, macOS refuses to
-open one; download with `curl -LO`, or clear the flag with
-`xattr -d com.apple.quarantine forkdeck`.
 
 A release is cut by pushing a tag `vX.Y.Z` that matches the version in
 `Cargo.toml`; `.github/workflows/release.yaml` tests, builds, writes the SBOMs

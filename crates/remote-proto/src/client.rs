@@ -152,7 +152,9 @@ impl Client {
             }
             let _ = sink.close().await;
         });
-        let (p, s, c) = (pending.clone(), streams.clone(), closed.clone());
+        // Weak: the reader must not keep the writer, and with it the connection, alive once the
+        // client is dropped.
+        let (p, s, c, cancel) = (pending.clone(), streams.clone(), closed.clone(), out.downgrade());
         tokio::spawn(async move {
             while let Some(Ok(msg)) = rx.next().await {
                 match msg {
@@ -169,6 +171,10 @@ impl Client {
                         if let Some(tx) = streams.get(&stream_id) {
                             if tx.try_send((seq, event)).is_err() {
                                 streams.remove(&stream_id);
+                                // And the server stops sending it, or each catch-up would add a stream.
+                                if let Some(out) = cancel.upgrade() {
+                                    let _ = out.try_send(OutboundClientMessage::Stream(StreamClientMessage::Cancel { stream_id }, None));
+                                }
                             }
                         }
                     }
@@ -247,6 +253,12 @@ impl Client {
         let stream_id = (1u64 << 62) | self.next.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel(1024);
         self.streams.lock().unwrap().insert(stream_id, tx);
+        // Checked after registering, as `call` does: once the reader has gone, nothing would ever
+        // remove this sender, and the receiver would wait for good.
+        if self.closed.load(Ordering::SeqCst) {
+            self.streams.lock().unwrap().remove(&stream_id);
+            return Err(err("disconnected"));
+        }
         let open = StreamClientMessage::Open {
             stream_id,
             method_id: SUBSCRIBE,
@@ -256,7 +268,10 @@ impl Client {
             sampling: 0,
             message: Call::Subscribe { since },
         };
-        self.out.send(OutboundClientMessage::Stream(open, None)).await.map_err(|_| err("disconnected"))?;
+        if self.out.send(OutboundClientMessage::Stream(open, None)).await.is_err() {
+            self.streams.lock().unwrap().remove(&stream_id);
+            return Err(err("disconnected"));
+        }
         Ok(rx)
     }
 }

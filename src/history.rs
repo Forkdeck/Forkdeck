@@ -8,7 +8,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// How many jobs are kept; older ones are removed when forkdeck starts.
+/// A job whose issue plan is still in progress: a publication pending, or not yet marked ready for build.
+/// Resolved is what `Plan::ready_for_intake` says: ready, nothing pending, and the current revision
+/// reviewed, accepted and published.
+const UNRESOLVED_PLAN: &str = "(issue_plan IS NOT NULL AND NOT (json_extract(issue_plan, '$.ready') IS 1 \
+    AND json_extract(issue_plan, '$.pending') IS NULL \
+    AND json_extract(issue_plan, '$.reviewed') IS json_extract(issue_plan, '$.revision') \
+    AND json_extract(issue_plan, '$.accepted') IS json_extract(issue_plan, '$.revision') \
+    AND json_extract(issue_plan, '$.published') IS json_extract(issue_plan, '$.revision')))";
+
+/// How many jobs are kept; older ones are removed when forkdeck starts. Issue plans still in
+/// progress are kept as well, whatever their age.
 pub const KEEP: usize = 200;
 
 /// Schema changes, in order. `PRAGMA user_version` says how many have been applied.
@@ -165,7 +175,8 @@ impl StageRecord {
         };
         Stage {
             unprinted: 0,
-            pushed: 0,
+            // As if the restored lines had just been pushed: a viewer's offsets stay inside the tail.
+            pushed: self.tail.len() as u64,
             agent: self.agent,
             via: self.via,
             session: None,
@@ -444,8 +455,14 @@ impl History {
     }
 
     /// The newest `limit` jobs, oldest first. Rows that were reserved but never saved are skipped.
+    /// Also every issue plan still in progress, however old: it is working state, holding drafts and
+    /// the tokens that reconcile an uncertain write, not history.
     pub fn load(&self, limit: usize) -> Result<Vec<JobRecord>, String> {
-        self.load_where("1 = ?1", 1, limit)
+        let mut out = self.load_where("1 = ?1", 1, limit)?;
+        let newest_kept = out.first().map(|r| r.id as i64).unwrap_or(i64::MAX);
+        let mut older = self.load_where(&format!("id < ?1 AND {}", UNRESOLVED_PLAN), newest_kept, usize::MAX >> 1)?;
+        older.append(&mut out);
+        Ok(older)
     }
 
     fn load_where(&self, filter: &str, arg: i64, limit: usize) -> Result<Vec<JobRecord>, String> {
@@ -540,7 +557,7 @@ impl History {
         let db = self.db.lock().unwrap();
         let cut: Option<i64> = db.query_row("SELECT id FROM jobs ORDER BY id DESC LIMIT 1 OFFSET ?1", params![keep as i64], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
         match cut {
-            Some(c) => db.execute("DELETE FROM jobs WHERE id <= ?1", params![c]).map_err(|e| e.to_string()),
+            Some(c) => db.execute(&format!("DELETE FROM jobs WHERE id <= ?1 AND NOT ({})", UNRESOLVED_PLAN), params![c]).map_err(|e| e.to_string()),
             None => Ok(0),
         }
     }
@@ -650,6 +667,26 @@ mod tests {
         }
         let r = history.get(id).unwrap().unwrap();
         assert_eq!((r.status, r.outcome.as_str()), (JobStatus::Done, "final"));
+    }
+
+    #[test]
+    fn an_issue_plan_in_progress_outlives_trimming() {
+        let h = History::in_memory();
+        let cfg: crate::config::Config = toml::from_str("[[repos]]\nprovider='github'\nrepo='a/b'\npath='/tmp'\n").unwrap();
+        let plan = crate::planning::Plan::new(&cfg.repos[0], "7").unwrap();
+        let mut ready = plan.clone();
+        (ready.ready, ready.revision, ready.reviewed, ready.accepted, ready.published) = (true, 2, Some(2), Some(2), Some(2));
+        assert!(ready.ready_for_intake());
+        for (plan, title) in [(Some(plan), "unresolved"), (Some(ready), "ready"), (None, "a"), (None, "b"), (None, "c")] {
+            let id = h.new_id().unwrap();
+            let mut j = job(id, Source::Manual, JobStatus::Done);
+            j.title = title.into();
+            j.issue_plan = plan;
+            h.save(&JobRecord::of(&j)).unwrap();
+        }
+        h.prune(2).unwrap();
+        let titles: Vec<String> = h.load(2).unwrap().into_iter().map(|r| r.title).collect();
+        assert_eq!(titles, ["unresolved", "b", "c"], "the plan in progress is kept and loaded; the finished one is history");
     }
 
     #[test]

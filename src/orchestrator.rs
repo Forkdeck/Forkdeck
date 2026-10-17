@@ -320,6 +320,9 @@ impl Hub {
         issue_plan: Option<crate::planning::Plan>,
     ) -> Result<u32, String> {
         let _busy = Busy::enter(&self.busy);
+        if let Some(other) = issue_plan.as_ref().and_then(|p| p.taken_by(&self.state.lock().unwrap_or_else(|e| e.into_inner()).jobs, None)) {
+            return Err(format!("task #{other} already plans this issue; continue there"));
+        }
         // The database hands out ids, so jobs from another forkdeck sharing it never collide.
         let from_db = match self.history.clone() {
             Some(h) => Some(self.rt.spawn_blocking(move || h.new_id()).await.map_err(|e| e.to_string())??),
@@ -405,6 +408,11 @@ impl Hub {
     /// tree and is given the conversation so far. Err says why it was not taken.
     pub async fn reply(&self, id: u32, text: String) -> Result<(), String> {
         let _admission = self.admission.lock().await;
+        self.reply_admitted(id, text).await
+    }
+
+    /// `reply`, for a caller that already holds the admission lock.
+    async fn reply_admitted(&self, id: u32, text: String) -> Result<(), String> {
         // A finished task starts working again: take it over first, as `resume` does, so a second
         // forkdeck that restored the same task cannot run it at the same time.
         let finished_typed = self.job(id, |j| j.source.is_manual() && j.status.finished() && j.in_history).unwrap_or(false);
@@ -488,11 +496,22 @@ impl Hub {
             if !j.status.finished() { return Err("wait for the current turn to finish".into()); }
             let queued = !j.inbox.is_empty();
             let p = j.issue_plan.as_mut().ok_or("select an issue plan")?;
+            let before = p.clone();
             match action {
                 crate::planning::Action::Publish => p.accept(queued)?,
                 crate::planning::Action::Ready => p.request_ready(queued)?,
                 crate::planning::Action::Draft => return Err("use a reply to refine the plan".into()),
             }
+            // Saved while the task is still finished: if the save fails, the plan goes back to how it
+            // was and nothing is left queued without a run to take it.
+            drop(st);
+            if let Err(e) = self.persist(id) {
+                self.job(id, |j| j.issue_plan = Some(before));
+                return Err(e);
+            }
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.stopping { return Err("shutting down".into()); }
+            let j = st.jobs.iter_mut().find(|j| j.id == id).ok_or("select an issue plan")?;
             j.status = JobStatus::Queued;
             j.resume_from = None;
             j.finished = None;
@@ -502,7 +521,6 @@ impl Hub {
             j.active_started = Instant::now();
             j.created = Instant::now();
         }
-        self.persist(id)?;
         let hub = self.clone();
         self.rt.spawn(async move { run_job(hub, id).await });
         Ok(())
@@ -512,20 +530,26 @@ impl Hub {
     pub async fn link_plan(&self, id: u32, plan: crate::planning::Plan, request: String) -> Result<(), String> {
         let workdir = crate::planning::repo(self, &plan)?.path;
         let eligible = |j: &mut Job| j.source.is_manual() && j.status.finished() && j.issue_plan.is_none();
+        // Held from the check to the reply: nothing (a reply from the phone, say) may start the task
+        // in between, or the takeover would replace a job that is running here.
+        let _admission = self.admission.lock().await;
         if !self.job(id, eligible).unwrap_or(false) { return Err("finish the local planning turn before linking an issue".into()); }
         // Taken over first: a takeover reloads the saved job, which would drop a link made before it.
         if self.job(id, |j| j.in_history).unwrap_or(false) {
-            let _admission = self.admission.lock().await;
             self.take_over(id, false).await?;
         }
-        self.job(id, |j| -> Result<(), String> {
-            if !eligible(j) { return Err("finish the local planning turn before linking an issue".into()); }
-            j.issue_plan = Some(plan);
-            j.workdir = workdir;
-            Ok(())
-        }).ok_or("task missing")??;
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(other) = plan.taken_by(&st.jobs, Some(id)) { return Err(format!("task #{other} already plans this issue; continue there")); }
+            st.jobs.iter_mut().find(|j| j.id == id).map(|j| -> Result<(), String> {
+                if !eligible(j) { return Err("finish the local planning turn before linking an issue".into()); }
+                j.issue_plan = Some(plan);
+                j.workdir = workdir;
+                Ok(())
+            }).ok_or("task missing")??;
+        }
         if self.history.is_some() { self.persist(id)?; }
-        self.reply(id, format!("{request}\n\nRefine this into a complete issue implementation plan and submit it for plan review.")).await
+        self.reply_admitted(id, format!("{request}\n\nRefine this into a complete issue implementation plan and submit it for plan review.")).await
     }
 
     /// Pick how a planned task goes ahead.
@@ -1388,12 +1412,9 @@ async fn tree_state(hub: &Hub, id: u32, w: &Work<'_>) -> Option<String> {
     if w.is_issue {
         return hub.job(id, |j| j.staged_tree.clone()).flatten();
     }
-    let scratch = proc::Scratch::new().ok()?;
-    let env = [("GIT_INDEX_FILE", scratch.0.join("index").display().to_string())];
-    issues::sh_env("git", &["read-tree", "HEAD"], Some(w.dir), &env).await.ok()?;
-    issues::sh_env("git", &["add", "-A"], Some(w.dir), &env).await.ok()?;
-    issues::sh_env("git", &["write-tree"], Some(w.dir), &env).await.ok()
-
+    // Without `git add`, which would run any clean filter the worker defined in the checkout.
+    let dir = w.dir.to_path_buf();
+    tokio::task::spawn_blocking(move || agents::snapshot_tree(&dir)).await.ok()?.ok()
 }
 
 async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &Cancel) -> Result<Refined, Finish> {

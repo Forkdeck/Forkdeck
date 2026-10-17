@@ -75,6 +75,8 @@ if method != 'GET':
  artifact=json.loads(row[0])
  if method=='POST' and is_collection: assert artifact['pending']['create_attempted']
  if method=='POST' and is_comments: assert artifact['pending']['comment_attempted']
+if method=='GET' and path=='user':
+ print(json.dumps({'login':'alice','username':'alice'})); sys.exit(0)
 if method=='GET':
  if (root/'fail_read').exists():
   (root/'fail_read').unlink(); print('offline', file=sys.stderr); sys.exit(1)

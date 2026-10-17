@@ -79,6 +79,11 @@ pub fn key(r: &RepoCfg, input: &str) -> Result<String, String> {
     if !matches!(url.scheme(), "http" | "https") || url.query().is_some() || url.fragment().is_some() {
         return Err("Use an issue URL without a query or fragment.".into());
     }
+    // Checked before anything is attached: a link to the same path on another host would otherwise
+    // be saved and then refused on every turn, holding the issue up.
+    if r.host.contains('.') && !url.host_str().is_some_and(|h| h.eq_ignore_ascii_case(&r.host)) {
+        return Err(format!("Issue URL is not on {}, where the selected repository's clone points.", r.host));
+    }
     let prefix = if r.provider == Provider::Github { format!("/{}/issues/", r.repo) } else { format!("/{}/-/issues/", r.repo) };
     let n = url.path().strip_prefix(&prefix).ok_or("Issue URL does not match the selected repository.")?;
     number(n).map(|n| n.to_string())
@@ -86,9 +91,16 @@ pub fn key(r: &RepoCfg, input: &str) -> Result<String, String> {
 
 async fn api(r: &RepoCfg, method: &str, path: &str, data: Option<Value>) -> Result<String, String> {
     let dir = if r.path.is_dir() { Some(r.path.as_path()) } else { None };
+    let host = r.host_args();
+    let mut args: Vec<&str> = vec!["api"];
+    args.extend(host.iter().map(String::as_str));
     if let Some(data) = data {
-        issues::sh_in(tool(r), &["api", "-X", method, path, "--input", "-", "-H", "Content-Type: application/json"], dir, &data.to_string()).await
-    } else { issues::sh(tool(r), &["api", path], dir).await }
+        args.extend(["-X", method, path, "--input", "-", "-H", "Content-Type: application/json"]);
+        issues::sh_in(tool(r), &args, dir, &data.to_string()).await
+    } else {
+        args.push(path);
+        issues::sh(tool(r), &args, dir).await
+    }
 }
 
 fn parse(r: &RepoCfg, v: &Value) -> Result<RemoteIssue, String> {
@@ -123,6 +135,11 @@ pub async fn read_ref(r: &RepoCfg, reference: &IssueRef) -> Result<RemoteIssue, 
     Ok(remote)
 }
 
+/// The forge answers and the CLI is logged in, right before a write whose outcome could be uncertain.
+pub async fn reachable(r: &RepoCfg) -> Result<(), String> {
+    api(r, "GET", "user", None).await.map(|_| ()).map_err(|e| format!("The forge cannot be reached, so nothing was sent: {e}"))
+}
+
 pub async fn create(r: &RepoCfg, title: &str, body: &str) -> Result<RemoteIssue, String> {
     let data = if r.provider == Provider::Github { json!({"title":title,"body":body}) } else { json!({"title":title,"description":body}) };
     let out = api(r, "POST", &root(r), Some(data)).await?;
@@ -132,7 +149,11 @@ pub async fn create(r: &RepoCfg, title: &str, body: &str) -> Result<RemoteIssue,
 /// Find an uncertain create by its durable marker, including closed issues and all pages.
 pub async fn find_created(r: &RepoCfg, marker: &str) -> Result<Option<RemoteIssue>, String> {
     let dir = if r.path.is_dir() { Some(r.path.as_path()) } else { None };
-    let out = issues::sh(tool(r), &["api", "--paginate", &format!("{}?state=all&per_page=100", root(r))], dir).await?;
+    let (host, path) = (r.host_args(), format!("{}?state=all&per_page=100", root(r)));
+    let mut args: Vec<&str> = vec!["api"];
+    args.extend(host.iter().map(String::as_str));
+    args.extend(["--paginate", &path]);
+    let out = issues::sh(tool(r), &args, dir).await?;
     let mut found = None;
     for page in serde_json::Deserializer::from_str(&out).into_iter::<Value>() {
         let page = page.map_err(|e| e.to_string())?;
@@ -184,6 +205,16 @@ mod tests {
         assert!(!refused("gh api: Server Error (HTTP 502)"));
         assert!(!refused("gh api: API rate limit exceeded (HTTP 429)"));
         assert!(!refused("gh api: timed out"));
+    }
+
+    #[test]
+    fn an_issue_url_on_another_host_is_refused_before_anything_is_saved() {
+        let mut cfg: crate::config::Config = toml::from_str("[[repos]]\nprovider='gitlab'\nrepo='a/b'\npath='/tmp'\n").unwrap();
+        cfg.repos[0].host = "gitlab.one.example".into();
+        let r = &cfg.repos[0];
+        assert_eq!(key(r, "https://gitlab.one.example/a/b/-/issues/7").unwrap(), "7");
+        assert!(key(r, "https://gitlab.two.example/a/b/-/issues/7").unwrap_err().contains("gitlab.one.example"));
+        assert_eq!(key(r, "#7").unwrap(), "7", "a number has no host to check");
     }
 
     #[test]
