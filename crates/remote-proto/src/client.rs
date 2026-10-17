@@ -152,7 +152,9 @@ impl Client {
             }
             let _ = sink.close().await;
         });
-        let (p, s, c, cancel) = (pending.clone(), streams.clone(), closed.clone(), out.clone());
+        // Weak: the reader must not keep the writer, and with it the connection, alive once the
+        // client is dropped.
+        let (p, s, c, cancel) = (pending.clone(), streams.clone(), closed.clone(), out.downgrade());
         tokio::spawn(async move {
             while let Some(Ok(msg)) = rx.next().await {
                 match msg {
@@ -170,7 +172,9 @@ impl Client {
                             if tx.try_send((seq, event)).is_err() {
                                 streams.remove(&stream_id);
                                 // And the server stops sending it, or each catch-up would add a stream.
-                                let _ = cancel.try_send(OutboundClientMessage::Stream(StreamClientMessage::Cancel { stream_id }, None));
+                                if let Some(out) = cancel.upgrade() {
+                                    let _ = out.try_send(OutboundClientMessage::Stream(StreamClientMessage::Cancel { stream_id }, None));
+                                }
                             }
                         }
                     }

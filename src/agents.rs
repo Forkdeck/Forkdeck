@@ -704,6 +704,16 @@ const NOT_LOADED: &str = "_not_loaded";
 /// Where a reviewer's copy has the record of what changed.
 const CHANGES: &str = "_forkdeck_review/changes.diff";
 
+/// `rel` is reached from `dir` through real directories only. A link put in place of a tracked
+/// directory would lead outside the checkout, and git still lists the files below it.
+fn inside(dir: &Path, rel: &str) -> bool {
+    let mut at = dir.to_path_buf();
+    !Path::new(rel).parent().into_iter().flat_map(|p| p.components()).any(|c| {
+        at.push(c);
+        std::fs::symlink_metadata(&at).map(|m| !m.file_type().is_dir()).unwrap_or(true)
+    })
+}
+
 /// Git, with nothing the repository configures run along: no hooks, no fsmonitor, no external
 /// diff. In a typed task the worker could have rewritten the checkout's git config.
 fn plain_git(dir: &Path, args: &[&str], env: &[(&str, &Path)], input: Option<&Path>) -> Result<Vec<u8>, String> {
@@ -734,7 +744,7 @@ pub(crate) fn snapshot_tree(dir: &Path) -> Result<String, String> {
     let mut lines = Vec::new();
     for rel in listed.split(|b| *b == 0).filter(|p| !p.is_empty()) {
         let rel = String::from_utf8_lossy(rel).to_string();
-        if gitlinks.iter().any(|(_, p)| *p == rel) { continue; }
+        if gitlinks.iter().any(|(_, p)| *p == rel) || !inside(dir, &rel) { continue; }
         let Ok(meta) = std::fs::symlink_metadata(dir.join(&rel)) else { continue };
         if meta.file_type().is_symlink() {
             let target = std::fs::read_link(dir.join(&rel)).map_err(|e| e.to_string())?;
@@ -823,14 +833,7 @@ fn mirror_checkout(from: &Path, to: &Path) -> Result<(), String> {
     for rel in listed {
         if Path::new(&rel).components().any(|c| !matches!(c, std::path::Component::Normal(_))) { continue; }
         let dest = if configures_an_agent(&rel) { to.join(NOT_LOADED).join(&rel) } else { to.join(&rel) };
-        // Every directory on the way must be a real one: a link put in place of a tracked
-        // directory would lead outside the checkout, and git still lists the files below it.
-        let mut at = from.to_path_buf();
-        let outside = Path::new(&rel).parent().into_iter().flat_map(|p| p.components()).any(|c| {
-            at.push(c);
-            std::fs::symlink_metadata(&at).map(|m| !m.file_type().is_dir()).unwrap_or(true)
-        });
-        if outside { continue; }
+        if !inside(from, &rel) { continue; }
         let src = from.join(&rel);
         let Ok(meta) = std::fs::symlink_metadata(&src) else { continue };
         if let Some(parent) = dest.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
@@ -916,6 +919,8 @@ mod tests {
         let changes = std::fs::read_to_string(to.join(CHANGES)).unwrap();
         assert!(changes.contains("since HEAD") && changes.contains("+changed") && changes.contains("new.txt"), "{changes}");
         assert!(!ran.exists(), "a filter configured in the checkout ran");
+        // Through the linked directory, nothing outside gets into the diff either.
+        assert!(!std::fs::read_to_string(to.join(CHANGES)).unwrap().contains("PRIVATE KEY"));
         // No `git diff` in the prompt (a review asked again): the job's starting commit.
         write_changes(&from, &to, "Look again.", Some("HEAD")).unwrap();
         assert!(std::fs::read_to_string(to.join(CHANGES)).unwrap().contains("+changed"));

@@ -49,6 +49,13 @@ impl Plan {
     }
 
     pub fn invalidate(&mut self) { self.reviewed = None; }
+    /// Another task's plan for the same issue, which this one must not be attached beside: intake
+    /// waits while any plan for an issue is unready, so a second would hold it up for good.
+    pub fn taken_by(&self, jobs: &[Job], except: Option<u32>) -> Option<u32> {
+        let i = self.issue.as_ref()?;
+        jobs.iter().find(|j| Some(j.id) != except && j.issue_plan.as_ref().is_some_and(|o| o.provider == self.provider && o.repo == self.repo && o.host == self.host && o.issue.as_ref().is_some_and(|oi| oi.key == i.key))).map(|j| j.id)
+    }
+
     /// Planned for this configured repository: same forge, name and host.
     pub fn is_for(&self, r: &RepoCfg) -> bool {
         self.provider == r.provider && self.repo == r.repo && self.host == r.host
@@ -117,13 +124,6 @@ pub async fn prepare(hub: &Hub, id: u32) -> Result<(), String> {
     let p = plan(hub, id)?;
     if p.pending.is_some() { return Err("Reconcile the pending publication with Accept / retry before refining.".into()); }
     let r = repo(hub, &p)?;
-    // One plan per issue: intake waits while any plan for the issue is unready, so a second would hold
-    // it up for good.
-    if let Some(i) = &p.issue {
-        if let Some(other) = hub.state.lock().unwrap().jobs.iter().find(|j| j.id != id && j.issue_plan.as_ref().is_some_and(|o| o.is_for(&r) && o.issue.as_ref().is_some_and(|oi| oi.key == i.key))).map(|j| j.id) {
-            return Err(format!("Task #{other} already plans this issue; continue there."));
-        }
-    }
     if let Some(i) = &p.issue {
         let remote = tracker::read_ref(&r, i).await?;
         guard(hub, &r, &remote).await?;
@@ -191,6 +191,12 @@ pub async fn publish(hub: &Hub, id: u32) -> Result<String, String> {
             }
         };
         durable(hub, id)?;
+        // The forges have no conditional update for an issue body: read it once more right before
+        // writing, so a person's edit made meanwhile is not overwritten. A retry starts from it.
+        let latest = tracker::read(&r, &remote.reference.key).await?;
+        if latest.body != remote.body {
+            return Err("The issue was edited while the plan was being published; retry to publish against the latest text.".into());
+        }
         tracker::update(&r, &remote.reference.key, &body).await?;
     }
     let marker = format!("<!-- forkdeck:history {} -->", op.token);

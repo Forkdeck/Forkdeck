@@ -320,6 +320,9 @@ impl Hub {
         issue_plan: Option<crate::planning::Plan>,
     ) -> Result<u32, String> {
         let _busy = Busy::enter(&self.busy);
+        if let Some(other) = issue_plan.as_ref().and_then(|p| p.taken_by(&self.state.lock().unwrap_or_else(|e| e.into_inner()).jobs, None)) {
+            return Err(format!("task #{other} already plans this issue; continue there"));
+        }
         // The database hands out ids, so jobs from another forkdeck sharing it never collide.
         let from_db = match self.history.clone() {
             Some(h) => Some(self.rt.spawn_blocking(move || h.new_id()).await.map_err(|e| e.to_string())??),
@@ -528,12 +531,16 @@ impl Hub {
             let _admission = self.admission.lock().await;
             self.take_over(id, false).await?;
         }
-        self.job(id, |j| -> Result<(), String> {
-            if !eligible(j) { return Err("finish the local planning turn before linking an issue".into()); }
-            j.issue_plan = Some(plan);
-            j.workdir = workdir;
-            Ok(())
-        }).ok_or("task missing")??;
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(other) = plan.taken_by(&st.jobs, Some(id)) { return Err(format!("task #{other} already plans this issue; continue there")); }
+            st.jobs.iter_mut().find(|j| j.id == id).map(|j| -> Result<(), String> {
+                if !eligible(j) { return Err("finish the local planning turn before linking an issue".into()); }
+                j.issue_plan = Some(plan);
+                j.workdir = workdir;
+                Ok(())
+            }).ok_or("task missing")??;
+        }
         if self.history.is_some() { self.persist(id)?; }
         self.reply(id, format!("{request}\n\nRefine this into a complete issue implementation plan and submit it for plan review.")).await
     }

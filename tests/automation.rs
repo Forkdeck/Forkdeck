@@ -1201,8 +1201,8 @@ const MACHINE: &str = "0123456789abcdef";
 
 /// Seconds since the epoch as the forge would print them.
 fn forge_time(ago_secs: i64) -> String {
-    let out = Command::new("date").args(["-u", "-d", &format!("@{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - ago_secs), "+%Y-%m-%dT%H:%M:%SZ"]).output().unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    // Not `date -d`: that is GNU date only, and macOS has BSD date.
+    (chrono::Utc::now() - chrono::Duration::seconds(ago_secs)).format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 impl Rig {
