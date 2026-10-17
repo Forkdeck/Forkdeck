@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.96.0"
+
+jobs:
+  test:
+    name: Test on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "${RUST_VERSION}" \
+            --profile minimal \
+            --component clippy
+          rustup default "${RUST_VERSION}"
+
+      # The integration tests make commits in throwaway repositories.
+      - name: Identify git
+        run: |
+          git config --global user.name "forkdeck CI"
+          git config --global user.email "ci@forkdeck.invalid"
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      # Drive the real interface through a terminal. They read /proc, so Linux only.
+      - name: Terminal tests
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked
+          python3 -I tests/tui_exit.py target/debug/forkdeck
+          python3 -I tests/tui_issue_plans.py target/debug/forkdeck
