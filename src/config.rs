@@ -770,7 +770,11 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
             anyhow::bail!("config file {} not found", c.display());
         }
     }
-    Ok((Config::default(), None))
+    // The defaults name paths under `~` too: expanded the same way, or `remote pair` without a
+    // config file would keep its keys in a directory literally called `~` under the current one.
+    let mut cfg = Config::default();
+    cfg.remote.dir = expand(&cfg.remote.dir);
+    Ok((cfg, None))
 }
 
 impl RepoCfg {

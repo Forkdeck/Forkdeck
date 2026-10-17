@@ -92,6 +92,9 @@ pub async fn serve(hub: Hub) -> anyhow::Result<()> {
     }
 }
 
+/// Calls one connection may have under way at once.
+const MAX_CALLS: usize = 32;
+
 async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::Result<()> {
     let local = tcp.local_addr()?.ip();
     let same = pair::same_subnet(local, peer.ip(), &pair::interfaces());
@@ -128,6 +131,12 @@ async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::
                 let Some(Ok(msg)) = msg else { break };
                 match msg {
                     InboundServerMessage::Unary(ClientMessage::Request(req), _) => {
+                        // A bounded number at once: a client that only sends could otherwise grow this without end.
+                        if calls.len() >= MAX_CALLS {
+                            let busy = Reply::Err { msg: "too many calls at once".into() };
+                            let _ = out.send(OutboundServerMessage::Unary(Response { request_id: req.id, message: Ok(busy) }, None)).await;
+                            continue;
+                        }
                         let (ctx, out, device) = (ctx.clone(), out.clone(), device.clone());
                         calls.spawn(async move {
                             let reply = match &device {
@@ -161,6 +170,8 @@ async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::
                     InboundServerMessage::Stream(StreamClientMessage::Data { .. }, _) => {}
                 }
             }
+            // Finished calls are collected as they end.
+            Some(_) = calls.join_next(), if !calls.is_empty() => {}
             _ = recheck.tick(), if fp.is_some() => {
                 if fp.as_deref().and_then(|fp| ctx.devices.lookup(fp)).is_none() {
                     revoked = true;

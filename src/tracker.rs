@@ -79,6 +79,11 @@ pub fn key(r: &RepoCfg, input: &str) -> Result<String, String> {
     if !matches!(url.scheme(), "http" | "https") || url.query().is_some() || url.fragment().is_some() {
         return Err("Use an issue URL without a query or fragment.".into());
     }
+    // Checked before anything is attached: a link to the same path on another host would otherwise
+    // be saved and then refused on every turn, holding the issue up.
+    if r.host.contains('.') && !url.host_str().is_some_and(|h| h.eq_ignore_ascii_case(&r.host)) {
+        return Err(format!("Issue URL is not on {}, where the selected repository's clone points.", r.host));
+    }
     let prefix = if r.provider == Provider::Github { format!("/{}/issues/", r.repo) } else { format!("/{}/-/issues/", r.repo) };
     let n = url.path().strip_prefix(&prefix).ok_or("Issue URL does not match the selected repository.")?;
     number(n).map(|n| n.to_string())
@@ -200,6 +205,16 @@ mod tests {
         assert!(!refused("gh api: Server Error (HTTP 502)"));
         assert!(!refused("gh api: API rate limit exceeded (HTTP 429)"));
         assert!(!refused("gh api: timed out"));
+    }
+
+    #[test]
+    fn an_issue_url_on_another_host_is_refused_before_anything_is_saved() {
+        let mut cfg: crate::config::Config = toml::from_str("[[repos]]\nprovider='gitlab'\nrepo='a/b'\npath='/tmp'\n").unwrap();
+        cfg.repos[0].host = "gitlab.one.example".into();
+        let r = &cfg.repos[0];
+        assert_eq!(key(r, "https://gitlab.one.example/a/b/-/issues/7").unwrap(), "7");
+        assert!(key(r, "https://gitlab.two.example/a/b/-/issues/7").unwrap_err().contains("gitlab.one.example"));
+        assert_eq!(key(r, "#7").unwrap(), "7", "a number has no host to check");
     }
 
     #[test]

@@ -408,6 +408,11 @@ impl Hub {
     /// tree and is given the conversation so far. Err says why it was not taken.
     pub async fn reply(&self, id: u32, text: String) -> Result<(), String> {
         let _admission = self.admission.lock().await;
+        self.reply_admitted(id, text).await
+    }
+
+    /// `reply`, for a caller that already holds the admission lock.
+    async fn reply_admitted(&self, id: u32, text: String) -> Result<(), String> {
         // A finished task starts working again: take it over first, as `resume` does, so a second
         // forkdeck that restored the same task cannot run it at the same time.
         let finished_typed = self.job(id, |j| j.source.is_manual() && j.status.finished() && j.in_history).unwrap_or(false);
@@ -525,10 +530,12 @@ impl Hub {
     pub async fn link_plan(&self, id: u32, plan: crate::planning::Plan, request: String) -> Result<(), String> {
         let workdir = crate::planning::repo(self, &plan)?.path;
         let eligible = |j: &mut Job| j.source.is_manual() && j.status.finished() && j.issue_plan.is_none();
+        // Held from the check to the reply: nothing (a reply from the phone, say) may start the task
+        // in between, or the takeover would replace a job that is running here.
+        let _admission = self.admission.lock().await;
         if !self.job(id, eligible).unwrap_or(false) { return Err("finish the local planning turn before linking an issue".into()); }
         // Taken over first: a takeover reloads the saved job, which would drop a link made before it.
         if self.job(id, |j| j.in_history).unwrap_or(false) {
-            let _admission = self.admission.lock().await;
             self.take_over(id, false).await?;
         }
         {
@@ -542,7 +549,7 @@ impl Hub {
             }).ok_or("task missing")??;
         }
         if self.history.is_some() { self.persist(id)?; }
-        self.reply(id, format!("{request}\n\nRefine this into a complete issue implementation plan and submit it for plan review.")).await
+        self.reply_admitted(id, format!("{request}\n\nRefine this into a complete issue implementation plan and submit it for plan review.")).await
     }
 
     /// Pick how a planned task goes ahead.

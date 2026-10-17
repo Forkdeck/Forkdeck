@@ -33,20 +33,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux: static musl binaries, built natively on each architecture.
+          # Static musl binaries, built natively on each architecture.
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             asset: linux-amd64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             asset: linux-arm64
-          # macOS: native builds; they link only the system libraries every Mac has.
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            asset: macos-arm64
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            asset: macos-amd64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
 
@@ -57,15 +50,9 @@ jobs:
           persist-credentials: false
 
       - name: Install native musl toolchain
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes musl-tools
-
-      - name: Install GNU tar
-        if: runner.os == 'macOS'
-        # BSD tar cannot write a reproducible archive (sorted, fixed owner and times).
-        run: command -v gtar || brew install gnu-tar
 
       - name: Install Rust
         env:
@@ -114,13 +101,6 @@ jobs:
           ASSET: ${{ matrix.asset }}
           TARGET: ${{ matrix.target }}
         run: |
-          if [ "${RUNNER_OS}" = macOS ]; then
-            tar=gtar
-            sha() { shasum -a 256 "$@"; }
-          else
-            tar=tar
-            sha() { sha256sum "$@"; }
-          fi
           package="forkdeck-${RELEASE_VERSION}-${ASSET}"
           mkdir -p "dist/${package}"
           install -m 0755 "target/${TARGET}/release/forkdeck" "dist/${package}/forkdeck"
@@ -130,19 +110,9 @@ jobs:
           "dist/${package}/forkdeck" --version |
             grep -F -x \
               "forkdeck ${RELEASE_VERSION#v}"
-          if [ "${RUNNER_OS}" = macOS ]; then
-            # Only libraries every Mac has: nothing from Homebrew or elsewhere.
-            otool -L "dist/${package}/forkdeck"
-            if otool -L "dist/${package}/forkdeck" | tail -n +2 | awk '{print $1}' |
-              grep -v -E '^(/usr/lib/|/System/Library/)'; then
-              echo "links a library outside the system ones" >&2
-              exit 1
-            fi
-          else
-            # Statically linked: it runs on any Linux of this architecture.
-            # `file` says "static-pie linked" for a position-independent static build.
-            file "dist/${package}/forkdeck" | grep -q -E "statically linked|static-pie linked"
-          fi
+          # Statically linked: it runs on any Linux of this architecture.
+          # `file` says "static-pie linked" for a position-independent static build.
+          file "dist/${package}/forkdeck" | grep -q -E "statically linked|static-pie linked"
           commit_time="$(git show -s --format=%ct)"
           SOURCE_DATE_EPOCH="${commit_time}" \
             cargo +"${RUST_VERSION}" cyclonedx \
@@ -162,7 +132,7 @@ jobs:
           install -m 0644 \
             "dist/${package}.cdx.json" \
             "dist/${package}/SBOM.cdx.json"
-          "${tar}" \
+          tar \
             --sort=name \
             --owner=0 \
             --group=0 \
@@ -173,8 +143,8 @@ jobs:
             "${package}"
           (
             cd dist
-            sha "${package}.tar.gz" >"${package}.tar.gz.sha256"
-            sha "${package}.cdx.json" >"${package}.cdx.json.sha256"
+            sha256sum "${package}.tar.gz" >"${package}.tar.gz.sha256"
+            sha256sum "${package}.cdx.json" >"${package}.cdx.json.sha256"
           )
 
       - name: Upload workflow artifact

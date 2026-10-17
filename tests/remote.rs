@@ -74,7 +74,9 @@ fn start(name: &str) -> Server {
 
 impl Server {
     fn code(&self) -> PairInfo {
-        let out = forkdeck(&self.dir, &self.config).args(["remote", "pair", "--iface", "lo", "--ttl", "60"]).output().unwrap();
+        // The loopback interface: `lo` on Linux, `lo0` on macOS.
+        let lo = if cfg!(target_os = "macos") { "lo0" } else { "lo" };
+        let out = forkdeck(&self.dir, &self.config).args(["remote", "pair", "--iface", lo, "--ttl", "60"]).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let text = String::from_utf8(out.stdout).unwrap();
         let uri = text.lines().map(str::trim).find(|l| l.starts_with("forkdeck://")).expect("a pairing code is printed");

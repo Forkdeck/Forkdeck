@@ -253,6 +253,12 @@ impl Client {
         let stream_id = (1u64 << 62) | self.next.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel(1024);
         self.streams.lock().unwrap().insert(stream_id, tx);
+        // Checked after registering, as `call` does: once the reader has gone, nothing would ever
+        // remove this sender, and the receiver would wait for good.
+        if self.closed.load(Ordering::SeqCst) {
+            self.streams.lock().unwrap().remove(&stream_id);
+            return Err(err("disconnected"));
+        }
         let open = StreamClientMessage::Open {
             stream_id,
             method_id: SUBSCRIBE,
@@ -262,7 +268,10 @@ impl Client {
             sampling: 0,
             message: Call::Subscribe { since },
         };
-        self.out.send(OutboundClientMessage::Stream(open, None)).await.map_err(|_| err("disconnected"))?;
+        if self.out.send(OutboundClientMessage::Stream(open, None)).await.is_err() {
+            self.streams.lock().unwrap().remove(&stream_id);
+            return Err(err("disconnected"));
+        }
         Ok(rx)
     }
 }

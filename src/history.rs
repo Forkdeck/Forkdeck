@@ -175,7 +175,8 @@ impl StageRecord {
         };
         Stage {
             unprinted: 0,
-            pushed: 0,
+            // As if the restored lines had just been pushed: a viewer's offsets stay inside the tail.
+            pushed: self.tail.len() as u64,
             agent: self.agent,
             via: self.via,
             session: None,
