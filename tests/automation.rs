@@ -2,22 +2,43 @@
 //! `claude`, `gh` and an MCP server, and a local bare repository as the remote. They need `git` and `sh`.
 
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const CLAUDE: &str = r#"#!/bin/sh
 [ "$1" = "--version" ] && { echo stand-in; exit 0; }
+[ -n "$FAKE_ARGS" ] && echo "$*" >> "$FAKE_ARGS"
 prompt=$(cat)
 [ -n "$FAKE_PROMPTS" ] && printf '%s\n-----\n' "$prompt" >> "$FAKE_PROMPTS"
 case "$prompt" in
+  *"<options>"*)
+    # FAKE_PLAN_WAIT: the first plan takes until it is stopped (the marker says it started).
+    if [ -n "$FAKE_PLAN_WAIT" ] && [ ! -f "$FAKE_PLAN_WAIT" ]; then touch "$FAKE_PLAN_WAIT"; sleep 600; fi
+    printf '%s\n' '{"type":"result","is_error":false,"result":"Two ways.\n<options>{\"options\": [{\"title\": \"Patch it\", \"summary\": \"small\"}, {\"title\": \"Rewrite it\", \"summary\": \"clean\", \"recommended\": true}]}</options>"}'
+    ;;
   *"Write at most three short rules"*)
     [ -n "$FAKE_LESSONS_SEEN" ] && printf '%s' "$prompt" > "$FAKE_LESSONS_SEEN"
     printf '%s\n' "{\"type\":\"result\",\"is_error\":false,\"result\":\"${FAKE_LESSONS:-NONE}\",\"usage\":{\"input_tokens\":40,\"output_tokens\":10}}"
     ;;
   *"Do not modify any file"*)
     [ -n "$FAKE_DURING_REVIEW" ] && PROMPT="$prompt" sh -c "$FAKE_DURING_REVIEW" >/dev/null 2>&1
-    printf '%s\n' "{\"type\":\"result\",\"is_error\":false,\"result\":\"Looked at it.\\nVERDICT: ${FAKE_VERDICT:-PASS}\"}"
+    # Reviews are counted: FAKE_VERDICTS gives one verdict per review in turn (PASS after the
+    # list), FAKE_REVIEW_CRASH=1 crashes the first review (=always: every one), and
+    # FAKE_REVIEW_NOVERDICT=1 leaves the verdict out of the first.
+    n=$(cat "$FAKE_GH/reviews" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_GH/reviews"
+    # FAKE_REVIEW_RESUME_FAILS: a review that tries to continue an earlier one finds it gone.
+    if [ -n "$FAKE_REVIEW_RESUME_FAILS" ]; then case "$*" in *--resume*) echo "No conversation found with session ID" >&2; exit 1 ;; esac; fi
+    [ "$FAKE_REVIEW_CRASH" = always ] && { echo "reviewer crashed" >&2; exit 1; }
+    [ "$n" = 1 ] && [ -n "$FAKE_REVIEW_CRASH" ] && { echo "reviewer crashed" >&2; exit 1; }
+    if [ "$n" = 1 ] && [ -n "$FAKE_REVIEW_NOVERDICT" ]; then
+      printf '%s\n' '{"type":"result","is_error":false,"result":"Looked at it, it seems fine."}'
+      exit 0
+    fi
+    v=${FAKE_VERDICT:-PASS}
+    [ -n "$FAKE_VERDICTS" ] && { v=$(echo "$FAKE_VERDICTS" | awk -v n="$n" '{print $n}'); [ -n "$v" ] || v=PASS; }
+    printf '%s\n' "{\"type\":\"result\",\"is_error\":false,\"result\":\"Looked at it.\\nVERDICT: $v\"}"
     ;;
   *)
     sh -c "${FAKE_WORK:-echo change >> by_agent.txt}" >/dev/null 2>&1
@@ -39,6 +60,10 @@ while [ $# -gt 0 ]; do
 done
 prompt=$(cat)
 [ -n "$FAKE_PROMPTS" ] && printf '%s\n-----\n' "$prompt" >> "$FAKE_PROMPTS"
+# FAKE_COPILOT_REJECT_LATER: this model works the first time and is refused from then on.
+if [ -n "$FAKE_COPILOT_REJECT_LATER" ] && [ "$model" = "$FAKE_COPILOT_REJECT_LATER" ]; then
+  if [ -f "$FAKE_GH/used-$model" ]; then FAKE_COPILOT_REJECT="$FAKE_COPILOT_REJECT $model"; else touch "$FAKE_GH/used-$model"; fi
+fi
 for m in $FAKE_COPILOT_REJECT; do
   if [ "$m" = "$model" ]; then
     printf '%s\n' "{\"type\":\"model.call_failure\",\"data\":{\"model\":\"$model\",\"statusCode\":400,\"errorCode\":\"model_not_supported\"}}"
@@ -1461,6 +1486,33 @@ fn a_finished_item_cannot_be_put_back_in_the_queue_by_a_release() {
     assert!(!rig.calls().contains("label") && !rig.calls().contains("POST"), "{}", rig.calls());
 }
 
+/// Real `claude` or `codex` installed on the machine must not take part in the copilot tests.
+const NO_REAL_CLIS: &str = "[agents.claude]\ncmd = \"absent-claude\"\n[agents.codex]\ncmd = \"absent-codex\"\n";
+
+fn copilot_runs(rig: &Rig) -> Vec<String> {
+    fs::read_to_string(rig.root.join("gh/copilot.log")).unwrap_or_default().lines().map(String::from).collect()
+}
+
+fn model_of(run: &str) -> &str {
+    run.split("--model ").nth(1).and_then(|r| r.split(' ').next()).unwrap_or("")
+}
+
+#[test]
+fn with_only_copilot_work_and_review_come_from_different_vendors() {
+    let rig = Rig::with_agents("copilot-only", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    assert_eq!(runs.len(), 2, "{:?}", runs);
+    // Whichever part the router gave the work, the review comes from the other vendor.
+    let (work, review) = (model_of(&runs[0]), model_of(&runs[1]));
+    assert!(runs[0].contains("--allow-tool write") && runs[1].contains("--deny-tool write"), "{:?}", runs);
+    assert!((work.starts_with("claude-") && review.starts_with("gpt-")) || (work.starts_with("gpt-") && review.starts_with("claude-")), "{:?}", runs);
+    assert!(runs.iter().all(|r| !r.contains("allow-all") && !r.contains("--yolo")), "{:?}", runs);
+    assert!(rig.calls().contains("pr create"), "{}", rig.calls());
+}
+
 // ---------------------------------------------------------------------------------------------
 // Before a deployment is triggered, the deployment system is asked what is already going on
 
@@ -1767,6 +1819,403 @@ fn an_agent_cannot_change_the_teams_notes_through_an_issue() {
 }
 
 #[test]
+fn a_model_the_organisation_switched_off_is_skipped() {
+    let rig = Rig::with_agents("copilot-refused", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_COPILOT_REJECT", "claude-sonnet-5.5 claude-sonnet-5 gpt-5.5 gpt-5.4")]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    let workers: Vec<&str> = runs.iter().filter(|r| r.contains("--allow-tool write")).map(|r| model_of(r)).collect();
+    let claude = ["claude-sonnet-5.5", "claude-sonnet-5", "claude-sonnet-4.6"];
+    let codex = ["gpt-5.5", "gpt-5.4", "gpt-5.3-codex"];
+    assert!(workers == claude || workers == codex, "each refused model is tried once, then the next: {:?}", runs);
+    assert!(out.contains("is not available to this copilot account"), "{}", out);
+}
+
+#[test]
+fn with_codex_missing_copilot_plays_codex() {
+    let rig = Rig::with_agents("claude-and-copilot", "[agents.codex]\ncmd = \"absent-codex\"\n", "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    assert_eq!(runs.len(), 1, "claude does its own part, copilot only codex's: {:?}", runs);
+    assert!(model_of(&runs[0]).starts_with("gpt-"), "{}", runs[0]);
+}
+
+#[test]
+fn a_copilot_profile_reviews_pull_requests_next_to_claude() {
+    let extra = "[agents.codex]\ncmd = \"absent-codex\"\n[agents.copilot.profiles.second]\nvendor = \"xai\"\nmodels = { light = \"grok-4.7\", standard = \"grok-4.7\", heavy = \"grok-4.7\" }\n[review]\npr_reviewers = [\"claude\", \"copilot:second\"]";
+    let rig = Rig::with_agents("copilot-profile", extra, "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    assert_eq!(runs.len(), 1, "{:?}", runs);
+    assert_eq!(model_of(&runs[0]), "grok-4.7");
+    let calls = rig.calls();
+    assert!(calls.contains("copilot:second") && calls.contains("--add-label review:passed"), "{}", calls);
+}
+
+#[test]
+fn a_copilot_review_that_stops_early_is_not_a_pass() {
+    let rig = Rig::with_agents("copilot-truncated", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (_, out) = rig.once(&[("FAKE_COPILOT_TRUNCATE", "1")]);
+    let calls = rig.calls();
+    assert!(!calls.contains("review:passed"), "{}\n{}", calls, out);
+    assert!(calls.contains("--add-label review:ready"), "{}\n{}", calls, out);
+    assert!(out.contains("exited before reporting a result"), "it failed for the missing closing line: {}", out);
+}
+
+fn arg_after<'a>(line: &'a str, flag: &str) -> Option<&'a str> {
+    let mut it = line.split(' ');
+    it.find(|a| *a == flag)?;
+    it.next()
+}
+
+#[test]
+fn a_fix_round_continues_the_workers_own_conversation() {
+    let rig = Rig::new("session", "", "");
+    rig.issue();
+    let log = rig.root.join("args.log");
+    let (_, out) = rig.once(&[("FAKE_VERDICTS", "FAIL PASS"), ("FAKE_ARGS", log.to_str().unwrap())]);
+    let runs: Vec<String> = fs::read_to_string(&log).unwrap().lines().map(String::from).collect();
+    let workers: Vec<&String> = runs.iter().filter(|r| r.contains("acceptEdits")).collect();
+    let reviews: Vec<&String> = runs.iter().filter(|r| r.contains("--permission-mode plan")).collect();
+    assert_eq!((workers.len(), reviews.len()), (2, 2), "work, review, fix, review: {:?}\n{}", runs, out);
+    let first = arg_after(workers[0], "--session-id").expect("the first run names its conversation");
+    assert_eq!(arg_after(workers[1], "--resume"), Some(first), "the fix continues it: {:?}", workers);
+    // A reviewer may continue its own earlier review, never the worker's conversation.
+    assert!(reviews.iter().all(|r| arg_after(r, "--resume") != Some(first)), "reviews are not the worker's conversation: {:?}", reviews);
+}
+
+
+#[test]
+fn a_typed_task_cut_off_by_a_stop_continues_its_own_conversation_later() {
+    let rig = Rig::new("resume", "", "");
+    let log = rig.root.join("args.log");
+    let logged = log.to_str().unwrap().to_string();
+    // The first attempt works slowly, and forkdeck is stopped while it does.
+    let child = rig
+        .bare(&[("FAKE_ARGS", &logged), ("FAKE_WORK", "sleep 30")])
+        .args(["run", "add a change file"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("forkdeck starts");
+    for _ in 0..100 {
+        if fs::read_to_string(&log).map(|l| l.contains("acceptEdits")).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    let out = child.wait_with_output().unwrap();
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success() && said.contains("interrupted"), "{}", said);
+    assert!(!rig.clone().join("by_agent.txt").exists(), "the first attempt never finished");
+
+    let (_, listed) = rig.run(&["history"], &[]);
+    assert!(listed.contains("interrupted") && listed.contains("add a change file"), "{}", listed);
+
+    // Next time, the task carries on in the same conversation and finishes.
+    let (ok, out) = rig.run(&["resume"], &[("FAKE_ARGS", &logged)]);
+    assert!(ok, "{}", out);
+    let runs = fs::read_to_string(&log).unwrap();
+    let workers: Vec<&str> = runs.lines().filter(|r| r.contains("acceptEdits")).collect();
+    assert_eq!(workers.len(), 2, "{:?}", workers);
+    let first = arg_after(workers[0], "--session-id").expect("the first attempt named its conversation");
+    assert_eq!(arg_after(workers[1], "--resume"), Some(first), "{:?}", workers);
+    assert!(rig.clone().join("by_agent.txt").exists());
+    let (_, listed) = rig.run(&["history"], &[]);
+    assert!(listed.contains("done") && !listed.contains("interrupted"), "{}", listed);
+    let (ok, again) = rig.run(&["resume"], &[]);
+    assert!(ok && again.contains("nothing to resume"), "{}", again);
+}
+
+#[test]
+fn a_copilot_review_that_reports_usage_but_no_result_is_not_a_pass() {
+    let rig = Rig::with_agents("copilot-usage-eof", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (_, out) = rig.once(&[("FAKE_COPILOT_TRUNCATE", "usage")]);
+    let calls = rig.calls();
+    assert!(!calls.contains("review:passed"), "{}\n{}", calls, out);
+    assert!(calls.contains("--add-label review:ready"), "{}\n{}", calls, out);
+    assert!(out.contains("exited before reporting a result"), "it failed for the missing closing line: {}", out);
+}
+
+#[test]
+fn every_configured_pull_request_reviewer_runs_and_a_third_fail_counts() {
+    let extra = "[agents.codex]\ncmd = \"absent-codex\"\n[agents.copilot.profiles.second]\nvendor = \"xai\"\nmodels = { light = \"grok-4.7\", standard = \"grok-4.7\", heavy = \"grok-4.7\" }\n[agents.copilot.profiles.third]\nvendor = \"google\"\nmodels = { light = \"gemini-3.8-pro\", standard = \"gemini-3.8-pro\", heavy = \"gemini-3.8-pro\" }\n[review]\npr_reviewers = [\"claude\", \"copilot:second\", \"copilot:third\"]";
+    let rig = Rig::with_agents("three-reviewers", extra, "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[("FAKE_COPILOT_FAIL_MODEL", "gemini-3.8-pro")]);
+    assert!(ok, "{}", out);
+    let mut models: Vec<String> = copilot_runs(&rig).iter().map(|r| model_of(r).to_string()).collect();
+    models.sort();
+    assert_eq!(models, ["gemini-3.8-pro", "grok-4.7"], "both copilot profiles ran");
+    let calls = rig.calls();
+    assert!(calls.contains("copilot:third") && calls.contains("--add-label review:changes"), "{}", calls);
+    assert!(!calls.contains("review:passed"), "{}", calls);
+}
+
+#[test]
+fn a_pinned_copilot_model_the_account_refuses_falls_back_to_the_cli_choice() {
+    let extra = format!("{}[agents.copilot]\nmodels = {{ light = \"gpt-5.5\", standard = \"gpt-5.5\", heavy = \"gpt-5.5\" }}\n[review]\npr_reviewers = [\"copilot\"]", NO_REAL_CLIS);
+    let rig = Rig::with_agents("copilot-pinned-refused", &extra, "", &[("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[("FAKE_COPILOT_REJECT", "gpt-5.5")]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    let models: Vec<&str> = runs.iter().map(|r| model_of(r)).collect();
+    assert_eq!(models, ["gpt-5.5", ""], "the refused pin is tried once, then the CLI picks: {:?}", runs);
+    assert!(rig.calls().contains("--add-label review:passed"), "{}", rig.calls());
+}
+
+/// Collect a child's output as it comes, so a test can wait for a line before doing the next thing.
+fn tee(child: &mut std::process::Child) -> std::sync::Arc<std::sync::Mutex<String>> {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    for stream in [child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>)].into_iter().flatten() {
+        let seen = seen.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut stream = stream;
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                seen.lock().unwrap().push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+    }
+    seen
+}
+
+fn wait_until_said(seen: &std::sync::Arc<std::sync::Mutex<String>>, needle: &str) {
+    for _ in 0..600 {
+        if seen.lock().unwrap().contains(needle) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("never said {:?}:\n{}", needle, seen.lock().unwrap());
+}
+
+/// Start `forkdeck run` with a worker that waits on its first attempt (until the test says so)
+/// and works at once on later ones. Returns once the first attempt is running.
+fn run_with_slow_first_attempt(rig: &Rig, first_takes: &str) -> std::process::Child {
+    let marker = rig.root.join("first-attempt");
+    let work = format!("if [ -f {m} ]; then echo change >> by_agent.txt; else touch {m}; {first_takes}; fi", m = marker.display());
+    let (args, prompts) = (rig.root.join("args.log"), rig.root.join("prompts.log"));
+    let child = rig
+        .bare(&[("FAKE_ARGS", args.to_str().unwrap()), ("FAKE_PROMPTS", prompts.to_str().unwrap()), ("FAKE_WORK", &work)])
+        .args(["run", "add a change file"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("forkdeck starts");
+    for _ in 0..600 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(marker.exists(), "the first attempt never started");
+    child
+}
+
+fn workers(rig: &Rig) -> Vec<String> {
+    fs::read_to_string(rig.root.join("args.log")).unwrap_or_default().lines().filter(|l| l.contains("acceptEdits")).map(String::from).collect()
+}
+
+#[test]
+fn a_message_sent_while_the_agent_works_is_taken_in_the_same_conversation() {
+    let rig = Rig::new("message-queued", "", "");
+    // The first attempt finishes only once the message is known to be queued.
+    let go = rig.root.join("go");
+    let mut child = run_with_slow_first_attempt(&rig, &format!("while [ ! -f {} ]; do sleep 0.1; done", go.display()));
+    let seen = tee(&mut child);
+    child.stdin.as_mut().unwrap().write_all(b"also mention it in the README\n").unwrap();
+    wait_until_said(&seen, "message queued");
+    fs::write(&go, "").unwrap();
+    let status = child.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let said = seen.lock().unwrap().clone();
+    assert!(status.success(), "{}", said);
+    let w = workers(&rig);
+    assert_eq!(w.len(), 2, "the first attempt finished, then the message was taken: {:?}\n{}", w, said);
+    assert_eq!(arg_after(&w[1], "--resume"), arg_after(&w[0], "--session-id"), "{:?}", w);
+    let prompts = fs::read_to_string(rig.root.join("prompts.log")).unwrap();
+    assert!(prompts.contains("While you were working, the user said:\nalso mention it in the README"), "{}", prompts);
+    assert!(prompts.contains("Later, the user also asked (oldest first):\n- also mention it in the README"), "the reviewer knows: {}", prompts);
+}
+
+#[test]
+fn a_message_sent_with_a_bang_stops_the_agent_and_is_taken_at_once() {
+    let rig = Rig::new("message-now", "", "");
+    // The first attempt would never finish on its own: only stopping it lets the job go on.
+    let mut child = run_with_slow_first_attempt(&rig, "sleep 600");
+    let seen = tee(&mut child);
+    child.stdin.as_mut().unwrap().write_all(b"!use a different file name\n").unwrap();
+    let status = child.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let said = seen.lock().unwrap().clone();
+    assert!(status.success(), "{}", said);
+    let w = workers(&rig);
+    assert_eq!(w.len(), 2, "{:?}", w);
+    assert_eq!(arg_after(&w[1], "--resume"), arg_after(&w[0], "--session-id"));
+    let prompts = fs::read_to_string(rig.root.join("prompts.log")).unwrap();
+    assert!(prompts.contains("the user said:\nuse a different file name"), "{}", prompts);
+}
+
+fn plan_runs(rig: &Rig) -> (Vec<String>, String) {
+    let args = fs::read_to_string(rig.root.join("args.log")).unwrap_or_default().lines().map(String::from).collect();
+    (args, fs::read_to_string(rig.root.join("prompts.log")).unwrap_or_default())
+}
+
+fn run_planned(rig: &Rig, typed: &str) -> (bool, String) {
+    let (args, prompts) = (rig.root.join("args.log"), rig.root.join("prompts.log"));
+    let mut child = rig
+        .bare(&[("FAKE_ARGS", args.to_str().unwrap()), ("FAKE_PROMPTS", prompts.to_str().unwrap())])
+        .args(["run", "--plan", "add a change file"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("forkdeck starts");
+    // Typed straight away, before the plan is even there: it is kept for the choice.
+    child.stdin.as_mut().unwrap().write_all(typed.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+}
+
+#[test]
+fn a_planned_task_goes_ahead_with_the_option_picked_in_the_plans_conversation() {
+    let rig = Rig::new("plan-pick", "", "");
+    let (ok, out) = run_planned(&rig, "1\n");
+    assert!(ok, "{}", out);
+    let (args, prompts) = plan_runs(&rig);
+    let plan = args.iter().find(|a| a.contains("--permission-mode plan")).expect("planned read-only");
+    let work: Vec<&String> = args.iter().filter(|a| a.contains("acceptEdits")).collect();
+    assert_eq!(work.len(), 1, "{:?}", args);
+    assert_eq!(arg_after(work[0], "--resume"), arg_after(plan, "--session-id"), "the work continues the plan's conversation: {:?}", args);
+    assert!(prompts.contains("Go ahead with this: Option 1: Patch it. small"), "{}", prompts);
+    assert!(out.contains("option 1: Patch it"), "{}", out);
+    assert!(rig.clone().join("by_agent.txt").exists());
+}
+
+#[test]
+fn a_planned_task_can_go_its_own_way() {
+    let rig = Rig::new("plan-own", "", "");
+    let (ok, out) = run_planned(&rig, "keep it to one line\n");
+    assert!(ok, "{}", out);
+    let (_, prompts) = plan_runs(&rig);
+    assert!(prompts.contains("None of the proposed options; the user wants this instead: keep it to one line"), "{}", prompts);
+}
+
+/// A decision server that asks for a plan first, whatever the task.
+fn jev_wanting_a_plan() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 65536];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let body = r#"{"answers":{"agent":{"choice":"claude","confidence":0.9},"effort":{"score":1,"confidence":0.9},"review":{"noul":0.9},"plan":{"noul":0.97}}}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        }
+    });
+    url
+}
+
+#[test]
+fn an_issue_the_router_wants_planned_takes_the_recommended_option_and_says_so() {
+    let jev = jev_wanting_a_plan();
+    let rig = Rig::new("plan-issue", &format!("[router]\nkind = \"jev\"\n[router.jev]\nbase_url = \"{}\"", jev), "");
+    rig.issue();
+    let log = rig.root.join("prompts.log");
+    let (ok, out) = rig.once(&[("FAKE_PROMPTS", log.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    assert!(out.contains("took option 2: Rewrite it"), "{}", out);
+    let prompts = fs::read_to_string(&log).unwrap();
+    assert!(prompts.contains("Go ahead with this: Option 2: Rewrite it. clean"), "{}", prompts);
+    let calls = rig.calls();
+    assert!(calls.contains("Planned first: option 2: Rewrite it. Also proposed: Patch it."), "{}", calls);
+}
+
+fn reviews_run(rig: &Rig) -> u32 {
+    fs::read_to_string(rig.root.join("gh/reviews")).map(|n| n.trim().parse().unwrap_or(0)).unwrap_or(0)
+}
+
+#[test]
+fn a_failed_review_goes_back_to_the_worker_until_it_passes() {
+    let rig = Rig::new("fix-until-pass", "", "");
+    rig.issue();
+    let log = rig.root.join("args.log");
+    let (ok, out) = rig.once(&[("FAKE_VERDICTS", "FAIL FAIL PASS"), ("FAKE_ARGS", log.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    let workers = fs::read_to_string(&log).unwrap().lines().filter(|l| l.contains("acceptEdits")).count();
+    assert_eq!((workers, reviews_run(&rig)), (3, 3), "work, then a fix for each failed review: {}", out);
+    assert!(out.contains("fix round 2 of 5"), "{}", out);
+    assert!(rig.calls().contains("pr create"), "{}", rig.calls());
+}
+
+#[test]
+fn fixing_stops_at_the_cap_and_says_so() {
+    let rig = Rig::new("fix-cap", "[review]\nmax_fix_rounds = 2", "");
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_VERDICT", "FAIL")]);
+    assert!(!ok, "{}", out);
+    assert_eq!(reviews_run(&rig), 3);
+    assert!(out.contains("review still failing after 2 fix rounds"), "{}", out);
+}
+
+#[test]
+fn a_fix_that_changes_nothing_ends_the_rounds() {
+    let rig = Rig::new("fix-stalled", "", "");
+    rig.issue();
+    // Every attempt writes the same file with the same content: after the first, nothing changes.
+    let (ok, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_WORK", "echo same > by_agent.txt")]);
+    assert!(!ok, "{}", out);
+    assert_eq!(reviews_run(&rig), 1, "no second review of an unchanged tree: {}", out);
+    assert!(out.contains("the last fix changed nothing"), "{}", out);
+}
+
+#[test]
+fn a_reviewer_that_crashes_is_asked_again() {
+    let rig = Rig::new("review-crash-once", "", "");
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_REVIEW_CRASH", "1")]);
+    assert!(ok, "{}", out);
+    assert!(out.contains("gave no verdict") && out.contains("asking again"), "{}", out);
+    assert_eq!(reviews_run(&rig), 2);
+
+    let rig = Rig::new("review-crash-always", "", "");
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_REVIEW_CRASH", "always")]);
+    assert!(!ok && out.contains("reviewer failed"), "{}", out);
+    assert_eq!(reviews_run(&rig), 2, "asked once more, not forever");
+}
+
+#[test]
+fn a_review_without_a_verdict_is_asked_for_one() {
+    let rig = Rig::new("review-noverdict", "", "");
+    rig.issue();
+    let log = rig.root.join("prompts.log");
+    let (ok, out) = rig.once(&[("FAKE_REVIEW_NOVERDICT", "1"), ("FAKE_PROMPTS", log.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    assert!(fs::read_to_string(&log).unwrap().contains("Your previous review ended without a verdict."));
+}
+
+#[test]
 fn nothing_is_picked_up_while_the_journal_cannot_be_used() {
     let rig = Rig::new("journal-broken", "[limits]\njobs_per_day = 5", "");
     let journal = rig.root.join("home/.local/state/forkdeck/journal.jsonl");
@@ -1849,128 +2298,40 @@ fn the_open_notes_pull_request_is_found_among_any_number_of_old_branches() {
     assert_eq!(git(&rig.origin(), &["for-each-ref", "--format=%(refname:short)", "refs/heads/forkdeck/notes-*"]).lines().count(), 7, "and no new branch");
 }
 
-/// Real `claude` or `codex` installed on the machine must not take part in the copilot tests.
-const NO_REAL_CLIS: &str = "[agents.claude]\ncmd = \"absent-claude\"\n[agents.codex]\ncmd = \"absent-codex\"\n";
-
-fn copilot_runs(rig: &Rig) -> Vec<String> {
-    fs::read_to_string(rig.root.join("gh/copilot.log")).unwrap_or_default().lines().map(String::from).collect()
-}
-
-fn model_of(run: &str) -> &str {
-    run.split("--model ").nth(1).and_then(|r| r.split(' ').next()).unwrap_or("")
-}
-
 #[test]
-fn with_only_copilot_work_and_review_come_from_different_vendors() {
-    let rig = Rig::with_agents("copilot-only", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+fn the_second_review_continues_the_first_and_checks_its_own_points() {
+    let rig = Rig::new("re-review", "", "");
     rig.issue();
-    let (ok, out) = rig.once(&[]);
+    let (args, prompts) = (rig.root.join("args.log"), rig.root.join("prompts.log"));
+    let (ok, out) = rig.once(&[("FAKE_VERDICTS", "FAIL PASS"), ("FAKE_ARGS", args.to_str().unwrap()), ("FAKE_PROMPTS", prompts.to_str().unwrap())]);
     assert!(ok, "{}", out);
-    let runs = copilot_runs(&rig);
-    assert_eq!(runs.len(), 2, "{:?}", runs);
-    // Whichever part the router gave the work, the review comes from the other vendor.
-    let (work, review) = (model_of(&runs[0]), model_of(&runs[1]));
-    assert!(runs[0].contains("--allow-tool write") && runs[1].contains("--deny-tool write"), "{:?}", runs);
-    assert!((work.starts_with("claude-") && review.starts_with("gpt-")) || (work.starts_with("gpt-") && review.starts_with("claude-")), "{:?}", runs);
-    assert!(runs.iter().all(|r| !r.contains("allow-all") && !r.contains("--yolo")), "{:?}", runs);
-    assert!(rig.calls().contains("pr create"), "{}", rig.calls());
-    assert_eq!(git(&rig.origin(), &["show", "--name-only", "--format=", "forkdeck/issue-7"]), "by_agent.txt");
+    let runs = fs::read_to_string(&args).unwrap();
+    let reviews: Vec<&str> = runs.lines().filter(|l| l.contains("--permission-mode plan")).collect();
+    assert_eq!(reviews.len(), 2, "{:?}", reviews);
+    let first = arg_after(reviews[0], "--session-id").expect("the first review names its conversation");
+    assert_eq!(arg_after(reviews[1], "--resume"), Some(first), "the second review continues it: {:?}", reviews);
+    let p = fs::read_to_string(&prompts).unwrap();
+    assert!(p.contains("For each point you raised, check whether it is fixed."), "{}", p);
 }
 
 #[test]
-fn a_model_the_organisation_switched_off_is_skipped() {
-    let rig = Rig::with_agents("copilot-refused", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+fn copilot_receives_notes_and_learns_from_failed_reviews() {
+    let extra = format!("{}[review]\nmax_fix_rounds = 0\n[knowledge]\nlearn = true\nshare = false", NO_REAL_CLIS);
+    let rig = Rig::with_agents("copilot-notes", &extra, "", &[("copilot", COPILOT)]);
+    let (ok, out) = rig.run(&["notes", "o/r", "add", "Money is integer cents."], &[]);
+    assert!(ok, "{}", out);
     rig.issue();
-    let (ok, out) = rig.once(&[("FAKE_COPILOT_REJECT", "claude-sonnet-5.5 claude-sonnet-5 gpt-5.5 gpt-5.4")]);
-    assert!(ok, "{}", out);
-    let runs = copilot_runs(&rig);
-    let workers: Vec<&str> = runs.iter().filter(|r| r.contains("--allow-tool write")).map(|r| model_of(r)).collect();
-    let claude = ["claude-sonnet-5.5", "claude-sonnet-5", "claude-sonnet-4.6"];
-    let codex = ["gpt-5.5", "gpt-5.4", "gpt-5.3-codex"];
-    assert!(workers == claude || workers == codex, "each refused model is tried once, then the next: {:?}", runs);
-    assert!(out.contains("is not available to this copilot account"), "{}", out);
+    let prompts = rig.root.join("prompts.txt");
+    let asked = rig.root.join("asked.txt");
+    let (ok, out) = rig.once(&[("FAKE_PROMPTS", prompts.to_str().unwrap()), ("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", "- Run make fmt before finishing the work."), ("FAKE_LESSONS_SEEN", asked.to_str().unwrap())]);
+    assert!(!ok && out.contains("1 rule(s) added to the notes for o/r"), "{}", out);
+    assert!(fs::read_to_string(prompts).unwrap().contains("<notes>\n- Money is integer cents.\n</notes>"));
+    assert!(fs::read_to_string(asked).unwrap().contains("A reviewer did not pass the change:\nLooked at it."));
+    assert!(fs::read_to_string(rig.notes_file()).unwrap().contains("Run make fmt"));
+    let entries = rig.journal();
+    assert_eq!(entries[0]["learned"], 1);
+    assert_eq!(entries[0]["copilot"]["runs"], 3);
 }
-
-#[test]
-fn with_codex_missing_copilot_plays_codex() {
-    let rig = Rig::with_agents("claude-and-copilot", "[agents.codex]\ncmd = \"absent-codex\"\n", "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
-    rig.issue();
-    let (ok, out) = rig.once(&[]);
-    assert!(ok, "{}", out);
-    let runs = copilot_runs(&rig);
-    assert_eq!(runs.len(), 1, "claude does its own part, copilot only codex's: {:?}", runs);
-    assert!(model_of(&runs[0]).starts_with("gpt-"), "{}", runs[0]);
-}
-
-#[test]
-fn a_copilot_profile_reviews_pull_requests_next_to_claude() {
-    let extra = "[agents.codex]\ncmd = \"absent-codex\"\n[agents.copilot.profiles.second]\nvendor = \"xai\"\nmodels = { light = \"grok-4.7\", standard = \"grok-4.7\", heavy = \"grok-4.7\" }\n[review]\npr_reviewers = [\"claude\", \"copilot:second\"]";
-    let rig = Rig::with_agents("copilot-profile", extra, "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
-    rig.pull_request(5, "feat");
-    rig.list_pull_request(5, "feat");
-    let (ok, out) = rig.once(&[]);
-    assert!(ok, "{}", out);
-    let runs = copilot_runs(&rig);
-    assert_eq!(runs.len(), 1, "{:?}", runs);
-    assert_eq!(model_of(&runs[0]), "grok-4.7");
-    let calls = rig.calls();
-    assert!(calls.contains("copilot:second") && calls.contains("--add-label review:passed"), "{}", calls);
-}
-
-#[test]
-fn a_copilot_review_that_stops_early_is_not_a_pass() {
-    let rig = Rig::with_agents("copilot-truncated", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
-    rig.pull_request(5, "feat");
-    rig.list_pull_request(5, "feat");
-    let (_, out) = rig.once(&[("FAKE_COPILOT_TRUNCATE", "1")]);
-    let calls = rig.calls();
-    assert!(!calls.contains("review:passed"), "{}\n{}", calls, out);
-    assert!(calls.contains("--add-label review:ready"), "{}\n{}", calls, out);
-    assert!(out.contains("exited before reporting a result"), "it failed for the missing closing line: {}", out);
-}
-
-#[test]
-fn a_copilot_review_that_reports_usage_but_no_result_is_not_a_pass() {
-    let rig = Rig::with_agents("copilot-usage-eof", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
-    rig.pull_request(5, "feat");
-    rig.list_pull_request(5, "feat");
-    let (_, out) = rig.once(&[("FAKE_COPILOT_TRUNCATE", "usage")]);
-    let calls = rig.calls();
-    assert!(!calls.contains("review:passed"), "{}\n{}", calls, out);
-    assert!(calls.contains("--add-label review:ready"), "{}\n{}", calls, out);
-    assert!(out.contains("exited before reporting a result"), "it failed for the missing closing line: {}", out);
-}
-
-#[test]
-fn every_configured_pull_request_reviewer_runs_and_a_third_fail_counts() {
-    let extra = "[agents.codex]\ncmd = \"absent-codex\"\n[agents.copilot.profiles.second]\nvendor = \"xai\"\nmodels = { light = \"grok-4.7\", standard = \"grok-4.7\", heavy = \"grok-4.7\" }\n[agents.copilot.profiles.third]\nvendor = \"google\"\nmodels = { light = \"gemini-3.8-pro\", standard = \"gemini-3.8-pro\", heavy = \"gemini-3.8-pro\" }\n[review]\npr_reviewers = [\"claude\", \"copilot:second\", \"copilot:third\"]";
-    let rig = Rig::with_agents("three-reviewers", extra, "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
-    rig.pull_request(5, "feat");
-    rig.list_pull_request(5, "feat");
-    let (ok, out) = rig.once(&[("FAKE_COPILOT_FAIL_MODEL", "gemini-3.8-pro")]);
-    assert!(ok, "{}", out);
-    let mut models: Vec<String> = copilot_runs(&rig).iter().map(|r| model_of(r).to_string()).collect();
-    models.sort();
-    assert_eq!(models, ["gemini-3.8-pro", "grok-4.7"], "both copilot profiles ran");
-    let calls = rig.calls();
-    assert!(calls.contains("copilot:third") && calls.contains("--add-label review:changes"), "{}", calls);
-    assert!(!calls.contains("review:passed"), "{}", calls);
-}
-
-#[test]
-fn a_pinned_copilot_model_the_account_refuses_falls_back_to_the_cli_choice() {
-    let extra = format!("{}[agents.copilot]\nmodels = {{ light = \"gpt-5.5\", standard = \"gpt-5.5\", heavy = \"gpt-5.5\" }}\n[review]\npr_reviewers = [\"copilot\"]", NO_REAL_CLIS);
-    let rig = Rig::with_agents("copilot-pinned-refused", &extra, "", &[("copilot", COPILOT)]);
-    rig.pull_request(5, "feat");
-    rig.list_pull_request(5, "feat");
-    let (ok, out) = rig.once(&[("FAKE_COPILOT_REJECT", "gpt-5.5")]);
-    assert!(ok, "{}", out);
-    let runs = copilot_runs(&rig);
-    let models: Vec<&str> = runs.iter().map(|r| model_of(r)).collect();
-    assert_eq!(models, ["gpt-5.5", ""], "the refused pin is tried once, then the CLI picks: {:?}", runs);
-    assert!(rig.calls().contains("--add-label review:passed"), "{}", rig.calls());
-}
-
 #[test]
 fn copilot_usage_is_recorded_separately_and_counts_toward_limits() {
     let extra = format!("{}[limits]\ntokens_per_day = 20", NO_REAL_CLIS);
@@ -1995,20 +2356,238 @@ fn copilot_usage_is_recorded_separately_and_counts_toward_limits() {
 }
 
 #[test]
-fn copilot_receives_notes_and_learns_from_failed_reviews() {
-    let extra = format!("{}[review]\nmax_fix_rounds = 0\n[knowledge]\nlearn = true\nshare = false", NO_REAL_CLIS);
-    let rig = Rig::with_agents("copilot-notes", &extra, "", &[("copilot", COPILOT)]);
-    let (ok, out) = rig.run(&["notes", "o/r", "add", "Money is integer cents."], &[]);
+fn a_fix_that_is_committed_counts_as_a_change() {
+    let rig = Rig::new("fix-committed", "", "");
+    // Each attempt commits a different change, so nothing is left uncommitted between rounds.
+    let work = "date +%s%N >> committed.txt && git add committed.txt && git commit -qm attempt";
+    let out = rig.bare(&[("FAKE_VERDICTS", "FAIL FAIL PASS"), ("FAKE_WORK", work)]).args(["run", "add a change file"]).output().unwrap();
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{}", said);
+    assert!(!said.contains("changed nothing"), "{}", said);
+    assert_eq!(reviews_run(&rig), 3, "{}", said);
+}
+
+#[test]
+fn a_task_another_forkdeck_is_running_is_not_resumed_by_a_second_one() {
+    let rig = Rig::new("resume-live-owner", "", "");
+    let mut child = run_with_slow_first_attempt(&rig, "sleep 600");
+    let (ok, out) = rig.run(&["resume"], &[]);
+    assert!(ok && out.contains("nothing to resume"), "the running job is the other process's:\n{}", out);
+    assert_eq!(workers(&rig).len(), 1, "no second worker was started");
+    Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    let _ = child.wait();
+    // Once that forkdeck is gone, its interrupted task can be taken over.
+    let args = rig.root.join("args.log");
+    let (ok, out) = rig.run(&["resume"], &[("FAKE_ARGS", args.to_str().unwrap())]);
     assert!(ok, "{}", out);
+    assert_eq!(workers(&rig).len(), 2);
+}
+
+#[test]
+fn a_reviewer_whose_earlier_review_is_gone_starts_a_new_one_told_what_it_said() {
+    let rig = Rig::new("re-review-gone", "", "");
     rig.issue();
-    let prompts = rig.root.join("prompts.txt");
-    let asked = rig.root.join("asked.txt");
-    let (ok, out) = rig.once(&[("FAKE_PROMPTS", prompts.to_str().unwrap()), ("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", "- Run make fmt before finishing the work."), ("FAKE_LESSONS_SEEN", asked.to_str().unwrap())]);
+    let (args, prompts) = (rig.root.join("args.log"), rig.root.join("prompts.log"));
+    let (ok, out) = rig.once(&[("FAKE_VERDICTS", "FAIL"), ("FAKE_REVIEW_RESUME_FAILS", "1"), ("FAKE_ARGS", args.to_str().unwrap()), ("FAKE_PROMPTS", prompts.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    let runs = fs::read_to_string(&args).unwrap();
+    let reviews: Vec<&str> = runs.lines().filter(|l| l.contains("--permission-mode plan")).collect();
+    assert_eq!(reviews.len(), 3, "first review, the resume that failed, a new review: {:?}", reviews);
+    assert!(arg_after(reviews[1], "--resume").is_some() && arg_after(reviews[2], "--resume").is_none(), "{:?}", reviews);
+    let p = fs::read_to_string(&prompts).unwrap();
+    assert!(p.contains("----- BEGIN EARLIER REVIEW -----\nLooked at it.\nVERDICT: FAIL"), "the new review is told what the first said: {}", p);
+    assert!(p.contains("The task, with everything the user has asked for since:"), "{}", p);
+}
+
+#[test]
+fn a_refused_model_is_not_asked_again_on_the_next_turn() {
+    let rig = Rig::with_agents("copilot-fallback-kept", &format!("{}[review]\nmax_fix_rounds = 1", NO_REAL_CLIS), "", &[("copilot", COPILOT)]);
+    rig.issue();
+    let (_, out) = rig.once(&[("FAKE_COPILOT_REJECT", "claude-sonnet-5.5 gpt-5.5"), ("FAKE_VERDICT", "FAIL")]);
+    let runs = copilot_runs(&rig);
+    let workers: Vec<&String> = runs.iter().filter(|r| r.contains("--allow-tool write")).collect();
+    assert_eq!(workers.len(), 3, "refused, fallback, fix: {:?}\n{}", workers, out);
+    assert_eq!(model_of(workers[2]), model_of(workers[1]), "the fix uses the model that worked: {:?}", workers);
+    assert!(workers[2].contains("--resume"), "and continues its conversation: {:?}", workers);
+}
+
+#[test]
+fn a_message_that_stops_the_planning_is_taken_into_the_plan() {
+    let rig = Rig::new("plan-steered", "", "");
+    let (args, prompts, marker) = (rig.root.join("args.log"), rig.root.join("prompts.log"), rig.root.join("planning"));
+    let mut child = rig
+        .bare(&[("FAKE_ARGS", args.to_str().unwrap()), ("FAKE_PROMPTS", prompts.to_str().unwrap()), ("FAKE_PLAN_WAIT", marker.to_str().unwrap())])
+        .args(["run", "--plan", "add a change file"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..600 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let seen = tee(&mut child);
+    child.stdin.as_mut().unwrap().write_all(b"!only touch one file\n").unwrap();
+    wait_until_said(&seen, "interrupted with a message");
+    child.stdin.as_mut().unwrap().write_all(b"1\n").unwrap();
+    let status = child.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let said = seen.lock().unwrap().clone();
+    assert!(status.success(), "the task goes on instead of failing: {}", said);
+    let runs = fs::read_to_string(&args).unwrap();
+    let plans: Vec<&str> = runs.lines().filter(|l| l.contains("--permission-mode plan")).collect();
+    assert!(arg_after(plans[1], "--resume") == arg_after(plans[0], "--session-id"), "planned again in the same conversation: {:?}", plans);
+    let p = fs::read_to_string(&prompts).unwrap();
+    assert!(p.contains("The user says: only touch one file"), "{}", p);
+    assert!(p.contains("Go ahead with this: Option 1: Patch it"), "{}", p);
+}
+
+
+/// Stop `run --plan` while the first plan is still being made. The job is saved as interrupted there.
+fn plan_stopped_while_planning(rig: &Rig) {
+    let marker = rig.root.join("planning");
+    let child = rig
+        .bare(&[("FAKE_PLAN_WAIT", marker.to_str().unwrap())])
+        .args(["run", "--plan", "add a change file"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..600 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(marker.exists(), "the plan never started");
+    Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    let _ = child.wait_with_output();
+}
+
+fn resume_typing(rig: &Rig, typed: &str) -> (bool, String) {
+    let prompts = rig.root.join("prompts.log");
+    let mut child = rig
+        .bare(&[("FAKE_PROMPTS", prompts.to_str().unwrap())])
+        .arg("resume")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(typed.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+}
+
+#[test]
+fn a_task_stopped_while_planning_takes_its_choice_from_resume() {
+    let rig = Rig::new("resume-plan-choice", "", "");
+    plan_stopped_while_planning(&rig);
+    let (ok, out) = resume_typing(&rig, "2\n");
+    assert!(ok, "{}", out);
+    let p = fs::read_to_string(rig.root.join("prompts.log")).unwrap();
+    assert!(p.contains("Go ahead with this: Option 2: Rewrite it"), "{}", p);
+}
+
+#[test]
+fn a_planned_task_stopped_before_it_started_still_plans_first() {
+    let rig = Rig::new("resume-queued-plan", "", "");
+    plan_stopped_while_planning(&rig);
+    // As if it had been stopped while still waiting in the queue.
+    let db = rusqlite::Connection::open(rig.root.join("home/.local/state/forkdeck/forkdeck.db")).unwrap();
+    db.execute("UPDATE jobs SET resume_from = 'queued'", []).unwrap();
+    drop(db);
+    let (ok, out) = resume_typing(&rig, "1\n");
+    assert!(ok, "{}", out);
+    let p = fs::read_to_string(rig.root.join("prompts.log")).unwrap();
+    let plan_at = p.find("Before anything is changed, propose how to do the task").expect("it planned");
+    let work_at = p.find("Go ahead with this: Option 1: Patch it").expect("then worked as chosen");
+    assert!(plan_at < work_at, "{}", p);
+}
+
+#[test]
+fn notes_are_still_learned_when_copilot_refuses_the_first_model() {
+    let extra = format!("{}[review]\nmax_fix_rounds = 0\n[knowledge]\nlearn = true\nshare = false", NO_REAL_CLIS);
+    let rig = Rig::with_agents("copilot-notes-fallback", &extra, "", &[("copilot", COPILOT)]);
+    rig.issue();
+    // The first light model of both families is refused; learning runs on the light tier.
+    let (ok, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", "- Keep money in integer cents."), ("FAKE_COPILOT_REJECT", "claude-haiku-5.5 gpt-5.4-mini")]);
     assert!(!ok && out.contains("1 rule(s) added to the notes for o/r"), "{}", out);
-    assert!(fs::read_to_string(prompts).unwrap().contains("<notes>\n- Money is integer cents.\n</notes>"));
-    assert!(fs::read_to_string(asked).unwrap().contains("A reviewer did not pass the change:\nLooked at it."));
-    assert!(fs::read_to_string(rig.notes_file()).unwrap().contains("Run make fmt"));
-    let entries = rig.journal();
-    assert_eq!(entries[0]["learned"], 1);
-    assert_eq!(entries[0]["copilot"]["runs"], 3);
+}
+
+#[test]
+fn a_fix_to_a_binary_file_counts_as_a_change() {
+    let rig = Rig::new("fix-binary", "", "");
+    // Each attempt writes new random bytes (not valid UTF-8) to a file git does not track yet.
+    let work = "head -c 64 /dev/urandom > 'blob one.bin'";
+    let out = rig.bare(&[("FAKE_VERDICTS", "FAIL PASS"), ("FAKE_WORK", work)]).args(["run", "add a change file"]).output().unwrap();
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && !said.contains("changed nothing"), "{}", said);
+    assert_eq!(reviews_run(&rig), 2);
+}
+
+#[test]
+fn a_crash_during_the_first_run_still_continues_that_conversation() {
+    let rig = Rig::new("crash-session", "", "");
+    let mut child = run_with_slow_first_attempt(&rig, "sleep 600");
+    // Past an autosave, then killed outright: no shutdown, nothing written on the way out.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    Command::new("kill").args(["-KILL", &child.id().to_string()]).status().unwrap();
+    let _ = child.wait();
+    // The agent it left behind belongs to nobody now.
+    let _ = Command::new("pkill").args(["-f", rig.root.join("first-attempt").to_str().unwrap()]).status();
+    let args = rig.root.join("args.log");
+    let (ok, out) = rig.run(&["resume"], &[("FAKE_ARGS", args.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    let w = workers(&rig);
+    assert_eq!(w.len(), 2, "{:?}", w);
+    assert_eq!(arg_after(&w[1], "--resume"), arg_after(&w[0], "--session-id"), "{:?}", w);
+}
+
+#[test]
+fn a_model_refused_on_a_resumed_turn_hands_its_successor_the_whole_story() {
+    let rig = Rig::with_agents("copilot-refused-on-resume", NO_REAL_CLIS, "", &[("copilot", COPILOT)]);
+    let marker = rig.root.join("first-attempt");
+    let work = format!("if [ -f {m} ]; then echo change >> by_agent.txt; else touch {m}; sleep 600; fi", m = marker.display());
+    let child = rig.bare(&[("FAKE_WORK", &work)]).args(["run", "add a change file"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    for _ in 0..600 {
+        if marker.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    let _ = child.wait_with_output();
+    let first = copilot_runs(&rig)[0].clone();
+    let model = model_of(&first).to_string();
+    let prompts = rig.root.join("prompts.log");
+    // The model that started the task is refused when the task continues.
+    fs::write(rig.root.join(format!("gh/used-{}", model)), "").unwrap();
+    let (ok, out) = rig.run(&["resume"], &[("FAKE_WORK", &work), ("FAKE_COPILOT_REJECT_LATER", &model), ("FAKE_PROMPTS", prompts.to_str().unwrap())]);
+    assert!(ok, "{}", out);
+    let runs = copilot_runs(&rig);
+    let after: Vec<&String> = runs.iter().skip(1).filter(|r| r.contains("--allow-tool write")).collect();
+    assert!(after[0].contains("--resume") && model_of(after[0]) == model, "it first tried to continue: {:?}", after);
+    assert!(model_of(after[1]) != model && !after[1].contains("--resume"), "then a new model in a new conversation: {:?}", after);
+    let p = fs::read_to_string(&prompts).unwrap();
+    assert!(p.contains("add a change file\n\nAn earlier attempt at this was interrupted"), "the new conversation is told everything: {}", p);
+}
+
+
+#[test]
+fn a_choice_waiting_after_a_restart_shows_its_options_again() {
+    let rig = Rig::new("resume-shows-options", "", "");
+    // Planned, then stopped while it waited for a choice.
+    let mut child = rig.bare(&[]).args(["run", "--plan", "add a change file"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let seen = tee(&mut child);
+    wait_until_said(&seen, "pick 1–2 or type your own");
+    Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    let _ = child.wait();
+    let (ok, out) = resume_typing(&rig, "1\n");
+    assert!(ok, "{}", out);
+    assert!(out.contains("1) Patch it — small") && out.contains("2) Rewrite it (recommended) — clean"), "the options are shown before the choice: {}", out);
 }

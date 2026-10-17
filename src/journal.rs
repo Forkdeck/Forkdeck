@@ -58,6 +58,8 @@ pub struct Entry {
     pub checks: Option<bool>,
     pub claude: Usage,
     pub codex: Usage,
+    /// Entries written before copilot was an agent have none.
+    #[serde(default)]
     pub copilot: Usage,
     pub pr: String,
     pub rolled_back: bool,
@@ -117,6 +119,7 @@ pub fn entry(j: &Job, status: JobStatus, outcome: &str, learned: u32) -> Entry {
     }
 }
 
+/// Where a CLI's usage is kept in `Job::used`.
 pub fn slot(a: AgentKind) -> usize {
     match a {
         AgentKind::Claude => 0,
@@ -447,13 +450,6 @@ mod tests {
     }
 
     #[test]
-    fn older_journal_entries_default_copilot_usage_to_zero() {
-        let entry: Entry = serde_json::from_str(r#"{"ts":1,"claude":{"runs":1,"tokens_in":10},"codex":{"runs":1,"tokens_out":5}}"#).unwrap();
-        assert_eq!(entry.copilot, Usage::default());
-        assert_eq!(entry.tokens(), 15);
-    }
-
-    #[test]
     fn a_damaged_line_does_not_hide_the_rest() {
         let a = serde_json::to_string(&e(10, "issue", "o/r", "done")).unwrap();
         let b = serde_json::to_string(&e(20, "review", "o/r", "failed")).unwrap();
@@ -566,5 +562,12 @@ mod tests {
         assert!(text(&summarise(&[], 7))[1].contains("nothing on record"));
         assert_eq!(percentile(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 90), 10);
         assert_eq!(percentile(&[5], 50), 5);
+    }
+
+    #[test]
+    fn older_journal_entries_default_copilot_usage_to_zero() {
+        let entry: Entry = serde_json::from_str(r#"{"ts":1,"claude":{"runs":1,"tokens_in":10},"codex":{"runs":1,"tokens_out":5}}"#).unwrap();
+        assert_eq!(entry.copilot, Usage::default());
+        assert_eq!(entry.tokens(), 15);
     }
 }

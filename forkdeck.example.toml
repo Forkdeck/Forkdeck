@@ -16,6 +16,10 @@ default_agent = "claude"
 # Answers under this confidence count as "split" and take the cautious branch:
 # the default agent, the next effort tier up, and a review. Between 0.5 and 1.
 threshold = 0.6
+# With a decision server: "auto" lets it ask for a plan first on open-ended tasks,
+# so you choose an approach before work starts; "never" does not ask. Ctrl-P and
+# `forkdeck run --plan` plan either way.
+plan = "auto"
 
 [router.jev]
 # A local server such as jeff listens here by default. Any server that speaks the
@@ -87,7 +91,10 @@ reviewer = "other"     # other: the CLI that did not do the work | same
 # With reviewer = "other": the first of these that is available and runs a model
 # from a different vendor than the worker's reviews.
 reviewer_order = ["claude", "codex"]
-max_fix_rounds = 1
+# Fix rounds after a failed review or failed checks. The worker addresses each
+# failure until the review passes; this only caps runaway loops. It also stops
+# early when a fix changes nothing.
+max_fix_rounds = 5
 # Commands run after the worker finishes a task typed into the prompt. A failing
 # command goes back to the worker as a fix round. Repositories list their own below.
 checks = []
@@ -115,7 +122,7 @@ publish_on_failed_review = false
 # 0 switches a limit off. What a limit holds back stays labelled and untouched.
 [limits]
 jobs_per_day = 0           # issues and reviews picked up, all repositories together
-tokens_per_day = 0         # tokens in and out, all CLIs, typed tasks included
+tokens_per_day = 0         # tokens in and out, both CLIs, typed tasks included
 job_mins = 0               # one issue or review may run this long, then goes to a person
 pause_after_failures = 5   # this many failed in a row on a repository: stop picking up from it
 pause_mins = 60            # ...for this long

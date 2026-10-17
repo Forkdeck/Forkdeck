@@ -47,8 +47,10 @@ the config names commands to run.
    failure goes back to the worker with the output.
 4. **Review.** An agent running another vendor's model reads the diff, read-only, and ends with
    `VERDICT: PASS` or `VERDICT: FAIL`. It sees the task and the tree, not the
-   worker's summary. A fail goes back to the worker, up to
-   `review.max_fix_rounds` times. Only the last line of the review counts as
+   worker's summary. A fail goes back to the worker with the review, and the
+   worker keeps addressing it until the review passes. `review.max_fix_rounds`
+   (5) only caps runaway loops, and fixing also stops when a fix changes
+   nothing. A reviewer that crashes or gives no verdict is asked once more. Only the last line of the review counts as
    the verdict, so one quoted from a description or a code comment is ignored,
    and no verdict is never treated as a pass.
 
@@ -560,7 +562,7 @@ resets nothing.
 ```toml
 [limits]
 jobs_per_day = 20          # issues and reviews picked up, all repositories together
-tokens_per_day = 5000000   # in and out, all CLIs, typed tasks included
+tokens_per_day = 5000000   # in and out, both CLIs, typed tasks included
 job_mins = 90              # one issue or review may run this long
 pause_after_failures = 5   # default
 pause_mins = 60            # default
@@ -569,7 +571,7 @@ pause_mins = 60            # default
 - **`jobs_per_day`** and a repository's own `jobs_per_day` cap how many issues
   and reviews are picked up. Deployments and typed tasks are not counted: one
   follows from a merge and the other from you.
-- **`tokens_per_day`** counts everything all CLIs report having used. When it
+- **`tokens_per_day`** counts everything both CLIs report having used. When it
   is reached nothing more is picked up; a job already running finishes.
 - **`job_mins`** stops an issue or review that runs too long, kills its agent,
   and hands the item to a person with the failure label. Deployments are
@@ -720,7 +722,12 @@ back by hand, or with `forkdeck team release`.
 
 | | |
 |---|---|
-| `Enter` | run the typed task in the current directory |
+| `Enter` | with a typed task selected, send what you typed to it: a follow-up once it has finished, a message for the agent while it works, your choice while it waits for one; otherwise run it as a new task in the current directory |
+| `Ctrl-S` | send what you typed to the selected task now: its agent stops and continues with the message |
+| `Ctrl-N` | make the next `Enter` start a new task instead of replying |
+| `Ctrl-P` | the next new task proposes approaches first, and you pick one |
+| `1`–`9` | pick that option of a task waiting for a choice |
+| `Ctrl-R` | continue the selected interrupted task |
 | `Tab` | force the next task to claude, codex, copilot, or back to auto |
 | `↑` `↓` | select a job; `Esc` goes back to following the newest |
 | `Ctrl-A` | issue and pull request polling on/off |
@@ -728,11 +735,46 @@ back by hand, or with `forkdeck team release`.
 | `Ctrl-X` | cancel the selected job |
 | `Ctrl-C` | quit, stopping any running agent |
 
+### Conversations, history and resuming
+
+A typed task keeps its conversation. Select it (`↑` `↓`) and type: once it has
+finished, that is a follow-up, and the same agent continues in the same tree;
+while it works, it is a message the agent gets as soon as its current step ends,
+before checks and review. `Ctrl-S` sends it at once instead: the agent is stopped
+and carries on with the message. Either way the change goes through the checks
+and review again, and the reviewer is told what you asked for since the task.
+
+The agent continues its own conversation in its CLI (`claude --resume`,
+`codex exec resume`, `copilot --resume`), so nothing it was told is lost and
+nothing is sent twice. When a CLI no longer has the conversation, the agent
+starts a new one with the exchanges so far.
+
+Jobs are kept in `~/.local/state/forkdeck/forkdeck.db` (SQLite, the newest 200).
+They come back when forkdeck starts. A typed task that was cut off by quitting,
+Ctrl-C or SIGTERM is marked interrupted and continues by itself from the stage it
+had reached; `Ctrl-R` retries one by hand. Issue and pull request jobs come back
+for reference only: their labels already put them back in the queue. Several
+forkdecks can share the file. `forkdeck history` lists the saved jobs,
+`forkdeck history clear` removes them, and `forkdeck resume` continues
+interrupted typed tasks without the interface.
+
+### Planning first
+
+With `Ctrl-P` before `Enter` (or `forkdeck run --plan`), the agent first looks at
+the code without changing anything and proposes two to four approaches, marking
+the one it recommends. Pick one with its number, or type how you want it done
+instead; the same agent then does it, in the conversation it planned in. With a
+decision server, the fork layer can also ask for a plan on open-ended tasks
+(`router.plan = "auto"`, the default; `"never"` turns that off). Issue jobs
+have nobody to ask, so they take the recommended option, and the pull request
+says which one and what else was proposed.
+
 Typed tasks share the current directory, so they run one at a time. Issue and
 review jobs each have a worktree and run `automation.max_parallel` at once.
 
-`forkdeck run "task"` does one job without the interface, and `forkdeck once`
-does one pass over the configured repositories. Both exit non-zero if a job
+`forkdeck run "task"` does one job without the interface: lines you type while it
+runs are sent to the task, and a line starting with `!` stops the agent to take
+it at once. `forkdeck once` does one pass over the configured repositories. Both exit non-zero if a job
 fails and stop their agents on SIGTERM or SIGINT, which is enough for a script
 or a cron entry.
 

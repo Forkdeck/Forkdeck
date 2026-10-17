@@ -80,7 +80,7 @@ impl Serialize for AgentRef {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Light,
@@ -104,10 +104,15 @@ impl Tier {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Queued,
     Routing,
+    /// The agent is proposing ways to do the task.
+    Planning,
+    /// Waiting for the user to pick one of the proposed ways.
+    Choosing,
     Working,
     Reviewing,
     Fixing,
@@ -119,6 +124,8 @@ pub enum JobStatus {
     Done,
     Failed,
     Cancelled,
+    /// forkdeck stopped while the job ran. A typed task continues on the next start.
+    Interrupted,
 }
 
 impl JobStatus {
@@ -126,6 +133,8 @@ impl JobStatus {
         match self {
             JobStatus::Queued => "queued",
             JobStatus::Routing => "routing",
+            JobStatus::Planning => "planning",
+            JobStatus::Choosing => "choose an option",
             JobStatus::Working => "working",
             JobStatus::Reviewing => "reviewing",
             JobStatus::Fixing => "fixing",
@@ -136,10 +145,11 @@ impl JobStatus {
             JobStatus::Done => "done",
             JobStatus::Failed => "failed",
             JobStatus::Cancelled => "cancelled",
+            JobStatus::Interrupted => "interrupted",
         }
     }
     pub fn finished(self) -> bool {
-        matches!(self, JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled)
+        matches!(self, JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled | JobStatus::Interrupted)
     }
 }
 
@@ -157,6 +167,8 @@ pub struct Stage {
     pub agent: Option<AgentKind>,
     /// Set when the agent ran on another CLI: "copilot" standing in, or a "copilot:<name>" profile.
     pub via: String,
+    /// The CLI's id for the conversation in this box, as soon as it is known.
+    pub session: Option<String>,
     /// What the box shows when no agent runs in it (a deployment step).
     pub label: String,
     pub model: String,
@@ -177,6 +189,7 @@ impl Default for Stage {
         Stage {
             agent: None,
             via: String::new(),
+            session: None,
             label: String::new(),
             model: String::new(),
             effort: String::new(),
@@ -212,7 +225,7 @@ impl Stage {
 }
 
 /// One typed answer from the decision layer, drawn as a bar in the fork-layer box.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Gate {
     pub name: String,
     pub answer: String,
@@ -220,7 +233,7 @@ pub struct Gate {
     pub sharp: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Decision {
     pub agent: AgentKind,
     pub tier: Tier,
@@ -229,6 +242,85 @@ pub struct Decision {
     pub source: String,
     pub ms: u128,
     pub note: String,
+    /// The fork layer thinks the user should choose an approach before work starts.
+    #[serde(default)]
+    pub plan: bool,
+}
+
+/// Whether a job proposes approaches before it works.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Planning {
+    /// When the fork layer says so.
+    #[default]
+    IfRouted,
+    Always,
+    Never,
+}
+
+/// One way of doing the task, as the agent proposed it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlanOption {
+    pub title: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub recommended: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Choice {
+    /// One of the proposed options, counted from 0.
+    Option(usize),
+    /// The user's own approach instead.
+    Own(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Plan {
+    pub options: Vec<PlanOption>,
+    /// Everything the agent said while planning.
+    pub text: String,
+    pub chosen: Option<Choice>,
+}
+
+impl Plan {
+    /// The recommended option, else the first.
+    pub fn default_choice(&self) -> usize {
+        self.options.iter().position(|o| o.recommended).unwrap_or(0)
+    }
+    pub fn describe(&self, c: &Choice) -> String {
+        match c {
+            Choice::Option(i) => self.options.get(*i).map(|o| format!("option {}: {}", i + 1, o.title)).unwrap_or_else(|| format!("option {}", i + 1)),
+            Choice::Own(t) => format!("own approach: {}", t),
+        }
+    }
+}
+
+/// The options in an agent's plan: the last `<options>{...}</options>` block. Earlier blocks (a
+/// quoted example, a first draft) do not count. None when there is no usable block.
+pub fn parse_options(text: &str) -> Option<Vec<PlanOption>> {
+    let start = text.rfind("<options>")? + "<options>".len();
+    let end = start + text[start..].find("</options>")?;
+    #[derive(Deserialize)]
+    struct Block {
+        options: Vec<PlanOption>,
+    }
+    let mut opts = serde_json::from_str::<Block>(text[start..end].trim()).ok()?.options;
+    opts.retain(|o| !o.title.trim().is_empty());
+    if opts.is_empty() || opts.len() > 9 {
+        return None;
+    }
+    // One recommendation at most: the first one marked.
+    let mut seen = false;
+    for o in &mut opts {
+        if o.recommended && seen {
+            o.recommended = false;
+        }
+        seen |= o.recommended;
+    }
+    Some(opts)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -238,7 +330,7 @@ pub enum Provider {
     Gitlab,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Source {
     Manual,
     Issue { repo_idx: usize, repo: String, number: u64, url: String },
@@ -284,6 +376,22 @@ impl Cancel {
     }
 }
 
+/// The worker's own conversation in its CLI, continued on later turns instead of retelling it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Session {
+    pub cli: AgentKind,
+    pub id: String,
+    pub model: String,
+}
+
+/// One exchange in a typed task's conversation: what the user asked and what the agent said back.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Turn {
+    pub ask: String,
+    /// Empty until the turn has produced a result.
+    pub answer: String,
+}
+
 pub struct Job {
     pub id: u32,
     pub title: String,
@@ -315,14 +423,38 @@ pub struct Job {
     pub claim: Option<Arc<crate::team::Held>>,
     /// A teammate handed the item back to the queue: stop without touching its labels.
     pub released: bool,
+    /// The conversation so far. The first turn is the task itself; each reply adds one.
+    pub turns: Vec<Turn>,
     /// A teammate whose forkdeck announced the same deployment before this one did.
     pub peer: Option<String>,
-    /// What each CLI was used for in this job so far: claude, codex, then copilot.
+    /// What each CLI was used for in this job so far: claude, codex, copilot (`journal::slot`).
     pub used: [crate::journal::Usage; 3],
     /// What checks and reviewers objected to, for the repository's notes.
     pub findings: Vec<String>,
     /// Stopped by `limits.job_mins`.
     pub over_time: bool,
+    /// The worker's conversation, once its CLI has named it.
+    pub session: Option<Session>,
+    /// Set on an interrupted typed task that is to continue: the stage it had reached.
+    pub resume_from: Option<JobStatus>,
+    /// Messages sent to a running typed task, for the agent once its current step ends.
+    pub inbox: VecDeque<String>,
+    /// Fired to stop the agent that is running now, so that it takes the first message at once.
+    pub steer: Arc<Cancel>,
+    /// Whether to propose approaches before working.
+    pub planning: Planning,
+    /// The approaches proposed, and the one chosen.
+    pub plan: Option<Plan>,
+    /// Woken when the user chooses.
+    pub chose: Arc<tokio::sync::Notify>,
+    /// The worker and reviewer as they last ran, when that differs from the first choice (a model
+    /// the account refused was replaced). Later turns use these, so the refused model is not asked
+    /// again and the conversation they started can continue.
+    pub worker_ran: Option<crate::pick::Exec>,
+    pub reviewer_ran: Option<crate::pick::Exec>,
+    /// The database reserved this job's id, so it may be saved there. A job whose id could not be
+    /// reserved is never saved: its number may belong to another job in the history.
+    pub in_history: bool,
 }
 
 impl Job {
@@ -589,6 +721,20 @@ mod tests {
         st.forget_unlisted(0, false, &[1, 2]);
         assert!(st.should_take(k, t0));
     }
+    #[test]
+    fn plan_options_are_read_from_the_last_block() {
+        let text = "Here is an example: <options>{\"options\":[{\"title\":\"fake\"}]}</options>\n\nMy proposal:\n<options>\n{\"options\": [{\"title\": \"Small fix\", \"summary\": \"patch it\"}, {\"title\": \"Rewrite\", \"summary\": \"cleaner\", \"recommended\": true}, {\"title\": \"Both\", \"recommended\": true}]}\n</options>";
+        let o = parse_options(text).unwrap();
+        assert_eq!(o.iter().map(|o| o.title.as_str()).collect::<Vec<_>>(), ["Small fix", "Rewrite", "Both"]);
+        assert_eq!(o.iter().map(|o| o.recommended).collect::<Vec<_>>(), [false, true, false], "one recommendation at most");
+        let plan = Plan { options: o, text: String::new(), chosen: None };
+        assert_eq!(plan.default_choice(), 1);
+        assert_eq!(plan.describe(&Choice::Option(0)), "option 1: Small fix");
+        for bad in ["no block at all", "<options>not json</options>", "<options>{\"options\":[]}</options>", "<options>{\"options\":[{\"title\":\"x\"}]}"] {
+            assert_eq!(parse_options(bad), None, "{}", bad);
+        }
+    }
+
     #[test]
     fn agent_refs_round_trip() {
         for s in ["claude", "codex", "copilot", "copilot:second", "copilot:a_b-1"] {

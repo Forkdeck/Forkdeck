@@ -14,8 +14,7 @@
 use crate::agents::Slot;
 use crate::config::RepoCfg;
 use crate::issues;
-use crate::orchestrator::{self, Hub};
-use crate::pick;
+use crate::orchestrator::Hub;
 use crate::state::{clip, AgentKind, AgentRef, Provider, Source, Tier};
 use std::path::PathBuf;
 
@@ -243,12 +242,16 @@ pub async fn learn(hub: &Hub, id: u32) -> u32 {
         .flatten();
     let Some((idx, tag, findings, dir, agent)) = found else { return 0 };
     let Some(r) = hub.cfg.repos.get(idx).cloned() else { return 0 };
-    let available = orchestrator::avail_of(&hub.cfg, &hub.state.lock().unwrap());
-    let wanted = AgentRef::Kind(agent.unwrap_or(AgentKind::Claude));
-    let Some(exec) = pick::worker_for(&hub.cfg, &available.borrow(), &wanted, Tier::Light) else { return 0 };
+    // The agent that reviewed, else whichever can stand in, on the lightest tier.
+    let wanted = AgentRef::Kind(match agent {
+        Some(AgentKind::Codex) => AgentKind::Codex,
+        _ => AgentKind::Claude,
+    });
+    let Some(exec) = crate::pick::worker_for(&hub.cfg, &crate::orchestrator::avail(hub).borrow(), &wanted, Tier::Light) else { return 0 };
     let dir = if dir.is_dir() { dir } else { r.path.clone() };
     let prompt = ask(&r.repo, &findings);
-    let (out, _) = orchestrator::run_agent(hub, id, Slot::Reviewer, exec, Tier::Light, &prompt, &dir, true).await;
+    // Through the runner that moves on to the next model when the account refuses one.
+    let (out, _) = crate::orchestrator::run_agent(hub, id, Slot::Reviewer, exec, Tier::Light, &prompt, &dir, true, None).await;
     if !out.ok {
         hub.log("notes", format!("#{} nothing learned: {}", id, clip(&out.error, 120)));
         return 0;

@@ -3,6 +3,7 @@ mod cicd;
 mod config;
 mod copilot;
 mod demo;
+mod history;
 mod issues;
 mod journal;
 mod knowledge;
@@ -48,12 +49,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run one task without the interface and print progress
+    /// Run one task without the interface and print progress. Lines typed on stdin while it runs
+    /// are sent to the task; a line starting with "!" stops the agent to take it at once
     Run {
         /// Force an agent: claude, codex, copilot or copilot:<profile>
         #[arg(long)]
         agent: Option<String>,
+        /// Have the agent propose approaches first; pick one on stdin by its number, or type your own
+        #[arg(long)]
+        plan: bool,
         task: Vec<String>,
+    },
+    /// Continue the typed tasks that were cut off when forkdeck last stopped, without the interface.
+    /// Lines typed on stdin go to them as in `run` ("#N text" to pick one)
+    Resume,
+    /// List the jobs kept from earlier runs, or clear them
+    History {
+        #[command(subcommand)]
+        cmd: Option<HistoryCmd>,
     },
     /// Show what the fork layer would decide for a task
     Route { task: Vec<String> },
@@ -125,6 +138,12 @@ enum TeamCmd {
         #[arg(long)]
         unclaimed: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum HistoryCmd {
+    /// Remove every saved job
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -209,7 +228,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
     let rt = tokio::runtime::Runtime::new()?;
-    let hub = Hub::new(cfg, rt.handle().clone());
+    let hub = Hub::new(cfg, rt.handle().clone()).with_history();
     let cwd = std::env::current_dir()?;
 
     match cli.cmd {
@@ -226,6 +245,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Once) => {
             anyhow::ensure!(!hub.cfg.repos.is_empty(), "no [[repos]] configured, nothing to poll");
             rt.block_on(hub.detect_agents());
+            hub.start_autosave();
             let code = rt.block_on(once(&hub));
             std::process::exit(code);
         }
@@ -306,13 +326,32 @@ fn main() -> anyhow::Result<()> {
             let ok = rt.block_on(doctor(&hub, cfg_path));
             std::process::exit(if ok { 0 } else { 1 });
         }
-        Some(Cmd::Run { agent, task }) => {
+        Some(Cmd::Run { agent, plan, task }) => {
             let task = task.join(" ");
             anyhow::ensure!(!task.trim().is_empty(), "give a task to run");
             let forced = agent.as_deref().map(parse_agent).transpose()?;
             rt.block_on(hub.detect_agents());
-            let code = rt.block_on(headless(&hub, task, cwd, forced));
+            hub.start_autosave();
+            let code = rt.block_on(headless(&hub, task, cwd, forced, plan));
             std::process::exit(code);
+        }
+        Some(Cmd::Resume) => {
+            rt.block_on(hub.detect_agents());
+            hub.start_autosave();
+            let code = rt.block_on(resume_cmd(&hub));
+            std::process::exit(code);
+        }
+        Some(Cmd::History { cmd }) => {
+            let Some(h) = &hub.history else { anyhow::bail!("no history: {}", history::path().display()) };
+            match cmd {
+                Some(HistoryCmd::Clear) => println!("removed {} job(s)", h.clear().map_err(anyhow::Error::msg)?),
+                None => {
+                    for r in h.load(history::KEEP).map_err(anyhow::Error::msg)? {
+                        println!("{}", history::summary(&r));
+                    }
+                }
+            }
+            Ok(())
         }
         Some(Cmd::Init { .. }) => unreachable!(),
         None => {
@@ -321,6 +360,13 @@ fn main() -> anyhow::Result<()> {
             rt.spawn(team::watch_loop(hub.clone()));
             if let Some(path) = cli.snapshot {
                 return snapshot(&rt, &hub, cwd, &path, &cli.size, cli.after, cli.team_pane);
+            }
+            // Earlier jobs come back; typed tasks that were cut off continue by themselves.
+            hub.start_autosave();
+            for id in hub.restore() {
+                if let Err(e) = hub.resume(id) {
+                    hub.log("queue", format!("#{} not resumed: {} (Ctrl-R tries again)", id, e));
+                }
             }
             if let Some(p) = cfg_path {
                 hub.log("config", format!("loaded {}", p.display()));
@@ -348,22 +394,86 @@ async fn stop_signal() {
     }
 }
 
-async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentRef>) -> i32 {
+async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentRef>, plan: bool) -> i32 {
     let title = state::clip(&task, 80);
-    let id = hub.submit(title, task, Source::Manual, cwd, forced);
-    // The agent runs in its own process group, so a signal sent to us has to be passed on by hand.
+    // Without --plan nobody may be there to choose, so a plan is never waited for.
+    let id = hub.submit(title, task, Source::Manual, cwd, forced, if plan { state::Planning::Always } else { state::Planning::Never });
+    read_messages(hub, vec![id]);
+    wait_for(hub, &[id]).await
+}
+
+/// Continue every typed task that was cut off, and wait for them.
+/// Lines typed while jobs run go to them: queued for the agent, or at once with a leading "!". With
+/// several jobs, "#N text" picks one; otherwise a job waiting for a choice of plan gets it, else the
+/// first one still running.
+fn read_messages(hub: &Hub, ids: Vec<u32>) {
+    let h = hub.clone();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines() {
+            let Ok(line) = line else { break };
+            let mut text = line.trim();
+            let picked = text.strip_prefix('#').and_then(|r| r.split_once(' ')).and_then(|(n, rest)| n.parse::<u32>().ok().filter(|n| ids.contains(n)).map(|n| (n, rest.trim())));
+            let id = match picked {
+                Some((n, rest)) => {
+                    text = rest;
+                    n
+                }
+                None => {
+                    let st = h.state.lock().unwrap();
+                    let mine = || st.jobs.iter().filter(|j| ids.contains(&j.id));
+                    let Some(id) = mine().find(|j| j.status == JobStatus::Choosing).or_else(|| mine().find(|j| !j.status.finished())).map(|j| j.id) else { continue };
+                    id
+                }
+            };
+            let sent = match text.strip_prefix('!') {
+                Some(now) if !now.trim().is_empty() => h.steer_now(id, now.trim().to_string()),
+                _ if !text.is_empty() => h.reply(id, text.to_string()),
+                _ => continue,
+            };
+            if let Err(why) = sent {
+                h.log("queue", format!("#{} not sent: {}", id, why));
+            }
+        }
+    });
+}
+
+async fn resume_cmd(hub: &Hub) -> i32 {
+    let mut ids = Vec::new();
+    for id in hub.restore() {
+        match hub.resume(id) {
+            Ok(()) => ids.push(id),
+            Err(e) => hub.log("queue", format!("#{} not resumed: {}", id, e)),
+        }
+    }
+    if ids.is_empty() {
+        print_progress(hub);
+        say!("nothing to resume");
+        return 0;
+    }
+    // A task stopped while planning or choosing asks again, and the answer is typed here.
+    read_messages(hub, ids.clone());
+    wait_for(hub, &ids).await
+}
+
+/// Print progress until the jobs are finished: 0 when all are done.
+async fn wait_for(hub: &Hub, ids: &[u32]) -> i32 {
+    // The agents run in their own process groups, so a signal sent to us has to be passed on by
+    // hand. Stopping this way leaves typed tasks interrupted, to continue with `forkdeck resume`.
     let h = hub.clone();
     tokio::spawn(async move {
         stop_signal().await;
-        h.cancel(id);
+        h.shutdown(Duration::from_secs(45)).await;
     });
     loop {
         tokio::time::sleep(Duration::from_millis(150)).await;
         print_progress(hub);
         let st = hub.state.lock().unwrap();
-        let Some(j) = st.jobs.iter().find(|j| j.id == id) else { return 1 };
-        if j.status.finished() {
-            let code = if j.status == JobStatus::Done { 0 } else { 1 };
+        let mine: Vec<_> = st.jobs.iter().filter(|j| ids.contains(&j.id)).collect();
+        if mine.len() < ids.len() {
+            return 1;
+        }
+        if mine.iter().all(|j| j.status.finished()) && hub.settled() {
+            let code = if mine.iter().all(|j| j.status == JobStatus::Done) { 0 } else { 1 };
             drop(st);
             print_progress(hub);
             return code;
@@ -413,7 +523,7 @@ async fn once(hub: &Hub) -> i32 {
                 st.jobs.iter().filter(|j| matches!(j.status, JobStatus::Failed | JobStatus::Cancelled)).count(),
             )
         };
-        if open == 0 {
+        if open == 0 && hub.settled() {
             print_progress(hub);
             return if failed == 0 { 0 } else { 1 };
         }
@@ -688,8 +798,14 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
     ok
 }
 
+/// The selected job, when it is waiting for a choice of plan.
+fn choosing(hub: &Hub, u: &ui::Ui) -> Option<u32> {
+    let id = u.selected?;
+    hub.state.lock().unwrap().jobs.iter().find(|j| j.id == id && j.status == JobStatus::Choosing).map(|j| j.id)
+}
+
 fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
-    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false, jobs_per_day: hub.cfg.limits.jobs_per_day, tokens_per_day: hub.cfg.limits.tokens_per_day }
+    ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false, new_task: false, plan_next: false, jobs_per_day: hub.cfg.limits.jobs_per_day, tokens_per_day: hub.cfg.limits.tokens_per_day }
 }
 
 fn sync_selection(hub: &Hub, u: &mut ui::Ui) {
@@ -706,7 +822,7 @@ fn snapshot(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf, path: &std::p
     let mut u = new_ui(hub, cwd.clone());
     u.team = team_pane;
     if hub.cfg.demo {
-        hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd, None);
+        hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd, None, state::Planning::IfRouted);
     }
     rt.block_on(async { tokio::time::sleep(Duration::from_secs(after)).await });
     sync_selection(hub, &mut u);
@@ -721,7 +837,7 @@ fn snapshot(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf, path: &std::p
 fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<()> {
     let mut u = new_ui(hub, cwd.clone());
     if hub.cfg.demo {
-        hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd.clone(), None);
+        hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd.clone(), None, state::Planning::IfRouted);
     }
     // A signal (terminal closed, kill, service stop) is handled entirely on the runtime: the main
     // thread may be stuck reading a terminal that no longer exists.
@@ -769,13 +885,40 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                                 st.log("issues", "no [[repos]] configured, nothing to poll");
                             }
                         }
+                        KeyCode::Char('r') if ctrl => {
+                            if let Some(id) = u.selected {
+                                if let Err(why) = hub.resume(id) {
+                                    hub.log("queue", format!("#{} not resumed: {}", id, why));
+                                }
+                            }
+                        }
                         KeyCode::Char('x') if ctrl => {
                             if let Some(id) = u.selected {
                                 hub.cancel(id);
                             }
                         }
                         KeyCode::Char('t') if ctrl => u.team = !u.team,
+                        KeyCode::Char('n') if ctrl => u.new_task = !u.new_task,
+                        KeyCode::Char('p') if ctrl => u.plan_next = !u.plan_next,
+                        // Send what is typed to the selected task now, stopping its agent to take it.
+                        KeyCode::Char('s') if ctrl => {
+                            let text = u.input.trim().to_string();
+                            let target = ui::reply_target(&hub.state.lock().unwrap(), &u);
+                            if let (Some(id), false) = (target, text.is_empty()) {
+                                match hub.steer_now(id, text) {
+                                    Ok(()) => u.input.clear(),
+                                    Err(why) => hub.log("queue", format!("#{} not sent: {}", id, why)),
+                                }
+                            }
+                        }
                         KeyCode::Char('u') if ctrl => u.input.clear(),
+                        // With nothing typed, a digit picks that option of a plan waiting for a choice.
+                        KeyCode::Char(c) if !ctrl && u.input.is_empty() && c.is_ascii_digit() && c != '0' && choosing(hub, &u).is_some() => {
+                            let id = choosing(hub, &u).expect("checked");
+                            if let Err(why) = hub.choose(id, state::Choice::Option(c as usize - '1' as usize)) {
+                                hub.log("plan", format!("#{} {}", id, why));
+                            }
+                        }
                         KeyCode::Char(c) if !ctrl => u.input.push(c),
                         KeyCode::Backspace => {
                             u.input.pop();
@@ -806,10 +949,24 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                         KeyCode::Enter => {
                             let task = u.input.trim().to_string();
                             if !task.is_empty() {
-                                u.input.clear();
-                                let id = hub.submit(state::clip(&task, 80), task, Source::Manual, cwd.clone(), u.forced.clone());
-                                u.selected = Some(id);
-                                u.follow = false;
+                                let target = ui::reply_target(&hub.state.lock().unwrap(), &u);
+                                match target {
+                                    // A typed job is selected: carry on its conversation.
+                                    Some(id) => match hub.reply(id, task) {
+                                        Ok(()) => u.input.clear(),
+                                        // Keep what was typed so it can be sent once the job is done.
+                                        Err(why) => hub.log("queue", format!("#{} not sent: {}", id, why)),
+                                    },
+                                    None => {
+                                        u.input.clear();
+                                        let planning = if u.plan_next { state::Planning::Always } else { state::Planning::IfRouted };
+                                        let id = hub.submit(state::clip(&task, 80), task, Source::Manual, cwd.clone(), u.forced.clone(), planning);
+                                        u.plan_next = false;
+                                        u.selected = Some(id);
+                                        u.follow = false;
+                                        u.new_task = false;
+                                    }
+                                }
                             }
                         }
                         _ => {}

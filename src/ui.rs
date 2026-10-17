@@ -41,9 +41,22 @@ pub struct Ui {
     pub demo: bool,
     /// Show what teammates are working on in place of the agent tree.
     pub team: bool,
+    /// Enter starts a new task even though a typed job is selected (Ctrl-N).
+    pub new_task: bool,
+    /// The next new task proposes approaches first (Ctrl-P).
+    pub plan_next: bool,
     /// The daily limits, to show next to what has been used. 0: none.
     pub jobs_per_day: u32,
     pub tokens_per_day: u64,
+}
+
+/// The selected job, when Enter would send what is typed to it as a reply.
+pub fn reply_target(st: &State, ui: &Ui) -> Option<u32> {
+    if ui.new_task {
+        return None;
+    }
+    let id = ui.selected?;
+    st.jobs.iter().find(|j| j.id == id && j.source.is_manual()).map(|j| j.id)
 }
 
 fn fg(c: Color) -> Style {
@@ -65,6 +78,7 @@ fn status_color(s: JobStatus) -> Color {
         JobStatus::Done => GREEN,
         JobStatus::Failed => RED,
         JobStatus::Cancelled => DIM,
+        JobStatus::Interrupted => Color::Rgb(230, 190, 60),
         JobStatus::Routing => PURPLE,
         _ => ORANGE,
     }
@@ -126,7 +140,8 @@ pub fn draw(f: &mut Frame, st: &State, ui: &Ui) {
         None => empty_tree(f, cols[1]),
     }
     log_panel(f, rows[3], st);
-    prompt(f, rows[4], ui);
+    let target = reply_target(st, ui).map(|id| (id, st.jobs.iter().any(|j| j.id == id && !j.status.finished())));
+    prompt(f, rows[4], ui, target);
     status(f, rows[5], st);
 }
 
@@ -210,7 +225,8 @@ fn left_panel(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
         } else {
             spinner()
         };
-        let text = format!("#{} {}", j.id, j.title);
+        // Messages waiting for the agent show on the row.
+        let text = if j.inbox.is_empty() { format!("#{} {}", j.id, j.title) } else { format!("#{} ✉{} {}", j.id, j.inbox.len(), j.title) };
         let mut l = Line::from(vec![
             Span::styled(if sel { "◆ " } else { "  " }, fg(PURPLE)),
             Span::styled(format!("{} ", icon), fg(status_color(j.status))),
@@ -367,6 +383,7 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
             Span::styled(j.status.name(), bold(status_color(j.status))),
             Span::styled(format!("  ·  {}", mmss(secs)), fg(DIM)),
             Span::styled(j.branch.as_ref().map(|b| format!("  ·  {}", b)).unwrap_or_default(), fg(DIM)),
+            Span::styled(if j.inbox.is_empty() { String::new() } else { format!("  ·  ✉ {} queued", j.inbox.len()) }, fg(GREEN)),
         ]),
     ];
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Center).block(boxed(&format!("job #{}", j.id), ORANGE)), r);
@@ -545,13 +562,16 @@ fn log_panel(f: &mut Frame, area: Rect, st: &State) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn prompt(f: &mut Frame, area: Rect, ui: &Ui) {
+/// `reply`: the job Enter would send to, and whether it is still running.
+fn prompt(f: &mut Frame, area: Rect, ui: &Ui, reply: Option<(u32, bool)>) {
     let dir = ui.cwd.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let forced = match &ui.forced {
-        None => Span::styled("[agent: auto] ", fg(DIM)),
-        Some(a) => Span::styled(format!("[agent: {}] ", a.name()), fg(agent_color(a.kind()))),
+    let forced = match (reply, &ui.forced) {
+        (Some((id, true)), _) => Span::styled(format!("[message #{}] ", id), fg(GREEN)),
+        (Some((id, false)), _) => Span::styled(format!("[reply to #{}] ", id), fg(GREEN)),
+        (None, None) => Span::styled("[agent: auto] ", fg(DIM)),
+        (None, Some(a)) => Span::styled(format!("[agent: {}] ", a.name()), fg(agent_color(a.kind()))),
     };
-    let room = (area.width as usize).saturating_sub(dir.len() + 24);
+    let room = (area.width as usize).saturating_sub(dir.len() + 28);
     let shown: String = {
         let n = ui.input.chars().count();
         ui.input.chars().skip(n.saturating_sub(room)).collect()
@@ -559,6 +579,7 @@ fn prompt(f: &mut Frame, area: Rect, ui: &Ui) {
     let line = Line::from(vec![
         Span::styled(format!(" ~/{} ", dir), fg(GREEN)),
         Span::styled("$ ", fg(BRIGHT)),
+        Span::styled(if ui.plan_next && reply.is_none() { "[plan first] " } else { "" }, fg(PURPLE)),
         forced,
         Span::styled(shown, fg(BRIGHT)),
         Span::styled("█", fg(PURPLE)),

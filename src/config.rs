@@ -30,6 +30,9 @@ pub struct RouterCfg {
     pub default_agent: AgentKind,
     /// Answers below this confidence are "split": the safer branch is taken.
     pub threshold: f64,
+    /// "auto": the decision server may ask for a plan first on open-ended tasks; "never": it is
+    /// not asked. Ctrl-P and `run --plan` ask for one either way.
+    pub plan: String,
     pub jev: JevCfg,
     pub rules: RulesCfg,
 }
@@ -40,6 +43,7 @@ impl Default for RouterCfg {
             kind: "rules".into(),
             default_agent: AgentKind::Claude,
             threshold: 0.6,
+            plan: "auto".into(),
             jev: JevCfg::default(),
             rules: RulesCfg::default(),
         }
@@ -324,6 +328,8 @@ pub struct ReviewCfg {
     /// Who reviews when `reviewer` is "other": the first one that is available and runs a model
     /// from a different vendor than the worker's.
     pub reviewer_order: Vec<AgentRef>,
+    /// How many times a failed review or failed checks go back to the worker. It keeps fixing
+    /// until the review passes; this only caps runaway loops.
     pub max_fix_rounds: u32,
     /// Shell commands run after the worker finishes a typed task. Repositories have their own list.
     pub checks: Vec<String>,
@@ -343,7 +349,7 @@ impl Default for ReviewCfg {
             mode: "auto".into(),
             reviewer: "other".into(),
             reviewer_order: vec![AgentRef::Kind(AgentKind::Claude), AgentRef::Kind(AgentKind::Codex)],
-            max_fix_rounds: 1,
+            max_fix_rounds: 5,
             checks: vec![],
             check_timeout_mins: 20,
             pr_reviewers: vec![AgentRef::Kind(AgentKind::Claude), AgentRef::Kind(AgentKind::Codex)],
@@ -742,6 +748,9 @@ impl Config {
         }
         if !matches!(self.review.reviewer.as_str(), "other" | "same") {
             anyhow::bail!("review.reviewer must be other or same");
+        }
+        if !matches!(self.router.plan.as_str(), "auto" | "never") {
+            anyhow::bail!("router.plan must be auto or never");
         }
         if !(0.5..=1.0).contains(&self.router.threshold) {
             anyhow::bail!("router.threshold must be between 0.5 and 1.0, got {}", self.router.threshold);
