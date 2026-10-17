@@ -329,19 +329,32 @@ pub async fn comments(r: &RepoCfg, t: &Target) -> Result<Vec<Comment>, String> {
     let mut all = parse_comments(&out)?;
     if r.provider == Provider::Gitlab {
         // GitLab does not say it with the note, so ask about each account that wrote a marker.
-        // Developer (30) and above can push and label. An answer that cannot be had is a no.
+        // Developer (30) and above can push and label. Unknown membership stops claim decisions.
         let mut known: std::collections::HashMap<u64, bool> = Default::default();
-        for c in all.iter_mut().filter(|c| c.author_id > 0 && parse(&c.body).is_some()) {
+        for c in all.iter_mut().filter(|c| parse(&c.body).is_some()) {
+            if c.author_id == 0 { return Err("claim author has no account id".into()); }
             let ok = match known.get(&c.author_id) {
                 Some(k) => *k,
                 None => {
-                    let res = issues::sh("glab", &["api", &format!("{}/members/all/{}", gitlab_project(r), c.author_id)], dir(r)).await;
-                    let level = res.ok().and_then(|o| serde_json::from_str::<Value>(&o).ok()).and_then(|v| v.get("access_level").and_then(|l| l.as_u64())).unwrap_or(0);
+                    let level = match issues::sh("glab", &["api", &format!("{}/members/all/{}", gitlab_project(r), c.author_id)], dir(r)).await {
+                        // Not a member at all: a definite answer, and anyone can write a comment.
+                        Err(e) if not_found(&e) => 0,
+                        res => serde_json::from_str::<Value>(&res?).map_err(|e| e.to_string())?.get("access_level").and_then(|l| l.as_u64()).ok_or("membership response has no access level")?,
+                    };
                     known.insert(c.author_id, level >= 30);
                     level >= 30
                 }
             };
             c.trusted = ok;
+        }
+    }
+    if r.provider == Provider::Github {
+        let mut known = std::collections::HashMap::new();
+        for c in all.iter_mut().filter(|c| parse(&c.body).is_some()) {
+            c.trusted = match known.get(&c.author) {
+                Some(ok) => *ok,
+                None => { let ok = write_access(r, &c.author).await?; known.insert(c.author.clone(), ok); ok }
+            };
         }
     }
     Ok(all)
@@ -366,7 +379,7 @@ fn body_json(text: &str) -> String {
 
 async fn post(r: &RepoCfg, t: &Target, text: &str) -> Result<u64, String> {
     let path = list_path(r, t).ok_or("this forge has no editable comments there")?;
-    let out = issues::sh_in(tool(r), &["api", "-X", "POST", &path, "--input", "-"], dir(r), &body_json(text)).await?;
+    let out = issues::sh_in(tool(r), &["api", "-X", "POST", &path, "--input", "-", "-H", "Content-Type: application/json"], dir(r), &body_json(text)).await?;
     serde_json::from_str::<Value>(&out)
         .ok()
         .and_then(|v| v.get("id").and_then(|x| x.as_u64()))
@@ -375,35 +388,53 @@ async fn post(r: &RepoCfg, t: &Target, text: &str) -> Result<u64, String> {
 
 async fn edit(r: &RepoCfg, t: &Target, id: u64, text: &str) -> Result<(), String> {
     let (method, path) = edit_path(r, t, id).ok_or("this forge has no editable comments there")?;
-    issues::sh_in(tool(r), &["api", "-X", method, &path, "--input", "-"], dir(r), &body_json(text)).await.map(|_| ())
+    issues::sh_in(tool(r), &["api", "-X", method, &path, "--input", "-", "-H", "Content-Type: application/json"], dir(r), &body_json(text)).await.map(|_| ())
 }
 
 /// The account the forge CLI is logged in as.
-pub async fn me(hub: &Hub, provider: Provider) -> Result<String, String> {
-    let slot = (provider == Provider::Gitlab) as usize;
-    if let Some(n) = hub.team_me.lock().unwrap()[slot].clone() {
-        return Ok(n);
-    }
-    let name = match provider {
+pub async fn me(hub: &Hub, r: &RepoCfg) -> Result<String, String> {
+    // A clone identifies the host glab resolves, including installations with several GitLab hosts.
+    let key = format!("{:?}:{}", r.provider, if r.provider == Provider::Gitlab { r.path.display().to_string() } else { String::new() });
+    if let Some(n) = hub.team_me.lock().unwrap().get(&key).cloned() { return Ok(n); }
+    let name = match r.provider {
         Provider::Github => issues::sh("gh", &["api", "user", "--jq", ".login"], None).await?,
         Provider::Gitlab => {
-            let first = hub.cfg.repos.iter().find(|r| r.provider == Provider::Gitlab).map(|r| r.path.clone());
-            let out = issues::sh("glab", &["api", "user"], first.as_deref()).await?;
+            let out = issues::sh("glab", &["api", "user"], dir(r)).await?;
             serde_json::from_str::<Value>(&out).ok().and_then(|v| v.get("username").and_then(|x| x.as_str()).map(String::from)).unwrap_or_default()
         }
     };
     let name = plain(name.trim(), 60);
-    if name.is_empty() {
-        return Err("the forge CLI did not say who is logged in".into());
-    }
-    hub.team_me.lock().unwrap()[slot] = Some(name.clone());
+    if name.is_empty() { return Err("the forge CLI did not say who is logged in".into()); }
+    hub.team_me.lock().unwrap().insert(key, name.clone());
     Ok(name)
+}
+
+/// glab's answer for a 404: "404 Not Found" / "(HTTP 404)".
+fn not_found(err: &str) -> bool {
+    err.contains("404 Not Found") || err.contains("HTTP 404")
+}
+
+async fn write_access(r: &RepoCfg, by: &str) -> Result<bool, String> {
+    let endpoint = match r.provider {
+        Provider::Github => format!("repos/{}/collaborators/{}/permission", r.repo, by),
+        Provider::Gitlab => format!("{}/members/all?query={}", gitlab_project(r), by),
+    };
+    let out = issues::sh(tool(r), &["api", &endpoint], dir(r)).await?;
+    let v: Value = serde_json::from_str(&out).map_err(|e| e.to_string())?;
+    match r.provider {
+        Provider::Github => Ok(matches!(v.get("permission").and_then(|v| v.as_str()).ok_or("permission response has no permission")?, "admin" | "maintain" | "write")),
+        Provider::Gitlab => {
+            let members = v.as_array().ok_or("membership response is not an array")?;
+            Ok(members.iter().find(|m| m.get("username").and_then(|s| s.as_str()).is_some_and(|s| s.eq_ignore_ascii_case(by)))
+                .and_then(|m| m.get("access_level")).and_then(|v| v.as_u64()).is_some_and(|l| l >= 30))
+        }
+    }
 }
 
 /// Can anyone on the internet read this repository? Asked once per repository. When the forge
 /// does not answer, the repository is treated as public: the cautious side for what gets posted.
 pub async fn is_public(hub: &Hub, r: &RepoCfg) -> bool {
-    let key = format!("{}:{}", tool(r), r.repo);
+    let key = format!("{}:{}:{}", tool(r), r.host, r.repo);
     if let Some(p) = hub.team_public.lock().unwrap().get(&key) {
         return *p;
     }
@@ -450,12 +481,7 @@ pub fn machine_id() -> String {
                 return s.trim().to_string();
             }
         }
-        let mut raw = [0u8; 8];
-        let random = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut raw)).is_ok();
-        if !random {
-            // Nothing random to be had: an id that only lasts for this run, so nothing is ever matched by mistake.
-            return String::new();
-        }
+        let Ok(raw) = crate::proc::random_bytes::<8>() else { return String::new() };
         let id: String = raw.iter().map(|b| format!("{:02x}", b)).collect();
         let _ = std::fs::create_dir_all(crate::cicd::state_dir());
         // If it cannot be kept, a later run will not recognise this one's claims and waits for them to go stale.
@@ -477,9 +503,9 @@ fn hostname() -> String {
     }
 }
 
-fn alive(pid: u32) -> bool {
+pub fn alive(pid: u32) -> bool {
     // SAFETY: signal 0 delivers nothing; it only asks whether the process exists.
-    pid > 1 && pid <= i32::MAX as u32 && unsafe { libc::kill(pid as i32, 0) == 0 || *libc::__errno_location() == libc::EPERM }
+    pid > 0 && pid <= i32::MAX as u32 && (unsafe { libc::kill(pid as i32, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
 fn new_id() -> String {
@@ -545,7 +571,7 @@ pub fn on(hub: &Hub) -> bool {
 /// Say that this process is taking the item. Refuses when someone else is already on it.
 /// The caller moves the label next and then calls `confirm`.
 pub async fn claim(hub: &Hub, r: &RepoCfg, target: Target, what: &'static str) -> Result<Claimed, String> {
-    let by = me(hub, r.provider).await.map_err(|e| format!("team: {}", e))?;
+    let by = me(hub, r).await.map_err(|e| format!("team: {}", e))?;
     let host = shown_host(hub, r).await;
     let machine = machine_id();
     let seen = read_claims(&comments_surely(r, &target).await.map_err(|e| format!("team: {}", e))?);
@@ -558,7 +584,7 @@ pub async fn claim(hub: &Hub, r: &RepoCfg, target: Target, what: &'static str) -
     for s in live(&seen, t, stale) {
         // A claim this account left on this machine belongs to a run that has gone, unless that process is still there.
         // The machine is recognised by its made-up id, never by a name: names are not posted everywhere.
-        let mine = !machine.is_empty() && s.m.machine == machine && s.m.by.eq_ignore_ascii_case(&by) && !(alive(s.m.pid) && s.m.pid != std::process::id());
+        let mine = !machine.is_empty() && s.m.machine == machine && s.m.by.eq_ignore_ascii_case(&by) && !alive(s.m.pid);
         if !mine {
             return Ok(Claimed::Taken(describe(s, t)));
         }
@@ -599,7 +625,7 @@ pub async fn assign_if_on(hub: &Hub, r: &RepoCfg, n: u64) {
     let num = n.to_string();
     let res = match r.provider {
         Provider::Github => issues::sh("gh", &["issue", "edit", &num, "-R", &r.repo, "--add-assignee", "@me"], None).await,
-        Provider::Gitlab => match me(hub, r.provider).await {
+        Provider::Gitlab => match me(hub, r).await {
             Ok(u) => issues::sh("glab", &["issue", "update", &num, "-R", &r.repo, "--assignee", &format!("+{}", u)], dir(r)).await,
             Err(e) => Err(e),
         },
@@ -731,7 +757,7 @@ pub async fn announce(hub: &Hub, id: u32) {
         return;
     }
     let made = async {
-        let by = me(hub, r.provider).await?;
+        let by = me(hub, &r).await?;
         let t = now();
         let seen = read_claims(&comments(&r, &target).await?);
         let machine = machine_id();
@@ -895,13 +921,12 @@ pub async fn gather(hub: &Hub, all: bool) -> (Vec<Row>, Vec<String>) {
     let mut rows = Vec::new();
     let mut errors = Vec::new();
     let stale = (hub.cfg.team.stale_mins * 60) as i64;
-    let mut done_repos: HashSet<(bool, &str)> = HashSet::new();
-    for r in &hub.cfg.repos {
+    for (idx, r) in hub.cfg.repos.iter().enumerate() {
         // Two entries for the same repository (two environments) are one repository here.
-        if !done_repos.insert((r.provider == Provider::Github, r.repo.as_str())) {
+        if issues::polled_before(&hub.cfg.repos[..idx], r) {
             continue;
         }
-        let who = me(hub, r.provider).await.unwrap_or_default();
+        let who = me(hub, r).await.unwrap_or_default();
         let mut wanted: Vec<(bool, &str, &str)> = vec![(false, r.working_label.as_str(), "no status"), (true, r.pr_working_label.as_str(), "no status")];
         // An issue whose pull request is open is still being worked on while its CI is watched.
         if all || r.ci.is_some() {
@@ -1058,7 +1083,7 @@ pub async fn watch_loop(hub: Hub) {
     loop {
         let (rows, errors) = gather(&hub, false).await;
         {
-            let mut st = hub.state.lock().unwrap();
+            let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
             st.team.rows = rows;
             st.team.at = Some(Instant::now());
             st.team.error = errors.into_iter().next();
@@ -1100,20 +1125,18 @@ pub async fn release(hub: &Hub, what: &str, force: bool, unclaimed: bool) -> Res
     let (repo, pr, n) = parse_ref(what).ok_or("name the item as owner/repo#12 (an issue) or owner/repo!5 (a pull request)")?;
     let r = hub.cfg.repos.iter().find(|r| r.repo.eq_ignore_ascii_case(&repo)).ok_or_else(|| format!("{} is not one of the configured [[repos]]", repo))?;
     let target = if pr { Target::Pr(n) } else { Target::Issue(n) };
-    let by = me(hub, r.provider).await?;
+    let by = me(hub, r).await?;
     let all = comments(r, &target).await?;
     // Our own word has to count with the others, or the release would be ignored by everyone.
-    if let Some(c) = all.iter().rev().find(|c| c.author.eq_ignore_ascii_case(&by)) {
-        if !c.trusted {
-            return Err(format!("{} does not have write access to {}, so teammates' forkdecks would ignore the release", by, r.repo));
-        }
+    if !write_access(r, &by).await? {
+        return Err(format!("{} does not have write access to {}", by, r.repo));
     }
     let seen = read_claims(&all);
     let t = now();
     let stale = (hub.cfg.team.stale_mins * 60) as i64;
     let gone = ended(&seen);
     let open: Vec<&Seen> = seen.iter().filter(|s| s.m.state == "active" && !gone.contains(&s.m.id)).collect();
-    if let Some(s) = live(&seen, t, stale).into_iter().find(|s| !s.m.by.eq_ignore_ascii_case(&by)) {
+    if let Some(s) = live(&seen, t, stale).into_iter().find(|s| !s.m.by.eq_ignore_ascii_case(&by) || s.m.machine != machine_id()) {
         if !force {
             return Err(format!("{}. That is recent, so it was left alone; --force ends it anyway and stops their job", describe(s, t)));
         }

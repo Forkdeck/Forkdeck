@@ -205,6 +205,29 @@ fn a_reviewer_cannot_edit_or_run_commands() {
     }
 }
 
+#[test]
+#[ignore]
+fn a_reviewer_cannot_read_a_checkout_outside_its_directory() {
+    // Why a Copilot reviewer is given a copy of the checkout in its own directory: a checkout
+    // elsewhere (worktrees live under ~/.cache) cannot be read, and the ways to allow it load that
+    // directory's skills and agents (--add-dir) or open the whole disk (--allow-all-paths). Outside
+    // the system temp directory, which Copilot allows on its own.
+    let dir = workspace("review-outside");
+    let home = PathBuf::from(std::env::var("HOME").unwrap());
+    let checkout = home.join(".cache").join(format!("forkdeck-byok-outside-{}", std::process::id()));
+    std::fs::create_dir_all(&checkout).unwrap();
+    let notes = checkout.join("notes.txt");
+    std::fs::write(&notes, "hello\n").unwrap();
+    let url = fake_server(Answer::ToolThenText("view", json!({"path": notes})));
+    let mut args = REVIEW_ARGS.to_vec();
+    args.extend(["--no-custom-instructions", "--disable-builtin-mcps"]);
+    let r = copilot(&url, &dir, "Review the change. Do not modify any file.", &args);
+    let done = of_type(&r, "tool.execution_complete");
+    assert!(!done.iter().any(|e| e["data"]["success"] == true), "read outside its directory: {:?}", done);
+    let _ = std::fs::remove_dir_all(&checkout);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Copilot refused a tool on permission grounds (it does not ask: --no-ask-user, no allow rule).
 fn denied(r: &Run) -> bool {
     of_type(r, "tool.execution_complete").iter().any(|e| e["data"]["success"] == false && e["data"]["error"]["code"] == "denied")

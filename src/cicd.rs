@@ -280,7 +280,7 @@ async fn wait(pool: &mut Pool<'_>, server: &str, call: &CallCfg, vars: &Vars, wa
                     }
                 }
                 // What the system says about how far it has got, or failing that the answer itself.
-                let where_at = progress(call, &r.text).unwrap_or_else(|| one_line(&r.shown, 80));
+                let where_at = progress(call, &r.shown).unwrap_or_else(|| one_line(&r.shown, 80));
                 match reading {
                     Reading::Success => return Waited::Success,
                     Reading::Reverted => return Waited::Reverted(r.shown),
@@ -380,7 +380,7 @@ pub async fn ci_wait(hub: &Hub, id: u32, cancel: &Cancel) -> Ci {
     vars.insert("sha".into(), sha.clone());
     vars.insert("pr".into(), pr.to_string());
 
-    hub.log("ci", format!("#{} waiting for CI on {} via {}.{}", id, &sha[..sha.len().min(10)], ci.status.server.as_deref().unwrap_or(&ci.server), ci.status.tool));
+    hub.log("ci", format!("#{} waiting for CI on {} via {}.{}", id, &sha[..sha.char_indices().nth(10).map(|(i, _)| i).unwrap_or(sha.len())], ci.status.server.as_deref().unwrap_or(&ci.server), ci.status.tool));
     let mut pool = Pool::new(&hub.cfg);
     let opts = WaitOpts {
         interval: Duration::from_secs(ci.interval_secs.max(1)),
@@ -505,6 +505,7 @@ fn update_saved(key: &str, change: impl FnOnce(&mut Saved)) -> Result<Saved, Str
     static WRITE: Mutex<()> = Mutex::new(());
     let _held = WRITE.lock().map_err(|_| "state lock poisoned".to_string())?;
     let path = state_path();
+    let _file_lock = crate::proc::FileLock::take(&path.with_extension("write-lock"))?;
     let mut all = load_saved()?;
     let entry = all.entry(key.to_string()).or_default();
     change(entry);
@@ -512,17 +513,47 @@ fn update_saved(key: &str, change: impl FnOnce(&mut Saved)) -> Result<Saved, Str
     std::fs::create_dir_all(state_dir()).map_err(|e| e.to_string())?;
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     std::fs::write(&tmp, serde_json::to_string_pretty(&all).map_err(|e| e.to_string())?).map_err(|e| format!("cannot write {}: {}", tmp.display(), e))?;
+    std::fs::File::open(&tmp).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+    std::fs::File::open(state_dir()).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
     Ok(now)
 }
 
 fn saved_key(r: &RepoCfg, d: &DeployCfg) -> String {
-    format!("{:?}:{}:{}", r.provider, r.repo, d.environment).to_lowercase()
+    format!("{:?}:{}:{}", r.provider, r.qualified(), d.environment).to_lowercase()
+}
+
+/// State saved before the host was part of a self-hosted GitLab repository's key moves to the new
+/// key, but only where one configured repository can own it: with the same path on two hosts (or
+/// also on gitlab.com), nobody can tell whose it was, and it stays where it is.
+pub fn migrate_keys(repos: &[RepoCfg]) -> Result<(), String> {
+    let moves = crate::config::unambiguous_moves(repos.iter().filter_map(|r| r.deploy.as_ref().map(|d| (format!("{:?}:{}:{}", r.provider, r.repo, d.environment).to_lowercase(), saved_key(r, d)))));
+    if moves.is_empty() || !state_path().exists() {
+        return Ok(());
+    }
+    let _file_lock = crate::proc::FileLock::wait(&state_path().with_extension("write-lock"), std::time::Duration::from_secs(10))?;
+    let mut all = load_saved()?;
+    let mut changed = false;
+    for (old, new) in moves {
+        if !all.contains_key(&new) {
+            if let Some(s) = all.remove(&old) {
+                all.insert(new, s);
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    let path = state_path();
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_string_pretty(&all).map_err(|e| e.to_string())?).map_err(|e| format!("cannot write {}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("cannot write {}: {}", path.display(), e))
 }
 
 /// Say something once, not on every poll.
 fn note_once(hub: &Hub, msg: String) {
-    let mut st = hub.state.lock().unwrap();
+    let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
     if st.deploy_note.as_deref() != Some(msg.as_str()) {
         st.log("deploy", msg.clone());
         st.deploy_note = Some(msg);
@@ -563,7 +594,7 @@ pub async fn deploy_poll(hub: &Hub) {
     }
     for (idx, r) in hub.cfg.repos.iter().enumerate() {
         let Some(d) = &r.deploy else { continue };
-        let busy = hub.state.lock().unwrap().jobs.iter().any(|j| !j.status.finished() && matches!(&j.source, Source::Deploy { repo_idx, .. } if *repo_idx == idx));
+        let busy = hub.state.lock().unwrap_or_else(|e| e.into_inner()).jobs.iter().any(|j| !j.status.finished() && matches!(&j.source, Source::Deploy { repo_idx, .. } if *repo_idx == idx));
         if busy {
             continue;
         }
@@ -589,7 +620,7 @@ pub async fn deploy_poll(hub: &Hub) {
             record(hub, r, &key, |s| s.rolling_back = None);
         }
         // The user cancelled this one in this session; do not start it again behind their back.
-        if hub.state.lock().unwrap().deploy_cancelled.contains(&(idx, head.clone())) {
+        if hub.state.lock().unwrap_or_else(|e| e.into_inner()).deploy_cancelled.contains(&(idx, head.clone())) {
             continue;
         }
         match plan(saved.as_ref(), &head) {
@@ -631,6 +662,7 @@ pub async fn deploy_poll(hub: &Hub) {
                     hub.log("deploy", format!("{}: the deployment of {} was started and never finished (was forkdeck stopped?). Its state in {} is unknown; deploying {} now (try {} of {})", r.repo, short(&p), d.environment, short(&head), n, MAX_TRIES));
                 }
                 // Record first: if this cannot be written, a crash would lose track of a running deployment.
+                let before = saved.as_ref().map(|s| (s.in_progress.clone(), s.tries)).unwrap_or_default();
                 if let Err(e) = update_saved(&key, |s| {
                     s.in_progress = Some(head.clone());
                     s.tries = n;
@@ -638,14 +670,20 @@ pub async fn deploy_poll(hub: &Hub) {
                     note_once(hub, format!("{}: {}; not deploying", r.repo, e));
                     continue;
                 }
-                hub.submit(
+                if let Err(e) = hub.submit(
                     format!("{} deploy {} to {}", r.repo, short(&head), d.environment),
                     String::new(),
                     Source::Deploy { repo_idx: idx, repo: r.repo.clone(), sha: head },
                     r.path.clone(),
                     None,
                     crate::state::Planning::Never,
-                );
+                ).await {
+                    // Nothing was started: this was not a try, and the next poll makes it again.
+                    hub.log("queue", format!("submission failed: {}", e));
+                    if let Err(e) = update_saved(&key, |s| (s.in_progress, s.tries) = before) {
+                        note_once(hub, format!("{}: {}", r.repo, e));
+                    }
+                }
             }
         }
     }
@@ -700,7 +738,7 @@ fn step(hub: &Hub, id: u32, slot: Slot, label: &str, state: StageState, line: &s
 }
 
 fn short(s: &str) -> String {
-    s[..s.len().min(10)].to_string()
+    s.chars().take(10).collect()
 }
 
 /// How a deployment ended, before any rollback.
@@ -910,7 +948,7 @@ enum Existing {
 /// The revision an answer is about, for messages.
 fn revision_in(call: &CallCfg, text: &str) -> String {
     let got = call.revision.as_deref().and_then(|p| Regex::new(p).ok()).and_then(|re| re.captures(text).and_then(|c| c.get(1).map(|m| m.as_str().to_string())));
-    got.map(|g| short(&g).to_string()).unwrap_or_else(|| "another revision".into())
+    got.filter(|g| !g.is_empty() && g.chars().all(|c| c.is_ascii_hexdigit())).map(|g| short(&g).to_string()).unwrap_or_else(|| "another revision".into())
 }
 
 /// Ask the deployment system what is going on before triggering anything. It is the one place
@@ -955,17 +993,18 @@ async fn existing(hub: &Hub, id: u32, pool: &mut Pool<'_>, r: &RepoCfg, d: &Depl
                     return match read(&d.status, &res.text, Some(sha), false) {
                         Reading::Success => Existing::Ours("deployed"),
                         Reading::Pending | Reading::Paused => Existing::Ours("rolling out"),
-                        // An earlier try at this commit went wrong. Starting it again is what a retry is for.
-                        Reading::Failure | Reading::Reverted => Existing::Clear,
+                        // An earlier try at this commit went wrong. Triggering it again would be read back as the old failure and roll back at once.
+                        Reading::Failure => Existing::Stop(End::Bad("the deployment system already reports this revision failed; it was not triggered again".into())),
+                        Reading::Reverted => Existing::Stop(End::Reverted("this revision was already reverted".into())),
                     };
                 }
                 let busy = matches(&d.status.pending, &res.text) || matches(&d.status.paused, &res.text);
                 if busy {
-                    step(hub, id, Slot::Worker, "deploy", StageState::Running, &format!("a rollout of {} is under way; waiting for it before starting", revision_in(&d.status, &res.text)));
+                    step(hub, id, Slot::Worker, "deploy", StageState::Running, &format!("a rollout of {} is under way; waiting for it before starting", revision_in(&d.status, &res.shown)));
                     if start.elapsed() >= limit {
                         return Existing::Stop(End::Refused(format!(
                             "a rollout of {} was still under way after {} min, so this one was not started. Last answer: {}",
-                            revision_in(&d.status, &res.text),
+                            revision_in(&d.status, &res.shown),
                             limit.as_secs() / 60,
                             one_line(&res.shown, 160)
                         )));
@@ -974,6 +1013,9 @@ async fn existing(hub: &Hub, id: u32, pool: &mut Pool<'_>, r: &RepoCfg, d: &Depl
                     step(hub, id, Slot::Worker, "deploy", StageState::Running, &format!("{} announced this deployment first; giving it a moment", who));
                     pause = (interval * 2).clamp(Duration::from_secs(5), Duration::from_secs(60));
                 } else {
+                    let identified = revision_in(&d.status, &res.text) != "another revision";
+                    let settled = matches(&d.status.success, &res.text) || matches(&d.status.failure, &res.text) || matches(&d.status.reverted, &res.text);
+                    if !identified || !settled { return Existing::Stop(End::Refused("deployment status was unrecognizable; nothing was started".into())); }
                     return Existing::Clear;
                 }
             }
@@ -1004,6 +1046,12 @@ async fn attempt(hub: &Hub, id: u32, pool: &mut Pool<'_>, r: &RepoCfg, d: &Deplo
         Existing::Clear => true,
     };
     if let Some(t) = d.trigger.as_ref().filter(|_| start_it) {
+        match branch_head(r).await {
+            Some(head) if head == sha => {}
+            Some(head) => return End::Superseded(head),
+            None => return End::Refused("could not confirm the branch before triggering".into()),
+        }
+        if cancel.is_set() { return End::Cancelled("before triggering the deployment"); }
         match pool.call(&d.server, t, vars).await {
             Ok(res) if !res.is_error => step(hub, id, Slot::Worker, "deploy", StageState::Running, &format!("triggered with {}", t.tool)),
             Ok(res) => return End::Refused(format!("{} refused: {}", t.tool, one_line(&res.shown, 200))),
@@ -1062,6 +1110,7 @@ async fn attempt(hub: &Hub, id: u32, pool: &mut Pool<'_>, r: &RepoCfg, d: &Deplo
 }
 
 async fn rollback(pool: &mut Pool<'_>, d: &DeployCfg, rb: &CallCfg, vars: &Vars, last_good: &str, cancel: &Cancel, tick: impl FnMut(&str)) -> Result<(), String> {
+    if cancel.is_set() { return Err("cancelled before rollback".into()); }
     match pool.call(&d.server, rb, vars).await {
         Ok(res) if !res.is_error => {}
         Ok(res) => return Err(format!("{} refused: {}", rb.tool, one_line(&res.shown, 200))),
@@ -1108,6 +1157,14 @@ mod tests {
 
     fn vars(pairs: &[(&str, &str)]) -> Vars {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn revision_display_handles_unicode_and_rejects_non_commit_values() {
+        assert_eq!(short("aaaaaaaaaéxyz"), "aaaaaaaaaé");
+        let call: CallCfg = toml::from_str("tool = 'status'\nrevision = 'rev=(\\S+)'\n").unwrap();
+        assert_eq!(revision_in(&call, "rev=aaaaaaaaaé"), "another revision");
+        assert_eq!(revision_in(&call, "rev=abcdef01234567"), "abcdef0123");
     }
 
     #[test]

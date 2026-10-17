@@ -52,20 +52,30 @@ const MIGRATIONS: &[&str] = &["
 ", "
     CREATE TABLE ids (last INTEGER NOT NULL);
     INSERT INTO ids SELECT COALESCE(MAX(id), 0) FROM jobs;
+", "
+    ALTER TABLE jobs ADD COLUMN active_secs INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE jobs ADD COLUMN used TEXT;
 "];
 
 /// Who is running: this process, told apart from a later process that reuses its id by its start time.
 pub fn owner_token() -> String {
-    let pid = std::process::id();
-    format!("{}:{}", pid, start_time(pid).unwrap_or_default())
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| { let pid = std::process::id(); format!("{}:{}", pid, start_time(pid).unwrap_or_default()) }).clone()
 }
 
 /// The kernel's start time of a process (field 22 of /proc/<pid>/stat), or None where there is no /proc.
+#[cfg(target_os = "linux")]
 fn start_time(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    // The command name is in parentheses and may hold spaces; the fields after it are plain.
     let rest = &stat[stat.rfind(')')? + 2..];
     rest.split_whitespace().nth(19).map(String::from)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_time(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().ok()?;
+    let started = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (out.status.success() && !started.is_empty()).then_some(started)
 }
 
 /// Whether the process that wrote this owner token is still running.
@@ -80,7 +90,7 @@ pub fn owner_alive(token: &str) -> bool {
         // Same id, same start: the same process.
         Some(now) => start.is_empty() || now == start,
         // No /proc: ask the kernel whether the id is in use.
-        None => unsafe { libc::kill(pid as i32, 0) == 0 },
+        None => crate::team::alive(pid),
     }
 }
 
@@ -97,10 +107,8 @@ fn secs_of(at: Instant) -> u64 {
     now_secs().saturating_sub(at.elapsed().as_secs())
 }
 
-/// Unix seconds back to an `Instant`, as far back as this process can represent.
 fn instant_of(secs: u64) -> Instant {
-    let ago = Duration::from_secs(now_secs().saturating_sub(secs));
-    Instant::now().checked_sub(ago).unwrap_or_else(Instant::now)
+    Instant::now().checked_sub(Duration::from_secs(now_secs().saturating_sub(secs))).unwrap_or_else(Instant::now)
 }
 
 /// What a stage box shows, saved.
@@ -153,6 +161,7 @@ impl StageRecord {
             _ => StageState::Failed,
         };
         Stage {
+            unprinted: 0,
             agent: self.agent,
             via: self.via,
             session: None,
@@ -175,6 +184,8 @@ impl StageRecord {
 /// Everything about a job that outlives the process.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobRecord {
+    pub active_secs: u64,
+    pub used: [crate::journal::Usage; 3],
     pub id: u32,
     pub title: String,
     pub prompt: String,
@@ -208,6 +219,8 @@ pub struct JobRecord {
 impl JobRecord {
     pub fn of(j: &Job) -> JobRecord {
         JobRecord {
+            active_secs: j.active_secs + j.finished.unwrap_or_else(Instant::now).saturating_duration_since(j.active_started).as_secs(),
+            used: j.used,
             id: j.id,
             title: j.title.clone(),
             prompt: j.prompt.clone(),
@@ -240,12 +253,16 @@ impl JobRecord {
     /// The job as it was saved. One that was still running when forkdeck went away (killed, or
     /// out of time while stopping) did not finish: it comes back interrupted, from where it was.
     pub fn job(self) -> Job {
-        let (status, resume_from) = if self.status.finished() { (self.status, self.resume_from) } else { (JobStatus::Interrupted, Some(self.status)) };
+        let (status, resume_from) = if self.status.finished() { (self.status, self.resume_from) } else { (JobStatus::Interrupted, if self.status == JobStatus::Queued { self.resume_from.or(Some(self.status)) } else { Some(self.status) }) };
         let mut outcome = self.outcome;
         if status == JobStatus::Interrupted && outcome.is_empty() {
             outcome = "interrupted: forkdeck stopped while this ran".into();
         }
         Job {
+            active_secs: self.active_secs,
+            active_started: Instant::now(),
+            restored: true,
+            worktree_lock: None,
             id: self.id,
             title: self.title,
             prompt: self.prompt,
@@ -282,9 +299,10 @@ impl JobRecord {
             reviewer_ran: None,
             in_history: true,
             peer: None,
-            used: Default::default(),
+            used: self.used,
             findings: Vec::new(),
             over_time: false,
+            admitted: false,
         }
     }
 }
@@ -303,9 +321,13 @@ pub struct History {
 
 impl History {
     pub fn open(path: &Path) -> Result<History, String> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
         }
+        std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path).map_err(|e| e.to_string())?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
         let db = Connection::open(path).map_err(|e| format!("{}: {}", path.display(), e))?;
         History::setup(db)
     }
@@ -319,15 +341,23 @@ impl History {
         let e = |e: rusqlite::Error| e.to_string();
         db.busy_timeout(Duration::from_secs(5)).map_err(e)?;
         // WAL lets several forkdecks read and write the same file.
-        let _: String = db.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).map_err(e)?;
+        for attempt in 0..=50 {
+            match db.query_row::<String, _, _>("PRAGMA journal_mode = WAL", [], |r| r.get(0)) {
+                Ok(_) => break,
+                Err(err) if attempt < 50 && matches!(err.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)) => std::thread::sleep(Duration::from_millis(100)),
+                Err(err) => return Err(err.to_string()),
+            }
+        }
         db.execute_batch("PRAGMA foreign_keys = ON").map_err(e)?;
+        db.execute_batch("BEGIN IMMEDIATE").map_err(e)?;
         let done: usize = db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).map_err(e)? as usize;
         if done > MIGRATIONS.len() {
             return Err(format!("the history was written by a newer forkdeck (schema {}, this one knows {})", done, MIGRATIONS.len()));
         }
         for (i, m) in MIGRATIONS.iter().enumerate().skip(done) {
-            db.execute_batch(&format!("BEGIN; {} PRAGMA user_version = {}; COMMIT;", m, i + 1)).map_err(e)?;
+            db.execute_batch(&format!("{} PRAGMA user_version = {};", m, i + 1)).map_err(e)?;
         }
+        db.execute_batch("COMMIT").map_err(e)?;
         Ok(History { db: Mutex::new(db) })
     }
 
@@ -340,6 +370,7 @@ impl History {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(e)?;
         let last: i64 = tx.query_row("SELECT MAX((SELECT last FROM ids), COALESCE((SELECT MAX(id) FROM jobs), 0))", [], |r| r.get(0)).map_err(e)?;
         let id = last + 1;
+        if id > u32::MAX as i64 { return Err("job ids exhausted".into()); }
         tx.execute("INSERT INTO jobs (id, created) VALUES (?1, ?2)", params![id, now_secs() as i64]).map_err(e)?;
         tx.execute("UPDATE ids SET last = ?1", params![id]).map_err(e)?;
         tx.commit().map_err(e)?;
@@ -388,6 +419,7 @@ impl History {
             ],
         )
         .map_err(|e| e.to_string())?;
+        tx.execute("UPDATE jobs SET active_secs = ?1, used = ?2 WHERE id = ?3", params![r.active_secs, json(&r.used), r.id]).map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM turns WHERE job = ?1", params![r.id]).map_err(|e| e.to_string())?;
         for (n, t) in r.turns.iter().enumerate() {
             tx.execute("INSERT INTO turns (job, n, ask, answer) VALUES (?1, ?2, ?3, ?4)", params![r.id, n as i64, t.ask, t.answer]).map_err(|e| e.to_string())?;
@@ -402,10 +434,14 @@ impl History {
 
     fn load_where(&self, filter: &str, arg: i64, limit: usize) -> Result<Vec<JobRecord>, String> {
         let db = self.db.lock().unwrap();
+        Self::read_where(&db, filter, arg, limit)
+    }
+
+    fn read_where(db: &Connection, filter: &str, arg: i64, limit: usize) -> Result<Vec<JobRecord>, String> {
         let e = |e: rusqlite::Error| e.to_string();
         let mut q = db
             .prepare(&format!(
-                "SELECT id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan, inbox, owner
+                "SELECT id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan, inbox, owner, active_secs, used
                  FROM jobs WHERE source != 'null' AND {} ORDER BY id DESC LIMIT ?2",
                 filter
             ))
@@ -414,6 +450,8 @@ impl History {
             .query_map(params![arg, limit as i64], |r| {
                 let text = |i: usize| r.get::<_, Option<String>>(i).map(|v| v.unwrap_or_default());
                 Ok(JobRecord {
+                    active_secs: r.get(25)?,
+                    used: serde_json::from_str(&text(26)?).unwrap_or_default(),
                     id: r.get(0)?,
                     title: text(1)?,
                     prompt: text(2)?,
@@ -454,22 +492,28 @@ impl History {
 
     /// Take a job over for this process, unless another forkdeck that is still running owns it.
     /// One transaction, so two processes starting at once cannot both take it.
-    pub fn claim(&self, id: u32) -> Result<bool, String> {
+    pub fn take_over(&self, id: u32, resume: bool) -> Result<Option<JobRecord>, String> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-        let owner: Option<Option<String>> = tx.query_row("SELECT owner FROM jobs WHERE id = ?1", params![id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        let record = Self::read_where(&tx, "id = ?1", id as i64, 1)?.into_iter().next();
         let me = owner_token();
-        match owner {
-            None => return Ok(false),
-            Some(Some(o)) if o != me && owner_alive(&o) => return Ok(false),
-            _ => {}
+        let owner: Option<Option<String>> = tx.query_row("SELECT owner FROM jobs WHERE id = ?1", params![id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        if owner.as_ref().and_then(|o| o.as_deref()).is_some_and(|o| o != me && owner_alive(o)) { return Err("another forkdeck that is still running has it".into()); }
+        if owner.is_none() { tx.execute("INSERT INTO jobs (id, created, owner) VALUES (?1, ?2, ?3)", params![id, now_secs() as i64, me]).map_err(|e| e.to_string())?; }
+        if let Some(r) = &record {
+            if r.owner.as_deref().is_some_and(|o| o != me && owner_alive(o)) { return Err("another forkdeck that is still running has it".into()); }
+            if resume && r.status.finished() && r.status != JobStatus::Interrupted { return Err("the saved job is no longer interrupted".into()); }
         }
         tx.execute("UPDATE jobs SET owner = ?1 WHERE id = ?2", params![me, id]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(true)
+        Ok(record)
     }
 
+    #[cfg(test)]
+    pub fn claim(&self, id: u32) -> Result<bool, String> { self.take_over(id, false).map(|_| true).or_else(|e| if e.contains("still running") { Ok(false) } else { Err(e) }) }
+
     /// One saved job, as it is in the database now.
+    #[cfg(test)]
     pub fn get(&self, id: u32) -> Result<Option<JobRecord>, String> {
         Ok(self.load_where("id = ?1", id as i64, 1)?.into_iter().next())
     }
@@ -517,6 +561,10 @@ mod tests {
         worker.push("▸ Edit src/a.rs");
         worker.push("Done.");
         Job {
+            active_secs: 0,
+            active_started: Instant::now(),
+            restored: false,
+            worktree_lock: None,
             id,
             title: format!("job {}", id),
             prompt: "fix it".into(),
@@ -550,6 +598,7 @@ mod tests {
             used: Default::default(),
             findings: Vec::new(),
             over_time: false,
+            admitted: false,
             planning: Planning::Always,
             plan: Some(Plan { options: vec![crate::state::PlanOption { title: "a".into(), summary: "b".into(), recommended: true }], text: "t".into(), chosen: Some(crate::state::Choice::Own("mine".into())) }),
             chose: Default::default(),
@@ -557,6 +606,78 @@ mod tests {
             reviewer_ran: None,
             in_history: true,
         }
+    }
+
+    #[tokio::test]
+    async fn failed_id_reservation_does_not_create_a_runtime_job_and_saves_keep_the_latest_state() {
+        let history = std::sync::Arc::new(History::in_memory());
+        let mut hub = crate::orchestrator::Hub::new(crate::config::Config::default(), tokio::runtime::Handle::current());
+        hub.history = Some(history.clone());
+        let _permit = hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel as u32).await.unwrap();
+        history.db.lock().unwrap().execute("UPDATE ids SET last = ?1", params![u32::MAX]).unwrap();
+        assert!(hub.submit("x".into(), "x".into(), Source::Manual, PathBuf::from("."), None, Planning::Never).await.is_err());
+        assert!(hub.state.lock().unwrap().jobs.is_empty());
+        history.db.lock().unwrap().execute("UPDATE ids SET last = 0", []).unwrap();
+        let id = hub.submit("x".into(), "x".into(), Source::Manual, PathBuf::from("."), None, Planning::Never).await.unwrap();
+        assert_eq!(id, 1);
+        for i in 0..20 {
+            hub.job(id, |j| { j.outcome = i.to_string(); });
+            hub.save(id);
+        }
+        hub.job(id, |j| { j.status = JobStatus::Done; j.outcome = "final".into(); });
+        hub.save(id);
+        for _ in 0..200 {
+            if history.get(id).unwrap().is_some_and(|r| r.status == JobStatus::Done && r.outcome == "final") { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let r = history.get(id).unwrap().unwrap();
+        assert_eq!((r.status, r.outcome.as_str()), (JobStatus::Done, "final"));
+    }
+
+    #[test]
+    fn queued_resumes_keep_the_stage_and_usage_without_downtime() {
+        let mut j = job(1, Source::Manual, JobStatus::Queued);
+        j.resume_from = Some(JobStatus::Reviewing);
+        j.active_secs = 17;
+        j.used[0].tokens_in = 91;
+        let mut record = JobRecord::of(&j);
+        record.created = now_secs() - 86400;
+        let back = record.job();
+        assert_eq!(back.resume_from, Some(JobStatus::Reviewing));
+        assert_eq!(back.used[0].tokens_in, 91);
+        assert_eq!(crate::journal::entry(&back, JobStatus::Done, "done", 0).secs, 17);
+    }
+
+    #[test]
+    fn takeover_reads_the_latest_record_and_refuses_completed_work() {
+        let h = History::in_memory();
+        let id = h.new_id().unwrap();
+        let mut r = JobRecord::of(&job(id, Source::Manual, JobStatus::Interrupted));
+        h.save(&r).unwrap();
+        r.turns.push(Turn { ask: "newer request".into(), answer: "new answer".into() });
+        h.save(&r).unwrap();
+        assert_eq!(h.take_over(id, true).unwrap().unwrap().turns.len(), 3);
+        r.status = JobStatus::Done;
+        h.save(&r).unwrap();
+        assert!(h.take_over(id, true).unwrap_err().contains("no longer interrupted"));
+        assert!(h.take_over(id, false).unwrap().is_some());
+    }
+
+    #[test]
+    fn concurrent_open_migrates_once_and_creates_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = crate::proc::Scratch::new().unwrap();
+        let path = scratch.0.join("state/history.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let threads: Vec<_> = (0..4).map(|_| {
+            let (p, b) = (path.clone(), barrier.clone());
+            std::thread::spawn(move || { b.wait(); History::open(&p).unwrap().new_id().unwrap() })
+        }).collect();
+        let mut ids: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        ids.sort();
+        assert_eq!(ids, [1, 2, 3, 4]);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
     }
 
     #[test]
@@ -616,7 +737,7 @@ mod tests {
         h.save(&r).unwrap();
         assert!(owner_alive(&other));
         assert!(!h.claim(id).unwrap(), "a running forkdeck keeps its job");
-        assert!(!h.claim(9999).unwrap(), "no such job");
+        assert!(h.claim(9999).unwrap(), "a missing job has nobody to refuse takeover");
         assert_eq!(h.get(id).unwrap().map(|r| r.id), Some(id));
         assert!(h.get(9999).unwrap().is_none());
     }

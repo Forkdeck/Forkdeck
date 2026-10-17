@@ -23,7 +23,9 @@ case "$prompt" in
     printf '%s\n' "{\"type\":\"result\",\"is_error\":false,\"result\":\"${FAKE_LESSONS:-NONE}\",\"usage\":{\"input_tokens\":40,\"output_tokens\":10}}"
     ;;
   *"Do not modify any file"*)
-    [ -n "$FAKE_DURING_REVIEW" ] && PROMPT="$prompt" sh -c "$FAKE_DURING_REVIEW" >/dev/null 2>&1
+    [ -n "$FAKE_REVIEW_CWD" ] && pwd >> "$FAKE_REVIEW_CWD"
+    checkout=$(printf '%s' "$prompt" | sed -n 's/^The checkout to inspect is \(.*\)\. Use absolute paths.*/\1/p' | head -1)
+    [ -n "$FAKE_DURING_REVIEW" ] && ( [ -n "$checkout" ] && cd "$checkout"; PROMPT="$prompt" sh -c "$FAKE_DURING_REVIEW" ) >/dev/null 2>&1
     # Reviews are counted: FAKE_VERDICTS gives one verdict per review in turn (PASS after the
     # list), FAKE_REVIEW_CRASH=1 crashes the first review (=always: every one), and
     # FAKE_REVIEW_NOVERDICT=1 leaves the verdict out of the first.
@@ -106,7 +108,7 @@ if [ "$1" = "api" ]; then
     case "$1" in
       -X) method=$2; shift 2 ;;
       --input) input=$(cat); shift 2 ;;
-      --jq) shift 2 ;;
+      --jq|-H) shift 2 ;;
       --paginate) shift ;;
       *) path=$1; shift ;;
     esac
@@ -122,6 +124,14 @@ if [ "$1" = "api" ]; then
   case "$method $path" in
     "GET user") echo "${FAKE_LOGIN:-alice}" ;;
     "GET repos/o/r") cat "$FAKE_GH/visibility" 2>/dev/null || echo private ;;
+    GET\ repos/*/collaborators/*/permission)
+      who=${bare%/permission}; who=${who##*/}; permission=write
+      for f in "$FAKE_GH"/c/*/*.who; do
+        [ -f "$f" ] || continue
+        if [ "$(cat "$f")" = "$who" ] && [ "$(cat "${f%.who}.assoc" 2>/dev/null)" = NONE ]; then permission=read; fi
+      done
+      [ -n "$FAKE_PERMISSION" ] && permission=$FAKE_PERMISSION
+      printf '{"permission":"%s"}\n' "$permission" ;;
     GET\ repos/*/commits\?*) cat "$FAKE_GH/commits.json" 2>/dev/null || echo "[]" ;;
     GET\ *)
       d="$FAKE_GH/c/$key"; printf '['; sep=""
@@ -148,8 +158,16 @@ if [ "$1" = "api" ]; then
 fi
 if [ -n "$FAKE_GH_FAIL_CMD" ] && [ "$1 $2" = "$FAKE_GH_FAIL_CMD" ]; then echo "HTTP 503: service unavailable" >&2; exit 1; fi
 case "$1 $2" in
-  "issue view"|"pr view") cat "$FAKE_GH/view-$3.json" 2>/dev/null || echo '{"labels":[]}' ;;
-  "issue list") cat "$FAKE_GH/issues.json" ;;
+  "issue view"|"pr view")
+    # An item nobody relabelled is still open and asked for.
+    if [ -f "$FAKE_GH/view-$3.json" ]; then cat "$FAKE_GH/view-$3.json"
+    elif [ "$1" = issue ]; then echo '{"state":"OPEN","labels":[{"name":"agent:ready"}]}'
+    else echo '{"state":"OPEN","labels":[{"name":"review:ready"}]}'
+    fi ;;
+  "issue list")
+    cat "$FAKE_GH/issues.json"
+    # Later listings leave the item out, as a page filled by newer requests would.
+    [ -n "$FAKE_LIST_ONCE" ] && echo '[]' > "$FAKE_GH/issues.json" ;;
   "pr list")
     # With a label: what is waiting for a review. Without: every open pull request.
     case " $* " in
@@ -158,8 +176,17 @@ case "$1 $2" in
     esac ;;
   *)
     printf '%s ' "$@" | tr '\n' ' ' >> "$FAKE_GH/calls.log"
+    case " $* " in *" --body-file - "*) cat | tr '\n' ' ' >> "$FAKE_GH/calls.log" ;; esac
     echo >> "$FAKE_GH/calls.log"
     [ "$1 $2" = "pr create" ] && echo https://example.invalid/o/r/pull/12
+    # A label move is what a later view shows.
+    if [ "$2" = edit ]; then
+      num=$3; shift 3
+      while [ $# -gt 0 ]; do
+        if [ "$1" = --add-label ]; then printf '{"state":"OPEN","labels":[{"name":"%s"}]}' "$2" > "$FAKE_GH/view-$num.json"; break; fi
+        shift
+      done
+    fi
     ;;
 esac
 exit 0
@@ -358,11 +385,11 @@ impl Rig {
         (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
     }
 
-    /// Start `forkdeck once`, wait until `ready` holds (or ten seconds), send it SIGTERM as a
+    /// Start `forkdeck once`, wait until `ready` holds (or thirty seconds), send it SIGTERM as a
     /// service manager or a closing terminal would, and return its output.
     fn once_then_stop(&self, ready: impl Fn(&Rig) -> bool, while_running: impl FnOnce(&Rig)) -> String {
         let child = self.command(&[]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().expect("forkdeck starts");
-        for _ in 0..100 {
+        for _ in 0..300 {
             if ready(self) {
                 break;
             }
@@ -414,7 +441,7 @@ impl Rig {
     /// Add a commit to the remote's main branch, as a merge would. Until something is triggered,
     /// the deployment system goes on reporting an older revision, settled.
     fn merge_to_main(&self, file: &str) -> String {
-        self.mcp_before(Some("rev=00000000aaaa Synced"));
+        self.mcp_before(Some("rev=00000000aaaa Healthy"));
         let c = self.clone();
         fs::write(c.join(file), "merged\n").unwrap();
         git(&c, &["add", "."]);
@@ -461,6 +488,7 @@ fn a_failed_attempt_survives_a_retry() {
     assert_ne!(first, git(&rig.clone(), &["rev-parse", "origin/main"]), "the attempt was committed locally");
 
     // The issue is labelled again; this attempt fails as well.
+    rig.labelled(7, "agent:ready");
     let (_, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_WORK", "echo second >> other.txt")]);
     let holding = git(&rig.clone(), &["branch", "--contains", &first, "--format=%(refname:short)"]);
     assert!(holding.contains("forkdeck/attempts/issue-7-"), "first attempt must stay on a branch, got {:?}\n{}", holding, out);
@@ -471,6 +499,7 @@ fn a_failed_attempt_survives_a_retry() {
     // Work left uncommitted in the worktree (a crash) is kept too.
     let wt = rig.worktrees().join("issue-7");
     fs::write(wt.join("half-done.txt"), "wip\n").unwrap();
+    rig.labelled(7, "agent:ready");
     rig.once(&[("FAKE_VERDICT", "FAIL")]);
     let kept = git(&rig.clone(), &["log", "--all", "--format=%s", "--", "half-done.txt"]);
     assert!(kept.contains("Unfinished attempt at #7"), "{:?}", kept);
@@ -488,7 +517,7 @@ fn a_pull_request_whose_head_moves_during_review_is_not_passed() {
     let (ok, out) = rig.once(&[("FAKE_DURING_REVIEW", &push)]);
     assert!(ok, "{}", out);
     let calls = rig.calls();
-    assert!(!calls.contains("review:passed"), "an unreviewed head must never get the pass label:\n{}", calls);
+    assert!(!calls.contains("--add-label review:passed"), "an unreviewed head must never get the pass label:\n{}", calls);
     assert!(calls.contains("forkdeck review: stale"), "{}", calls);
     assert!(calls.contains(&reviewed[..12]) && calls.contains(&later[..12]), "the comment names both commits:\n{}", calls);
     assert!(calls.contains("--remove-label review:running --add-label review:ready"), "{}", calls);
@@ -513,7 +542,7 @@ fn an_incomplete_review_goes_back_to_the_request_label() {
     rig.list_pull_request(5, "feat");
     let (_, out) = rig.once(&[("FAKE_VERDICT", "MAYBE")]);
     let calls = rig.calls();
-    assert!(!calls.contains("review:passed") && !calls.contains("review:changes"), "{}\n{}", calls, out);
+    assert!(!calls.contains("--add-label review:passed") && !calls.contains("--add-label review:changes"), "{}\n{}", calls, out);
     assert!(calls.contains("--add-label review:ready"), "{}", calls);
 }
 
@@ -767,7 +796,7 @@ fn a_newer_merge_takes_over_instead_of_triggering_a_rollback() {
     // The next pass deploys B.
     let b = git(&rig.clone(), &["rev-parse", "HEAD"]);
     assert_ne!(a, b);
-    rig.mcp_before(Some("rev=00000000aaaa Synced"));
+    rig.mcp_before(Some("rev=00000000aaaa Healthy"));
     rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &b[..12])]);
     let (ok, out) = rig.once(&[]);
     assert!(ok, "{}", out);
@@ -777,12 +806,13 @@ fn a_newer_merge_takes_over_instead_of_triggering_a_rollback() {
 
 #[test]
 fn stopping_during_verification_rolls_nothing_back_and_the_next_start_picks_it_up() {
-    let rig = Rig::new("stop-verify", MCP_SERVER, &DEPLOY_STAGE.replace("test -f README", "test -f {root}/fast || sleep 60"));
+    let rig = Rig::new("stop-verify", MCP_SERVER, &DEPLOY_STAGE.replace("test -f README", "touch {root}/verifying; test -f {root}/fast || sleep 60"));
     rig.adopt();
     let a = rig.merge_to_main("a.txt");
     rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &a[..12])]);
+    // Stopped once verification runs: by then the first process has made all its tool calls.
     let out = rig.once_then_stop(
-        |r| r.mcp_calls().contains(r#""name":"deploy_status""#),
+        |r| r.root.join("verifying").exists(),
         |r| {
             // A second forkdeck started meanwhile must stay out of deployments altogether.
             let before = r.mcp_calls().len();
@@ -860,7 +890,7 @@ fn a_branch_forced_back_is_deployed_again_rather_than_assumed() {
     assert!(!rig.mcp_calls().contains(r#""name":"rollback""#));
 
     // B was triggered, so the environment is not known to be on the old commit any more: deploy it again.
-    rig.mcp_before(Some(&format!("rev={} Progressing", &b[..12])));
+    rig.mcp_before(Some(&format!("rev={} Healthy", &b[..12])));
     rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &start[..12])]);
     let (ok, out) = rig.once(&[]);
     assert!(ok, "{}", out);
@@ -887,7 +917,7 @@ fn a_failed_smoke_test_does_not_roll_back_once_a_newer_commit_is_on_the_branch()
 
     // The newer commit is deployed on the next pass.
     let c = git(&rig.clone(), &["rev-parse", "HEAD"]);
-    rig.mcp_before(Some("rev=00000000aaaa Synced"));
+    rig.mcp_before(Some("rev=00000000aaaa Healthy"));
     rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &c[..12])]);
     fs::write(rig.clone().join("smoke-ok"), "").unwrap();
     let (ok, out) = rig.once(&[]);
@@ -1083,7 +1113,7 @@ impl Rig {
 
     /// The labels `gh issue view` / `gh pr view` reports for an item.
     fn labelled(&self, n: u64, label: &str) {
-        fs::write(self.root.join(format!("gh/view-{}.json", n)), format!(r#"{{"labels":[{{"name":"{}"}}]}}"#, label)).unwrap();
+        fs::write(self.root.join(format!("gh/view-{}.json", n)), format!(r#"{{"state":"OPEN","labels":[{{"name":"{}"}}]}}"#, label)).unwrap();
     }
 
     /// A script the stand-in agent can run mid-job: `$1` posts a release naming the running job's
@@ -1235,7 +1265,6 @@ fn nothing_is_claimed_when_the_claims_cannot_be_read() {
 fn a_teammates_release_stops_the_job_before_anything_is_pushed() {
     let rig = Rig::new("team-release", TEAM, "");
     rig.issue();
-    rig.labelled(7, "agent:working");
     // While Alice's agent is working, Bob hands the issue back to the queue from his machine.
     let release = format!("echo change >> by_agent.txt; FAKE_LOGIN=bob {} team release o/r#7 --force > {}/release.out 2>&1", env!("CARGO_BIN_EXE_forkdeck"), rig.root.display());
     let (ok, out) = rig.once(&[("FAKE_WORK", &release)]);
@@ -1450,7 +1479,6 @@ fn a_claim_that_expired_while_the_agent_ran_publishes_nothing() {
 fn a_job_that_fails_after_it_was_released_leaves_the_labels_to_the_new_holder() {
     let rig = Rig::new("team-fail-released", "[team]\nenabled = true\n[review]\nmax_fix_rounds = 0", "");
     rig.issue();
-    rig.labelled(7, "agent:working");
     let release = format!("echo change >> by_agent.txt; FAKE_LOGIN=bob {} team release o/r#7 --force > {}/release.out 2>&1", env!("CARGO_BIN_EXE_forkdeck"), rig.root.display());
     let (ok, out) = rig.once(&[("FAKE_WORK", &release), ("FAKE_VERDICT", "FAIL")]);
     assert!(!ok, "{}", out);
@@ -1655,6 +1683,55 @@ fn the_daily_job_limit_leaves_the_rest_labelled_and_untouched() {
 }
 
 #[test]
+fn a_per_repository_limit_counts_each_job_once() {
+    // One issue and one pull request against a limit of two: the issue, once submitted, is a
+    // running job and must not also count as picked in this poll.
+    let rig = Rig::new("limit-once", "", "jobs_per_day = 2");
+    rig.issue();
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(!out.contains("job limit for this repository reached"), "{}", out);
+    let calls = rig.calls();
+    assert!(calls.contains("issue edit 7 ") && calls.contains("pr edit 5 "), "both are taken:\n{}", calls);
+}
+
+#[test]
+fn an_item_left_off_a_later_listing_is_still_taken() {
+    // The recheck before claiming asks about the item itself, not a listing that may not show it.
+    let rig = Rig::new("recheck-direct", "", "");
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_LIST_ONCE", "1")]);
+    assert!(ok, "{}", out);
+    let calls = rig.calls();
+    assert!(calls.contains("issue edit 7 ") && calls.contains("pr create"), "{}\n{}", calls, out);
+}
+
+#[test]
+fn a_typed_task_stopped_midway_still_counts_toward_the_token_limit() {
+    for signal in ["-TERM", "-KILL"] {
+    // -KILL: nothing marks it interrupted; it is left as it was, by a forkdeck that is gone.
+    let rig = Rig::new(&format!("limit-interrupted{}", signal), "[limits]\ntokens_per_day = 1000", "");
+    // The worker spends the day's tokens; forkdeck is stopped while the reviewer looks.
+    let reviewing = rig.root.join("reviewing");
+    let during = format!("touch {}; sleep 30", reviewing.display());
+    let mut child = rig.bare(&[("FAKE_TOKENS", "5000"), ("FAKE_DURING_REVIEW", &during)]).args(["run", "add a change file"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    for _ in 0..300 {
+        if reviewing.exists() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(reviewing.exists(), "the review never started");
+    Command::new("kill").args([signal, &child.id().to_string()]).status().unwrap();
+    let _ = child.wait();
+    rig.issue();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok && out.contains("token limit reached"), "the interrupted task's tokens were not counted:\n{}", out);
+    assert!(!rig.calls().contains("issue edit 7 "), "nothing is claimed:\n{}", rig.calls());
+    }
+}
+
+#[test]
 fn nothing_more_is_picked_up_once_the_token_limit_is_spent() {
     let rig = Rig::new("limit-tokens", "[limits]\ntokens_per_day = 1000", "");
     rig.issue();
@@ -1792,7 +1869,7 @@ fn learned_rules_are_proposed_to_the_team_as_a_pull_request() {
     assert!(!fs::read_to_string(&prompts).unwrap().contains("Run make fmt"), "an unmerged rule steers no job");
 
     // While that pull request is open, more rules are added to it; a rule it already has is not repeated.
-    fs::write(rig.root.join("gh/open-prs.json"), format!(r#"[{{"number":12,"url":"https://example.invalid/o/r/pull/12","headRefName":"{}"}}]"#, branch)).unwrap();
+    fs::write(rig.root.join("gh/open-prs.json"), format!(r#"[{{"number":12,"url":"https://example.invalid/o/r/pull/12","headRefName":"{}","isCrossRepository":false,"author":{{"login":"alice"}}}}]"#, branch)).unwrap();
     rig.issues(&[9]);
     let more = r"- Run make fmt before finishing the work.\n- Never edit generated files under gen.";
     let (_, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", more)]);
@@ -1801,7 +1878,8 @@ fn learned_rules_are_proposed_to_the_team_as_a_pull_request() {
     assert_eq!(git(&rig.origin(), &["rev-list", "--count", &format!("main..{}", branch)]), "2");
     let calls = rig.calls();
     assert_eq!(calls.matches("--title Notes for agents").count(), 1, "one pull request, not two:\n{}", calls);
-    assert!(calls.contains("pr comment 12 -R o/r --body forkdeck added 1 more rule(s)"), "{}", calls);
+    assert!(calls.contains("--body-file - forkdeck distilled these"), "the body goes on stdin:\n{}", calls);
+    assert!(calls.contains("pr comment 12 -R o/r --body-file - forkdeck added 1 more rule(s)"), "{}", calls);
     let notes = git(&rig.origin(), &["show", &format!("{}:.forkdeck/notes.md", branch)]);
     assert_eq!(notes.matches("Run make fmt").count(), 1, "{}", notes);
     assert!(notes.contains("Never edit generated files under gen."), "{}", notes);
@@ -1865,7 +1943,7 @@ fn a_copilot_review_that_stops_early_is_not_a_pass() {
     rig.list_pull_request(5, "feat");
     let (_, out) = rig.once(&[("FAKE_COPILOT_TRUNCATE", "1")]);
     let calls = rig.calls();
-    assert!(!calls.contains("review:passed"), "{}\n{}", calls, out);
+    assert!(!calls.contains("--add-label review:passed"), "{}\n{}", calls, out);
     assert!(calls.contains("--add-label review:ready"), "{}\n{}", calls, out);
     assert!(out.contains("exited before reporting a result"), "it failed for the missing closing line: {}", out);
 }
@@ -1943,7 +2021,7 @@ fn a_copilot_review_that_reports_usage_but_no_result_is_not_a_pass() {
     rig.list_pull_request(5, "feat");
     let (_, out) = rig.once(&[("FAKE_COPILOT_TRUNCATE", "usage")]);
     let calls = rig.calls();
-    assert!(!calls.contains("review:passed"), "{}\n{}", calls, out);
+    assert!(!calls.contains("--add-label review:passed"), "{}\n{}", calls, out);
     assert!(calls.contains("--add-label review:ready"), "{}\n{}", calls, out);
     assert!(out.contains("exited before reporting a result"), "it failed for the missing closing line: {}", out);
 }
@@ -1961,7 +2039,7 @@ fn every_configured_pull_request_reviewer_runs_and_a_third_fail_counts() {
     assert_eq!(models, ["gemini-3.8-pro", "grok-4.7"], "both copilot profiles ran");
     let calls = rig.calls();
     assert!(calls.contains("copilot:third") && calls.contains("--add-label review:changes"), "{}", calls);
-    assert!(!calls.contains("review:passed"), "{}", calls);
+    assert!(!calls.contains("--add-label review:passed"), "{}", calls);
 }
 
 #[test]
@@ -2090,10 +2168,20 @@ fn run_planned(rig: &Rig, typed: &str) -> (bool, String) {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("forkdeck starts");
-    // Typed straight away, before the plan is even there: it is kept for the choice.
+    let seen = tee(&mut child);
+    if typed.trim().parse::<usize>().is_err() {
+        for _ in 0..200 {
+            if seen.lock().unwrap().contains("pick 1") { break; }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(seen.lock().unwrap().contains("pick 1"), "the job reaches Choosing");
+    }
     child.stdin.as_mut().unwrap().write_all(typed.as_bytes()).unwrap();
-    let out = child.wait_with_output().unwrap();
-    (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    child.stdin.take();
+    let status = child.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let output = seen.lock().unwrap().clone();
+    (status.success(), output)
 }
 
 #[test]
@@ -2289,7 +2377,7 @@ fn the_open_notes_pull_request_is_found_among_any_number_of_old_branches() {
         git(&c, &["push", "-q", "origin", &format!("HEAD:refs/heads/forkdeck/notes-2026010{}-000000", n)]);
     }
     let oldest = "forkdeck/notes-20260101-000000";
-    fs::write(rig.root.join("gh/open-prs.json"), format!(r#"[{{"number":3,"url":"https://example.invalid/o/r/pull/3","headRefName":"feature/x"}},{{"number":40,"url":"https://example.invalid/o/r/pull/40","headRefName":"{}"}}]"#, oldest)).unwrap();
+    fs::write(rig.root.join("gh/open-prs.json"), format!(r#"[{{"number":3,"url":"https://example.invalid/o/r/pull/3","headRefName":"feature/x"}},{{"number":40,"url":"https://example.invalid/o/r/pull/40","headRefName":"{}","isCrossRepository":false,"author":{{"login":"alice"}}}}]"#, oldest)).unwrap();
     rig.issue();
     let (_, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", r"- Run make fmt before finishing the work.")]);
     assert!(out.contains("1 rule(s) proposed for the team's notes: https://example.invalid/o/r/pull/40"), "{}", out);
@@ -2590,4 +2678,356 @@ fn a_choice_waiting_after_a_restart_shows_its_options_again() {
     let (ok, out) = resume_typing(&rig, "1\n");
     assert!(ok, "{}", out);
     assert!(out.contains("1) Patch it — small") && out.contains("2) Rewrite it (recommended) — clean"), "the options are shown before the choice: {}", out);
+}
+
+#[test]
+fn reviewers_start_outside_untrusted_configuration_and_checks_restore_the_head() {
+    let rig = Rig::new("review-isolation", "", "pr_checks = true\nchecks = [\"git reset --hard origin/main; echo generated > check-output.txt\"]");
+    let reviewed = rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let seen = rig.root.join("review-head");
+    let cwd = rig.root.join("review-cwd");
+    let args = rig.root.join("review-args");
+    let look = format!("git rev-parse HEAD > {}; git status --porcelain >> {}", seen.display(), seen.display());
+    let (ok, out) = rig.once(&[("FAKE_REVIEW_CWD", cwd.to_str().unwrap()), ("FAKE_ARGS", args.to_str().unwrap()), ("FAKE_DURING_REVIEW", &look)]);
+    assert!(ok, "{}", out);
+    assert_eq!(fs::read_to_string(seen).unwrap().trim(), reviewed);
+    for path in fs::read_to_string(cwd).unwrap().lines() { assert!(!Path::new(path).starts_with(rig.clone()) && !Path::new(path).starts_with(rig.root.join("wt"))); }
+    let args = fs::read_to_string(args).unwrap();
+    assert!(args.contains("--setting-sources user --strict-mcp-config --mcp-config"), "{}", args);
+}
+
+#[test]
+fn two_processes_cannot_replace_an_active_issue_worktree() {
+    let rig = Rig::new("worktree-lock", "", "");
+    rig.issue();
+    let marker = rig.root.join("started");
+    // The first job holds its worktree until the test says so, however slowly the second starts.
+    let release = rig.root.join("release");
+    let work = format!("echo original > valuable.txt; touch {}; i=0; while [ ! -f {} ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done", marker.display(), release.display());
+    let first = rig.command(&[("FAKE_WORK", &work)]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    for _ in 0..200 {
+        if marker.exists() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(marker.exists());
+    let (ok, out) = rig.once(&[]);
+    fs::write(&release, "").unwrap();
+    assert!(ok && out.contains("locked by another operation"), "{}", out);
+    let out = first.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(git(&rig.origin(), &["show", "forkdeck/issue-7:valuable.txt"]), "original");
+}
+
+#[test]
+fn a_detached_failed_attempt_keeps_its_uncommitted_files_on_retry() {
+    let rig = Rig::new("preserve-detached", "", "");
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_WORK", "git checkout --detach; echo precious > valuable.txt")]);
+    assert!(!ok && out.contains("no longer on"), "{}", out);
+    rig.labelled(7, "agent:ready");
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let branches = git(&rig.clone(), &["for-each-ref", "--format=%(refname)", "refs/heads/forkdeck/attempts/"]);
+    assert!(branches.lines().any(|b| {
+        Command::new("git").args(["show", &format!("{}:valuable.txt", b)]).current_dir(rig.clone()).output().is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("precious"))
+    }), "{}", branches);
+}
+
+#[test]
+fn cancellation_during_a_commit_hook_stops_the_push() {
+    let rig = Rig::new("cancel-commit", "", "");
+    rig.issue();
+    let marker = rig.root.join("committing");
+    let hook = rig.clone().join(".git/hooks/pre-commit");
+    fs::write(&hook, format!("#!/bin/sh\ntouch {}\nsleep 2\n", marker.display())).unwrap();
+    fs::set_permissions(hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = rig.once_then_stop(|_| marker.exists(), |_| {});
+    assert!(!rig.calls().contains("pr create"), "{}", out);
+    assert!(git(&rig.origin(), &["for-each-ref", "refs/heads/forkdeck/issue-7"]).is_empty());
+}
+
+#[test]
+fn duplicate_repo_entries_poll_issues_once() {
+    let rig = Rig::new("duplicate-repo", "", "");
+    rig.issue();
+    let cfg = rig.root.join("home/.config/forkdeck/config.toml");
+    let extra = format!("\n[[repos]]\nprovider='github'\nrepo='o/r'\npath='{}'\n", rig.clone().display());
+    fs::OpenOptions::new().append(true).open(cfg).unwrap().write_all(extra.as_bytes()).unwrap();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert_eq!(rig.calls().matches("pr create").count(), 1);
+}
+
+#[test]
+fn a_missing_smoke_executable_is_inconclusive_and_never_rolls_back() {
+    let cfg = DEPLOY_STAGE.replace("verify = [\"test -f README\"]", "verify = ['forkdeck-command-that-does-not-exist']");
+    let rig = Rig::new("verify-not-found", MCP_SERVER, &cfg);
+    rig.adopt();
+    let sha = rig.merge_to_main("change");
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &sha[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok && out.contains("verification gave no result"), "{}", out);
+    assert!(!rig.mcp_calls().contains(r#""name":"rollback""#));
+}
+
+#[test]
+fn unknown_deploy_status_does_not_authorize_a_trigger() {
+    let rig = Rig::new("unknown-preflight", MCP_SERVER, DEPLOY_STAGE);
+    rig.adopt();
+    rig.merge_to_main("change");
+    rig.mcp_before(Some("schema changed"));
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok && out.contains("unrecognizable"), "{}", out);
+    assert!(!rig.mcp_calls().contains(r#""name":"deploy""#));
+}
+
+#[test]
+fn a_branch_moving_during_preflight_is_not_deployed() {
+    let rig = Rig::new("preflight-head", MCP_SERVER, DEPLOY_STAGE);
+    rig.adopt();
+    let sha = rig.merge_to_main("change");
+    let later = rig.pull_request(8, "later");
+    let script = format!("git -C {} update-ref refs/heads/main {}", rig.origin().display(), later);
+    fs::write(rig.root.join("mcp/on_deploy_status.sh"), script).unwrap();
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    assert!(!rig.mcp_calls().contains(r#""name":"deploy""#), "{}", sha);
+}
+
+#[test]
+fn demo_rejects_real_release_and_mcp_calls() {
+    let rig = Rig::new("demo-write", TEAM, "");
+    for args in [vec!["--demo", "team", "release", "o/r#7", "--force"], vec!["--demo", "mcp", "call", "pipeline", "deploy"]] {
+        let (ok, out) = rig.run(&args, &[]);
+        assert!(!ok, "{}", out);
+    }
+    assert!(rig.calls().is_empty());
+    assert!(rig.mcp_calls().is_empty());
+}
+
+#[test]
+fn headless_eof_chooses_a_plan_and_keeps_output_in_history() {
+    let rig = Rig::new("eof-history", "", "");
+    let (ok, out) = rig.run(&["run", "--plan", "add a change file"], &[]);
+    assert!(ok && out.contains("input closed; taking option 2"), "{}", out);
+    let db = rusqlite::Connection::open(rig.root.join("home/.local/state/forkdeck/forkdeck.db")).unwrap();
+    let worker: String = db.query_row("SELECT worker FROM jobs", [], |r| r.get(0)).unwrap();
+    assert!(worker.contains("Patch it"), "{}", worker);
+    let answer: String = db.query_row("SELECT answer FROM turns ORDER BY n DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    assert!(answer.contains("Did the work"));
+    let (ok, out) = rig.run(&["resume"], &[]);
+    assert!(ok && out.contains("nothing to resume") && !out.contains("Did the work"), "{}", out);
+}
+
+#[test]
+fn a_claude_error_result_and_nonzero_exit_cannot_become_success() {
+    for (name, script) in [("error-subtype", "echo '{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"result\":\"partial\"}'"), ("error-exit", "echo '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}'; exit 1")] {
+        let cli = format!("#!/bin/sh\n[ \"$1\" = --version ] && exit 0\ncat >/dev/null\n{}\n", script);
+        let rig = Rig::with_agents(name, "", "", &[("claude", &cli)]);
+        let (ok, out) = rig.run(&["run", "--agent", "claude", "fix typo"], &[]);
+        assert!(!ok, "{}", out);
+    }
+}
+
+#[test]
+fn a_final_agent_event_does_not_wait_forever_for_the_cli_or_escaped_pipes() {
+    let cli = "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\ncat >/dev/null\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}'\nsetsid sh -c 'sleep 8' &\nsleep 600\n";
+    let rig = Rig::with_agents("agent-drain", "", "", &[("claude", cli)]);
+    let start = std::time::Instant::now();
+    let (ok, out) = rig.run(&["run", "--agent", "claude", "fix typo"], &[]);
+    assert!(ok, "{}", out);
+    assert!(start.elapsed() < std::time::Duration::from_secs(15));
+}
+
+#[test]
+fn one_recovery_probe_is_admitted_after_a_failure_pause() {
+    let rig = Rig::new("one-probe", "[limits]\npause_after_failures = 2\npause_mins = 1", "");
+    let old = chrono::Utc::now().timestamp() - 120;
+    let entry = format!("{{\"ts\":{},\"kind\":\"issue\",\"repo\":\"o/r\",\"status\":\"failed\"}}\n", old);
+    fs::write(rig.root.join("home/.local/state/forkdeck/journal.jsonl"), entry.repeat(2)).unwrap();
+    rig.issues(&[7, 8, 9]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[]);
+    assert!(ok && out.contains("single recovery probe"), "{}", out);
+    assert_eq!(rig.calls().matches("pr create").count(), 1);
+    assert!(!rig.calls().contains("pr edit 5"));
+}
+
+#[test]
+fn notes_updates_are_locked_across_processes_and_fork_prs_do_not_block_learning() {
+    let rig = Rig::new("notes-locked", "[review]\nmax_fix_rounds=0\n[knowledge]\nlearn=true", "");
+    let children: Vec<_> = (0..8).map(|n| rig.bare(&[]).args(["notes", "o/r", "add", &format!("Human note number {}", n)]).stdout(std::process::Stdio::null()).spawn().unwrap()).collect();
+    for mut child in children { assert!(child.wait().unwrap().success()); }
+    let notes = fs::read_to_string(rig.notes_file()).unwrap();
+    for n in 0..8 { assert!(notes.contains(&format!("Human note number {}", n))); }
+    rig.issue();
+    fs::write(rig.root.join("gh/open-prs.json"), r#"[{"headRefName":"forkdeck/notes-attacker","url":"https://example.invalid/o/r/pull/2","isCrossRepository":true,"author":{"login":"alice"}}]"#).unwrap();
+    let (_, out) = rig.once(&[("FAKE_VERDICT", "FAIL"), ("FAKE_LESSONS", "- Always run the project checks before publishing.")]);
+    assert!(out.contains("1 rule(s) proposed"), "{}", out);
+    assert!(!rig.calls().contains("--head forkdeck/notes-attacker"));
+}
+
+#[test]
+fn an_own_account_claim_on_another_machine_requires_force() {
+    let rig = Rig::new("own-remote-claim", TEAM, "");
+    rig.labelled(7, "agent:working");
+    rig.seed_claim("issues_7", 50, "alice", claim("a1", "alice", "another-machine", 1), 5);
+    let (ok, out) = rig.run(&["team", "release", "o/r#7"], &[]);
+    assert!(!ok && out.contains("--force"), "{}", out);
+    assert!(!rig.calls().contains("POST") && !rig.calls().contains("--add-label"));
+}
+
+#[test]
+fn collaborator_read_access_is_not_trusted_for_claims() {
+    let rig = Rig::new("read-collaborator", TEAM, "");
+    rig.issue();
+    rig.seed_claim("issues_7", 50, "bob", claim("b1", "bob", "elsewhere", 1), 5);
+    rig.assoc("issues_7", 50, "COLLABORATOR");
+    let (ok, out) = rig.run(&["team", "--json"], &[("FAKE_PERMISSION", "read")]);
+    assert!(ok && !out.contains("b1"), "{}", out);
+    assert!(rig.calls().contains("collaborators/bob/permission"));
+}
+
+#[test]
+fn review_label_failure_is_reported_and_old_outcomes_are_removed() {
+    let rig = Rig::new("label-failure", "", "");
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let sabotage = format!("touch {}/fail-label", rig.root.join("gh").display());
+    let gh = rig.root.join("bin/gh");
+    let patched = GH.replace("case \"$1 $2\" in\n", "[ -f \"$FAKE_GH/fail-label\" ] && [ \"$1 $2\" = 'pr edit' ] && { echo 'label outage' >&2; exit 1; }\ncase \"$1 $2\" in\n");
+    fs::write(&gh, patched).unwrap();
+    let (ok, out) = rig.once(&[("FAKE_DURING_REVIEW", &sabotage)]);
+    assert!(!ok && out.contains("comment posted but label transition unconfirmed"), "{}", out);
+    assert!(rig.calls().contains("--remove-label review:ready,review:passed,review:changes"));
+}
+
+#[test]
+fn mcp_stdio_receives_only_configured_credentials() {
+    let script = "#!/bin/sh\nprintf '%s|%s' \"${OTHER_SERVICE_TOKEN-unset}\" \"$OWN_TOKEN\" > \"$CAPTURE\"\nexit 1\n";
+    let cfg = "[mcp.test]\ncommand='{root}/bin/env-server'\nenv={OWN_TOKEN='${MY_SERVER_TOKEN}', CAPTURE='{root}/env-seen'}";
+    let rig = Rig::with_agents("mcp-env", cfg, "", &[("env-server", script)]);
+    let _ = rig.run(&["mcp", "tools", "test"], &[("OTHER_SERVICE_TOKEN", "other-secret"), ("MY_SERVER_TOKEN", "own-secret")]);
+    assert_eq!(fs::read_to_string(rig.root.join("env-seen")).unwrap(), "unset|own-secret");
+}
+
+#[test]
+fn deployment_progress_redacts_configured_secrets() {
+    let server = MCP_SERVER.replace("FAKE_MCP =", "TOKEN='${PROGRESS_SECRET}', FAKE_MCP =");
+    let stage = DEPLOY_STAGE.replace("success = \"Healthy\"", "success = \"Healthy\"\nprogress = 'step=(\\S+)'\npending = 'Progressing'");
+    let rig = Rig::new("progress-secret", &server, &stage);
+    let head = git(&rig.clone(), &["rev-parse", "HEAD"]);
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Healthy", &head[..12])]);
+    let env = [("PROGRESS_SECRET", "progress-secret-123")];
+    let (ok, out) = rig.once(&env);
+    assert!(ok, "{}", out);
+    let sha = rig.merge_to_main("change");
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Progressing step=progress-secret-123", &sha[..12]), &format!("rev={} Healthy", &sha[..12])]);
+    let (ok, out) = rig.once(&env);
+    assert!(ok && out.contains("pending · ***") && !out.contains("progress-secret-123"), "{}", out);
+    let db = rusqlite::Connection::open(rig.root.join("home/.local/state/forkdeck/forkdeck.db")).unwrap();
+    let worker: String = db.query_row("SELECT worker FROM jobs ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    assert!(!worker.contains("progress-secret-123"));
+}
+
+#[test]
+fn gitlab_membership_errors_are_unavailable_and_prose_does_not_block_a_release() {
+    let glab = r#"#!/bin/sh
+[ "$1" = --version ] && exit 0
+echo "$PWD $*" >> "$FAKE_GH/glab.log"
+case "$*" in
+  'api user') printf '{"username":"alice"}\n' ;;
+  *'/members/all/'*)
+    [ "$MEMBERSHIP_FAIL" = 404 ] && { echo 'glab: 404 Not Found (HTTP 404)' >&2; exit 1; }
+    [ -n "$MEMBERSHIP_FAIL" ] && { echo 'HTTP 429' >&2; exit 1; }; echo '{"access_level":40}' ;;
+  *'/members/all?query='*) echo '[{"username":"alice","access_level":40}]' ;;
+  *'/notes?per_page='*) cat "$FAKE_GH/glab-notes.json" ;;
+  'issue view '*) echo '{"labels":["agent:working"]}' ;;
+  'issue update '*) echo updated ;;
+  *) echo '[]' ;;
+esac
+"#;
+    let rig = Rig::with_agents("gitlab-membership", TEAM, "", &[("glab", glab)]);
+    let cfg = rig.root.join("home/.config/forkdeck/config.toml");
+    fs::write(&cfg, fs::read_to_string(&cfg).unwrap().replace("provider = \"github\"", "provider = \"gitlab\"")).unwrap();
+    let marker = claim("bob1", "bob", "other", 1);
+    let body = format!("<!-- forkdeck:claim {} -->", marker);
+    let notes = serde_json::json!([{"id":50,"body":body,"author":{"id":42,"username":"bob"},"updated_at":chrono::Utc::now().to_rfc3339()}]);
+    fs::write(rig.root.join("gh/glab-notes.json"), notes.to_string()).unwrap();
+    let (ok, out) = rig.run(&["team", "release", "o/r#7", "--force"], &[("MEMBERSHIP_FAIL", "1")]);
+    assert!(!ok && out.contains("429"), "{}", out);
+    assert!(!fs::read_to_string(rig.root.join("gh/glab.log")).unwrap().contains("issue update"));
+    // GitLab answers 404 for someone who is not a member: anyone can comment, so the marker is not a claim.
+    let (ok, out) = rig.run(&["team", "release", "o/r#7", "--unclaimed"], &[("MEMBERSHIP_FAIL", "404")]);
+    assert!(ok && out.contains("label back"), "an outsider's marker must not block the item: {}", out);
+    fs::write(rig.root.join("gh/glab-notes.json"), r#"[{"id":51,"body":"Just an ordinary comment","author":{"id":1,"username":"alice"}}]"#).unwrap();
+    let (ok, out) = rig.run(&["team", "release", "o/r#7", "--unclaimed"], &[]);
+    assert!(ok && out.contains("label back"), "{}", out);
+}
+
+#[test]
+fn gitlab_identity_is_resolved_in_each_hosts_clone() {
+    let glab = r#"#!/bin/sh
+[ "$1" = --version ] && exit 0
+case "$*" in
+  'api user') echo "$PWD" >> "$FAKE_GH/logins"; printf '{"username":"%s"}\n' "$(basename "$PWD")" ;;
+  *) echo '[]' ;;
+esac
+"#;
+    let rig = Rig::with_agents("gitlab-hosts", TEAM, "", &[("glab", glab)]);
+    let second = rig.root.join("second-host");
+    fs::create_dir(&second).unwrap();
+    let cfg = rig.root.join("home/.config/forkdeck/config.toml");
+    let text = fs::read_to_string(&cfg).unwrap().replace("provider = \"github\"", "provider = \"gitlab\"");
+    fs::write(cfg, format!("{}\n[[repos]]\nprovider='gitlab'\nrepo='other/project'\npath='{}'\n", text, second.display())).unwrap();
+    let (ok, out) = rig.run(&["team", "--json"], &[]);
+    assert!(ok, "{}", out);
+    let calls = fs::read_to_string(rig.root.join("gh/logins")).unwrap();
+    assert!(calls.contains(rig.clone().to_str().unwrap()) && calls.contains(second.to_str().unwrap()), "{}", calls);
+}
+
+#[test]
+fn cancellation_during_deploy_preflight_prevents_the_trigger() {
+    let rig = Rig::new("cancel-preflight", MCP_SERVER, DEPLOY_STAGE);
+    rig.adopt();
+    rig.merge_to_main("change");
+    let marker = rig.root.join("preflight");
+    fs::write(rig.root.join("mcp/on_deploy_status.sh"), format!("touch {}; sleep 2", marker.display())).unwrap();
+    let out = rig.once_then_stop(|_| marker.exists(), |_| {});
+    assert!(!rig.mcp_calls().contains(r#""name":"deploy""#), "{}", out);
+}
+
+#[test]
+fn an_already_failed_revision_is_not_retriggered_on_retry() {
+    let rig = Rig::new("failed-preflight", MCP_SERVER, DEPLOY_STAGE);
+    let old = rig.adopt();
+    let sha = rig.merge_to_main("change");
+    rig.mcp_before(None);
+    rig.mcp_answers("deploy_status", &[&format!("rev={} Degraded", &sha[..12]), &format!("rev={} Healthy", &old[..12])]);
+    let (ok, out) = rig.once(&[]);
+    assert!(!ok && out.contains("not triggered again"), "{}", out);
+    assert!(!rig.mcp_calls().contains(r#""name":"deploy""#));
+}
+
+#[test]
+fn non_latin_review_bodies_travel_on_stdin_and_unicode_instruction_paths_are_reported() {
+    let cli = r#"#!/bin/sh
+[ "$1" = --version ] && exit 0
+cat >/dev/null
+printf '{"type":"result","result":"'
+awk 'BEGIN { for (i=0;i<55000;i++) printf "界"; }'
+printf '%s\n' '\nVERDICT: PASS"}'
+"#;
+    let rig = Rig::with_agents("unicode-body", "", "", &[("claude", cli)]);
+    fs::create_dir(rig.clone().join("ü")).unwrap();
+    fs::write(rig.clone().join("ü/CLAUDE.md"), "Untrusted instructions\n").unwrap();
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let (ok, out) = rig.once(&[]);
+    assert!(ok, "{}", out);
+    let calls = rig.calls();
+    assert!(calls.contains("--body-file -") && calls.contains("ü/CLAUDE.md"), "{}", out);
+    assert!(calls.len() > 128 * 1024);
 }

@@ -56,7 +56,9 @@ pub fn reply_target(st: &State, ui: &Ui) -> Option<u32> {
         return None;
     }
     let id = ui.selected?;
-    st.jobs.iter().find(|j| j.id == id && j.source.is_manual()).map(|j| j.id)
+    let j = st.jobs.iter().find(|j| j.id == id && j.source.is_manual())?;
+    // Following along, typing starts a new task, except that a task showing its options takes the choice.
+    (!ui.follow || j.status == JobStatus::Choosing).then_some(j.id)
 }
 
 fn fg(c: Color) -> Style {

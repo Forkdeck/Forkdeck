@@ -667,6 +667,10 @@ pub struct RepoCfg {
     pub ci: Option<CiCfg>,
     #[serde(default)]
     pub deploy: Option<DeployCfg>,
+    /// The forge host the clone's origin names, read when the config is loaded. GitLab paths
+    /// repeat across hosts, so it is part of what makes two entries the same repository.
+    #[serde(skip)]
+    pub host: String,
 }
 
 fn d_base() -> String {
@@ -728,6 +732,7 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
                 toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {}", c.display(), e))?;
             for r in &mut cfg.repos {
                 r.path = expand(&r.path);
+                r.host = origin_host(&r.path);
             }
             cfg.validate()?;
             return Ok((cfg, Some(c)));
@@ -736,6 +741,45 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
         }
     }
     Ok((Config::default(), None))
+}
+
+impl RepoCfg {
+    /// The repository as forkdeck tells it apart from others: "group/project@host" on a
+    /// self-hosted GitLab, where the same path may exist on another host; otherwise the name alone,
+    /// as it always was.
+    pub fn qualified(&self) -> String {
+        if self.provider == Provider::Gitlab && !self.host.is_empty() && self.host != "gitlab.com" {
+            format!("{}@{}", self.repo, self.host)
+        } else {
+            self.repo.clone()
+        }
+    }
+}
+
+/// Renames from old names to new ones, kept only where an old name has exactly one new owner and
+/// actually changes. Several owners mean nobody can tell whose the old file was.
+pub fn unambiguous_moves<T: Eq + std::hash::Hash + Clone>(pairs: impl IntoIterator<Item = (T, T)>) -> Vec<(T, T)> {
+    let mut owners: HashMap<T, Vec<T>> = HashMap::new();
+    for (old, new) in pairs {
+        let v = owners.entry(old).or_default();
+        if !v.contains(&new) { v.push(new); }
+    }
+    owners.into_iter().filter(|(old, new)| new.len() == 1 && new[0] != *old).map(|(old, mut new)| (old, new.remove(0))).collect()
+}
+
+/// The host a clone's origin names, or "" when there is none to read.
+pub fn origin_host(clone: &Path) -> String {
+    std::process::Command::new("git").args(["-C"]).arg(clone).args(["remote", "get-url", "origin"]).stderr(std::process::Stdio::null()).output().ok()
+        .filter(|o| o.status.success()).and_then(|o| host_of(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default()
+}
+
+/// "git@host:group/p.git", "ssh://git@host:22/group/p", "https://user@host/group/p" -> "host".
+pub fn host_of(url: &str) -> Option<String> {
+    let rest = url.trim().split_once("://").map(|(_, r)| r).unwrap_or(url.trim());
+    let authority = rest.split('/').next()?;
+    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = authority.split(':').next()?.to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
 }
 
 impl Config {
@@ -798,7 +842,7 @@ impl Config {
         let mut targets = std::collections::HashSet::new();
         for r in &self.repos {
             if let Some(d) = &r.deploy {
-                let key = format!("{:?}:{}:{}", r.provider, r.repo, d.environment).to_lowercase();
+                let key = format!("{:?}:{}:{}", r.provider, r.qualified(), d.environment).to_lowercase();
                 anyhow::ensure!(targets.insert(key), "repos: {} has more than one deploy stage for {:?}", r.repo, d.environment);
             }
         }
@@ -865,6 +909,14 @@ impl Config {
             if !r.path.is_absolute() {
                 anyhow::bail!("repos: path for {} must be absolute or start with ~/, got {}", r.repo, r.path.display());
             }
+            for labels in [[&r.label, &r.working_label, &r.done_label, &r.failed_label], [&r.pr_label, &r.pr_working_label, &r.pr_pass_label, &r.pr_fail_label]] {
+                let mut seen = std::collections::HashSet::new();
+                for label in labels {
+                    // GitHub label names ignore case: "Agent:Ready" and "agent:ready" are one label there.
+                    let key = if r.provider == Provider::Github { label.to_lowercase() } else { label.to_string() };
+                    anyhow::ensure!(!label.trim().is_empty() && !label.contains(',') && seen.insert(key), "repos: {} labels must be nonempty, comma-free and distinct within each kind", r.repo);
+                }
+            }
             for (name, v) in [("repo", &r.repo), ("base", &r.base)] {
                 if v.is_empty() || v.starts_with('-') || v.contains(char::is_whitespace) {
                     anyhow::bail!("repos: {} {:?} is not a valid name", name, v);
@@ -925,6 +977,21 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_old_name_moves_only_to_its_one_owner() {
+        let mut got = unambiguous_moves([("a", "a@one"), ("a", "a@one"), ("b", "b@one"), ("b", "b@two"), ("c", "c@one"), ("c", "c"), ("d", "d")]);
+        got.sort();
+        assert_eq!(got, [("a", "a@one")], "two environments on one host are one owner; two hosts, or gitlab.com too, are ambiguous; unchanged names stay");
+    }
+
+    #[test]
+    fn automation_labels_cannot_broaden_the_filter_or_conflict() {
+        for bad in ["label = ''", "pr_label = 'a,b'", "working_label = 'agent:ready'", "pr_pass_label = 'review:ready'"] {
+            let c: Config = toml::from_str(&format!("[[repos]]\nprovider = 'github'\nrepo = 'o/r'\npath = '/tmp/repo'\n{}", bad)).unwrap();
+            assert!(c.validate().is_err(), "{}", bad);
+        }
+    }
 
     #[test]
     fn example_config_parses() {

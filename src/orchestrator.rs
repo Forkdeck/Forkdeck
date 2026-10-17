@@ -29,7 +29,7 @@ pub struct Hub {
     /// One per configured repository: fetches and worktree changes in a shared clone must not interleave.
     pub git_locks: Arc<Vec<Arc<tokio::sync::Mutex<()>>>>,
     /// The account each forge CLI is logged in as (GitHub, GitLab), once asked.
-    pub team_me: Arc<Mutex<[Option<String>; 2]>>,
+    pub team_me: Arc<Mutex<std::collections::HashMap<String, String>>>,
     /// Whether each repository is readable by anyone, once the forge has said.
     pub team_public: Arc<Mutex<std::collections::HashMap<String, bool>>>,
     /// Jobs kept across restarts. None in demo mode, or when the database cannot be used.
@@ -39,10 +39,13 @@ pub struct Hub {
     /// `run_job` calls still going. A job's status says finished before its last steps (labels,
     /// the closing log line, saving) are done, so whoever exits waits for this to reach zero.
     busy: Arc<std::sync::atomic::AtomicUsize>,
+    admission: Arc<tokio::sync::Mutex<()>>,
+    saved: Arc<Mutex<std::collections::HashMap<u32, crate::history::JobRecord>>>,
+    pub input_closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Counts a `run_job` from its start until it returns, whichever way it does.
-struct Busy(Arc<std::sync::atomic::AtomicUsize>);
+pub struct Busy(Arc<std::sync::atomic::AtomicUsize>);
 
 impl Busy {
     fn enter(n: &Arc<std::sync::atomic::AtomicUsize>) -> Busy {
@@ -96,11 +99,14 @@ impl Hub {
             http: http.build().unwrap_or_default(),
             rt,
             git_locks: Arc::new(git_locks),
-            team_me: Arc::new(Mutex::new([None, None])),
+            team_me: Arc::new(Mutex::new(Default::default())),
             team_public: Arc::new(Mutex::new(Default::default())),
             history: None,
             history_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             busy: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            admission: Arc::new(tokio::sync::Mutex::new(())),
+            saved: Arc::new(Mutex::new(Default::default())),
+            input_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -121,19 +127,53 @@ impl Hub {
     }
 
     /// No job is in the middle of its last steps.
+    /// Held while something that may still add a job is under way (a submission typed just before
+    /// quitting, say): shutdown waits for it.
+    pub fn busy(&self) -> Busy {
+        Busy::enter(&self.busy)
+    }
+
     pub fn settled(&self) -> bool {
         self.busy.load(std::sync::atomic::Ordering::SeqCst) == 0
     }
 
     /// Write the job as it is now to the history.
     pub fn save(&self, id: u32) {
-        let Some(h) = &self.history else { return };
-        let Some(rec) = self.job(id, |j| j.in_history.then(|| crate::history::JobRecord::of(j))).flatten() else { return };
-        if let Err(e) = h.save(&rec) {
-            if !self.history_failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                self.log("history", format!("could not save job #{}: {}", id, e));
-            }
+        let Some(h) = self.history.clone() else { return };
+        let hub = self.clone();
+        let busy = Busy::enter(&self.busy);
+        self.rt.spawn_blocking(move || {
+            let _busy = busy;
+            // Snapshot and persistence have one ordering; an older autosave cannot follow completion.
+            let mut saved = hub.saved.lock().unwrap();
+            let Some(rec) = hub.job(id, |j| j.in_history.then(|| crate::history::JobRecord::of(j))).flatten() else { return };
+            // Elapsed time alone changes every tick: compared by the minute, a long quiet run is
+            // still saved about once a minute, and nothing more often than that.
+            let mut comparable = rec.clone();
+            comparable.worker.secs /= 60;
+            comparable.reviewer.secs /= 60;
+            comparable.created = 0;
+            comparable.active_secs /= 60;
+            if saved.get(&id) == Some(&comparable) { return; }
+            if let Err(e) = h.save(&rec) {
+                if !hub.history_failed.swap(true, std::sync::atomic::Ordering::SeqCst) { hub.log("history", format!("could not save job #{}: {}", id, e)); }
+            } else { saved.insert(id, comparable); }
+        });
+    }
+
+    async fn take_over(&self, id: u32, resume: bool) -> Result<(), String> {
+        let saved = self.job(id, |j| j.in_history).unwrap_or(false);
+        if let (Some(h), true) = (self.history.clone(), saved) {
+            let hub = self.clone();
+            self.rt.spawn_blocking(move || {
+                let _lock = hub.saved.lock().unwrap();
+                if let Some(r) = hub.job(id, |j| (!j.restored).then(|| crate::history::JobRecord::of(j))).flatten() { h.save(&r)?; }
+                let record = h.take_over(id, resume)?;
+                if let Some(r) = record { hub.job(id, |j| { *j = r.job(); j.restored = false; }); }
+                Ok::<_, String>(())
+            }).await.map_err(|e| e.to_string())??;
         }
+        Ok(())
     }
 
     /// Save running jobs every few seconds, so their output is there after a crash too.
@@ -145,7 +185,7 @@ impl Hub {
         self.rt.spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                let open: Vec<u32> = hub.state.lock().unwrap().jobs.iter().filter(|j| !j.status.finished()).map(|j| j.id).collect();
+                let open: Vec<u32> = hub.state.lock().unwrap_or_else(|e| e.into_inner()).jobs.iter().filter(|j| !j.status.finished()).map(|j| j.id).collect();
                 for id in open {
                     hub.save(id);
                 }
@@ -164,7 +204,7 @@ impl Hub {
             }
         };
         let mut resumable = Vec::new();
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let me = crate::history::owner_token();
         for r in records {
             if st.jobs.iter().any(|j| j.id == r.id) {
@@ -186,18 +226,12 @@ impl Hub {
     }
 
     /// Continue an interrupted typed task from the stage it had reached. Err says why not.
-    pub fn resume(&self, id: u32) -> Result<(), String> {
-        // Taken over in the database first: two forkdecks starting at once must not both run it.
-        let saved = self.job(id, |j| j.in_history).unwrap_or(false);
-        if let (Some(h), true) = (&self.history, saved) {
-            match h.claim(id) {
-                Ok(true) => {}
-                Ok(false) => return Err("another forkdeck that is still running has it".into()),
-                Err(e) => return Err(format!("could not take it over: {}", e)),
-            }
-        }
+    pub async fn resume(&self, id: u32) -> Result<(), String> {
+        let _admission = self.admission.lock().await;
+        if !self.job(id, |j| j.status == JobStatus::Interrupted && j.source.is_manual()).unwrap_or(false) { return Err("only an interrupted typed task can be resumed".into()); }
+        self.take_over(id, true).await?;
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if st.stopping {
                 return Err("shutting down".into());
             }
@@ -208,12 +242,18 @@ impl Hub {
             if !j.workdir.is_dir() {
                 return Err(format!("{} no longer exists", j.workdir.display()));
             }
+            j.active_started = Instant::now();
             j.resume_from.get_or_insert(JobStatus::Working);
             j.status = JobStatus::Queued;
             j.finished = None;
             j.outcome.clear();
             j.cancel = Cancel::new();
             j.worker.push("› continuing after forkdeck was stopped");
+            // Planned before the restart, still to be chosen: what was shown then is gone. Shown here,
+            // before anything typed can be taken as the choice.
+            if let Some(p) = j.plan.clone().filter(|p| p.chosen.is_none()) {
+                p.show_options(&mut j.worker);
+            }
             st.log("queue", format!("#{} continues where it stopped", id));
         }
         self.save(id);
@@ -222,16 +262,35 @@ impl Hub {
         Ok(())
     }
 
+    /// Write the journal entries of jobs that ended while it could not be written. Err: the first
+    /// failure; what is still owed stays owed.
+    pub fn record_owed(&self) -> Result<(), String> {
+        let owed: Vec<crate::journal::Entry> = std::mem::take(&mut self.state.lock().unwrap_or_else(|e| e.into_inner()).unrecorded);
+        let mut broken: Option<String> = None;
+        let mut still_owed = Vec::new();
+        for e in owed {
+            if broken.is_none() {
+                match crate::journal::append(&e) {
+                    Ok(()) => continue,
+                    Err(err) => broken = Some(err),
+                }
+            }
+            still_owed.push(e);
+        }
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).unrecorded.extend(still_owed);
+        broken.map_or(Ok(()), Err)
+    }
+
     pub fn log(&self, who: &str, msg: impl Into<String>) {
-        self.state.lock().unwrap().log(who, msg);
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).log(who, msg);
     }
 
     pub fn job<R>(&self, id: u32, f: impl FnOnce(&mut Job) -> R) -> Option<R> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.jobs.iter_mut().find(|j| j.id == id).map(f)
     }
 
-    pub fn submit(
+    pub async fn submit(
         &self,
         title: String,
         prompt: String,
@@ -239,26 +298,25 @@ impl Hub {
         workdir: PathBuf,
         forced: Option<AgentRef>,
         planning: Planning,
-    ) -> u32 {
+    ) -> Result<u32, String> {
+        let _busy = Busy::enter(&self.busy);
         // The database hands out ids, so jobs from another forkdeck sharing it never collide.
-        let from_db = match &self.history {
-            Some(h) => match h.new_id() {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    self.log("history", format!("could not reserve a job id ({}); this job is not kept across restarts", e));
-                    None
-                }
-            },
+        let from_db = match self.history.clone() {
+            Some(h) => Some(self.rt.spawn_blocking(move || h.new_id()).await.map_err(|e| e.to_string())??),
             None => None,
         };
         let id = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let stopping = st.stopping;
             // The id the database reserved is used as it is: two submissions can reach this lock in
             // either order, and a different number would be one nobody reserved.
             let id = from_db.unwrap_or(st.next_id);
             st.next_id = st.next_id.max(id + 1);
             st.jobs.push(Job {
+                active_secs: 0,
+                active_started: Instant::now(),
+                restored: false,
+                worktree_lock: None,
                 id,
                 title: title.clone(),
                 prompt: prompt.clone(),
@@ -298,14 +356,20 @@ impl Hub {
                 used: Default::default(),
                 findings: Vec::new(),
                 over_time: false,
+                admitted: false,
             });
             if stopping {
-                // Shutting down: the job exists so the caller has an id, but it never starts and claims nothing.
+                // Shutting down: the job exists so the caller has an id, but it never starts and claims
+                // nothing. A typed task was accepted all the same: it is kept, to start on resume.
+                let keep = st.jobs.last().is_some_and(|j| j.source.is_manual() && j.in_history);
                 if let Some(j) = st.jobs.last_mut() {
-                    j.status = JobStatus::Cancelled;
+                    j.status = if keep { JobStatus::Interrupted } else { JobStatus::Cancelled };
+                    j.resume_from = keep.then_some(JobStatus::Queued);
                     j.finished = Some(Instant::now());
                 }
-                return id;
+                drop(st);
+                if keep { self.save(id); }
+                return Ok(id);
             }
             st.log("queue", format!("#{} {}", id, clip(&title, 90)));
             id
@@ -313,35 +377,19 @@ impl Hub {
         let hub = self.clone();
         self.rt.spawn(async move { run_job(hub, id).await });
         self.save(id);
-        id
+        Ok(id)
     }
 
     /// Send a follow-up message to a finished typed task. The agent picks up in the same working
     /// tree and is given the conversation so far. Err says why it was not taken.
-    pub fn reply(&self, id: u32, text: String) -> Result<(), String> {
+    pub async fn reply(&self, id: u32, text: String) -> Result<(), String> {
+        let _admission = self.admission.lock().await;
         // A finished task starts working again: take it over first, as `resume` does, so a second
         // forkdeck that restored the same task cannot run it at the same time.
         let finished_typed = self.job(id, |j| j.source.is_manual() && j.status.finished() && j.in_history).unwrap_or(false);
-        if let (true, Some(h)) = (finished_typed, &self.history) {
-            match h.claim(id) {
-                Ok(true) => {}
-                Ok(false) => return Err("another forkdeck that is still running has it".into()),
-                Err(e) => return Err(format!("could not take it over: {}", e)),
-            }
-            // What the forkdeck that had it last saved is newer than what this one restored.
-            if let Ok(Some(saved)) = h.get(id) {
-                self.job(id, |j| {
-                    if saved.turns.len() > j.turns.len() {
-                        j.turns = saved.turns.clone();
-                    }
-                    if saved.session.is_some() {
-                        j.session = saved.session.clone();
-                    }
-                });
-            }
-        }
+        if finished_typed { self.take_over(id, false).await?; }
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if st.stopping {
                 return Err("shutting down".into());
             }
@@ -352,10 +400,7 @@ impl Hub {
             if j.status == JobStatus::Choosing {
                 // While it waits for a choice, a number picks an option and anything else is the user's own way.
                 let n = j.plan.as_ref().map(|p| p.options.len()).unwrap_or(0);
-                let c = match text.trim().parse::<usize>() {
-                    Ok(k) if (1..=n).contains(&k) => Choice::Option(k - 1),
-                    _ => Choice::Own(text.clone()),
-                };
+                let c = Choice::parse(&text, n);
                 drop(st);
                 return self.choose(id, c);
             }
@@ -368,6 +413,9 @@ impl Hub {
                 self.save(id);
                 return Ok(());
             }
+            let interrupted = j.status == JobStatus::Interrupted;
+            if interrupted { j.active_secs += j.finished.unwrap_or_else(Instant::now).saturating_duration_since(j.active_started).as_secs(); }
+            j.resume_from = None;
             j.turns.push(Turn { ask: text.clone(), answer: String::new() });
             j.status = JobStatus::Queued;
             j.finished = None;
@@ -375,11 +423,15 @@ impl Hub {
             j.verdict = None;
             j.checks = None;
             j.rounds = 0;
-            // The previous turn is already journalled; account only for this new run.
-            j.used = Default::default();
+            // An interrupted turn has not been journalled yet; carry its usage into the eventual entry.
+            if !interrupted {
+                j.used = Default::default();
+                j.active_secs = 0;
+                j.created = Instant::now();
+            }
             j.findings.clear();
             j.over_time = false;
-            j.created = Instant::now();
+            j.active_started = Instant::now();
             j.cancel = Cancel::new();
             j.worker.push(format!("› {}", clip(&text, 300)));
             j.reviewer.state = StageState::Idle;
@@ -394,7 +446,7 @@ impl Hub {
     /// Pick how a planned task goes ahead.
     pub fn choose(&self, id: u32, c: Choice) -> Result<(), String> {
         let chose = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return Err("no such job".into()) };
             if j.status != JobStatus::Choosing {
                 return Err("it is not waiting for a choice".into());
@@ -420,9 +472,9 @@ impl Hub {
 
     /// Send a message and have the running agent take it now: it is stopped and continues its
     /// conversation with the message. A finished task takes it as a reply.
-    pub fn steer_now(&self, id: u32, text: String) -> Result<(), String> {
+    pub async fn steer_now(&self, id: u32, text: String) -> Result<(), String> {
         let steer = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return Err("no such job".into()) };
             if !j.source.is_manual() {
                 return Err("only typed tasks take messages".into());
@@ -432,6 +484,7 @@ impl Hub {
             } else {
                 j.inbox.push_front(text.clone());
                 j.worker.push(format!("› {} (now)", clip(&text, 300)));
+                j.steer.fire();
                 st.log("queue", format!("#{} interrupted with a message: {}", id, clip(&text, 90)));
                 st.jobs.iter().find(|j| j.id == id).map(|j| j.steer.clone())
             }
@@ -442,7 +495,7 @@ impl Hub {
                 self.save(id);
                 Ok(())
             }
-            None => self.reply(id, text),
+            None => self.reply(id, text).await,
         }
     }
 
@@ -459,17 +512,17 @@ impl Hub {
         loop {
             // Every pass: a poll that was already in flight may still add a job after the first one.
             let open: Vec<Arc<Cancel>> = {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.automation = false;
                 st.stopping = true;
                 st.jobs.iter().filter(|j| !j.status.finished()).map(|j| j.cancel.clone()).collect()
             };
             for c in &open {
-                c.fire();
+                c.shutdown();
             }
             if (open.is_empty() && self.settled()) || Instant::now() >= deadline {
                 // Whatever is still running is saved as it stands; it comes back interrupted.
-                let left: Vec<u32> = self.state.lock().unwrap().jobs.iter().filter(|j| !j.status.finished()).map(|j| j.id).collect();
+                let left: Vec<u32> = self.state.lock().unwrap_or_else(|e| e.into_inner()).jobs.iter().filter(|j| !j.status.finished()).map(|j| j.id).collect();
                 for id in left {
                     self.save(id);
                 }
@@ -490,7 +543,7 @@ impl Hub {
         let installed: std::collections::HashSet<AgentKind> = AgentKind::ALL.into_iter().zip(found).filter(|(_, f)| *f).map(|(k, _)| k).collect();
         // Which models the account may use decides what copilot can stand in for, so ask before any job starts.
         let probe = if installed.contains(&AgentKind::Copilot) { crate::copilot::probe(&self.cfg.agents.get(AgentKind::Copilot).cmd.unwrap_or_default()).await } else { Default::default() };
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.installed = installed;
         st.copilot = probe;
         st.stand_in = self.cfg.agents.copilot.stand_in();
@@ -544,10 +597,26 @@ fn cancelled() -> Finish {
 
 pub async fn run_job(hub: Hub, id: u32) {
     let _busy = Busy::enter(&hub.busy);
+    loop {
+        let h = hub.clone();
+        match tokio::spawn(async move { run_job_inner(h, id).await }).await {
+            Ok(true) => continue,
+            Ok(false) => return,
+            Err(e) => {
+                hub.job(id, |j| { j.status = JobStatus::Failed; j.outcome = format!("job ended abnormally: {}", e); j.finished = Some(Instant::now()); j.worktree_lock = None; });
+                hub.save(id);
+                hub.log("queue", format!("#{} failed: job ended abnormally: {}", id, e));
+                return;
+            }
+        }
+    }
+}
+
+async fn run_job_inner(hub: Hub, id: u32) -> bool {
     let Some((manual, is_pr, is_deploy, cancel, reply, resuming)) = hub.job(id, |j| {
         (j.source.is_manual(), matches!(j.source, Source::Pr { .. }), matches!(j.source, Source::Deploy { .. }), j.cancel.clone(), j.turns.len() > 1, j.resume_from.is_some())
     }) else {
-        return;
+        return false;
     };
     let fin = {
         let wait = async {
@@ -558,6 +627,7 @@ pub async fn run_job(hub: Hub, id: u32) {
         };
         tokio::select! {
             _held = wait => {
+                hub.job(id, |j| j.admitted = true);
                 // One issue or review may only run so long. A deployment has its own time limits,
                 // and stopping one halfway is worse than letting it finish.
                 let limit = hub.cfg.limits.job_mins;
@@ -620,24 +690,21 @@ pub async fn run_job(hub: Hub, id: u32) {
     // Before the job counts as finished, so that a shutdown waits for the last word to teammates.
     team::finish(&hub, id, fin.status).await;
     // Stopped by a shutdown, a typed task is not cancelled: it continues on the next start.
-    let stopping = hub.state.lock().unwrap().stopping;
-    let fin = if stopping && manual && fin.status == JobStatus::Cancelled {
+    let fin = if cancel.is_shutdown() && manual && fin.status == JobStatus::Cancelled {
         Finish { status: JobStatus::Interrupted, outcome: "interrupted: forkdeck stopped while this ran".into(), ..fin }
     } else {
         fin
     };
-    // What the checks and reviewers objected to becomes a rule or two for the next job.
     let learned = knowledge::learn(&hub, id).await;
-    // A job that was never started (a teammate holds the item) did nothing worth recording.
-    if fin.wait.is_none() && !hub.cfg.demo {
-        if let Some(e) = hub.job(id, |j| journal::entry(j, fin.status, &fin.outcome, learned)) {
-            if let Err(err) = journal::append(&e) {
-                hub.log("journal", format!("#{} not recorded: {}. Nothing more is picked up until the journal can be written", id, err));
-                hub.state.lock().unwrap().unrecorded.push(e);
-            }
+    let mut entry = None;
+    let again = hub.job(id, |j| {
+        if manual && !cancel.is_set() && !j.inbox.is_empty() {
+            let ask = j.inbox.drain(..).collect::<Vec<_>>().join("\n\n");
+            j.turns.push(Turn { ask, answer: String::new() });
+            j.status = JobStatus::Queued;
+            j.resume_from = None;
+            return true;
         }
-    }
-    hub.job(id, |j| {
         if fin.status == JobStatus::Interrupted {
             // Where it was, unless it was already resuming from an earlier stop.
             let at = j.resume_from.unwrap_or(j.status);
@@ -648,9 +715,22 @@ pub async fn run_job(hub: Hub, id: u32) {
         j.status = fin.status;
         j.outcome = fin.outcome.clone();
         j.finished = Some(Instant::now());
-    });
+        entry = Some(journal::entry(j, fin.status, &fin.outcome, learned));
+        false
+    }).unwrap_or(false);
+    if again { hub.save(id); return true; }
+    // A job that was never started (a teammate holds the item) did nothing worth recording.
+    if fin.wait.is_none() && fin.status != JobStatus::Interrupted && !hub.cfg.demo {
+        if let Some(e) = entry {
+            if let Err(err) = journal::append(&e) {
+                hub.log("journal", format!("#{} not recorded: {}. Nothing more is picked up until the journal can be written", id, err));
+                hub.state.lock().unwrap_or_else(|e| e.into_inner()).unrecorded.push(e);
+            }
+        }
+    }
+
     if fin.status == JobStatus::Cancelled {
-        let mut st = hub.state.lock().unwrap();
+        let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
         let which = st.jobs.iter().find(|j| j.id == id).and_then(|j| match &j.source {
             Source::Deploy { repo_idx, sha, .. } => Some((*repo_idx, sha.clone())),
             _ => None,
@@ -664,7 +744,7 @@ pub async fn run_job(hub: Hub, id: u32) {
     if !manual {
         let now = Instant::now();
         let (max, base) = (hub.cfg.review.max_retries, hub.cfg.review.retry_secs);
-        let mut st = hub.state.lock().unwrap();
+        let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
         let found = st.jobs.iter().find(|j| j.id == id).and_then(|j| j.source.key().map(|k| (k, j.branch.is_some())));
         if let (Some((key, _)), Some(w)) = (found, fin.wait) {
             st.look_again(key, now + w);
@@ -677,7 +757,7 @@ pub async fn run_job(hub: Hub, id: u32) {
                     st.schedule_retry(key, max, base, immediate, now);
                 }
                 // A pull request review that could not run has its request label put back as well.
-                (JobStatus::Failed, None, true, _) => {
+                (JobStatus::Failed, None, true, _) if !over_time => {
                     st.schedule_retry(key, max, base, false, now);
                 }
                 // An issue we never managed to claim still carries its label.
@@ -691,9 +771,11 @@ pub async fn run_job(hub: Hub, id: u32) {
     }
     // Saved last: the modes without an interface exit once every job counts as finished, and a
     // write before the steps above would let that happen before they are done.
+    hub.job(id, |j| j.worktree_lock = None);
     hub.save(id);
     // The whole outcome: in the modes without an interface this line is the report.
     hub.log("queue", format!("#{} {}: {}", id, fin.status.name(), clip(&fin.outcome, 600)));
+    false
 }
 
 fn set_status(hub: &Hub, id: u32, s: JobStatus) {
@@ -731,7 +813,7 @@ pub fn avail(hub: &Hub) -> AvailOwned {
         let installed = [AgentKind::Claude, AgentKind::Codex].into_iter().collect();
         return AvailOwned { installed, enabled: None, no_seat: false, rejected: HashSet::new() };
     }
-    AvailOwned::of(&hub.state.lock().unwrap())
+    AvailOwned::of(&hub.state.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Run an agent. When copilot refuses the model before doing anything, remember that and run the
@@ -744,13 +826,13 @@ pub async fn run_agent(hub: &Hub, id: u32, slot: Slot, mut exec: Exec, tier: Tie
     loop {
         let out = agents::run(hub, id, slot, RunSpec { exec: &exec, prompt: &prompt, dir, read_only, resume: resume.as_ref().map(|(sid, _)| sid.as_str()) }).await;
         if out.no_models {
-            hub.state.lock().unwrap().copilot.seat = Some(false);
+            hub.state.lock().unwrap_or_else(|e| e.into_inner()).copilot.seat = Some(false);
             hub.log("agents", format!("copilot has no model this account may use: {}", out.error));
             return (out, exec);
         }
         let Some(m) = out.rejected_model.clone() else { return (out, exec) };
         let m = if m.is_empty() { exec.model.clone() } else { m };
-        hub.state.lock().unwrap().rejected_models.insert(m.clone());
+        hub.state.lock().unwrap_or_else(|e| e.into_inner()).rejected_models.insert(m.clone());
         hub.log("agents", format!("#{} {} is not available to this copilot account, skipping it", id, m));
         match pick::resolve(&hub.cfg, &avail(hub).borrow(), &exec.asked, tier) {
             Some(next) if next.model != exec.model => {
@@ -776,7 +858,7 @@ async fn decide(hub: &Hub, id: u32, prompt: &str, is_issue: bool, forced: Option
     let routed = router::route(&hub.cfg, &hub.http, prompt, is_issue).await;
     let mut d = routed.decision;
     {
-        let mut st = hub.state.lock().unwrap();
+        let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
         if routed.asked_jev {
             st.router.calls += 1;
             st.router.last_ms = d.ms;
@@ -876,6 +958,7 @@ pub async fn run_checks_detailed(hub: &Hub, id: u32, cmds: &[String], dir: &Path
         };
         let ended = match res {
             Ok((Some(0), _, _)) => None,
+            Ok((Some(126 | 127), out, err)) => Some(Checked::Errored(tail(&format!("{}{}", out, err)))),
             Ok((Some(_), out, err)) => Some(Checked::Failed(tail(&format!("{}{}", out, err)))),
             Ok((None, out, err)) => Some(Checked::Errored(tail(&format!("{}{}\nended by a signal", out, err)))),
             Err(e) => Some(Checked::Errored(tail(&e))),
@@ -952,6 +1035,10 @@ async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, fresh: Option
     let mut prompt = prompt.to_string();
     let mut fresh = fresh.map(String::from);
     loop {
+        if let Some(msg) = take_messages(hub, id, None) {
+            prompt = format!("{}\n\n{}", prompt, messages_prompt(&msg));
+            fresh = hub.job(id, |j| format!("{}\n\n{}", continue_fresh(&j.turns, w.prompt), prompt));
+        }
         // The worker as it last ran: a model the account refused has been replaced there.
         let worker = hub.job(id, |j| j.worker_ran.clone()).flatten().unwrap_or_else(|| w.worker.clone());
         let resume = resumable(hub, id, &worker);
@@ -989,6 +1076,7 @@ async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, fresh: Option
         if out.interrupted {
             // Stopped for a message that was taken in the meantime: carry on where it was.
             prompt = "Carry on with the task where you stopped, then summarise what you changed.".into();
+            fresh = hub.job(id, |j| continue_fresh(&j.turns, w.prompt));
             continue;
         }
         // From here the index holds exactly what the agent did. Checks run against that, and whatever
@@ -1026,7 +1114,6 @@ fn choice_text(plan: &Plan, c: &Choice) -> String {
 /// no usable plan, work from the task as written.
 async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool, cancel: &Cancel) -> Result<Option<(String, String)>, Finish> {
     let saved = hub.job(id, |j| j.plan.clone()).flatten();
-    let from_before = saved.is_some();
     let plan = match saved {
         // Planned before forkdeck was stopped: not again.
         Some(p) => p,
@@ -1072,24 +1159,13 @@ async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool
             record_answer(hub, id, &out.text);
             let plan = Plan { options, text: out.text.clone(), chosen: None };
             hub.job(id, |j| {
-                for (i, o) in plan.options.iter().enumerate() {
-                    j.worker.push(format!("{}) {}{} — {}", i + 1, o.title, if o.recommended { " (recommended)" } else { "" }, o.summary));
-                }
+                plan.show_options(&mut j.worker);
                 j.plan = Some(plan.clone());
             });
             hub.save(id);
             plan
         }
     };
-    // Planned before a restart, still to be chosen: what was shown then is gone, so the options are
-    // shown again, whichever way the choice is about to be made.
-    if from_before && plan.chosen.is_none() {
-        hub.job(id, |j| {
-            for (i, o) in plan.options.iter().enumerate() {
-                j.worker.push(format!("{}) {}{} — {}", i + 1, o.title, if o.recommended { " (recommended)" } else { "" }, o.summary));
-            }
-        });
-    }
     let choice = match plan.chosen.clone() {
         Some(c) => c,
         None if !ask_user => {
@@ -1098,19 +1174,18 @@ async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool
             hub.job(id, |j| if let Some(p) = &mut j.plan { p.chosen = Some(c.clone()) });
             c
         }
-        None if hub.job(id, |j| !j.inbox.is_empty()).unwrap_or(false) => {
-            // Typed while it was still planning: that is the choice.
-            let text = hub.job(id, |j| j.inbox.pop_front()).flatten().unwrap_or_default();
-            let c = match text.trim().parse::<usize>() {
-                Ok(k) if (1..=plan.options.len()).contains(&k) => Choice::Option(k - 1),
-                _ => Choice::Own(text),
-            };
-            hub.job(id, |j| if let Some(p) = &mut j.plan { p.chosen = Some(c.clone()) });
-            hub.log("plan", format!("#{} {}", id, plan.describe(&c)));
-            c
-        }
         None => {
-            set_status(hub, id, JobStatus::Choosing);
+            hub.job(id, |j| {
+                // A number typed early chooses; ordinary messages remain guidance for the worker.
+                let early = j.inbox.iter().position(|t| matches!(Choice::parse(t, plan.options.len()), Choice::Option(_)));
+                if let Some(i) = early {
+                    let c = Choice::parse(&j.inbox.remove(i).unwrap(), plan.options.len());
+                    j.worker.push(format!("› {}", plan.describe(&c)));
+                    if let Some(p) = &mut j.plan { p.chosen = Some(c); }
+                }
+                j.status = JobStatus::Choosing;
+            });
+            hub.save(id);
             let how = if plan.options.is_empty() { "type how to go ahead".to_string() } else { format!("pick 1–{} or type your own", plan.options.len()) };
             hub.log("plan", format!("#{} {}", id, how));
             hub.job(id, |j| j.worker.push(format!("› {}", how)));
@@ -1119,7 +1194,15 @@ async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool
                 if let Some(c) = hub.job(id, |j| j.plan.as_ref().and_then(|p| p.chosen.clone())).flatten() {
                     break c;
                 }
+                if hub.input_closed.load(std::sync::atomic::Ordering::SeqCst) {
+                    if plan.options.is_empty() { return Err(failed("input closed and the plan has no usable options")); }
+                    let c = Choice::Option(plan.default_choice());
+                    hub.log("plan", format!("#{} input closed; taking {}", id, plan.describe(&c)));
+                    let _ = hub.choose(id, c.clone());
+                    break c;
+                }
                 tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                     _ = chose.notified() => {}
                     _ = cancel.wait() => return Err(cancelled()),
                 }
@@ -1161,7 +1244,9 @@ fn take_messages(hub: &Hub, id: u32, answer: Option<&str>) -> Option<String> {
 
 /// The task, followed by what the user asked for since, oldest first.
 fn with_later_requests(task: &str, turns: &[Turn]) -> String {
-    let later: Vec<String> = turns.iter().skip(1).map(|t| format!("- {}", t.ask)).filter(|l| !task.contains(&l[2..])).collect();
+    let folded = task.rsplit_once("\n\nFollow-up request: ").map(|(_, s)| s);
+    let skip = folded.and_then(|f| turns.iter().rposition(|t| t.ask == f));
+    let later: Vec<String> = turns.iter().enumerate().skip(1).filter(|(i, _)| Some(*i) != skip).map(|(_, t)| format!("- {}", t.ask)).collect();
     if later.is_empty() {
         task.to_string()
     } else {
@@ -1191,20 +1276,12 @@ async fn tree_state(hub: &Hub, id: u32, w: &Work<'_>) -> Option<String> {
     if w.is_issue {
         return hub.job(id, |j| j.staged_tree.clone()).flatten();
     }
-    // -z: names as they are, not quoted or escaped.
-    let status = issues::sh("git", &["status", "--porcelain", "-z", "--untracked-files=all"], Some(w.dir)).await.ok()?;
-    let diff = issues::sh("git", &["diff", "HEAD"], Some(w.dir)).await.ok()?;
-    // A worker that commits its fix leaves no diff behind: the committed tree counts as well.
-    let head = issues::sh("git", &["rev-parse", "HEAD^{tree}"], Some(w.dir)).await.unwrap_or_default();
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    (&status, &diff, &head).hash(&mut h);
-    // Untracked files show by name only; their bytes count too. One that cannot be read means the
-    // state cannot be told, and then nothing is cut short.
-    for f in status.split('\0').filter_map(|e| e.strip_prefix("?? ")) {
-        std::fs::read(w.dir.join(f)).ok()?.hash(&mut h);
-    }
-    Some(format!("{:x}", h.finish()))
+    let scratch = proc::Scratch::new().ok()?;
+    let env = [("GIT_INDEX_FILE", scratch.0.join("index").display().to_string())];
+    issues::sh_env("git", &["read-tree", "HEAD"], Some(w.dir), &env).await.ok()?;
+    issues::sh_env("git", &["add", "-A"], Some(w.dir), &env).await.ok()?;
+    issues::sh_env("git", &["write-tree"], Some(w.dir), &env).await.ok()
+
 }
 
 async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &Cancel) -> Result<Refined, Finish> {
@@ -1262,7 +1339,7 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
                 let why = if rev.ok { "no VERDICT line".to_string() } else { clip(&rev.error, 120) };
                 hub.log("review", format!("#{} {} gave no verdict ({}), asking again", id, ran.label(), why));
                 // A conversation that could not be continued is not tried again: a new one, told everything.
-                let again_resume = if rev.ok { resume.clone() } else { None };
+                let again_resume = if rev.ok && agents::can_resume(&hub.cfg, &ran, true) { rev.session.clone() } else { None };
                 if !rev.ok {
                     used = fresh.clone();
                 }
@@ -1531,10 +1608,7 @@ fn chat_prompt(turns: &[Turn]) -> String {
     for t in &before[skipped..] {
         out.push_str(&format!("User: {}\n\nYou: {}\n\n", t.ask, if t.answer.is_empty() { "(no result)".to_string() } else { clip(&t.answer, CHAT_ANSWER_CHARS) }));
     }
-    out.push_str(&format!(
-        "The user now says:\n{}\n\nDo what they ask in this working tree, then summarise what you changed or answer their question.",
-        now.ask
-    ));
+    out.push_str(&reply_prompt(&now.ask));
     out
 }
 
@@ -1550,6 +1624,32 @@ fn continue_fresh(turns: &[Turn], prompt: &str) -> String {
     }
 }
 
+async fn continuation_setup(hub: &Hub, id: u32, task: &str, dir: &Path, forced: Option<AgentRef>, known: Option<Decision>, cancel: &Cancel) -> Result<(Decision, Exec, Exec), Finish> {
+    let (d, worker) = match known {
+        Some(d) => {
+            let wanted = forced.unwrap_or(AgentRef::Kind(d.agent));
+            let worker = pick::worker_for(&hub.cfg, &avail(hub).borrow(), &wanted, d.tier).ok_or_else(|| failed(format!("{} is not available and nothing can stand in for it", wanted.name())))?;
+            (d, worker)
+        }
+        None => decide(hub, id, task, false, forced).await?,
+    };
+    let (reviewer, _) = pick::reviewer_for(&hub.cfg, &avail(hub).borrow(), &worker, d.tier.up());
+    if !d.review { hub.job(id, |j| j.reviewer.state = StageState::Skipped); }
+    if cancel.is_set() { return Err(cancelled()); }
+    if !hub.cfg.demo && !hub.job(id, |j| j.base_sha.is_some()).unwrap_or(false) {
+        if let Ok(sha) = issues::sh("git", &["rev-parse", "--verify", "HEAD^{commit}"], Some(dir)).await { hub.job(id, |j| j.base_sha = Some(sha)); }
+    }
+    Ok((d, worker, reviewer))
+}
+
+async fn continuation_finish(hub: &Hub, id: u32, w: &Work<'_>, summary: String, cancel: &Cancel) -> Finish {
+    record_answer(hub, id, &summary);
+    let r = match refine(hub, id, w, summary, cancel).await { Ok(r) => r, Err(f) => return f };
+    record_answer(hub, id, &r.summary);
+    if cancel.is_set() { return cancelled(); }
+    if r.good { done(clip(&first_para(&r.summary), 300)) } else { failed(r.why_not()) }
+}
+
 /// An interrupted typed task, continued from the stage it had reached: the worker carries on (in
 /// its own conversation when the CLI still has it), or, if the work was done, the review runs again.
 async fn resumed(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
@@ -1557,6 +1657,7 @@ async fn resumed(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
         return failed("job vanished");
     };
     let from = from.unwrap_or(JobStatus::Working);
+    set_status(hub, id, from);
     // Stopped before anything was done: start it the usual way, so a plan asked for is still made
     // and the starting commit is noted.
     if matches!(from, JobStatus::Queued | JobStatus::Routing) {
@@ -1567,26 +1668,10 @@ async fn resumed(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
         (Some(first), Some(last)) if turns.len() > 1 => format!("{}\n\nFollow-up request: {}", first.ask, last.ask),
         _ => prompt.clone(),
     };
-    let (d, worker) = match known {
-        Some(d) => {
-            let wanted = forced.unwrap_or(AgentRef::Kind(d.agent));
-            match pick::worker_for(&hub.cfg, &avail(hub).borrow(), &wanted, d.tier) {
-                Some(w) => (d, w),
-                None => return failed(format!("{} is not available and nothing can stand in for it", wanted.name())),
-            }
-        }
-        None => match decide(hub, id, &task, false, forced).await {
-            Ok(x) => x,
-            Err(f) => return f,
-        },
+    let (d, worker, reviewer) = match continuation_setup(hub, id, &task, &dir, forced, known, cancel).await {
+        Ok(x) => x,
+        Err(f) => return f,
     };
-    let (reviewer, _) = pick::reviewer_for(&hub.cfg, &avail(hub).borrow(), &worker, d.tier.up());
-    if !d.review {
-        hub.job(id, |j| j.reviewer.state = StageState::Skipped);
-    }
-    if cancel.is_set() {
-        return cancelled();
-    }
     let w = Work { prompt: &task, dir: &dir, d: &d, worker: &worker, reviewer: &reviewer, checks: &checks, is_issue: false, followup: None };
     // The work was finished and only the review was cut short: review it again.
     let answered = turns.last().map(|t| t.answer.clone()).filter(|a| !a.is_empty());
@@ -1613,16 +1698,7 @@ async fn resumed(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
             }
         }
     };
-    record_answer(hub, id, &summary);
-    let r = match refine(hub, id, &w, summary, cancel).await {
-        Ok(r) => r,
-        Err(f) => return f,
-    };
-    record_answer(hub, id, &r.summary);
-    if cancel.is_set() {
-        return cancelled();
-    }
-    if r.good { done(clip(&first_para(&r.summary), 300)) } else { failed(r.why_not()) }
+    continuation_finish(hub, id, &w, summary, cancel).await
 }
 
 /// A reply to a typed task: the same agent, in the same tree, with the conversation as context.
@@ -1634,33 +1710,10 @@ async fn followup(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
         (Some(first), Some(last)) => format!("{}\n\nFollow-up request: {}", first.ask, last.ask),
         _ => return failed("job has no conversation"),
     };
-    let (d, worker) = match known {
-        // The same part as before: what was forced, else what the fork layer chose.
-        Some(d) => {
-            let wanted = forced.unwrap_or(AgentRef::Kind(d.agent));
-            match pick::worker_for(&hub.cfg, &avail(hub).borrow(), &wanted, d.tier) {
-                Some(w) => (d, w),
-                None => return failed(format!("{} is not available and nothing can stand in for it", wanted.name())),
-            }
-        }
-        None => match decide(hub, id, &task, false, forced).await {
-            Ok(x) => x,
-            Err(f) => return f,
-        },
+    let (d, worker, reviewer) = match continuation_setup(hub, id, &task, &dir, forced, known, cancel).await {
+        Ok(x) => x,
+        Err(f) => return f,
     };
-    let (reviewer, _) = pick::reviewer_for(&hub.cfg, &avail(hub).borrow(), &worker, d.tier.up());
-    if !d.review {
-        hub.job(id, |j| j.reviewer.state = StageState::Skipped);
-    }
-    if cancel.is_set() {
-        return cancelled();
-    }
-    let have_base = hub.job(id, |j| j.base_sha.is_some()).unwrap_or(false);
-    if !have_base && !hub.cfg.demo {
-        if let Ok(sha) = issues::sh("git", &["rev-parse", "--verify", "HEAD^{commit}"], Some(&dir)).await {
-            hub.job(id, |j| j.base_sha = Some(sha.clone()));
-        }
-    }
     let w = Work { prompt: &task, dir: &dir, d: &d, worker: &worker, reviewer: &reviewer, checks: &checks, is_issue: false, followup: None };
     set_status(hub, id, JobStatus::Working);
     // With the agent's own conversation, only the new message is needed.
@@ -1669,16 +1722,7 @@ async fn followup(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
         Ok(s) => s,
         Err(f) => return f,
     };
-    record_answer(hub, id, &summary);
-    let r = match refine(hub, id, &w, summary, cancel).await {
-        Ok(r) => r,
-        Err(f) => return f,
-    };
-    record_answer(hub, id, &r.summary);
-    if cancel.is_set() {
-        return cancelled();
-    }
-    if r.good { done(clip(&first_para(&r.summary), 300)) } else { failed(r.why_not()) }
+    continuation_finish(hub, id, &w, summary, cancel).await
 }
 
 /// CI did not come good: say so on the pull request and hand the issue to a person. The pull request stays open.
@@ -1732,6 +1776,17 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     let steering = issues::agent_files_changed(hub, &dir, &base).await;
 
     let checks_res = run_checks(hub, id, &checks, &dir, cancel).await;
+    if !hub.cfg.demo && !checks.is_empty() {
+        let restore = async {
+            issues::sh("git", &["checkout", "--detach", "--force", &sha], Some(&dir)).await?;
+            issues::sh("git", &["reset", "--hard", &sha], Some(&dir)).await?;
+            issues::sh("git", &["clean", "-ffdx"], Some(&dir)).await?;
+            let head = issues::sh("git", &["rev-parse", "HEAD"], Some(&dir)).await?;
+            if head != sha { return Err("the review checkout changed revision".to_string()); }
+            Ok::<_, String>(())
+        }.await;
+        if let Err(e) = restore { return failed(format!("could not restore the reviewed commit after checks: {}", e)); }
+    }
     if cancel.is_set() {
         return cancelled();
     }
@@ -1788,7 +1843,7 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
         return failed("job vanished");
     };
     let next = |immediate: bool| {
-        let st = hub.state.lock().unwrap();
+        let st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
         issues::next_words(st.retry_preview(key, hub.cfg.review.max_retries, hub.cfg.review.retry_secs, immediate))
     };
 
@@ -1826,7 +1881,7 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
             Ok(h) if h == sha => {}
             other => {
                 let now_head = other.unwrap_or_else(|_| "unknown".into());
-                let _ = issues::pr_withdraw(hub, id, &sha, &now_head, &next(true)).await.map_err(|e| hub.log("issues", e));
+                if let Err(e) = issues::pr_withdraw(hub, id, &sha, &now_head, &next(true)).await { return failed(format!("pass withdrawal unconfirmed: {}", e)); }
                 return Finish {
                     status: JobStatus::Done,
                     outcome: format!("pass withdrawn: the head moved from {} to {} as the review was posted", short(&sha), short(&now_head)),
@@ -1970,6 +2025,56 @@ pub fn parse_verdict(text: &str) -> Option<bool> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_panicked_runner_is_failed_instead_of_left_running() {
+        let cfg = Config { demo: true, ..Config::default() };
+        let hub = Hub::new(cfg, tokio::runtime::Handle::current());
+        hub.detect_agents().await;
+        let id = hub.submit("x".into(), "x".into(), Source::Manual, PathBuf::from("."), None, Planning::Never).await.unwrap();
+        hub.job(id, |j| {
+            j.resume_from = Some(JobStatus::Choosing);
+            j.plan = Some(Plan { options: vec![], text: "corrupt saved plan".into(), chosen: Some(Choice::Option(99)) });
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if hub.job(id, |j| j.status.finished()).unwrap() && hub.settled() { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        hub.job(id, |j| { assert_eq!(j.status, JobStatus::Failed); assert!(j.outcome.contains("ended abnormally")); });
+    }
+
+    #[test]
+    fn short_later_requests_are_not_lost_as_substrings() {
+        let turns = [Turn { ask: "test it, yes".into(), answer: String::new() }, Turn { ask: "yes".into(), answer: String::new() }, Turn { ask: "test it".into(), answer: String::new() }];
+        let prompt = with_later_requests("test it, yes", &turns);
+        assert!(prompt.ends_with("- yes\n- test it"));
+    }
+
+    #[test]
+    fn a_reply_to_an_interrupted_task_starts_with_the_new_request() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = Hub::new(Config::default(), rt.handle().clone());
+        let permit = rt.block_on(hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel as u32)).unwrap();
+        let id = rt.block_on(hub.submit("x".into(), "x".into(), Source::Manual, PathBuf::from("."), None, Planning::Never)).unwrap();
+        hub.job(id, |j| {
+            j.status = JobStatus::Interrupted;
+            j.resume_from = Some(JobStatus::Reviewing);
+            j.used[0].tokens_in = 123;
+            j.active_secs = 7;
+            j.active_started = Instant::now() - Duration::from_secs(100);
+            j.finished = Some(j.active_started + Duration::from_secs(10));
+        });
+        rt.block_on(hub.reply(id, "new request".into())).unwrap();
+        hub.job(id, |j| {
+            assert_eq!(j.resume_from, None);
+            assert_eq!(j.turns.last().unwrap().ask, "new request");
+            assert_eq!(j.used[0].tokens_in, 123);
+            assert_eq!(j.active_secs, 17, "stopped time is excluded");
+        });
+        drop(permit);
+    }
+
     #[test]
     fn a_second_look_knows_the_first() {
         let fresh = re_review_prompt(Some("src/a.rs:3 off by one\nVERDICT: FAIL"), None);
@@ -2007,7 +2112,7 @@ mod tests {
         // Keep spawned jobs queued: this test exercises reply admission without running agents.
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let hub = Hub::new(Config::default(), rt.handle().clone());
-        let id = hub.submit("first task".into(), "first task".into(), Source::Manual, PathBuf::from("."), None, Planning::IfRouted);
+        let id = rt.block_on(hub.submit("first task".into(), "first task".into(), Source::Manual, PathBuf::from("."), None, Planning::IfRouted)).unwrap();
         hub.job(id, |j| {
             j.status = JobStatus::Done;
             j.turns[0].answer = "first answer".into();
@@ -2018,7 +2123,7 @@ mod tests {
             j.created = Instant::now() - Duration::from_secs(3600);
         });
         let first = hub.job(id, |j| journal::entry(j, JobStatus::Done, "done", 0)).unwrap();
-        hub.reply(id, "follow up".into()).unwrap();
+        rt.block_on(hub.reply(id, "follow up".into())).unwrap();
         let next = hub.job(id, |j| {
             assert_eq!(j.turns.len(), 2);
             assert_eq!(j.turns[0].answer, "first answer");

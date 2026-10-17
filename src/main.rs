@@ -175,11 +175,13 @@ macro_rules! warn {
 fn main() -> anyhow::Result<()> {
     // Whatever goes wrong, do not leave agents running with nobody watching them.
     let default_hook = std::panic::take_hook();
+    let main_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
-        proc::kill_all();
+        if std::thread::current().id() == main_thread { proc::kill_all(); }
         default_hook(info);
     }));
     let cli = Cli::parse();
+    anyhow::ensure!(!cli.demo || !matches!(cli.cmd, Some(Cmd::Team { cmd: Some(_), .. } | Cmd::Mcp { .. } | Cmd::Init { .. })), "this command is not supported in demo mode; nothing was executed");
     if let Some(Cmd::Init { path, force }) = &cli.cmd {
         let p = path.clone().unwrap_or_else(config::user_path);
         if p.exists() && !force {
@@ -202,6 +204,13 @@ fn main() -> anyhow::Result<()> {
         eprintln!("note: ./forkdeck.toml is not read. Move it to {} or pass --config.", config::user_path().display());
     }
     cfg.demo = cli.demo;
+    if !cfg.demo {
+        // Files saved under a repository's name from before its host was part of it.
+        knowledge::migrate_names(&cfg.repos);
+        if let Err(e) = cicd::migrate_keys(&cfg.repos) {
+            eprintln!("note: the deployment state was not moved to its new names: {}", e);
+        }
+    }
     if cfg.demo {
         cfg.automation.enabled = true;
         if cfg.repos.is_empty() {
@@ -224,6 +233,7 @@ fn main() -> anyhow::Result<()> {
                 jobs_per_day: 0,
                 ci: None,
                 deploy: None,
+                host: String::new(),
             });
         }
     }
@@ -364,7 +374,7 @@ fn main() -> anyhow::Result<()> {
             // Earlier jobs come back; typed tasks that were cut off continue by themselves.
             hub.start_autosave();
             for id in hub.restore() {
-                if let Err(e) = hub.resume(id) {
+                if let Err(e) = rt.block_on(hub.resume(id)) {
                     hub.log("queue", format!("#{} not resumed: {} (Ctrl-R tries again)", id, e));
                 }
             }
@@ -397,7 +407,7 @@ async fn stop_signal() {
 async fn headless(hub: &Hub, task: String, cwd: PathBuf, forced: Option<AgentRef>, plan: bool) -> i32 {
     let title = state::clip(&task, 80);
     // Without --plan nobody may be there to choose, so a plan is never waited for.
-    let id = hub.submit(title, task, Source::Manual, cwd, forced, if plan { state::Planning::Always } else { state::Planning::Never });
+    let id = match hub.submit(title, task, Source::Manual, cwd, forced, if plan { state::Planning::Always } else { state::Planning::Never }).await { Ok(id) => id, Err(e) => { hub.log("queue", e); return 1; } };
     read_messages(hub, vec![id]);
     wait_for(hub, &[id]).await
 }
@@ -419,28 +429,29 @@ fn read_messages(hub: &Hub, ids: Vec<u32>) {
                     n
                 }
                 None => {
-                    let st = h.state.lock().unwrap();
+                    let st = h.state.lock().unwrap_or_else(|e| e.into_inner());
                     let mine = || st.jobs.iter().filter(|j| ids.contains(&j.id));
                     let Some(id) = mine().find(|j| j.status == JobStatus::Choosing).or_else(|| mine().find(|j| !j.status.finished())).map(|j| j.id) else { continue };
                     id
                 }
             };
             let sent = match text.strip_prefix('!') {
-                Some(now) if !now.trim().is_empty() => h.steer_now(id, now.trim().to_string()),
-                _ if !text.is_empty() => h.reply(id, text.to_string()),
+                Some(now) if !now.trim().is_empty() => h.rt.block_on(h.steer_now(id, now.trim().to_string())),
+                _ if !text.is_empty() => h.rt.block_on(h.reply(id, text.to_string())),
                 _ => continue,
             };
             if let Err(why) = sent {
                 h.log("queue", format!("#{} not sent: {}", id, why));
             }
         }
+        h.input_closed.store(true, std::sync::atomic::Ordering::SeqCst);
     });
 }
 
 async fn resume_cmd(hub: &Hub) -> i32 {
     let mut ids = Vec::new();
     for id in hub.restore() {
-        match hub.resume(id) {
+        match hub.resume(id).await {
             Ok(()) => ids.push(id),
             Err(e) => hub.log("queue", format!("#{} not resumed: {}", id, e)),
         }
@@ -457,17 +468,33 @@ async fn resume_cmd(hub: &Hub) -> i32 {
 
 /// Print progress until the jobs are finished: 0 when all are done.
 async fn wait_for(hub: &Hub, ids: &[u32]) -> i32 {
+    let code = tokio::select! { result = wait_for_inner(hub, ids) => result, _ = stop_and_wait(hub) => 1 };
+    record_owed(hub);
+    code
+}
+
+/// Before exiting: a job that ended while the journal was busy or unwritable is written now, or the
+/// limits would not count it next time.
+fn record_owed(hub: &Hub) {
+    if let Err(e) = hub.record_owed() {
+        warn!("{} finished job(s) could not be written to the journal: {}", hub.state.lock().unwrap_or_else(|e| e.into_inner()).unrecorded.len(), e);
+    }
+}
+
+async fn stop_and_wait(hub: &Hub) {
+    stop_signal().await;
+    hub.shutdown(Duration::from_secs(45)).await;
+    print_progress(hub);
+    proc::kill_all();
+}
+
+async fn wait_for_inner(hub: &Hub, ids: &[u32]) -> i32 {
     // The agents run in their own process groups, so a signal sent to us has to be passed on by
     // hand. Stopping this way leaves typed tasks interrupted, to continue with `forkdeck resume`.
-    let h = hub.clone();
-    tokio::spawn(async move {
-        stop_signal().await;
-        h.shutdown(Duration::from_secs(45)).await;
-    });
     loop {
         tokio::time::sleep(Duration::from_millis(150)).await;
         print_progress(hub);
-        let st = hub.state.lock().unwrap();
+        let st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
         let mine: Vec<_> = st.jobs.iter().filter(|j| ids.contains(&j.id)).collect();
         if mine.len() < ids.len() {
             return 1;
@@ -483,23 +510,26 @@ async fn wait_for(hub: &Hub, ids: &[u32]) -> i32 {
 
 /// Print and drain what has happened since the last call. Only for the modes without an interface.
 fn print_progress(hub: &Hub) {
-    let mut st = hub.state.lock().unwrap();
+    let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
     let lines: Vec<_> = st.log.drain(..).collect();
     for l in &lines {
         say!("{} {:<7} {}", l.time, l.who, l.msg);
     }
     for j in st.jobs.iter_mut() {
         let id = j.id;
-        for l in j.worker.tail.drain(..) {
+        for l in j.worker.tail.iter().skip(j.worker.tail.len().saturating_sub(j.worker.unprinted)) {
             say!("         #{:<3} worker  {}", id, l);
         }
-        for l in j.reviewer.tail.drain(..) {
+        for l in j.reviewer.tail.iter().skip(j.reviewer.tail.len().saturating_sub(j.reviewer.unprinted)) {
             say!("         #{:<3} review  {}", id, l);
         }
+        j.worker.unprinted = 0;
+        j.reviewer.unprinted = 0;
         for (i, e) in j.extra.iter_mut().enumerate() {
-            for l in e.tail.drain(..) {
+            for l in e.tail.iter().skip(e.tail.len().saturating_sub(e.unprinted)) {
                 say!("         #{:<3} review{} {}", id, i + 3, l);
             }
+            e.unprinted = 0;
         }
     }
     let _ = std::io::stdout().flush();
@@ -508,16 +538,17 @@ fn print_progress(hub: &Hub) {
 /// One pass over the repositories, for cron and for tests: take what is labelled now, finish it, exit.
 /// Exits 1 if any job failed.
 async fn once(hub: &Hub) -> i32 {
-    let h = hub.clone();
-    tokio::spawn(async move {
-        stop_signal().await;
-        h.shutdown(Duration::from_secs(45)).await;
-    });
+    let code = tokio::select! { result = once_inner(hub) => result, _ = stop_and_wait(hub) => 1 };
+    record_owed(hub);
+    code
+}
+
+async fn once_inner(hub: &Hub) -> i32 {
     issues::poll_once(hub).await;
     loop {
         print_progress(hub);
         let (open, failed) = {
-            let st = hub.state.lock().unwrap();
+            let st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
             (
                 st.jobs.iter().filter(|j| !j.status.finished()).count(),
                 st.jobs.iter().filter(|j| matches!(j.status, JobStatus::Failed | JobStatus::Cancelled)).count(),
@@ -635,7 +666,7 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
         }
     }
     {
-        let st = hub.state.lock().unwrap();
+        let st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.has(AgentKind::Copilot) {
             let p = &st.copilot;
             let who = p.login.clone().unwrap_or_else(|| "this account".into());
@@ -708,7 +739,7 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
     }
     if hub.cfg.team.enabled {
         for r in &hub.cfg.repos {
-            match team::me(hub, r.provider).await {
+            match team::me(hub, r).await {
                 Ok(name) => {
                     let public = team::is_public(hub, r).await;
                     let host = team::shown_host(hub, r).await;
@@ -798,18 +829,12 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
     ok
 }
 
-/// The selected job, when it is waiting for a choice of plan.
-fn choosing(hub: &Hub, u: &ui::Ui) -> Option<u32> {
-    let id = u.selected?;
-    hub.state.lock().unwrap().jobs.iter().find(|j| j.id == id && j.status == JobStatus::Choosing).map(|j| j.id)
-}
-
 fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
     ui::Ui { input: String::new(), selected: None, follow: true, forced: None, cwd, demo: hub.cfg.demo, team: false, new_task: false, plan_next: false, jobs_per_day: hub.cfg.limits.jobs_per_day, tokens_per_day: hub.cfg.limits.tokens_per_day }
 }
 
 fn sync_selection(hub: &Hub, u: &mut ui::Ui) {
-    let st = hub.state.lock().unwrap();
+    let st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
     if u.follow || u.selected.is_none() {
         // Follow the newest job that is still moving, else the newest.
         u.selected = st.jobs.iter().rev().find(|j| !j.status.finished()).or(st.jobs.last()).map(|j| j.id);
@@ -822,12 +847,12 @@ fn snapshot(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf, path: &std::p
     let mut u = new_ui(hub, cwd.clone());
     u.team = team_pane;
     if hub.cfg.demo {
-        hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd, None, state::Planning::IfRouted);
+        let _ = rt.block_on(hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd, None, state::Planning::IfRouted));
     }
     rt.block_on(async { tokio::time::sleep(Duration::from_secs(after)).await });
     sync_selection(hub, &mut u);
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))?;
-    term.draw(|f| ui::draw(f, &hub.state.lock().unwrap(), &u))?;
+    term.draw(|f| ui::draw(f, &hub.state.lock().unwrap_or_else(|e| e.into_inner()), &u))?;
     let buf = term.backend().buffer();
     let out = if path.extension().map(|e| e == "html").unwrap_or(false) { ui::to_html(buf) } else { ui::to_text(buf) };
     std::fs::write(path, out)?;
@@ -837,7 +862,7 @@ fn snapshot(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf, path: &std::p
 fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<()> {
     let mut u = new_ui(hub, cwd.clone());
     if hub.cfg.demo {
-        hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd.clone(), None, state::Planning::IfRouted);
+        let _ = rt.block_on(hub.submit("Fix the failing retry test in the network client".into(), "Fix the failing retry test in the network client".into(), Source::Manual, cwd.clone(), None, state::Planning::IfRouted));
     }
     // A signal (terminal closed, kill, service stop) is handled entirely on the runtime: the main
     // thread may be stuck reading a terminal that no longer exists.
@@ -857,6 +882,13 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
     }
     let mut term = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste);
+    // What was typed and then refused (a reply to a job another forkdeck holds, say) comes back to
+    // the input line rather than being lost.
+    let bounced: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let bounce = |text: String| {
+        let b = bounced.clone();
+        move || b.lock().unwrap_or_else(|e| e.into_inner()).push(text)
+    };
     let res = (|| -> anyhow::Result<()> {
         loop {
             if stopping.load(std::sync::atomic::Ordering::SeqCst) {
@@ -864,8 +896,12 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
+            for text in std::mem::take(&mut *bounced.lock().unwrap_or_else(|e| e.into_inner())) {
+                // In front of anything typed since, which stays as it is.
+                u.input = if u.input.trim().is_empty() { text } else { format!("{} {}", text, u.input) };
+            }
             sync_selection(hub, &mut u);
-            term.draw(|f| ui::draw(f, &hub.state.lock().unwrap(), &u))?;
+            term.draw(|f| ui::draw(f, &hub.state.lock().unwrap_or_else(|e| e.into_inner()), &u))?;
             if !event::poll(Duration::from_millis(100))? {
                 continue;
             }
@@ -876,7 +912,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                     match k.code {
                         KeyCode::Char('c') | KeyCode::Char('q') if ctrl => return Ok(()),
                         KeyCode::Char('a') if ctrl => {
-                            let mut st = hub.state.lock().unwrap();
+                            let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
                             st.automation = !st.automation;
                             let on = st.automation;
                             let none = st.repos.is_empty();
@@ -887,9 +923,8 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                         }
                         KeyCode::Char('r') if ctrl => {
                             if let Some(id) = u.selected {
-                                if let Err(why) = hub.resume(id) {
-                                    hub.log("queue", format!("#{} not resumed: {}", id, why));
-                                }
+                                let h = hub.clone();
+                                rt.spawn(async move { if let Err(why) = h.resume(id).await { h.log("queue", format!("#{} not resumed: {}", id, why)); } });
                             }
                         }
                         KeyCode::Char('x') if ctrl => {
@@ -903,22 +938,14 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                         // Send what is typed to the selected task now, stopping its agent to take it.
                         KeyCode::Char('s') if ctrl => {
                             let text = u.input.trim().to_string();
-                            let target = ui::reply_target(&hub.state.lock().unwrap(), &u);
+                            let target = ui::reply_target(&hub.state.lock().unwrap_or_else(|e| e.into_inner()), &u);
                             if let (Some(id), false) = (target, text.is_empty()) {
-                                match hub.steer_now(id, text) {
-                                    Ok(()) => u.input.clear(),
-                                    Err(why) => hub.log("queue", format!("#{} not sent: {}", id, why)),
-                                }
+                                u.input.clear();
+                                let (h, back) = (hub.clone(), bounce(text.clone()));
+                                rt.spawn(async move { if let Err(why) = h.steer_now(id, text).await { h.log("queue", format!("#{} not sent: {}", id, why)); back(); } });
                             }
                         }
                         KeyCode::Char('u') if ctrl => u.input.clear(),
-                        // With nothing typed, a digit picks that option of a plan waiting for a choice.
-                        KeyCode::Char(c) if !ctrl && u.input.is_empty() && c.is_ascii_digit() && c != '0' && choosing(hub, &u).is_some() => {
-                            let id = choosing(hub, &u).expect("checked");
-                            if let Err(why) = hub.choose(id, state::Choice::Option(c as usize - '1' as usize)) {
-                                hub.log("plan", format!("#{} {}", id, why));
-                            }
-                        }
                         KeyCode::Char(c) if !ctrl => u.input.push(c),
                         KeyCode::Backspace => {
                             u.input.pop();
@@ -937,7 +964,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                             }
                         }
                         KeyCode::Up | KeyCode::Down => {
-                            let st = hub.state.lock().unwrap();
+                            let st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
                             let ids: Vec<u32> = st.jobs.iter().map(|j| j.id).collect();
                             if !ids.is_empty() {
                                 let pos = u.selected.and_then(|s| ids.iter().position(|i| *i == s)).unwrap_or(ids.len() - 1);
@@ -949,21 +976,23 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                         KeyCode::Enter => {
                             let task = u.input.trim().to_string();
                             if !task.is_empty() {
-                                let target = ui::reply_target(&hub.state.lock().unwrap(), &u);
+                                let target = ui::reply_target(&hub.state.lock().unwrap_or_else(|e| e.into_inner()), &u);
                                 match target {
                                     // A typed job is selected: carry on its conversation.
-                                    Some(id) => match hub.reply(id, task) {
-                                        Ok(()) => u.input.clear(),
-                                        // Keep what was typed so it can be sent once the job is done.
-                                        Err(why) => hub.log("queue", format!("#{} not sent: {}", id, why)),
-                                    },
+                                    Some(id) => {
+                                        u.input.clear();
+                                        let (h, back) = (hub.clone(), bounce(task.clone()));
+                                        rt.spawn(async move { if let Err(why) = h.reply(id, task).await { h.log("queue", format!("#{} not sent: {}", id, why)); back(); } });
+                                    }
                                     None => {
                                         u.input.clear();
                                         let planning = if u.plan_next { state::Planning::Always } else { state::Planning::IfRouted };
-                                        let id = hub.submit(state::clip(&task, 80), task, Source::Manual, cwd.clone(), u.forced.clone(), planning);
+                                        // Held from now: quitting straight away waits for the task to be saved.
+                                        let (h, dir, forced, back, busy) = (hub.clone(), cwd.clone(), u.forced.clone(), bounce(task.clone()), hub.busy());
+                                        rt.spawn(async move { let _busy = busy; if let Err(e) = h.submit(state::clip(&task, 80), task, Source::Manual, dir, forced, planning).await { h.log("queue", e); back(); } });
                                         u.plan_next = false;
-                                        u.selected = Some(id);
-                                        u.follow = false;
+                                        u.selected = None;
+                                        u.follow = true;
                                         u.new_task = false;
                                     }
                                 }
@@ -979,7 +1008,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
     let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
     let _ = ratatui::try_restore();
     // Stop any agent still running, and give claimed issues time to be handed back with a comment.
-    let busy = hub.state.lock().unwrap().jobs.iter().filter(|j| !j.status.finished()).count();
+    let busy = hub.state.lock().unwrap_or_else(|e| e.into_inner()).jobs.iter().filter(|j| !j.status.finished()).count();
     if busy > 0 {
         warn!("stopping {} job(s) and handing claimed issues back…", busy);
     }
@@ -987,6 +1016,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
     if left > 0 {
         warn!("{} job(s) did not finish in time; check their issues for a stale working label", left);
     }
+    record_owed(hub);
     proc::kill_all();
     res
 }

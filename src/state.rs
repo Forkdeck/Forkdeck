@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -164,6 +164,7 @@ pub enum StageState {
 
 #[derive(Clone, Debug)]
 pub struct Stage {
+    pub unprinted: usize,
     pub agent: Option<AgentKind>,
     /// Set when the agent ran on another CLI: "copilot" standing in, or a "copilot:<name>" profile.
     pub via: String,
@@ -202,6 +203,7 @@ impl Default for Stage {
             started: None,
             elapsed: None,
             tail: VecDeque::new(),
+            unprinted: 0,
         }
     }
 }
@@ -211,6 +213,7 @@ impl Stage {
         let line = line.into();
         self.last = line.clone();
         self.tail.push_back(line);
+        self.unprinted = (self.unprinted + 1).min(200);
         while self.tail.len() > 200 {
             self.tail.pop_front();
         }
@@ -285,7 +288,19 @@ pub struct Plan {
     pub chosen: Option<Choice>,
 }
 
+impl Choice {
+    pub fn parse(text: &str, n: usize) -> Choice {
+        match text.trim().parse::<usize>() {
+            Ok(k) if (1..=n).contains(&k) => Choice::Option(k - 1),
+            _ => Choice::Own(text.to_string()),
+        }
+    }
+}
+
 impl Plan {
+    pub fn show_options(&self, stage: &mut Stage) {
+        for (i, o) in self.options.iter().enumerate() { stage.push(format!("{}) {}{} — {}", i + 1, o.title, if o.recommended { " (recommended)" } else { "" }, o.summary)); }
+    }
     /// The recommended option, else the first.
     pub fn default_choice(&self) -> usize {
         self.options.iter().position(|o| o.recommended).unwrap_or(0)
@@ -347,20 +362,25 @@ impl Source {
 }
 
 pub struct Cancel {
-    flag: AtomicBool,
+    flag: std::sync::atomic::AtomicU8,
     notify: tokio::sync::Notify,
 }
 
 impl Cancel {
     pub fn new() -> Arc<Cancel> {
-        Arc::new(Cancel { flag: AtomicBool::new(false), notify: tokio::sync::Notify::new() })
+        Arc::new(Cancel { flag: std::sync::atomic::AtomicU8::new(0), notify: tokio::sync::Notify::new() })
     }
     pub fn fire(&self) {
-        self.flag.store(true, Ordering::SeqCst);
+        let _ = self.flag.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
         self.notify.notify_waiters();
     }
+    pub fn shutdown(&self) {
+        let _ = self.flag.compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+    pub fn is_shutdown(&self) -> bool { self.flag.load(Ordering::SeqCst) == 2 }
     pub fn is_set(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
+        self.flag.load(Ordering::SeqCst) != 0
     }
     pub async fn wait(&self) {
         loop {
@@ -393,6 +413,10 @@ pub struct Turn {
 }
 
 pub struct Job {
+    pub restored: bool,
+    pub active_secs: u64,
+    pub active_started: Instant,
+    pub worktree_lock: Option<Arc<crate::proc::FileLock>>,
     pub id: u32,
     pub title: String,
     pub prompt: String,
@@ -433,6 +457,9 @@ pub struct Job {
     pub findings: Vec<String>,
     /// Stopped by `limits.job_mins`.
     pub over_time: bool,
+    /// Has its run slot and is under way, though its status may still read Queued while the item
+    /// is claimed and prepared. Not saved: a restored job starts over.
+    pub admitted: bool,
     /// The worker's conversation, once its CLI has named it.
     pub session: Option<Session>,
     /// Set on an interrupted typed task that is to continue: the stage it had reached.
@@ -500,6 +527,8 @@ pub struct RepoStatus {
     pub hold: Option<String>,
     /// Rules waiting to be proposed are not retried before this.
     pub notes_retry: Option<Instant>,
+    /// Where the next poll goes on asking about seen items a full listing left out.
+    pub recheck_from: [usize; 2],
 }
 
 /// (repo index, is a pull request, number)
@@ -579,7 +608,7 @@ impl State {
         self.has(AgentKind::Copilot) && self.copilot.seat != Some(false)
     }
 
-    fn active(&self, key: Key) -> bool {
+    pub fn active(&self, key: Key) -> bool {
         self.jobs.iter().any(|j| !j.status.finished() && j.source.key() == Some(key))
     }
 
@@ -679,6 +708,18 @@ pub fn clip(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_cancellation_reason_survives_shutdown() {
+        let user = Cancel::new();
+        user.fire();
+        user.shutdown();
+        assert!(user.is_set() && !user.is_shutdown());
+        let stopped = Cancel::new();
+        stopped.shutdown();
+        stopped.fire();
+        assert!(stopped.is_shutdown());
+    }
 
     #[test]
     fn retry_policy_is_bounded_and_reset_by_relabelling() {

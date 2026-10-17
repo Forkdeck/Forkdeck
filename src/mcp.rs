@@ -152,7 +152,10 @@ impl Session {
                 for a in &cfg.args {
                     args.push(expand_into(a, secrets)?);
                 }
-                c.args(args);
+                c.args(args).env_clear();
+                for k in ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT"] {
+                    if let Some(v) = std::env::var_os(k) { c.env(k, v); }
+                }
                 for (k, v) in &cfg.env {
                     c.env(k, expand_into(v, secrets)?);
                 }
@@ -164,17 +167,26 @@ impl Session {
                 // Servers log to stderr; it must be drained or a chatty one blocks. Only the end is kept.
                 let mut err = child.stderr.take().expect("piped stderr");
                 let tail = stderr_tail.clone();
+                let hidden = secrets.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
+                    let mut raw = String::new();
                     while let Ok(n) = err.read(&mut buf).await {
                         if n == 0 {
                             break;
                         }
                         if let Ok(mut t) = tail.lock() {
-                            t.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            raw.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            *t = redact(&raw, &hidden);
                             if t.len() > 2000 {
                                 let cut = t.char_indices().map(|(i, _)| i).find(|i| t.len() - i <= 1500).unwrap_or(0);
                                 *t = t[cut..].to_string();
+                            }
+                            // Preserve enough raw context to recognise a secret split across reads.
+                            let keep = 4096 + hidden.iter().map(String::len).max().unwrap_or(0);
+                            if raw.len() > keep * 2 {
+                                let cut = raw.char_indices().map(|(i, _)| i).find(|i| raw.len() - i <= keep).unwrap_or(0);
+                                raw = raw[cut..].to_string();
                             }
                         }
                     }
@@ -366,7 +378,7 @@ impl Session {
             req = req.header(k, v);
         }
         // reqwest puts the full URL in its messages, and a URL may carry a token.
-        let resp = req.send().await.map_err(|e| {
+        let mut resp = req.send().await.map_err(|e| {
             let why = if e.is_timeout() {
                 format!("no answer within {} s", limit.as_secs())
             } else if e.is_connect() {
@@ -384,13 +396,27 @@ impl Session {
             *session = Some(sid.to_string());
         }
         let ctype = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
-        let body = resp.text().await.map_err(|e| format!("{}: {}", name, e.without_url()))?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| format!("{}: {}", name, e.without_url()))? {
+            if bytes.len() + chunk.len() > MAX_LINE { return Err(format!("{}: HTTP response exceeds {} bytes", name, MAX_LINE)); }
+            bytes.extend_from_slice(&chunk);
+            if status.is_success() && ctype.contains("text/event-stream") {
+                if let Some(id) = want {
+                    let body = String::from_utf8_lossy(&bytes);
+                    // Only completed SSE frames can end the request.
+                    if let Some(end) = body.rfind("\n\n").or_else(|| body.rfind("\r\n\r\n")) {
+                        if let Some(v) = sse_messages(&body[..end]).into_iter().find(|v| v.get("id").and_then(|i| i.as_u64()) == Some(id) && v.get("method").is_none()) { return Ok(Some(v)); }
+                    }
+                }
+            }
+        }
+        let body = String::from_utf8_lossy(&bytes);
         if status.as_u16() == 404 && session.is_some() {
             // The server no longer knows this session. Nothing was executed.
             return Err(format!("{}: {}", name, SESSION_EXPIRED));
         }
         if !status.is_success() {
-            let short: String = body.chars().take(200).collect();
+            let short: String = redact(&body, &self.secrets).chars().take(200).collect();
             return Err(format!("{}: HTTP {} {}", name, status.as_u16(), short.replace('\n', " ")));
         }
         let Some(id) = want else { return Ok(None) };
@@ -429,27 +455,31 @@ mod tests {
         assert_eq!(m[1]["id"], 7);
     }
 
+    async fn request(sock: &mut tokio::net::TcpStream) -> (String, String) {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let k = sock.read(&mut tmp).await.unwrap();
+            buf.extend_from_slice(&tmp[..k]);
+            let text = String::from_utf8_lossy(&buf).to_string();
+            if let Some(at) = text.find("\r\n\r\n") {
+                let head = text[..at].to_string();
+                let len = head.lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                if buf.len() >= at + 4 + len {
+                    break (head, text[at + 4..].to_string());
+                }
+            }
+            if k == 0 {
+                break (text, String::new());
+            }
+        }
+    }
+
     /// One HTTP exchange: read a request, hand it to `reply`, write what it returns.
     async fn serve(listener: TcpListener, n: usize, reply: fn(usize, &str, &str) -> String) {
         for i in 0..n {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 4096];
-            let (head, body) = loop {
-                let k = sock.read(&mut tmp).await.unwrap();
-                buf.extend_from_slice(&tmp[..k]);
-                let text = String::from_utf8_lossy(&buf).to_string();
-                if let Some(at) = text.find("\r\n\r\n") {
-                    let head = text[..at].to_string();
-                    let len = head.lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap())).unwrap_or(0);
-                    if buf.len() >= at + 4 + len {
-                        break (head, text[at + 4..].to_string());
-                    }
-                }
-                if k == 0 {
-                    break (text, String::new());
-                }
-            };
+            let (head, body) = request(&mut sock).await;
             sock.write_all(reply(i, &head, &body).as_bytes()).await.unwrap();
             let _ = sock.shutdown().await;
         }
@@ -492,6 +522,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_sse_response_finishes_without_waiting_for_stream_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = McpServerCfg { url: Some(format!("http://{}/mcp", listener.local_addr().unwrap())), timeout_secs: 2, ..Default::default() };
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let _ = request(&mut first).await;
+            let data = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}\n\n";
+            first.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n", data.len(), data).as_bytes()).await.unwrap();
+            let (mut second, _) = listener.accept().await.unwrap();
+            let _ = request(&mut second).await;
+            second.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(first);
+        });
+        let result = tokio::time::timeout(Duration::from_secs(1), Session::open("stream", &cfg)).await;
+        server.abort();
+        assert!(matches!(result, Ok(Ok(_))), "matching response must end the request while the stream is still open");
+    }
+
+    #[tokio::test]
     async fn secrets_never_appear_in_errors_or_answers() {
         std::env::set_var("FORKDECK_TEST_SECRET", "hunter2SECRET");
         // Unreachable server, token in the URL.
@@ -512,7 +562,10 @@ mod tests {
                 let b = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"env: TOKEN=hunter2SECRET"}]}}"#;
                 format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", b.len(), b)
             }
-            _ => "HTTP/1.1 500 Oops\r\nContent-Length: 26\r\nConnection: close\r\n\r\nbad key: hunter2SECRET !!!".to_string(),
+            _ => {
+                let b = format!("bad key: {}hunter2SECRET !!!", "x".repeat(185));
+                format!("HTTP/1.1 500 Oops\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", b.len(), b)
+            }
         }));
         let mut headers = HashMap::new();
         headers.insert("X-Api-Key".to_string(), "${FORKDECK_TEST_SECRET}".to_string());
@@ -522,7 +575,7 @@ mod tests {
         assert_eq!(r.shown, "env: TOKEN=***", "what is shown has the secret blanked");
         assert_eq!(r.text, "env: TOKEN=hunter2SECRET", "what patterns are matched against is untouched");
         let e = s.call("env", json!({})).await.err().unwrap();
-        assert!(e.contains("500") && e.contains("bad key: ***") && !e.contains("hunter2"), "{}", e);
+        assert!(e.contains("500") && e.contains("bad key:") && e.contains("***") && !e.contains("hunter2"), "{}", e);
         server.await.unwrap();
     }
 
