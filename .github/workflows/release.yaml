@@ -1,0 +1,222 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # A change to this pipeline builds everything it would release, without publishing.
+  pull_request:
+    paths:
+      - .github/workflows/release.yaml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.96.0"
+  RUST_SBOM_VERSION: "0.5.9"
+  # Bundled SQLite and ring compile C. The cc crate looks for x86_64-linux-musl-gcc and
+  # aarch64-linux-musl-gcc; musl-tools on a native runner provides musl-gcc.
+  CC_x86_64_unknown_linux_musl: musl-gcc
+  CC_aarch64_unknown_linux_musl: musl-gcc
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Linux: static musl binaries, built natively on each architecture.
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: linux-amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: linux-arm64
+          # macOS: native builds; they link only the system libraries every Mac has.
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: macos-arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: macos-amd64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install native musl toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - name: Install GNU tar
+        if: runner.os == 'macOS'
+        # BSD tar cannot write a reproducible archive (sorted, fixed owner and times).
+        run: command -v gtar || brew install gnu-tar
+
+      - name: Install Rust
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install "${RUST_VERSION}" \
+            --profile minimal \
+            --target "${TARGET}"
+
+      - name: Install pinned SBOM generator
+        run: |
+          cargo +"${RUST_VERSION}" install cargo-cyclonedx \
+            --version "=${RUST_SBOM_VERSION}" \
+            --locked
+
+      - name: Work out the release version
+        run: |
+          crate_version="$(
+            cargo +"${RUST_VERSION}" metadata \
+              --locked \
+              --no-deps \
+              --format-version 1 |
+              jq --raw-output \
+                '.packages[] | select(.name == "forkdeck") | .version'
+          )"
+          if [ "${GITHUB_EVENT_NAME}" = push ]; then
+            # The tag has to match Cargo.toml.
+            test "${GITHUB_REF_NAME}" = "v${crate_version}"
+          fi
+          echo "RELEASE_VERSION=v${crate_version}" >>"${GITHUB_ENV}"
+
+      - name: Test
+        run: cargo +"${RUST_VERSION}" test --locked
+
+      - name: Build release binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo +"${RUST_VERSION}" build \
+            --locked \
+            --release \
+            --target "${TARGET}"
+
+      - name: Package release asset
+        env:
+          ASSET: ${{ matrix.asset }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [ "${RUNNER_OS}" = macOS ]; then
+            tar=gtar
+            sha() { shasum -a 256 "$@"; }
+          else
+            tar=tar
+            sha() { sha256sum "$@"; }
+          fi
+          package="forkdeck-${RELEASE_VERSION}-${ASSET}"
+          mkdir -p "dist/${package}"
+          install -m 0755 "target/${TARGET}/release/forkdeck" "dist/${package}/forkdeck"
+          install -m 0644 README.md "dist/${package}/README.md"
+          install -m 0644 LICENSE "dist/${package}/LICENSE"
+          install -m 0644 forkdeck.example.toml "dist/${package}/forkdeck.example.toml"
+          "dist/${package}/forkdeck" --version |
+            grep -F -x \
+              "forkdeck ${RELEASE_VERSION#v}"
+          if [ "${RUNNER_OS}" = macOS ]; then
+            # Only libraries every Mac has: nothing from Homebrew or elsewhere.
+            otool -L "dist/${package}/forkdeck"
+            if otool -L "dist/${package}/forkdeck" | tail -n +2 | awk '{print $1}' |
+              grep -v -E '^(/usr/lib/|/System/Library/)'; then
+              echo "links a library outside the system ones" >&2
+              exit 1
+            fi
+          else
+            # Statically linked: it runs on any Linux of this architecture.
+            file "dist/${package}/forkdeck" | grep -q "statically linked"
+          fi
+          commit_time="$(git show -s --format=%ct)"
+          SOURCE_DATE_EPOCH="${commit_time}" \
+            cargo +"${RUST_VERSION}" cyclonedx \
+              --format json \
+              --describe binaries \
+              --target "${TARGET}" \
+              --spec-version 1.5
+          mv \
+            forkdeck_bin.cdx.json \
+            "dist/${package}.cdx.json"
+          jq --exit-status \
+            '.bomFormat == "CycloneDX"
+              and .specVersion == "1.5"
+              and .metadata.component.name == "forkdeck"
+              and (.components | length) > 0' \
+            "dist/${package}.cdx.json" >/dev/null
+          install -m 0644 \
+            "dist/${package}.cdx.json" \
+            "dist/${package}/SBOM.cdx.json"
+          "${tar}" \
+            --sort=name \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            --mtime="@${commit_time}" \
+            -czf "dist/${package}.tar.gz" \
+            -C dist \
+            "${package}"
+          (
+            cd dist
+            sha "${package}.tar.gz" >"${package}.tar.gz.sha256"
+            sha "${package}.cdx.json" >"${package}.cdx.json.sha256"
+          )
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-forkdeck-${{ matrix.asset }}
+          path: |
+            dist/*.tar.gz
+            dist/*.cdx.json
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub release
+    if: github.event_name == 'push'
+    needs:
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify release artifacts
+        working-directory: dist
+        run: sha256sum --check --strict *.sha256
+
+      - name: Create GitHub release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz \
+            dist/*.cdx.json \
+            dist/*.sha256 \
+            --verify-tag \
+            --generate-notes \
+            --title "Forkdeck ${GITHUB_REF_NAME}"

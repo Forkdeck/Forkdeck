@@ -55,6 +55,9 @@ const MIGRATIONS: &[&str] = &["
 ", "
     ALTER TABLE jobs ADD COLUMN active_secs INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE jobs ADD COLUMN used TEXT;
+", "
+    ALTER TABLE jobs ADD COLUMN issue_plan TEXT;
+    CREATE TABLE composer (workdir TEXT PRIMARY KEY, state TEXT NOT NULL);
 "];
 
 /// Who is running: this process, told apart from a later process that reuses its id by its start time.
@@ -162,6 +165,7 @@ impl StageRecord {
         };
         Stage {
             unprinted: 0,
+            pushed: 0,
             agent: self.agent,
             via: self.via,
             session: None,
@@ -182,7 +186,7 @@ impl StageRecord {
 }
 
 /// Everything about a job that outlives the process.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct JobRecord {
     pub active_secs: u64,
     pub used: [crate::journal::Usage; 3],
@@ -214,6 +218,7 @@ pub struct JobRecord {
     pub inbox: Vec<String>,
     /// The forkdeck process that runs the job, as `owner_token` wrote it.
     pub owner: Option<String>,
+    pub issue_plan: Option<crate::planning::Plan>,
 }
 
 impl JobRecord {
@@ -247,6 +252,7 @@ impl JobRecord {
             plan: j.plan.clone(),
             inbox: j.inbox.iter().cloned().collect(),
             owner: Some(owner_token()),
+            issue_plan: j.issue_plan.clone(),
         }
     }
 
@@ -303,6 +309,7 @@ impl JobRecord {
             findings: Vec::new(),
             over_time: false,
             admitted: false,
+            issue_plan: self.issue_plan.map(|mut p| { p.build_job = None; p }),
         }
     }
 }
@@ -419,12 +426,21 @@ impl History {
             ],
         )
         .map_err(|e| e.to_string())?;
-        tx.execute("UPDATE jobs SET active_secs = ?1, used = ?2 WHERE id = ?3", params![r.active_secs, json(&r.used), r.id]).map_err(|e| e.to_string())?;
+        tx.execute("UPDATE jobs SET active_secs = ?1, used = ?2, issue_plan = ?3 WHERE id = ?4", params![r.active_secs, json(&r.used), r.issue_plan.as_ref().map(|p| json(p)), r.id]).map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM turns WHERE job = ?1", params![r.id]).map_err(|e| e.to_string())?;
         for (n, t) in r.turns.iter().enumerate() {
             tx.execute("INSERT INTO turns (job, n, ask, answer) VALUES (?1, ?2, ?3, ?4)", params![r.id, n as i64, t.ask, t.answer]).map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// What the input line held in a working directory when the interface last closed (JSON).
+    pub fn composer(&self, workdir: &str) -> Option<String> {
+        self.db.lock().unwrap().query_row("SELECT state FROM composer WHERE workdir = ?1", params![workdir], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    pub fn save_composer(&self, workdir: &str, state: &str) -> Result<(), String> {
+        self.db.lock().unwrap().execute("INSERT INTO composer (workdir, state) VALUES (?1, ?2) ON CONFLICT(workdir) DO UPDATE SET state = excluded.state", params![workdir, state]).map(|_| ()).map_err(|e| e.to_string())
     }
 
     /// The newest `limit` jobs, oldest first. Rows that were reserved but never saved are skipped.
@@ -441,7 +457,7 @@ impl History {
         let e = |e: rusqlite::Error| e.to_string();
         let mut q = db
             .prepare(&format!(
-                "SELECT id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan, inbox, owner, active_secs, used
+                "SELECT id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan, inbox, owner, active_secs, used, issue_plan
                  FROM jobs WHERE source != 'null' AND {} ORDER BY id DESC LIMIT ?2",
                 filter
             ))
@@ -478,6 +494,7 @@ impl History {
                     plan: r.get::<_, Option<String>>(22)?.and_then(|p| serde_json::from_str(&p).ok()),
                     inbox: r.get::<_, Option<String>>(23)?.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default(),
                     owner: r.get(24)?,
+                    issue_plan: r.get::<_, Option<String>>(27)?.and_then(|p| serde_json::from_str(&p).ok()),
                 })
             })
             .map_err(e)?;
@@ -599,6 +616,7 @@ mod tests {
             findings: Vec::new(),
             over_time: false,
             admitted: false,
+            issue_plan: None,
             planning: Planning::Always,
             plan: Some(Plan { options: vec![crate::state::PlanOption { title: "a".into(), summary: "b".into(), recommended: true }], text: "t".into(), chosen: Some(crate::state::Choice::Own("mine".into())) }),
             chose: Default::default(),

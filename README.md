@@ -19,6 +19,25 @@ can be a server on your own machine.
 cargo install --git https://github.com/forkdeck/forkdeck
 ```
 
+Or take a binary from the [releases](https://github.com/forkdeck/forkdeck/releases):
+static Linux builds (`linux-amd64`, `linux-arm64`) and macOS builds
+(`macos-arm64` for Apple silicon, `macos-amd64` for Intel). Each archive comes
+with a `.sha256` checksum and a CycloneDX SBOM (`.cdx.json`, also inside the
+archive as `SBOM.cdx.json`) listing every crate built into the binary:
+
+```
+sha256sum --check forkdeck-v0.1.0-linux-amd64.tar.gz.sha256    # macOS: shasum -a 256 --check
+tar -xzf forkdeck-v0.1.0-linux-amd64.tar.gz
+```
+
+The macOS binaries are not signed. Downloaded with a browser, macOS refuses to
+open one; download with `curl -LO`, or clear the flag with
+`xattr -d com.apple.quarantine forkdeck`.
+
+A release is cut by pushing a tag `vX.Y.Z` that matches the version in
+`Cargo.toml`; `.github/workflows/release.yaml` tests, builds, writes the SBOMs
+and publishes the release.
+
 You need at least one of `claude`, `codex` and `copilot` on your PATH. With
 `copilot` alone, it plays both of the others (see below). With only one of
 `claude` and `codex` and no `copilot`, that one also reviews its own work. Issue
@@ -109,8 +128,58 @@ Two routers ship:
 
 ### Running the decision model locally
 
+For a local RTX 3090, the repository includes a repeatable setup for
+[AutoJev-27B Q4_K_M](https://huggingface.co/thomasgauthier/autojev-27b-GGUF).
+It uses the [jev.cpp](https://github.com/thomasgauthier/jev.cpp) fork, which
+preserves AutoJev's classifier head and serves `/v1/systemone`. This model
+requires that fork; the publisher does not support standard llama.cpp or
+LM Studio for it.
+
+Requirements: Linux/WSL with GPU access, an RTX 3090 at GPU index 0, the CUDA
+toolkit (`nvcc`), CMake, a C++ compiler, Git, curl, and `sha256sum`. Testing
+also needs Rust/Cargo and Python 3. Allow at least 25 GB of free disk space;
+the text model download is approximately 15.8 GB. No vision projector is needed.
+
+```sh
+./scripts/local-jev.sh setup   # build pinned CUDA source; download and verify weights
+./scripts/local-jev.sh start   # foreground server; Ctrl-C stops it
+```
+
+In a second terminal, from this repository:
+
+```sh
+./scripts/local-jev.sh test
+
+# Or route your own task (this does not launch coding agents):
+export FORKDECK_JEV_KEY=forkdeck-local-dev
+cargo run --locked -- --config .local/jev/forkdeck.toml route "Fix the pagination bug"
+```
+
+The script keeps source, builds, model weights, and its dedicated configuration
+in ignored `.local/jev/`. Repeating `setup` reuses the build and verified model;
+interrupted downloads resume. It never writes your normal Forkdeck configuration.
+The server binds to `127.0.0.1:8000`, uses one request slot and an 8,192-token
+context, and requests full GPU offload. The test configuration allows 60 seconds
+per routing request and disables automation. The smoke test requires real Jev
+answers for three tasks, then checks authentication failure and connection
+failure both produce explicit rules-fallback diagnostics.
+
+The development key defaults to `forkdeck-local-dev`. To change it, export
+`FORKDECK_JEV_KEY` with the same value in both terminals. Set `JEV_BUILD_JOBS`
+to change build concurrency (default 4). If `nvidia-smi` reports GPU access
+blocked, run from a GPU-enabled terminal outside the sandbox. A working driver
+alone is not sufficient to build: `nvcc` must also be installed and on PATH.
+If port 8000 is occupied, stop the other service before starting this server.
+If CUDA runs out of memory, check `nvidia-smi` and free GPU memory; the script
+does not automatically reduce context or switch to CPU. Quantized accuracy
+still needs evaluation on your tasks; passing the smoke test establishes API
+integration, not routing quality.
+
+#### Smaller GLiFormer alternative
+
 [jeff](https://github.com/logan-markewich/jeff) is a self-hosted
-implementation of that API. Start it, then point forkdeck at it:
+implementation of that API using GLiFormer. Follow its upstream installation
+and model-download instructions, start it, then point forkdeck at it:
 
 ```
 JEFF_API_KEYS=devkey uv run jeff        # listens on :8000
@@ -470,7 +539,7 @@ random id into its claims, kept in `~/.local/state/forkdeck/machine-id`, so a
 restarted forkdeck can recognise a claim its previous run left behind. The id
 is not derived from anything about the machine.
 
-**Seeing it.** `Ctrl-T` swaps the agent tree for the team pane, and
+**Seeing it.** `F4` swaps the agent tree for the team pane, and
 `forkdeck team` prints the same thing:
 
 ![the team pane in demo mode](docs/team.png)
@@ -695,6 +764,43 @@ Repository labels must be nonempty, contain no commas, and be distinct within ea
 
 Stdio MCP servers receive their configured `env` plus basic process settings (`PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TMPDIR`, `SYSTEMROOT`). Other credentials are not inherited; add required variables explicitly. A deployment whose status is unrecognizable is not triggered. A revision already reported failed or reverted is not triggered again on retry.
 
+## Remote control from a phone
+
+The forkdeck Android app shows the job list and each job's tree as it runs,
+and can start a task, reply to one, cancel, pause polling or poll now. It
+talks to forkdeck directly over the local network: there is no relay and
+no account.
+
+```toml
+[remote]
+enabled = true
+listen = "0.0.0.0:7443"
+```
+
+Restart forkdeck, then pair a phone:
+
+```
+forkdeck remote pair            # shows a QR code; scan it in the app
+forkdeck remote devices         # paired phones
+forkdeck remote revoke pixel    # unpair one; it is disconnected within seconds
+```
+
+The connection is TLS in both directions. forkdeck keeps its own certificate
+authority in `~/.config/forkdeck/remote` and trusts nothing else; the QR code
+carries its fingerprint and a one-time code. When the phone pairs it makes a
+key that never leaves it and gets a certificate signed for that key. A
+connection without a paired certificate can do nothing but pair.
+
+A code works once, for two minutes, and only from the subnet it was made for:
+the phone has to be on the same network as this machine, not routed in from
+elsewhere. With `lan_only = true` (the default) every connection is held to
+that, not only pairing. Use `--iface` when the machine has more than one
+network.
+
+A paired phone can start agents that edit files in `workdir`: treat it like
+a terminal on this machine. Tasks from the phone run in `[remote] workdir`, or
+the directory forkdeck was started in.
+
 ## Before you leave it unattended
 
 Issue text is input from other people, and an agent that reads it can be
@@ -730,18 +836,118 @@ back by hand, or with `forkdeck team release`.
 
 | | |
 |---|---|
-| `Enter` | after selecting a typed task with ↑/↓, send what you typed to it: a follow-up once it has finished, a message for the agent while it works, your choice while it waits for one; otherwise run it as a new task in the current directory |
-| `Ctrl-S` | send what you typed to the selected task now: its agent stops and continues with the message |
-| `Ctrl-N` | make the next `Enter` start a new task instead of replying |
+| `Enter` | send what you typed to the task the input box names: a follow-up once it has finished, a queued message while it works, your choice while it waits for one. With nothing typed, an interrupted task resumes and a finished one carries on. After `Ctrl-T`, start a new task in the current directory |
+| `Ctrl-T` / `Ctrl-N` | make the next `Enter` start a new task, keeping your draft |
 | `Ctrl-P` | the next new task proposes approaches first, and you pick one |
-| `1`–`9` | pick that option of a task waiting for a choice |
-| `Ctrl-R` | continue the selected interrupted task |
+| `Ctrl-R` | pin replies to the selected typed task, whatever is selected later |
+| `Ctrl-S` | send what you typed to the task now: its agent stops and continues with the message |
 | `Tab` | force the next task to claude, codex, copilot, or back to auto |
-| `↑` `↓` | select a job; `Esc` goes back to following the newest |
+| `↑` `↓` | recall submitted messages; edit and press Enter to resend; Down restores your draft |
+| `Alt-↑` `Alt-↓` | select a job; `Esc` goes back to following the newest |
+| `F2` | switch between the factory board and agent tree |
+| `F5` | open planning choices for the selected task |
+| `F6` | create/link an issue plan; inspect, accept, refine or mark it ready for build |
 | `Ctrl-A` | issue and pull request polling on/off |
-| `Ctrl-T` | show what teammates are working on, and back |
+| `F4` | show what teammates are working on, and back |
 | `Ctrl-X` | cancel the selected job |
-| `Ctrl-C` | quit, stopping any running agent |
+| `Ctrl-C` / `Ctrl-Q` | quit from any view, saving the draft and stopping agents; again to quit at once |
+
+The TUI opens on a factory board: Queue, Build, Review, Delivery, Done, and Attention. Select a job with Alt-Up/Down to inspect its checks, review result, and live worker/reviewer output. F2 switches to the detailed agent tree. Message recall keeps the last 100 accepted submissions across TUI restarts; Enter replies to the current task; Ctrl-T starts a new task and F4 opens the team view.
+
+When a worker or reviewer reports exhausted usage before using tools, Forkdeck retries once with the other available CLI. The limited CLI is skipped for 15 minutes in that process and shown as LIMITED. A run that has used tools is not replayed automatically. If only one CLI remains available, its own review is explicitly logged.
+
+A typed task keeps its conversation. The input box's title says where `Enter`
+sends: once a task is started, to that task; `Alt-↑` `Alt-↓` selects another,
+`Ctrl-R` pins replies to the selected one, and `Ctrl-T` starts a new task. The
+same agent continues in the same tree with the earlier exchanges, and its change
+goes through the checks and review again. Messages sent while the task runs are
+queued on it and taken when its current step ends; `Ctrl-S` stops the agent to
+take one at once. The input box shows how many are queued, and the board the
+next one. A message the task cannot take (another forkdeck holds it, say) stays
+on the input line.
+
+Typed tasks, their conversations, queued messages and recent output are kept in
+the history database (`~/.local/state/forkdeck/forkdeck.db`), with the last 100
+messages you sent and an unfinished draft for each working directory. Tasks cut
+off by quitting continue by themselves when forkdeck starts again; if one could
+not, select it and press `Enter` with nothing typed.
+
+Choices open a picker when the task is selected and nothing is typed: the
+options of a plan waiting for its choice (`Ctrl-P`), or numbered choices in a
+finished answer (lists introduced as choices or options, and option tables).
+Up/Down highlight one and `Enter` sends it: a waiting plan takes the option
+itself, and for an answer it is sent as a reply. **Other / custom response**
+(or `c`) leaves the input line for your own words. Esc closes the picker; F5
+reopens it. An answer that offers choices and changed nothing finishes without
+checks or review, so you can decide what happens next; if the worker changed
+files, they are checked and reviewed as usual. Interactive permission prompts of
+the CLIs themselves are not handled by this picker.
+
+### Issue-backed planning
+
+Press **Ctrl-T**, then **F6** to start a plan for a configured GitHub or GitLab
+repository. F6 on a completed typed task attaches issue planning to that same
+conversation. Choose the repository with Left/Right; the current directory's
+matching repository is selected by default. Tab moves between the repository,
+existing issue URL/number, and planning request. Leave the issue field blank to
+create a new issue after acceptance. Enter starts planning.
+
+The planner and plan reviewer both use the configured read-only agent arguments.
+They review the goal, steps, acceptance criteria, dependencies and test strategy;
+repository code checks run later during Build. A complete plan goes to review
+even when ordinary task review is disabled. A failed or incomplete review cannot
+be accepted. Numbered choices and custom replies continue on the same task.
+
+F6 shows the complete saved plan and reviewer feedback. Tab switches between
+them; Up/Down and PageUp/PageDown scroll. Left/Right or 1–3 selects an action,
+and Enter applies it:
+
+1. **Accept and publish / retry** creates or updates the issue only after the
+   current revision passes review. This also reconciles an interrupted publication.
+2. **Refine** returns to the same task's message field for a custom response.
+   Queued feedback receives its own planning/review turn and invalidates approval.
+3. **Ready for build** applies the repository's existing intake label only after
+   the current revision is reviewed, accepted and successfully published.
+
+Publishing never starts Build by itself. The ordinary issue poller handles Ready
+issues, using its existing author, budget, claim and concurrency checks. The
+planning card links to that issue and shows the resulting build task number in
+the current session. If intake is paused, the card says **Ready — intake paused**;
+Ctrl-A enables intake when desired. The workflow never enables it automatically.
+Refining a linked issue removes its ready label before planning starts. Closed,
+actively claimed, building and PR-open issues cannot be refined or republished.
+
+Plans occupy a `<!-- forkdeck:plan:start -->` / `<!-- forkdeck:plan:end -->`
+section in the issue description. Text outside that section is preserved, and
+each accepted revision adds a short history comment. Forkdeck re-fetches before
+publication and refuses to overwrite a changed managed section. Refine to load
+the latest issue and review the new revision. These checks are optimistic:
+GitHub/GitLab issue edits and labels are not a cross-client transaction.
+
+The issue reference, full draft/review, revision approvals and publication
+progress are saved in the history database before remote writes. Restarting never
+publishes: unlike other typed tasks, an interrupted issue plan is not resumed by
+itself. Retry from F6 after a partial failure.
+Uncertain issue/comment creation is reconciled through durable hidden markers;
+if the result cannot yet be found, retry reports uncertainty instead of issuing
+a duplicate POST. Keep those markers while recovering an interrupted operation.
+A failed save blocks remote writes. One forkdeck at a time works on a task (it
+takes the task over in the database); separate machines still use the forge's
+claim checks.
+
+This uses existing `gh` / `glab` authentication and the selected clone's CLI host
+configuration. URL links must match that forge and repository. New issue plans
+are local until acceptance; linking an existing ready issue immediately holds it
+out of intake. Jira and other providers, issue-comment commands and headless
+planning commands are not part of this first version.
+
+Offline acceptance tests use fake agents and forge CLIs:
+
+```sh
+cargo test
+python3 tests/tui_issue_plans.py target/debug/forkdeck
+python3 tests/tui_exit.py target/debug/forkdeck
+```
 
 ### Conversations, history and resuming
 
@@ -779,7 +985,7 @@ says which one and what else was proposed.
 
 A number sent during planning is saved as an early choice; other messages remain guidance for the worker. When headless input closes, a waiting plan takes its recommended option.
 
-New tasks leave the interface following progress; another Enter starts another task. Use ↑/↓ to explicitly select a conversation for replies.
+After `Enter` starts a task, the input box replies to it; `Ctrl-T` starts another.
 
 Typed tasks share the current directory, so they run one at a time. Issue and
 review jobs each have a worktree and run `automation.max_parallel` at once.

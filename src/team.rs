@@ -491,7 +491,7 @@ pub fn machine_id() -> String {
     .clone()
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: the buffer is ours and its length is passed along.
     let ok = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0;

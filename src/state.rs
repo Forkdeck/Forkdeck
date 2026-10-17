@@ -104,9 +104,10 @@ impl Tier {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
+    #[default]
     Queued,
     Routing,
     /// The agent is proposing ways to do the task.
@@ -183,6 +184,8 @@ pub struct Stage {
     pub started: Option<Instant>,
     pub elapsed: Option<Duration>,
     pub tail: VecDeque<String>,
+    /// Lines ever pushed, so a remote viewer can ask for the ones it has not seen.
+    pub pushed: u64,
 }
 
 impl Default for Stage {
@@ -204,6 +207,7 @@ impl Default for Stage {
             elapsed: None,
             tail: VecDeque::new(),
             unprinted: 0,
+            pushed: 0,
         }
     }
 }
@@ -214,6 +218,7 @@ impl Stage {
         self.last = line.clone();
         self.tail.push_back(line);
         self.unprinted = (self.unprinted + 1).min(200);
+        self.pushed += 1;
         while self.tail.len() > 200 {
             self.tail.pop_front();
         }
@@ -345,8 +350,9 @@ pub enum Provider {
     Gitlab,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum Source {
+    #[default]
     Manual,
     Issue { repo_idx: usize, repo: String, number: u64, url: String },
     /// The base branch moved: deploy that commit.
@@ -460,6 +466,9 @@ pub struct Job {
     /// Has its run slot and is under way, though its status may still read Queued while the item
     /// is claimed and prepared. Not saved: a restored job starts over.
     pub admitted: bool,
+    /// Planning tied to an issue on the forge: the plan is reviewed, then published to the issue
+    /// and marked ready for build only when the user says so.
+    pub issue_plan: Option<crate::planning::Plan>,
     /// The worker's conversation, once its CLI has named it.
     pub session: Option<Session>,
     /// Set on an interrupted typed task that is to continue: the stage it had reached.
@@ -551,6 +560,8 @@ pub fn backoff(base_secs: u64, attempt: u32) -> Duration {
 pub struct State {
     pub jobs: Vec<Job>,
     pub log: VecDeque<LogLine>,
+    /// Lines ever logged; the log holds the newest ones.
+    pub log_seq: u64,
     pub router: RouterStats,
     pub repos: Vec<RepoStatus>,
     /// Items a job has been started for. An item in here is not taken again unless a retry is due.
@@ -579,6 +590,8 @@ pub struct State {
     pub unrecorded: Vec<crate::journal::Entry>,
     /// Used in the last 24 hours, as of the last poll.
     pub spent: crate::journal::Spent,
+    /// A CLI that reported a usage limit is passed over until then: claude, codex, copilot.
+    pub agent_cooldowns: [Option<Instant>; 3],
 }
 
 /// What teammates are working on, as last read from the forge.
@@ -602,6 +615,10 @@ impl Source {
 impl State {
     pub fn has(&self, k: AgentKind) -> bool {
         self.installed.contains(&k)
+    }
+    /// Installed and not resting after a usage limit.
+    pub fn agent_ready(&self, k: AgentKind) -> bool {
+        self.has(k) && self.agent_cooldowns[crate::journal::slot(k)].is_none_or(|until| Instant::now() >= until)
     }
     /// Copilot is installed and the account was not found unable to use it.
     pub fn copilot_usable(&self) -> bool {
@@ -686,6 +703,7 @@ impl State {
             who: who.to_string(),
             msg,
         });
+        self.log_seq += 1;
         while self.log.len() > 500 {
             self.log.pop_front();
         }

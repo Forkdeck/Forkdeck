@@ -508,6 +508,12 @@ pub async fn poll_once(hub: &Hub) {
                                 let mut held = 0;
                                 let mut why: Option<String> = None;
                                 for i in list {
+                                    // A conversation planning this issue owns it until the user marks the
+                                    // published revision ready. Not marked seen, so it is taken once ready.
+                                    if !pr && st.jobs.iter().any(|j| j.issue_plan.as_ref().is_some_and(|p| {
+                                        p.is_for(r) && p.issue.as_ref().is_some_and(|linked| linked.key == i.number.to_string()) &&
+                                        (!p.ready_for_intake() || !j.inbox.is_empty() || !j.status.finished())
+                                    })) { continue; }
                                     if st.jobs.iter().any(|j| !j.status.finished() && j.source.key() == Some((idx, pr, i.number))) {
                                         continue;
                                     }
@@ -575,14 +581,29 @@ pub async fn poll_once(hub: &Hub) {
                                 Planning::IfRouted,
                             ).await { submission_failed(hub, (idx, pr, i.number), &e); }
                         } else {
-                            if let Err(e) = hub.submit(
+                            match hub.submit(
                                 format!("{}#{} {}", r.repo, i.number, i.title),
                                 task_prompt(r, &i),
                                 Source::Issue { repo_idx: idx, repo: r.repo.clone(), number: i.number, url: i.url.clone() },
                                 r.path.clone(),
                                 None,
                                 Planning::IfRouted,
-                            ).await { submission_failed(hub, (idx, pr, i.number), &e); }
+                            ).await {
+                                Err(e) => submission_failed(hub, (idx, pr, i.number), &e),
+                                // A conversation that planned this issue shows which job builds it.
+                                Ok(build) => {
+                                    let mut planners = Vec::new();
+                                    for j in &mut hub.state.lock().unwrap_or_else(|e| e.into_inner()).jobs {
+                                        if let Some(p) = &mut j.issue_plan {
+                                            if p.is_for(r) && p.issue.as_ref().is_some_and(|linked| linked.key == i.number.to_string()) {
+                                                p.build_job = Some(build);
+                                                planners.push(j.id);
+                                            }
+                                        }
+                                    }
+                                    for id in planners { hub.save(id); }
+                                }
+                            }
                         }
                     }
                 }

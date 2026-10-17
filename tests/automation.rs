@@ -228,6 +228,120 @@ while IFS= read -r line; do
 done
 "#;
 
+const QUOTA_CLAUDE: &str = r#"#!/bin/sh
+[ "$1" = "--version" ] && { echo stand-in; exit 0; }
+cat >/dev/null
+echo claude >> "$FAKE_GH/attempts"
+if [ -n "$FAKE_PARTIAL" ]; then
+  echo partial > partial.txt
+  echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"partial.txt"}}]}}'
+fi
+if [ -n "$FAKE_ORDINARY" ]; then
+  echo '{"type":"result","is_error":true,"result":"connection refused"}'
+else
+  echo '{"type":"result","is_error":true,"result":"You’ve hit your session limit · resets 2pm (Europe/Berlin)"}'
+fi
+exit 1
+"#;
+
+const FALLBACK_CODEX: &str = r#"#!/bin/sh
+[ "$1" = "--version" ] && { echo stand-in; exit 0; }
+prompt=$(cat)
+echo codex >> "$FAKE_GH/attempts"
+if [ -n "$FAKE_BOTH_LIMITED" ]; then
+  echo '{"type":"error","message":"rate_limit_exceeded"}'
+  exit 1
+fi
+case "$prompt" in
+  *"Do not modify any file"*) echo '{"type":"item.completed","item":{"type":"agent_message","text":"VERDICT: PASS"}}' ;;
+  *) echo done > by_codex.txt
+     echo '{"type":"item.completed","item":{"type":"agent_message","text":"Did the work."}}' ;;
+esac
+echo '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+"#;
+
+fn quota_rig(name: &str) -> Rig {
+    let rig = Rig::new(name, "[agents.codex]\ncmd=\"{root}/bin/codex\"\n[review]\nmode=\"always\"", "");
+    for (name, body) in [("claude", QUOTA_CLAUDE), ("codex", FALLBACK_CODEX)] {
+        let path = rig.root.join("bin").join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    rig
+}
+
+#[test]
+fn quota_fallback_completes_worker_and_review() {
+    let rig = quota_rig("quota-fallback");
+    let (ok, out) = rig.run(&["run", "--agent", "claude", "Add a file"], &[]);
+    assert!(ok, "{out}");
+    assert!(rig.clone().join("by_codex.txt").exists());
+    assert_eq!(fs::read_to_string(rig.root.join("gh/attempts")).unwrap(), "claude\ncodex\ncodex\n");
+    assert!(out.contains("retrying with codex"), "{out}");
+    assert!(out.contains("same-vendor review: codex reviewed the work of codex"), "{out}");
+}
+
+#[test]
+fn quota_during_review_falls_back_once() {
+    let rig = quota_rig("quota-review");
+    let (ok, out) = rig.run(&["run", "--agent", "codex", "Add a file"], &[]);
+    assert!(ok, "{out}");
+    assert_eq!(fs::read_to_string(rig.root.join("gh/attempts")).unwrap(), "codex\nclaude\ncodex\n");
+}
+
+#[test]
+fn quota_does_not_replay_partial_work_or_other_errors() {
+    for (name, env) in [("quota-partial", "FAKE_PARTIAL"), ("quota-ordinary", "FAKE_ORDINARY")] {
+        let rig = quota_rig(name);
+        let (ok, out) = rig.run(&["run", "--agent", "claude", "Add a file"], &[(env, "1")]);
+        assert!(!ok, "{out}");
+        assert_eq!(fs::read_to_string(rig.root.join("gh/attempts")).unwrap(), "claude\n");
+        assert!(!rig.clone().join("by_codex.txt").exists());
+        if env == "FAKE_PARTIAL" { assert!(rig.clone().join("partial.txt").exists()); }
+    }
+}
+
+#[test]
+fn quota_on_both_agents_stops_after_two_attempts() {
+    let rig = quota_rig("quota-both");
+    let (ok, out) = rig.run(&["run", "--agent", "claude", "Add a file"], &[("FAKE_BOTH_LIMITED", "1")]);
+    assert!(!ok, "{out}");
+    assert_eq!(fs::read_to_string(rig.root.join("gh/attempts")).unwrap(), "claude\ncodex\n");
+}
+
+/// A worker that answers with choices; with `FAKE_CHANGE` it also changes a file.
+const ASKS_CLAUDE: &str = r#"#!/bin/sh
+[ "$1" = "--version" ] && { echo stand-in; exit 0; }
+prompt=$(cat)
+case "$prompt" in
+  *"Do not modify any file"*) echo reviewed >> "$FAKE_GH/planning-calls"
+     printf '%s\n' '{"type":"result","is_error":false,"result":"VERDICT: PASS"}' ;;
+  *) echo called >> "$FAKE_GH/planning-calls"
+     [ -n "$FAKE_CHANGE" ] && echo changed > by_agent.txt
+     printf '%s\n' '{"type":"result","is_error":false,"result":"Choose a planning approach:\n1. Minimal change\n2. Full redesign"}' ;;
+esac
+"#;
+
+#[test]
+fn planning_choices_finish_without_review_or_fix_rounds() {
+    let rig = Rig::new("planning-choices", "[review]\nmode=\"always\"\nchecks=[\"touch check-ran; exit 1\"]", "");
+    fs::write(rig.root.join("bin/claude"), ASKS_CLAUDE).unwrap();
+    let (ok, out) = rig.run(&["run", "--agent", "claude", "give me planning options"], &[]);
+    assert!(ok, "{out}");
+    assert!(out.contains("Planning options ready"), "{out}");
+    assert_eq!(fs::read_to_string(rig.root.join("gh/planning-calls")).unwrap(), "called\n");
+    assert!(!rig.clone().join("check-ran").exists());
+}
+
+#[test]
+fn choices_in_an_answer_do_not_skip_review_of_changes() {
+    let rig = Rig::new("choices-changed", "[review]\nmode=\"always\"\nmax_fix_rounds = 0", "");
+    fs::write(rig.root.join("bin/claude"), ASKS_CLAUDE).unwrap();
+    let (_, out) = rig.run(&["run", "--agent", "claude", "give me planning options"], &[("FAKE_CHANGE", "1")]);
+    assert!(!out.contains("Planning options ready"), "{out}");
+    assert!(fs::read_to_string(rig.root.join("gh/planning-calls")).unwrap().contains("reviewed"), "the change was reviewed:\n{out}");
+}
+
 struct Rig {
     root: PathBuf,
 }
