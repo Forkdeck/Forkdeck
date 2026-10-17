@@ -27,28 +27,44 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.asset_arch }}
+    name: Build ${{ matrix.asset }}
     strategy:
       fail-fast: true
       matrix:
         include:
+          # Linux: static musl binaries, built natively on each architecture.
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-            asset_arch: amd64
+            asset: linux-amd64
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            asset_arch: arm64
+            asset: linux-arm64
+          # macOS: native builds; they link only the system libraries every Mac has.
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: macos-arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: macos-amd64
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install native musl toolchain
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes musl-tools
+
+      - name: Install GNU tar
+        if: runner.os == 'macOS'
+        # BSD tar cannot write a reproducible archive (sorted, fixed owner and times).
+        run: command -v gtar || brew install gnu-tar
 
       - name: Install Rust
         env:
@@ -83,7 +99,7 @@ jobs:
       - name: Test
         run: cargo +"${RUST_VERSION}" test --locked
 
-      - name: Build static release binary
+      - name: Build release binary
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -94,21 +110,37 @@ jobs:
 
       - name: Package release asset
         env:
-          ASSET_ARCH: ${{ matrix.asset_arch }}
+          ASSET: ${{ matrix.asset }}
           TARGET: ${{ matrix.target }}
         run: |
-          package="forkdeck-${RELEASE_VERSION}-linux-${ASSET_ARCH}"
-          install -D -m 0755 \
-            "target/${TARGET}/release/forkdeck" \
-            "dist/${package}/forkdeck"
+          if [ "${RUNNER_OS}" = macOS ]; then
+            tar=gtar
+            sha() { shasum -a 256 "$@"; }
+          else
+            tar=tar
+            sha() { sha256sum "$@"; }
+          fi
+          package="forkdeck-${RELEASE_VERSION}-${ASSET}"
+          mkdir -p "dist/${package}"
+          install -m 0755 "target/${TARGET}/release/forkdeck" "dist/${package}/forkdeck"
           install -m 0644 README.md "dist/${package}/README.md"
           install -m 0644 LICENSE "dist/${package}/LICENSE"
           install -m 0644 forkdeck.example.toml "dist/${package}/forkdeck.example.toml"
           "dist/${package}/forkdeck" --version |
-            grep --fixed-strings --line-regexp \
+            grep -F -x \
               "forkdeck ${RELEASE_VERSION#v}"
-          # Statically linked: it runs on any Linux of this architecture.
-          file "dist/${package}/forkdeck" | grep --quiet "statically linked"
+          if [ "${RUNNER_OS}" = macOS ]; then
+            # Only libraries every Mac has: nothing from Homebrew or elsewhere.
+            otool -L "dist/${package}/forkdeck"
+            if otool -L "dist/${package}/forkdeck" | tail -n +2 | awk '{print $1}' |
+              grep -v -E '^(/usr/lib/|/System/Library/)'; then
+              echo "links a library outside the system ones" >&2
+              exit 1
+            fi
+          else
+            # Statically linked: it runs on any Linux of this architecture.
+            file "dist/${package}/forkdeck" | grep -q "statically linked"
+          fi
           commit_time="$(git show -s --format=%ct)"
           SOURCE_DATE_EPOCH="${commit_time}" \
             cargo +"${RUST_VERSION}" cyclonedx \
@@ -128,7 +160,7 @@ jobs:
           install -m 0644 \
             "dist/${package}.cdx.json" \
             "dist/${package}/SBOM.cdx.json"
-          tar \
+          "${tar}" \
             --sort=name \
             --owner=0 \
             --group=0 \
@@ -139,14 +171,14 @@ jobs:
             "${package}"
           (
             cd dist
-            sha256sum "${package}.tar.gz" >"${package}.tar.gz.sha256"
-            sha256sum "${package}.cdx.json" >"${package}.cdx.json.sha256"
+            sha "${package}.tar.gz" >"${package}.tar.gz.sha256"
+            sha "${package}.cdx.json" >"${package}.cdx.json.sha256"
           )
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-forkdeck-${{ matrix.asset_arch }}
+          name: release-forkdeck-${{ matrix.asset }}
           path: |
             dist/*.tar.gz
             dist/*.cdx.json
