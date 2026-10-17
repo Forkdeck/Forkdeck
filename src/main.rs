@@ -1084,12 +1084,21 @@ fn choice_key(hub: &Hub, ui: &mut ui::Ui, history: &mut input::History, key: eve
             if key.code == KeyCode::Enter && picker.selected < picker.options.len() {
                 if waiting {
                     // A plan waiting for its choice takes the option itself; anything typed goes along as a message.
+                    // What is typed goes along as a message, queued before the choice wakes the
+                    // worker. Sent as a reply, it would arrive while the task still waits for its
+                    // choice and be taken as another choice.
+                    let draft = ui.input.trim().to_string();
+                    if !draft.is_empty() {
+                        hub.job(picker.job, |j| { j.inbox.push_back(draft.clone()); j.worker.push(format!("› {} (queued)", state::clip(&draft, 300))); });
+                    }
                     match hub.choose(picker.job, state::Choice::Option(picker.selected)) {
                         Ok(()) => {
-                            let draft = ui.input.trim().to_string();
-                            if !draft.is_empty() { submit_input(hub, ui, history); }
+                            if !draft.is_empty() { history.submitted(draft); ui.input.clear(); }
                         }
-                        Err(why) => hub.log("choices", format!("#{} not chosen: {}", picker.job, why)),
+                        Err(why) => {
+                            if !draft.is_empty() { hub.job(picker.job, |j| { j.inbox.pop_back(); }); }
+                            hub.log("choices", format!("#{} not chosen: {}", picker.job, why));
+                        }
                     }
                 } else {
                     let option = &picker.options[picker.selected];

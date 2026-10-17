@@ -396,7 +396,7 @@ pub async fn retry_pending(hub: &Hub, idx: usize) {
 /// Asked of the forge directly, so it is found however many older notes branches are lying around.
 async fn open_notes_pr(hub: &Hub, r: &RepoCfg) -> Result<Option<(String, String)>, String> {
     let (out, head, url) = match r.provider {
-        Provider::Github => (issues::sh("gh", &["pr", "list", "-R", &r.repo, "--state", "open", "--limit", "200", "--json", "number,url,headRefName,isCrossRepository,author"], None).await?, "headRefName", "url"),
+        Provider::Github => (issues::sh("gh", &["pr", "list", "-R", &r.gh_repo(), "--state", "open", "--limit", "200", "--json", "number,url,headRefName,isCrossRepository,author"], None).await?, "headRefName", "url"),
         Provider::Gitlab => (issues::sh("glab", &["mr", "list", "-R", &r.repo, "--per-page", "100", "--output", "json"], Some(&r.path)).await?, "source_branch", "web_url"),
     };
     let v: serde_json::Value = serde_json::from_str(&out).map_err(|e| format!("the pull request list is not JSON: {}", e))?;

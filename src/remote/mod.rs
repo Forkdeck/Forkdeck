@@ -118,6 +118,8 @@ async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::
         let _ = sink.close().await;
     });
     let mut streams: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
+    // Calls under way: each holds a sender to the writer, so they end with the connection.
+    let mut calls = tokio::task::JoinSet::new();
     let mut recheck = tokio::time::interval(RECHECK);
     let mut revoked = false;
     loop {
@@ -127,7 +129,7 @@ async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::
                 match msg {
                     InboundServerMessage::Unary(ClientMessage::Request(req), _) => {
                         let (ctx, out, device) = (ctx.clone(), out.clone(), device.clone());
-                        tokio::spawn(async move {
+                        calls.spawn(async move {
                             let reply = match &device {
                                 Some(d) => call(&ctx, d, req.message).await,
                                 None => pairing(&ctx, peer.ip(), req.message).await,
@@ -139,7 +141,11 @@ async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::
                     InboundServerMessage::Stream(StreamClientMessage::Open { stream_id, method_id, message, .. }, _) => {
                         match (method_id, message, device.is_some()) {
                             (SUBSCRIBE, Call::Subscribe { since }, true) => {
-                                streams.insert(stream_id, tokio::spawn(subscribe(ctx.clone(), out.clone(), stream_id, since)));
+                                // An id used again replaces its stream: the old one stops, or it would
+                                // run on where nothing can reach it, revocation included.
+                                if let Some(old) = streams.insert(stream_id, tokio::spawn(subscribe(ctx.clone(), out.clone(), stream_id, since))) {
+                                    old.abort();
+                                }
                             }
                             _ => {
                                 let error = StreamError::new(std::io::ErrorKind::PermissionDenied, "no such stream");
@@ -166,8 +172,14 @@ async fn connection(ctx: Arc<Ctx>, tcp: TcpStream, peer: SocketAddr) -> anyhow::
     for (_, h) in streams {
         h.abort();
     }
+    calls.abort_all();
     drop(out);
-    let _ = writer.await;
+    if revoked {
+        // Closed at once: nothing more goes to a phone that is no longer paired.
+        writer.abort();
+    } else {
+        let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
+    }
     if revoked {
         ctx.hub.log("remote", format!("{} revoked, disconnected", device.unwrap_or_default()));
     }

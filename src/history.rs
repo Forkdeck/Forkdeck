@@ -9,7 +9,13 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A job whose issue plan is still in progress: a publication pending, or not yet marked ready for build.
-const UNRESOLVED_PLAN: &str = "(issue_plan IS NOT NULL AND (json_extract(issue_plan, '$.pending') IS NOT NULL OR json_extract(issue_plan, '$.ready') IS NOT 1))";
+/// Resolved is what `Plan::ready_for_intake` says: ready, nothing pending, and the current revision
+/// reviewed, accepted and published.
+const UNRESOLVED_PLAN: &str = "(issue_plan IS NOT NULL AND NOT (json_extract(issue_plan, '$.ready') IS 1 \
+    AND json_extract(issue_plan, '$.pending') IS NULL \
+    AND json_extract(issue_plan, '$.reviewed') IS json_extract(issue_plan, '$.revision') \
+    AND json_extract(issue_plan, '$.accepted') IS json_extract(issue_plan, '$.revision') \
+    AND json_extract(issue_plan, '$.published') IS json_extract(issue_plan, '$.revision')))";
 
 /// How many jobs are kept; older ones are removed when forkdeck starts. Issue plans still in
 /// progress are kept as well, whatever their age.
@@ -668,7 +674,8 @@ mod tests {
         let cfg: crate::config::Config = toml::from_str("[[repos]]\nprovider='github'\nrepo='a/b'\npath='/tmp'\n").unwrap();
         let plan = crate::planning::Plan::new(&cfg.repos[0], "7").unwrap();
         let mut ready = plan.clone();
-        ready.ready = true;
+        (ready.ready, ready.revision, ready.reviewed, ready.accepted, ready.published) = (true, 2, Some(2), Some(2), Some(2));
+        assert!(ready.ready_for_intake());
         for (plan, title) in [(Some(plan), "unresolved"), (Some(ready), "ready"), (None, "a"), (None, "b"), (None, "c")] {
             let id = h.new_id().unwrap();
             let mut j = job(id, Source::Manual, JobStatus::Done);

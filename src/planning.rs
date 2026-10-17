@@ -48,7 +48,8 @@ impl Plan {
         Ok(Self { provider: r.provider, repo: r.repo.clone(), host: r.host.clone(), issue, identity, revision: 0, draft: String::new(), review: String::new(), reviewed: None, accepted: None, published: None, base: None, remote_context: String::new(), pending: None, action: Action::Draft, ready: false, build_job: None })
     }
 
-    pub fn invalidate(&mut self) { self.reviewed = None; }
+    /// Feedback arrived: this revision is no longer reviewed, nor ready for build.
+    pub fn invalidate(&mut self) { self.reviewed = None; self.ready = false; }
     /// Another task's plan for the same issue, which this one must not be attached beside: intake
     /// waits while any plan for an issue is unready, so a second would hold it up for good.
     pub fn taken_by(&self, jobs: &[Job], except: Option<u32>) -> Option<u32> {

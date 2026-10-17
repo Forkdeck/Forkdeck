@@ -197,7 +197,7 @@ fn whole_page(listed: usize) -> bool {
 async fn list(r: &RepoCfg) -> Result<Vec<Issue>, String> {
     let out = match r.provider {
         Provider::Github => {
-            sh("gh", &["issue", "list", "-R", &r.repo, "--label", &r.label, "--state", "open", "--limit", PAGE, "--json", "number,title,body,url,author"], None).await?
+            sh("gh", &["issue", "list", "-R", &r.gh_repo(), "--label", &r.label, "--state", "open", "--limit", PAGE, "--json", "number,title,body,url,author"], None).await?
         }
         Provider::Gitlab => {
             sh("glab", &["issue", "list", "-R", &r.repo, "--label", &r.label, "--per-page", PAGE, "--output", "json"], Some(&r.path)).await?
@@ -209,7 +209,7 @@ async fn list(r: &RepoCfg) -> Result<Vec<Issue>, String> {
 async fn list_prs(r: &RepoCfg) -> Result<Vec<Issue>, String> {
     let out = match r.provider {
         Provider::Github => {
-            sh("gh", &["pr", "list", "-R", &r.repo, "--label", &r.pr_label, "--state", "open", "--limit", PAGE, "--json", "number,title,body,url,author,headRefName,baseRefName"], None).await?
+            sh("gh", &["pr", "list", "-R", &r.gh_repo(), "--label", &r.pr_label, "--state", "open", "--limit", PAGE, "--json", "number,title,body,url,author,headRefName,baseRefName"], None).await?
         }
         Provider::Gitlab => {
             sh("glab", &["mr", "list", "-R", &r.repo, "--label", &r.pr_label, "--per-page", PAGE, "--output", "json"], Some(&r.path)).await?
@@ -222,8 +222,8 @@ async fn list_prs(r: &RepoCfg) -> Result<Vec<Issue>, String> {
 pub async fn relabel(r: &RepoCfg, pr: bool, n: u64, from: &str, to: &str) -> Result<(), String> {
     let n = n.to_string();
     match (r.provider, pr) {
-        (Provider::Github, false) => sh("gh", &["issue", "edit", &n, "-R", &r.repo, "--remove-label", from, "--add-label", to], None).await,
-        (Provider::Github, true) => sh("gh", &["pr", "edit", &n, "-R", &r.repo, "--remove-label", from, "--add-label", to], None).await,
+        (Provider::Github, false) => sh("gh", &["issue", "edit", &n, "-R", &r.gh_repo(), "--remove-label", from, "--add-label", to], None).await,
+        (Provider::Github, true) => sh("gh", &["pr", "edit", &n, "-R", &r.gh_repo(), "--remove-label", from, "--add-label", to], None).await,
         (Provider::Gitlab, false) => sh("glab", &["issue", "update", &n, "-R", &r.repo, "--unlabel", from, "--label", to], Some(&r.path)).await,
         (Provider::Gitlab, true) => sh("glab", &["mr", "update", &n, "-R", &r.repo, "--unlabel", from, "--label", to], Some(&r.path)).await,
     }
@@ -233,8 +233,8 @@ pub async fn relabel(r: &RepoCfg, pr: bool, n: u64, from: &str, to: &str) -> Res
 pub async fn comment(r: &RepoCfg, pr: bool, n: u64, text: &str) -> Result<(), String> {
     let n = n.to_string();
     match (r.provider, pr) {
-        (Provider::Github, false) => sh_in("gh", &["issue", "comment", &n, "-R", &r.repo, "--body-file", "-"], None, text).await,
-        (Provider::Github, true) => sh_in("gh", &["pr", "comment", &n, "-R", &r.repo, "--body-file", "-"], None, text).await,
+        (Provider::Github, false) => sh_in("gh", &["issue", "comment", &n, "-R", &r.gh_repo(), "--body-file", "-"], None, text).await,
+        (Provider::Github, true) => sh_in("gh", &["pr", "comment", &n, "-R", &r.gh_repo(), "--body-file", "-"], None, text).await,
         (Provider::Gitlab, _) => {
             let endpoint = format!("projects/{}/{}/{}/notes", r.repo.replace('/', "%2F"), if pr { "merge_requests" } else { "issues" }, n);
             sh_in("glab", &["api", "-X", "POST", &endpoint, "--input", "-", "-H", "Content-Type: application/json"], Some(&r.path), &serde_json::json!({"body": text}).to_string()).await
@@ -276,8 +276,8 @@ fn submission_failed(hub: &Hub, key: crate::state::Key, why: &str) {
 async fn still_requested(r: &RepoCfg, pr: bool, n: u64) -> Result<(), String> {
     let num = n.to_string();
     let out = match (r.provider, pr) {
-        (Provider::Github, false) => sh("gh", &["issue", "view", &num, "-R", &r.repo, "--json", "state,labels"], None).await?,
-        (Provider::Github, true) => sh("gh", &["pr", "view", &num, "-R", &r.repo, "--json", "state,labels"], None).await?,
+        (Provider::Github, false) => sh("gh", &["issue", "view", &num, "-R", &r.gh_repo(), "--json", "state,labels"], None).await?,
+        (Provider::Github, true) => sh("gh", &["pr", "view", &num, "-R", &r.gh_repo(), "--json", "state,labels"], None).await?,
         (Provider::Gitlab, false) => sh("glab", &["issue", "view", &num, "-R", &r.repo, "--output", "json"], Some(&r.path)).await?,
         (Provider::Gitlab, true) => sh("glab", &["mr", "view", &num, "-R", &r.repo, "--output", "json"], Some(&r.path)).await?,
     };
@@ -1031,7 +1031,8 @@ pub async fn publish(hub: &Hub, id: u32, o: &Outcome<'_>) -> Result<String, Stri
 pub async fn open_pr(r: &RepoCfg, branch: &str, title: &str, body: &str, draft: bool, dir: Option<&Path>) -> Result<String, String> {
     match r.provider {
         Provider::Github => {
-            let mut a = vec!["pr", "create", "-R", &r.repo, "--head", branch, "--base", &r.base, "--title", title, "--body-file", "-"];
+            let repo = r.gh_repo();
+            let mut a = vec!["pr", "create", "-R", &repo, "--head", branch, "--base", &r.base, "--title", title, "--body-file", "-"];
             if draft {
                 a.push("--draft");
             }
@@ -1208,7 +1209,7 @@ pub async fn pr_withdraw(hub: &Hub, id: u32, reviewed: &str, head: &str, next: &
         // head nobody reviewed; take that off and leave the rest to them.
         let num = n.to_string();
         match r.provider {
-            Provider::Github => sh("gh", &["pr", "edit", &num, "-R", &r.repo, "--remove-label", &r.pr_pass_label], None).await?,
+            Provider::Github => sh("gh", &["pr", "edit", &num, "-R", &r.gh_repo(), "--remove-label", &r.pr_pass_label], None).await?,
             Provider::Gitlab => sh("glab", &["mr", "update", &num, "-R", &r.repo, "--unlabel", &r.pr_pass_label], Some(&r.path)).await?,
         };
         return Err(e);

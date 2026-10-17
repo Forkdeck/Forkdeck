@@ -140,7 +140,8 @@ jobs:
             fi
           else
             # Statically linked: it runs on any Linux of this architecture.
-            file "dist/${package}/forkdeck" | grep -q "statically linked"
+            # `file` says "static-pie linked" for a position-independent static build.
+            file "dist/${package}/forkdeck" | grep -q -E "statically linked|static-pie linked"
           fi
           commit_time="$(git show -s --format=%ct)"
           SOURCE_DATE_EPOCH="${commit_time}" \

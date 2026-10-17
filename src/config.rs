@@ -774,6 +774,15 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
 }
 
 impl RepoCfg {
+    /// The repository as `gh -R` takes it: with its host when the clone names one, so `GH_HOST`
+    /// cannot send the request to the same name on another server. Same rule as `host_args`.
+    pub fn gh_repo(&self) -> String {
+        match self.host_args().get(1) {
+            Some(host) => format!("{}/{}", host, self.repo),
+            None => self.repo.clone(),
+        }
+    }
+
     /// The `gh api` arguments that send a request to this repository's host. `gh` uses its default
     /// host otherwise (`GH_HOST` may name an Enterprise server), so github.com is named too;
     /// `glab` takes the host from the clone it runs in. An origin naming an SSH alias (no dot) says

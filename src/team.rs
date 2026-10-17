@@ -402,10 +402,11 @@ async fn edit(r: &RepoCfg, t: &Target, id: u64, text: &str) -> Result<(), String
 /// The account the forge CLI is logged in as.
 pub async fn me(hub: &Hub, r: &RepoCfg) -> Result<String, String> {
     // A clone identifies the host glab resolves, including installations with several GitLab hosts.
-    let key = format!("{:?}:{}", r.provider, if r.provider == Provider::Gitlab { r.path.display().to_string() } else { String::new() });
+    // A clone identifies the host glab resolves; for gh, the host it is told.
+    let key = format!("{:?}:{}", r.provider, if r.provider == Provider::Gitlab { r.path.display().to_string() } else { r.host_args().join(" ") });
     if let Some(n) = hub.team_me.lock().unwrap().get(&key).cloned() { return Ok(n); }
     let name = match r.provider {
-        Provider::Github => issues::sh("gh", &["api", "user", "--jq", ".login"], None).await?,
+        Provider::Github => issues::sh("gh", &with_host(r, &["user", "--jq", ".login"]), None).await?,
         Provider::Gitlab => {
             let out = issues::sh("glab", &["api", "user"], dir(r)).await?;
             serde_json::from_str::<Value>(&out).ok().and_then(|v| v.get("username").and_then(|x| x.as_str()).map(String::from)).unwrap_or_default()
@@ -447,7 +448,7 @@ pub async fn is_public(hub: &Hub, r: &RepoCfg) -> bool {
         return *p;
     }
     let seen = match r.provider {
-        Provider::Github => issues::sh("gh", &["api", &format!("repos/{}", r.repo), "--jq", ".visibility"], None).await,
+        Provider::Github => issues::sh("gh", &with_host(r, &[&format!("repos/{}", r.repo), "--jq", ".visibility"]), None).await,
         Provider::Gitlab => issues::sh("glab", &["api", &gitlab_project(r)], dir(r))
             .await
             .map(|o| serde_json::from_str::<Value>(&o).ok().and_then(|v| v.get("visibility").and_then(|x| x.as_str()).map(String::from)).unwrap_or_default()),
@@ -632,7 +633,7 @@ pub async fn assign_if_on(hub: &Hub, r: &RepoCfg, n: u64) {
     }
     let num = n.to_string();
     let res = match r.provider {
-        Provider::Github => issues::sh("gh", &["issue", "edit", &num, "-R", &r.repo, "--add-assignee", "@me"], None).await,
+        Provider::Github => issues::sh("gh", &["issue", "edit", &num, "-R", &r.gh_repo(), "--add-assignee", "@me"], None).await,
         Provider::Gitlab => match me(hub, r).await {
             Ok(u) => issues::sh("glab", &["issue", "update", &num, "-R", &r.repo, "--assignee", &format!("+{}", u)], dir(r)).await,
             Err(e) => Err(e),
@@ -861,8 +862,8 @@ fn parse_listed(provider: Provider, json: &str) -> Result<Vec<Listed>, String> {
 
 async fn listed(r: &RepoCfg, pr: bool, label: &str) -> Result<Vec<Listed>, String> {
     let out = match (r.provider, pr) {
-        (Provider::Github, false) => issues::sh("gh", &["issue", "list", "-R", &r.repo, "--label", label, "--state", "open", "--limit", "30", "--json", "number,title,url,assignees"], None).await?,
-        (Provider::Github, true) => issues::sh("gh", &["pr", "list", "-R", &r.repo, "--label", label, "--state", "open", "--limit", "30", "--json", "number,title,url,assignees"], None).await?,
+        (Provider::Github, false) => issues::sh("gh", &["issue", "list", "-R", &r.gh_repo(), "--label", label, "--state", "open", "--limit", "30", "--json", "number,title,url,assignees"], None).await?,
+        (Provider::Github, true) => issues::sh("gh", &["pr", "list", "-R", &r.gh_repo(), "--label", label, "--state", "open", "--limit", "30", "--json", "number,title,url,assignees"], None).await?,
         (Provider::Gitlab, false) => issues::sh("glab", &["issue", "list", "-R", &r.repo, "--label", label, "--per-page", "30", "--output", "json"], dir(r)).await?,
         (Provider::Gitlab, true) => issues::sh("glab", &["mr", "list", "-R", &r.repo, "--label", label, "--per-page", "30", "--output", "json"], dir(r)).await?,
     };
@@ -976,7 +977,7 @@ pub async fn gather(hub: &Hub, all: bool) -> (Vec<Row>, Vec<String>) {
 
 /// Deployments announced on the latest commits of the base branch.
 async fn deploys(r: &RepoCfg, me: &str, stale: i64) -> Result<Vec<Row>, String> {
-    let out = issues::sh("gh", &["api", &format!("repos/{}/commits?sha={}&per_page=10", r.repo, r.base)], None).await?;
+    let out = issues::sh("gh", &with_host(r, &[&format!("repos/{}/commits?sha={}&per_page=10", r.repo, r.base)]), None).await?;
     let v: Value = serde_json::from_str(&out).map_err(|e| format!("the commit list is not JSON: {}", e))?;
     let mut rows = Vec::new();
     for c in v.as_array().map(|a| a.as_slice()).unwrap_or_default() {
@@ -1114,8 +1115,8 @@ pub fn parse_ref(s: &str) -> Option<(String, bool, u64)> {
 async fn labels(r: &RepoCfg, pr: bool, n: u64) -> Result<Vec<String>, String> {
     let num = n.to_string();
     let out = match (r.provider, pr) {
-        (Provider::Github, false) => issues::sh("gh", &["issue", "view", &num, "-R", &r.repo, "--json", "labels"], None).await?,
-        (Provider::Github, true) => issues::sh("gh", &["pr", "view", &num, "-R", &r.repo, "--json", "labels"], None).await?,
+        (Provider::Github, false) => issues::sh("gh", &["issue", "view", &num, "-R", &r.gh_repo(), "--json", "labels"], None).await?,
+        (Provider::Github, true) => issues::sh("gh", &["pr", "view", &num, "-R", &r.gh_repo(), "--json", "labels"], None).await?,
         (Provider::Gitlab, false) => issues::sh("glab", &["issue", "view", &num, "-R", &r.repo, "--output", "json"], dir(r)).await?,
         (Provider::Gitlab, true) => issues::sh("glab", &["mr", "view", &num, "-R", &r.repo, "--output", "json"], dir(r)).await?,
     };

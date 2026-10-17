@@ -744,7 +744,8 @@ pub(crate) fn snapshot_tree(dir: &Path) -> Result<String, String> {
     let mut lines = Vec::new();
     for rel in listed.split(|b| *b == 0).filter(|p| !p.is_empty()) {
         let rel = String::from_utf8_lossy(rel).to_string();
-        if gitlinks.iter().any(|(_, p)| *p == rel) || !inside(dir, &rel) { continue; }
+        // One path per line below, so a name with a newline cannot be passed on; it is left out.
+        if rel.contains('\n') || gitlinks.iter().any(|(_, p)| *p == rel) || !inside(dir, &rel) { continue; }
         let Ok(meta) = std::fs::symlink_metadata(dir.join(&rel)) else { continue };
         if meta.file_type().is_symlink() {
             let target = std::fs::read_link(dir.join(&rel)).map_err(|e| e.to_string())?;
@@ -756,7 +757,9 @@ pub(crate) fn snapshot_tree(dir: &Path) -> Result<String, String> {
             files.push((rel, if meta.permissions().mode() & 0o111 != 0 { "100755" } else { "100644" }));
         }
     }
-    std::fs::write(&paths, files.iter().map(|(p, _)| format!("{}\n", p)).collect::<String>()).map_err(|e| e.to_string())?;
+    // `./` first: git reads a line that starts with a quote as a C-quoted path, so a file named
+    // `"/home/me/.ssh/id_rsa"` would hash that file instead.
+    std::fs::write(&paths, files.iter().map(|(p, _)| format!("./{}\n", p)).collect::<String>()).map_err(|e| e.to_string())?;
     let shas = plain_git(dir, &["hash-object", "-w", "--no-filters", "--stdin-paths"], &[], Some(&paths))?;
     for ((rel, mode), sha) in files.iter().zip(String::from_utf8_lossy(&shas).lines()) {
         lines.push(format!("{} {}\t{}", mode, sha, rel));
@@ -919,6 +922,12 @@ mod tests {
         let changes = std::fs::read_to_string(to.join(CHANGES)).unwrap();
         assert!(changes.contains("since HEAD") && changes.contains("+changed") && changes.contains("new.txt"), "{changes}");
         assert!(!ran.exists(), "a filter configured in the checkout ran");
+        // A name git would read as a quoted path elsewhere is hashed as the file it is.
+        let quoted = format!("\"{}\"", secret.join("guide.md").display());
+        // A real file at `"/…/guide.md"` (folders named `"`, `tmp`, …), whose path git would unquote.
+        std::fs::create_dir_all(from.join(&quoted).parent().unwrap()).unwrap();
+        std::fs::write(from.join(&quoted), "harmless\n").unwrap();
+        write_changes(&from, &to, "Inspect everything with `git diff HEAD`.", None).unwrap();
         // Through the linked directory, nothing outside gets into the diff either.
         assert!(!std::fs::read_to_string(to.join(CHANGES)).unwrap().contains("PRIVATE KEY"));
         // No `git diff` in the prompt (a review asked again): the job's starting commit.
