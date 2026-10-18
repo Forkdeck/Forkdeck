@@ -236,6 +236,11 @@ fn main() -> anyhow::Result<()> {
     }
     cfg.demo = cli.demo;
     if !cfg.demo {
+        if let Some((r, automation)) = config::launch_repo(&std::env::current_dir()?, &cfg)? {
+            cfg.repos.push(r);
+            cfg.automation.enabled |= automation;
+            cfg.validate()?;
+        }
         // Files saved under a repository's name from before its host was part of it.
         knowledge::migrate_names(&cfg.repos);
         if let Err(e) = cicd::migrate_keys(&cfg.repos) {

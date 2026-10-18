@@ -168,6 +168,9 @@ lan_only = true        # refuse connections from outside this machine's subnets,
 dir = "~/.config/forkdeck/remote"   # certificate authority, paired devices
 # workdir = "~/src/project"         # where tasks from the phone run; default: where forkdeck started
 
+# A repository can instead keep the keys below (except provider, repo, path and base) in its own
+# .forkdeck/config.toml, read from the base branch. Started inside such a clone, forkdeck adds it
+# without an entry here. For a repository listed here too, what you set here wins.
 #~ [[repos]]
 #~ provider = "github"    # uses the gh CLI and its login
 #~ repo = "your-name/your-project"
