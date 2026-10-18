@@ -4,6 +4,7 @@ mod cicd;
 mod config;
 mod copilot;
 mod demo;
+mod diff;
 mod history;
 mod input;
 mod issues;
@@ -922,6 +923,41 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
     ok
 }
 
+/// A click on an edit line opens its diff full screen; while it is open, keys and the wheel move
+/// through it and Esc closes it. True when the event was used here.
+fn diff_event(hub: &Hub, u: &mut ui::Ui, e: &Event, page: u16) -> bool {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    if let Some(v) = &mut u.diff {
+        match e {
+            Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => u.diff = None,
+                KeyCode::Up => v.scroll_by(-1, page),
+                KeyCode::Down => v.scroll_by(1, page),
+                KeyCode::PageUp => v.scroll_by(-(page as i32), page),
+                KeyCode::PageDown | KeyCode::Char(' ') => v.scroll_by(page as i32, page),
+                KeyCode::Home => v.scroll = 0,
+                KeyCode::End => v.scroll_by(i32::MAX / 2, page),
+                _ => {}
+            },
+            Event::Mouse(m) if m.kind == MouseEventKind::ScrollUp => v.scroll_by(-3, page),
+            Event::Mouse(m) if m.kind == MouseEventKind::ScrollDown => v.scroll_by(3, page),
+            _ => {}
+        }
+        return true;
+    }
+    let Event::Mouse(m) = e else { return false };
+    if m.kind != MouseEventKind::Down(MouseButton::Left) {
+        return true;
+    }
+    let Some(spot) = crate::diff::spot_at(&u.spots.borrow(), m.column, m.row).cloned() else { return true };
+    let st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(j) = st.jobs.iter().find(|j| j.id == spot.job) {
+        let base = j.base_sha.clone().unwrap_or_else(|| "HEAD".into());
+        u.diff = Some(crate::diff::View::open(j.id, spot.files, j.workdir.clone(), base));
+    }
+    true
+}
+
 fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
     ui::Ui {
         input: String::new(),
@@ -940,6 +976,8 @@ fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
         seen_choices: Default::default(),
         jobs_per_day: hub.cfg.limits.jobs_per_day,
         tokens_per_day: hub.cfg.limits.tokens_per_day,
+        spots: Default::default(),
+        diff: None,
     }
 }
 
@@ -1167,7 +1205,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
         rt.spawn(async move {
             stop_signal().await;
             let already = stopping.swap(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
+            let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste, event::DisableMouseCapture);
             let _ = ratatui::try_restore();
             if already {
                 proc::kill_all();
@@ -1184,7 +1222,8 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
         });
     }
     let mut term = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste);
+    // Mouse capture: clicking an edit line opens its diff. Shift-drag still selects text.
+    let _ = crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste, event::EnableMouseCapture);
     let res = (|| -> anyhow::Result<()> {
         loop {
             if stopping.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1198,11 +1237,17 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
             }
             sync_selection(hub, &mut u);
             sync_choices(hub, &mut u);
+            if let Some(v) = &mut u.diff { v.refresh(); }
             term.draw(|f| ui::draw(f, &hub.state.lock().unwrap_or_else(|e| e.into_inner()), &u))?;
             if !event::poll(Duration::from_millis(100))? {
                 continue;
             }
-            match event::read()? {
+            let page = term.size().map(|s| s.height.saturating_sub(2)).unwrap_or(20);
+            let event = event::read()?;
+            if diff_event(hub, &mut u, &event, page) {
+                continue;
+            }
+            match event {
                 Event::Paste(s) => {
                     if let Some(panel) = &mut u.issue_panel { panel.paste(&s); }
                     else { u.input.push_str(&s.replace(['\n', '\r'], " ")); }
@@ -1315,7 +1360,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
             }
         }
     })();
-    let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
+    let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste, event::DisableMouseCapture);
     let _ = ratatui::try_restore();
     save_composer(hub, &u, &history, &mut composer_saved);
     // Stop any agent still running, and give claimed issues time to be handed back with a comment.

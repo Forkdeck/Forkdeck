@@ -56,6 +56,10 @@ pub struct Ui {
     /// The daily limits, to show next to what has been used. 0: none.
     pub jobs_per_day: u32,
     pub tokens_per_day: u64,
+    /// Edit lines on screen, as last drawn, for a click to open their diff.
+    pub spots: std::cell::RefCell<Vec<crate::diff::Spot>>,
+    /// The full-screen diff opened by clicking an edit line.
+    pub diff: Option<crate::diff::View>,
 }
 
 /// The typed task Enter sends to: the one pinned with Ctrl-R, else the selected one. The input
@@ -123,6 +127,11 @@ fn mmss(secs: u64) -> String {
 }
 
 pub fn draw(f: &mut Frame, st: &State, ui: &Ui) {
+    ui.spots.borrow_mut().clear();
+    if let Some(v) = &ui.diff {
+        crate::diff::draw(f, f.area(), v);
+        return;
+    }
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(BG).fg(TEXT)), area);
     let rows = Layout::vertical([
@@ -145,7 +154,7 @@ pub fn draw(f: &mut Frame, st: &State, ui: &Ui) {
     let job = ui.selected.and_then(|id| st.jobs.iter().find(|j| j.id == id));
     match job {
         _ if ui.team => team_panel(f, cols[1], st),
-        Some(j) => tree(f, cols[1], j),
+        Some(j) => tree(f, cols[1], j, ui),
         None => empty_tree(f, cols[1]),
     }
     }
@@ -255,7 +264,8 @@ fn factory(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
             let outputs = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(detail[1]);
             for (rect, role, stage) in [(outputs[0], "worker", &job.worker), (outputs[1], "reviewer", &job.reviewer)] {
                 let agent = stage.agent.map(|a| a.name()).unwrap_or("waiting");
-                output_panel(f, rect, &format!("{} · {} · {} tools", role, agent, stage.tools), stage, stage.agent.map(agent_color).unwrap_or(DIM));
+                let spots = output_panel(f, rect, &format!("{} · {} · {} tools", role, agent, stage.tools), stage, stage.agent.map(agent_color).unwrap_or(DIM));
+                ui.spots.borrow_mut().extend(spots.into_iter().map(|s| crate::diff::Spot { job: job.id, ..s }));
             }
         }
         None => {
@@ -465,7 +475,7 @@ fn connector(f: &mut Frame, area: Rect, color: Color) {
     f.render_widget(Paragraph::new(Span::styled("┊", fg(color))).alignment(Alignment::Center), area);
 }
 
-fn tree(f: &mut Frame, area: Rect, j: &Job) {
+fn tree(f: &mut Frame, area: Rect, j: &Job, ui: &Ui) {
     let rows = Layout::vertical([
         Constraint::Length(5),
         Constraint::Length(1),
@@ -596,24 +606,36 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
             ("worker".to_string(), &j.worker)
         };
         let who = s.agent.map(|a| if s.via.is_empty() { a.name().to_string() } else { format!("{} via {}", a.name(), s.via) }).unwrap_or_else(|| "idle".into());
-        output_panel(f, rows[7], &format!("{} output · {}", name, who), s, DIM);
+        let spots = output_panel(f, rows[7], &format!("{} output · {}", name, who), s, DIM);
+        ui.spots.borrow_mut().extend(spots.into_iter().map(|s| crate::diff::Spot { job: j.id, ..s }));
     }
 }
 
-/// Follow the last screenful of rendered rows, including wrapped continuations.
-fn output_panel(f: &mut Frame, area: Rect, title: &str, stage: &Stage, color: Color) {
+/// Follow the last screenful of rendered rows, including wrapped continuations. Returns where the
+/// visible edit lines were drawn, for a click to open their diff (the job is filled in by the caller).
+fn output_panel(f: &mut Frame, area: Rect, title: &str, stage: &Stage, color: Color) -> Vec<crate::diff::Spot> {
     let block = boxed(title, color);
     let inner = block.inner(area);
-    let lines: Vec<Line> = stage.tail.iter().flat_map(|entry| {
-        entry.split('\n').map(|line| {
-            let color = if line.starts_with('▸') { DIM } else if line.starts_with("error") { RED } else { TEXT };
-            Line::from(Span::styled(line, fg(color)))
-        })
+    let raw: Vec<&str> = stage.tail.iter().flat_map(|entry| entry.split('\n')).collect();
+    let lines: Vec<Line> = raw.iter().map(|line| {
+        let color = if line.starts_with('▸') { DIM } else if line.starts_with("error") { RED } else { TEXT };
+        Line::from(Span::styled(*line, fg(color)))
     }).collect();
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
     // Use the widget's own wrapping calculation so Unicode and word boundaries agree.
     let scroll = paragraph.line_count(inner.width).saturating_sub(inner.height as usize).min(u16::MAX as usize) as u16;
     f.render_widget(paragraph.scroll((scroll, 0)).block(block), area);
+    let (mut spots, mut top) = (Vec::new(), 0usize);
+    for (raw, line) in raw.iter().zip(lines) {
+        let rows = Paragraph::new(line).wrap(Wrap { trim: false }).line_count(inner.width);
+        let (start, end) = (top.max(scroll as usize), (top + rows).min(scroll as usize + inner.height as usize));
+        if let (Some(files), true) = (crate::diff::edited_files(raw), start < end) {
+            let area = Rect::new(inner.x, inner.y + (start - scroll as usize) as u16, inner.width, (end - start) as u16);
+            spots.push(crate::diff::Spot { area, job: 0, files });
+        }
+        top += rows;
+    }
+    spots
 }
 
 fn stage_box(f: &mut Frame, area: Rect, role: &str, s: &Stage) {
@@ -804,11 +826,30 @@ mod tests {
     }
 
     #[test]
+    fn edit_lines_are_clickable_where_they_are_drawn() {
+        let mut stage = Stage::default();
+        stage.push("first second third fourth fifth sixth seventh eighth");
+        stage.push("▸ edit /w/crates/a/src/a_long_file_name.rs");
+        stage.push("▸ shell cargo test");
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(22, 12)).unwrap();
+        let mut spots = Vec::new();
+        term.draw(|f| spots = output_panel(f, f.area(), "worker", &stage, GREEN)).unwrap();
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        let buf = term.backend().buffer();
+        let row = |y: u16| (0..22).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        let s = &spots[0];
+        assert!(row(s.area.y).contains("▸ edit"), "{}", row(s.area.y));
+        assert!(s.area.height >= 2, "the wrapped path is part of it: {s:?}");
+        assert!(!row(s.area.y + s.area.height).contains("a_long"), "and nothing below it");
+        assert_eq!(s.files, ["/w/crates/a/src/a_long_file_name.rs"]);
+    }
+
+    #[test]
     fn output_wraps_and_follows_newest_rendered_rows_on_resize() {
         let mut stage = Stage::default();
         stage.push("first second third fourth fifth sixth seventh eighth");
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(22, 8)).unwrap();
-        term.draw(|f| output_panel(f, f.area(), "worker", &stage, GREEN)).unwrap();
+        term.draw(|f| { output_panel(f, f.area(), "worker", &stage, GREEN); }).unwrap();
         let text = to_text(term.backend().buffer());
         assert!(text.contains("first second third"), "{text}");
         assert!(text.contains("fourth fifth sixth"), "{text}");
@@ -817,7 +858,7 @@ mod tests {
         for width in [18, 30, 60] {
             term.backend_mut().resize(width, 5);
             term.resize(Rect::new(0, 0, width, 5)).unwrap();
-            term.draw(|f| output_panel(f, f.area(), "reviewer", &stage, GREEN)).unwrap();
+            term.draw(|f| { output_panel(f, f.area(), "reviewer", &stage, GREEN); }).unwrap();
             let text = to_text(term.backend().buffer());
             assert!(text.contains("FINAL"), "{text}");
             assert!(!text.contains("first second"), "{text}");
@@ -841,7 +882,7 @@ mod tests {
                 assert_eq!(stage.tail.back(), Some(&expected));
                 for width in [22, 40, 80] {
                     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 6)).unwrap();
-                    term.draw(|f| output_panel(f, f.area(), role, &stage, GREEN)).unwrap();
+                    term.draw(|f| { output_panel(f, f.area(), role, &stage, GREEN); }).unwrap();
                     let visible = to_text(term.backend().buffer());
                     assert!(visible.contains("END_SENTINEL"), "{visible}");
                     assert!(!visible.contains('…'), "{visible}");
