@@ -3171,3 +3171,13 @@ fn a_stop_while_an_issue_runs_hands_it_back_to_the_queue() {
     assert!(calls.contains("--remove-label agent:working --add-label agent:ready"), "{}", calls);
     assert!(!calls.contains("agent:needs-human") && !calls.contains("could not finish"), "a stop is nobody's failure:\n{}", calls);
 }
+
+#[test]
+fn an_oversized_agent_event_is_skipped_not_fatal() {
+    // A command with a huge output arrives as one event line; it must not end the job.
+    let cli = "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\ncat >/dev/null\nhead -c 1200000 /dev/zero | tr '\\0' a; echo\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done after a big event\"}'\n";
+    let rig = Rig::with_agents("agent-big-event", "", "", &[("claude", cli)]);
+    let (ok, out) = rig.run(&["run", "--agent", "claude", "fix typo"], &[]);
+    assert!(ok, "{}", out);
+    assert!(!out.contains("exceeded 1 MiB"), "{}", out);
+}

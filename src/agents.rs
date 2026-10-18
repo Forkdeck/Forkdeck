@@ -598,7 +598,22 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
                 break;
             }
         }
-        if raw.len() > proc::OUTPUT_LIMIT { error = "agent event exceeded 1 MiB".into(); group.kill(); break; }
+        if raw.len() > proc::OUTPUT_LIMIT {
+            // One event this big is a tool's whole output (a build log, a file dump), not the
+            // answer: drop the rest of the line, say so, and carry on reading.
+            raw.clear();
+            let mut rest = Vec::new();
+            while !raw.ends_with(b"\n") {
+                rest.clear();
+                match (&mut reader).take((proc::OUTPUT_LIMIT + 1) as u64).read_until(b'\n', &mut rest).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => if rest.ends_with(b"\n") { raw.push(b'\n'); },
+                }
+            }
+            raw.clear();
+            hub.job(job, |j| j.stage(slot).push("▸ (an event over 1 MiB was left out)".to_string()));
+            continue;
+        }
         let owned = String::from_utf8_lossy(&raw).trim().to_string();
         raw.clear();
         let line = owned.as_str();
