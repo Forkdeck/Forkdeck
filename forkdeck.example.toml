@@ -8,10 +8,11 @@
 # examples to uncomment.
 
 [router]
+# "auto":  ask a Jev-compatible decision server at router.jev.base_url when one answers
+#          (scripts/local-jev.sh starts one on this machine), the keyword rules otherwise.
 # "rules": keyword rules, no network.
-# "jev":   a Jev-compatible decision endpoint (POST /v1/systemone). Falls back to
-#          the rules when the endpoint does not answer.
-kind = "rules"
+# "jev":   always ask the decision server; say so when falling back to the rules.
+kind = "auto"
 default_agent = "claude"
 # Answers under this confidence count as "split" and take the cautious branch:
 # the default agent, the next effort tier up, and a review. Between 0.5 and 1.

@@ -42,7 +42,7 @@ pub struct RouterCfg {
 impl Default for RouterCfg {
     fn default() -> Self {
         RouterCfg {
-            kind: "rules".into(),
+            kind: "auto".into(),
             default_agent: AgentKind::Claude,
             threshold: 0.6,
             plan: "auto".into(),
@@ -971,8 +971,8 @@ pub fn host_of(url: &str) -> Option<String> {
 
 impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
-        if !matches!(self.router.kind.as_str(), "rules" | "jev") {
-            anyhow::bail!("router.kind must be \"rules\" or \"jev\", got {:?}", self.router.kind);
+        if !matches!(self.router.kind.as_str(), "rules" | "jev" | "auto") {
+            anyhow::bail!("router.kind must be \"auto\", \"rules\" or \"jev\", got {:?}", self.router.kind);
         }
         if !matches!(self.review.mode.as_str(), "auto" | "always" | "never") {
             anyhow::bail!("review.mode must be auto, always or never");
@@ -1325,7 +1325,7 @@ mod tests {
         let cfg: Config = toml::from_str(EXAMPLE).expect("example parses");
         cfg.validate().unwrap();
         // What `init` writes has to behave like having no config at all.
-        assert_eq!(cfg.router.kind, "rules");
+        assert_eq!(cfg.router.kind, "auto");
         assert!(cfg.repos.is_empty());
         assert!(!cfg.automation.enabled);
         assert_eq!(cfg.agents.get(AgentKind::Claude).models.unwrap().get(Tier::Heavy), "opus");
@@ -1425,7 +1425,7 @@ tool = "rollback"
     fn empty_config_is_valid() {
         let cfg: Config = toml::from_str("").unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.router.kind, "rules");
+        assert_eq!(cfg.router.kind, "auto");
         assert!(!cfg.automation.enabled);
     }
 

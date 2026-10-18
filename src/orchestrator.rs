@@ -411,6 +411,7 @@ impl Hub {
                 checks: None,
                 outcome: String::new(),
                 pr_url: None,
+                pr_open: None,
                 rounds: 0,
                 created: Instant::now(),
                 finished: None,

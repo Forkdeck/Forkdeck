@@ -391,7 +391,9 @@ impl Rig {
         fs::write(
             root.join("home/.config/forkdeck/config.toml"),
             format!(
-                "{}\n[automation]\nworktree_root = \"{}\"\n[[repos]]\nprovider = \"github\"\nrepo = \"o/r\"\npath = \"{}\"\n{}\n",
+                "{}{}\n[automation]\nworktree_root = \"{}\"\n[[repos]]\nprovider = \"github\"\nrepo = \"o/r\"\npath = \"{}\"\n{}\n",
+                // Never whatever decision server happens to run on this machine.
+                if extra_config.contains("[router") { "" } else { "[router]\nkind = \"rules\"\n" },
                 extra_config,
                 root.join("wt").display(),
                 clone.display(),

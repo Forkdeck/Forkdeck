@@ -445,6 +445,9 @@ pub struct Job {
     pub checks: Option<bool>,
     pub outcome: String,
     pub pr_url: Option<String>,
+    /// Whether that pull request is still open, as last asked: None until forkdeck has looked.
+    /// A finished job waits for a person while it is open.
+    pub pr_open: Option<bool>,
     pub rounds: u32,
     pub created: Instant,
     pub finished: Option<Instant>,

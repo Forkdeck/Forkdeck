@@ -21,7 +21,7 @@ pub async fn route(cfg: &Config, http: &reqwest::Client, task: &str, is_issue: b
         d.ms = start.elapsed().as_millis();
         return Routed { decision: d, fell_back: None, asked_jev: true };
     }
-    if cfg.router.kind == "jev" {
+    if cfg.router.kind == "jev" || cfg.router.kind == "auto" {
         match ask_jev(cfg, http, task).await {
             Ok(v) => match from_answers(cfg, &v) {
                 Ok(mut d) => {
@@ -37,6 +37,10 @@ pub async fn route(cfg: &Config, http: &reqwest::Client, task: &str, is_issue: b
             Err(e) => {
                 let mut d = rules(cfg, task, is_issue);
                 d.ms = start.elapsed().as_millis();
+                // "auto" asks a decision server only if one is running: none is not a failure.
+                if cfg.router.kind == "auto" && e.starts_with("cannot connect") {
+                    return Routed { decision: d, fell_back: None, asked_jev: false };
+                }
                 return Routed { decision: d, fell_back: Some(e), asked_jev: true };
             }
         }
@@ -86,6 +90,9 @@ pub fn request_body(cfg: &Config, task: &str) -> Value {
     body
 }
 
+/// The development key scripts/local-jev.sh serves with unless FORKDECK_JEV_KEY says otherwise.
+const LOCAL_DEV_KEY: &str = "forkdeck-local-dev";
+
 async fn ask_jev(cfg: &Config, http: &reqwest::Client, task: &str) -> Result<Value, String> {
     let j = &cfg.router.jev;
     let url = format!("{}/v1/systemone", j.base_url.trim_end_matches('/'));
@@ -93,12 +100,11 @@ async fn ask_jev(cfg: &Config, http: &reqwest::Client, task: &str) -> Result<Val
         .post(&url)
         .timeout(Duration::from_millis(j.timeout_ms))
         .json(&request_body(cfg, task));
-    if !j.api_key_env.is_empty() {
-        if let Ok(key) = std::env::var(&j.api_key_env) {
-            if !key.is_empty() {
-                req = req.bearer_auth(key);
-            }
-        }
+    let key = Some(&j.api_key_env).filter(|n| !n.is_empty()).and_then(|n| std::env::var(n).ok()).filter(|k| !k.is_empty());
+    // With no key set, "auto" on this machine uses the one scripts/local-jev.sh starts its server with.
+    let key = key.or_else(|| (cfg.router.kind == "auto" && crate::orchestrator::is_loopback(&j.base_url)).then(|| LOCAL_DEV_KEY.to_string()));
+    if let Some(key) = key {
+        req = req.bearer_auth(key);
     }
     let resp = req.send().await.map_err(|e| {
         if e.is_timeout() {
@@ -284,6 +290,59 @@ pub fn rules(cfg: &Config, task: &str, is_issue: bool) -> Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A decision server on loopback that answers every request and records the auth header.
+    fn stand_in() -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let s = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 65536];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                *s.lock().unwrap() = req.lines().find(|l| l.to_ascii_lowercase().starts_with("authorization:")).unwrap_or("").to_string();
+                let body = r#"{"answers":{"agent":{"choice":"claude","confidence":0.9},"effort":{"score":1,"confidence":0.9},"review":{"noul":0.9}}}"#;
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            }
+        });
+        (url, seen)
+    }
+
+    fn auto(url: &str) -> Config {
+        let mut cfg = Config::default();
+        cfg.router.jev.base_url = url.into();
+        cfg.router.jev.api_key_env = "FORKDECK_TEST_KEY_THAT_IS_NEVER_SET".into();
+        cfg
+    }
+
+    #[tokio::test]
+    async fn auto_uses_a_local_decision_server_when_one_answers() {
+        let (url, seen) = stand_in();
+        let cfg = auto(&url);
+        assert_eq!(cfg.router.kind, "auto", "the default");
+        let r = route(&cfg, &reqwest::Client::new(), "rename a field", false).await;
+        assert!(r.asked_jev && r.fell_back.is_none(), "{:?}", r.fell_back);
+        assert_eq!(r.decision.agent, AgentKind::Claude);
+        assert!(seen.lock().unwrap().contains("Bearer forkdeck-local-dev"), "the local server's development key: {}", seen.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn auto_without_a_server_uses_the_rules_quietly() {
+        let r = route(&auto("http://127.0.0.1:1"), &reqwest::Client::new(), "fix the failing test", false).await;
+        assert!(!r.asked_jev && r.fell_back.is_none(), "{:?}", r.fell_back);
+    }
+
+    #[tokio::test]
+    async fn jev_without_a_server_says_it_fell_back() {
+        let mut cfg = auto("http://127.0.0.1:1");
+        cfg.router.kind = "jev".into();
+        let r = route(&cfg, &reqwest::Client::new(), "fix the failing test", false).await;
+        assert!(r.fell_back.is_some_and(|e| e.contains("cannot connect")));
+    }
 
     #[test]
     fn rules_review_confidence_obeys_the_threshold() {

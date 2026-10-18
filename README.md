@@ -138,9 +138,13 @@ cost column stays empty, as Copilot bills per request.
 
 ## The fork layer
 
-Two routers ship:
+Two routers ship, and a default that picks between them:
 
-- `rules`: keyword lists from the config. No network. The default.
+- `auto`, the default: asks the decision server at `router.jev.base_url` when
+  one answers, and uses the rules quietly when none is running. On this machine
+  without `FORKDECK_JEV_KEY` set it uses the key `scripts/local-jev.sh` serves
+  with, so starting that server is all it takes.
+- `rules`: keyword lists from the config. No network.
 - `jev`: any server that speaks the Jev wire format (`POST /v1/systemone` with
   `choice`, `score` and `noul` questions). If it does not answer, the rules
   router is used and the interface says so.

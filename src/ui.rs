@@ -205,6 +205,10 @@ fn lane(status: JobStatus) -> usize {
 
 /// The board lane a job's card is in.
 fn job_lane(j: &Job) -> usize {
+    // A pull request still open is work a person has to review, not work that is done.
+    if j.status == JobStatus::Done && j.pr_url.is_some() && j.pr_open != Some(false) {
+        return 3;
+    }
     let status = if j.status == JobStatus::Done && j.issue_plan.as_ref().is_some_and(|p| p.build_job.is_none()) { JobStatus::Planning } else { j.status };
     lane(status)
 }
@@ -224,7 +228,7 @@ fn factory(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
     let narrow = area.width < 120;
     let rows = Layout::vertical([Constraint::Length(if narrow { 14 } else { 9 }), Constraint::Min(4)]).split(area);
     let board_rows = Layout::vertical(vec![Constraint::Ratio(1, if narrow { 2 } else { 1 }); if narrow { 2 } else { 1 }]).split(rows[0]);
-    let names = ["QUEUE", "BUILD", "REVIEW", "DELIVERY", "DONE", "ATTENTION"];
+    let names = ["QUEUE", "BUILD", "REVIEW", "PR REVIEW", "DONE", "ATTENTION"];
     let colors = [PURPLE, ORANGE, PURPLE, ORANGE, GREEN, RED];
     for (index, name) in names.iter().enumerate() {
         let count = if narrow { 3 } else { 6 };
@@ -911,6 +915,28 @@ mod tests {
                 assert!(text.contains("DONE 15"), "{text}");
             }
         }
+    }
+
+    #[test]
+    fn a_finished_job_waits_in_pr_review_until_its_pull_request_closes() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = crate::orchestrator::Hub::new(crate::config::Config::default(), rt.handle().clone());
+        let _slots = rt.block_on(hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel as u32)).unwrap();
+        let id = rt.block_on(hub.submit("t".into(), "t".into(), Source::Manual, PathBuf::from("."), None, Planning::Never)).unwrap();
+        let lane_now = || hub.job(id, |j| job_lane(j)).unwrap();
+        hub.job(id, |j| j.status = JobStatus::Done);
+        assert_eq!(lane_now(), 4, "done without a pull request is done");
+        hub.job(id, |j| j.pr_url = Some("https://github.com/o/r/pull/9".into()));
+        assert_eq!(lane_now(), 3, "a person still has to review it");
+        hub.job(id, |j| j.pr_open = Some(true));
+        assert_eq!(lane_now(), 3);
+        hub.job(id, |j| j.pr_open = Some(false));
+        assert_eq!(lane_now(), 4, "merged or closed");
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40)).unwrap();
+        hub.job(id, |j| j.pr_open = None);
+        let ui = crate::new_ui(&hub, PathBuf::from("."));
+        term.draw(|f| draw(f, &hub.state.lock().unwrap(), &ui)).unwrap();
+        assert!(to_text(term.backend().buffer()).contains("PR REVIEW 1"));
     }
 
     #[test]
