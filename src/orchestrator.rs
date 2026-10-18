@@ -856,7 +856,10 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
     // Handed back to the queue by a teammate: the item and its labels are theirs to move now.
     let released = hub.job(id, |j| j.released).unwrap_or(false);
     if !manual && fin.status != JobStatus::Done && !fin.reported && !released {
-        if cancel.is_shutdown() && fin.status == JobStatus::Cancelled {
+        // A stop or a usage limit says nothing about the work: the item goes back to the queue. On
+        // the next pick-up a limit still in force is met before any work, where the run falls back
+        // to the other agent.
+        if (cancel.is_shutdown() && fin.status == JobStatus::Cancelled) || agents::quota_error(&fin.outcome) {
             issues::hand_back(&hub, id).await;
         } else {
             issues::report_failure(&hub, id, &fin.outcome).await;

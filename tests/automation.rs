@@ -261,7 +261,12 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
 "#;
 
 fn quota_rig(name: &str) -> Rig {
-    let rig = Rig::new(name, "[agents.codex]\ncmd=\"{root}/bin/codex\"\n[review]\nmode=\"always\"", "");
+    quota_rig_with(name, "")
+}
+
+/// As `quota_rig`, with more configuration.
+fn quota_rig_with(name: &str, extra: &str) -> Rig {
+    let rig = Rig::new(name, &format!("[agents.codex]\ncmd=\"{{root}}/bin/codex\"\n[review]\nmode=\"always\"\n{}", extra), "");
     for (name, body) in [("claude", QUOTA_CLAUDE), ("codex", FALLBACK_CODEX)] {
         let path = rig.root.join("bin").join(name);
         fs::write(&path, body).unwrap();
@@ -3187,4 +3192,15 @@ fn an_oversized_agent_event_is_skipped_not_fatal() {
     let (ok, out) = rig.run(&["run", "--agent", "claude", "fix typo"], &[]);
     assert!(ok, "{}", out);
     assert!(!out.contains("exceeded 1 MiB"), "{}", out);
+}
+
+#[test]
+fn a_usage_limit_mid_issue_hands_it_back_instead_of_failing_it() {
+    // The rules send every task to Claude, so the limit is met halfway through its work.
+    let rig = quota_rig_with("quota-issue-partial", "[router.rules]\ncodex_keywords = []");
+    rig.issue();
+    let (_, out) = rig.once(&[("FAKE_PARTIAL", "1")]);
+    let calls = rig.calls();
+    assert!(calls.contains("--remove-label agent:working --add-label agent:ready"), "the next pick-up retries it:\n{}\n{}", calls, out);
+    assert!(!calls.contains("agent:needs-human") && !calls.contains("could not finish"), "a usage limit is nobody's failure:\n{}", calls);
 }
