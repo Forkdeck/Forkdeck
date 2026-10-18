@@ -149,6 +149,7 @@ learn = false
 share = true
 max_learned = 30           # learned rules kept per repository; the oldest make room
 max_chars = 6000           # how much of the notes goes into a prompt
+brief_chars = 30000        # repository brief in front of an issue: layout, manifests, the files it names; 0: off
 
 # Sharing with teammates who run forkdeck on the same repositories. The shared
 # state is comments on GitHub or GitLab; only metadata goes into them (who, which

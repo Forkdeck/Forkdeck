@@ -500,11 +500,14 @@ pub struct KnowledgeCfg {
     pub max_learned: usize,
     /// How much of the notes is put into a prompt.
     pub max_chars: usize,
+    /// Size of the repository brief put in front of an issue's task: its layout, build manifests,
+    /// which instruction files exist, and the files the issue names. 0 leaves it out.
+    pub brief_chars: usize,
 }
 
 impl Default for KnowledgeCfg {
     fn default() -> Self {
-        KnowledgeCfg { enabled: true, learn: false, share: true, max_learned: 30, max_chars: 6000 }
+        KnowledgeCfg { enabled: true, learn: false, share: true, max_learned: 30, max_chars: 6000, brief_chars: 30_000 }
     }
 }
 

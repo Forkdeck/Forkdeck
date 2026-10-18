@@ -16,7 +16,7 @@ use crate::config::RepoCfg;
 use crate::issues;
 use crate::orchestrator::Hub;
 use crate::state::{clip, AgentKind, AgentRef, Provider, Source, Tier};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const LEARNED: &str = "## Learned by forkdeck";
 /// The line the distilling prompt is recognised by. Tests answer it with scripted rules.
@@ -129,23 +129,132 @@ pub fn block(shared: &str, own: &str, max_chars: usize) -> Option<String> {
     ))
 }
 
+/// Build and dependency files, by name, for the common ecosystems: what tells a worker how a
+/// project is put together and built, whatever its language.
+const MANIFESTS: &[&str] = &[
+    "Cargo.toml", "go.mod", "go.work", "package.json", "deno.json", "pyproject.toml", "setup.py", "setup.cfg",
+    "requirements.txt", "Pipfile", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+    "build.sbt", "CMakeLists.txt", "meson.build", "configure.ac", "Makefile", "GNUmakefile", "justfile", "Taskfile.yml",
+    "WORKSPACE", "MODULE.bazel", "BUILD", "BUILD.bazel", "composer.json", "Gemfile", "mix.exs", "Package.swift",
+    "pubspec.yaml", "stack.yaml", "dune-project", "build.zig", "flake.nix", "Dockerfile",
+];
+/// Manifests recognised by extension: .NET projects and solutions, Haskell packages, and the like.
+const MANIFEST_EXTENSIONS: &[&str] = &[".csproj", ".fsproj", ".vbproj", ".sln", ".cabal", ".gemspec", ".nimble"];
+const INSTRUCTIONS: &[&str] = &["AGENTS.md", "CLAUDE.md", "GEMINI.md"];
+
+/// What a worker would otherwise spend its first turns finding out, each turn sending the whole
+/// conversation again: the layout, the build manifests, which instruction files exist, and the
+/// files the task names. `read` gives a tracked file's contents on the base commit.
+pub fn brief_from(files: &[String], read: impl Fn(&str) -> Option<String>, task: &str, max_chars: usize) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    let mut dirs: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut top = Vec::new();
+    for f in files {
+        match f.rsplit_once('/') {
+            Some((dir, _)) => *dirs.entry(dir.split('/').take(3).collect::<Vec<_>>().join("/")).or_default() += 1,
+            None => top.push(f.as_str()),
+        }
+    }
+    let mut map: Vec<String> = dirs.iter().map(|(d, n)| format!("{}/ ({} file{})", d, n, if *n == 1 { "" } else { "s" })).collect();
+    if map.len() > 150 {
+        let more = map.len() - 150;
+        map.truncate(150);
+        map.push(format!("... {} more directories", more));
+    }
+    let is_manifest = |f: &str| { let b = base(f); MANIFESTS.contains(&b.as_str()) || MANIFEST_EXTENSIONS.iter().any(|e| b.ends_with(e)) };
+    let manifests: Vec<&str> = files.iter().map(String::as_str).filter(|f| is_manifest(f)).take(40).collect();
+    let mut guides: Vec<&str> = files.iter().map(String::as_str).filter(|f| INSTRUCTIONS.contains(&base(f).as_str())).collect();
+    if files.iter().any(|f| f == SHARED) { guides.push(SHARED); }
+
+    let mut out = format!(
+        "Repository brief, from the base commit of this working tree. It is here so you do not have to look these \
+         things up: use it instead of listing the tree, opening build manifests to find the layout, or searching \
+         for instruction files.\n\n\
+         Instruction and notes files: {}. Your CLI loads its own instruction file and the notes are given above; \
+         do not search for them.\n\n\
+         Top-level files: {}\n\nLayout (tracked files, three levels):\n{}\n\nBuild manifests: {}\n",
+        if guides.is_empty() { "none".into() } else { guides.join(", ") },
+        top.join(", "),
+        map.join("\n"),
+        if manifests.is_empty() { "none".into() } else { manifests.join(", ") },
+    );
+
+    let named = named_files(files, task);
+    if !named.is_empty() {
+        out.push_str("\nFiles the task names, as they are on the base commit (read them here, not again):\n");
+        for path in named {
+            let room = max_chars.saturating_sub(out.chars().count() + path.len() + 40);
+            if room < 200 {
+                out.push_str(&format!("\n===== {} (left out: no room)\n", path));
+                continue;
+            }
+            let Some(text) = read(&path) else { continue };
+            let cut = text.chars().count() > room;
+            let text: String = text.chars().take(room).collect();
+            out.push_str(&format!("\n===== {}{}\n{}\n", path, if cut { " (cut short; read the rest if you need it)" } else { "" }, text));
+        }
+    }
+    Some(out)
+}
+
+/// Tracked files the task names, by link or path, in the order named. A name that fits more
+/// than one file names none of them.
+fn named_files(files: &[String], task: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for token in task.split(|c: char| c.is_whitespace() || "`()[]<>\"',".contains(c)) {
+        let token = match token.split_once("/blob/") {
+            Some((_, rest)) => rest.split_once('/').map(|(_, p)| p).unwrap_or(""),
+            None => token,
+        };
+        let token = token.split('#').next().unwrap_or("").trim_start_matches("./").trim_end_matches(['.', ':', ';']);
+        if token.len() < 3 || !(token.contains('/') || token.contains('.')) || token == SHARED {
+            continue;
+        }
+        let hits: Vec<&String> = match files.iter().find(|f| *f == token) {
+            Some(exact) => vec![exact],
+            None => files.iter().filter(|f| f.ends_with(&format!("/{}", token))).collect(),
+        };
+        if let [one] = hits[..] {
+            if !found.contains(one) { found.push(one.clone()); }
+        }
+    }
+    found
+}
+
+/// The brief for a working tree, from its HEAD commit.
+pub async fn brief(dir: &Path, task: &str, max_chars: usize) -> Option<String> {
+    let (dir, task) = (dir.to_path_buf(), task.to_string());
+    tokio::task::spawn_blocking(move || {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(&dir).args(args).stderr(std::process::Stdio::null()).output().ok()
+                .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        };
+        let files: Vec<String> = git(&["ls-tree", "-r", "--name-only", "HEAD"])?.lines().map(str::to_string).collect();
+        brief_from(&files, |p| git(&["show", &format!("HEAD:{}", p)]), &task, max_chars)
+    }).await.ok().flatten()
+}
+
 /// The task with the repository's notes in front of it. They come first because they are the
 /// same for every job on the repository, which is the part a model's context cache can reuse.
 pub async fn with_notes(hub: &Hub, id: u32, task: String) -> String {
-    if !hub.cfg.knowledge.enabled || hub.cfg.demo {
+    if hub.cfg.demo {
         return task;
     }
-    let repo = hub
+    let job = hub
         .job(id, |j| match &j.source {
-            Source::Issue { repo_idx, .. } => hub.cfg.repos.get(*repo_idx).cloned(),
+            Source::Issue { repo_idx, .. } => hub.cfg.repos.get(*repo_idx).cloned().map(|r| (r, j.workdir.clone())),
             _ => None,
         })
         .flatten();
-    let Some(r) = repo else { return task };
-    match block(&shared(&r).await, &load(&r), hub.cfg.knowledge.max_chars) {
-        Some(b) => format!("{}\n\n{}", b, task),
-        None => task,
-    }
+    let Some((r, dir)) = job else { return task };
+    let k = &hub.cfg.knowledge;
+    let notes = if k.enabled { block(&shared(&r).await, &load(&r), k.max_chars) } else { None };
+    // After the notes and before the task: the same for every job on one base commit.
+    let brief = if k.brief_chars > 0 { brief(&dir, &task, k.brief_chars).await } else { None };
+    [notes, brief, Some(task)].into_iter().flatten().collect::<Vec<_>>().join("\n\n")
 }
 
 fn norm(s: &str) -> String {
@@ -501,6 +610,63 @@ async fn propose(hub: &Hub, idx: usize, r: &RepoCfg, items: &[(String, String)])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mixed repository: no language is special.
+    fn tree() -> Vec<String> {
+        ["README.md", "AGENTS.md", ".forkdeck/notes.md",
+         "server/go.mod", "server/cmd/api/main.go", "server/internal/store/store.go", "server/internal/store/store_test.go",
+         "android/build.gradle.kts", "android/app/src/Main.java",
+         "engine/CMakeLists.txt", "engine/src/graph.cpp", "engine/include/graph.h",
+         "tools/pyproject.toml", "tools/gen/graph.py", "tools/gen/__init__.py",
+         "firmware/Makefile", "firmware/src/main.c",
+         "desktop/Desktop.csproj", "desktop/App.cs",
+         "docs/design/capacity.md"].iter().map(|s| s.to_string()).collect()
+    }
+
+    fn read(path: &str) -> Option<String> {
+        Some(format!("contents of {}", path))
+    }
+
+    #[test]
+    fn the_brief_maps_any_project_and_says_what_not_to_look_for() {
+        let b = brief_from(&tree(), read, "Fix it.", 30_000).unwrap();
+        assert!(b.contains("server/internal/store/ (2 files)") && b.contains("engine/src/ (1 file)"), "{b}");
+        for m in ["server/go.mod", "android/build.gradle.kts", "engine/CMakeLists.txt", "tools/pyproject.toml", "firmware/Makefile", "desktop/Desktop.csproj"] {
+            assert!(b.contains(m), "{m} is a build manifest: {b}");
+        }
+        assert!(!b.contains("main.go,") && !b.contains("Build manifests: README.md"), "{b}");
+        assert!(b.contains("AGENTS.md") && b.contains("do not search for them"), "{b}");
+        assert!(!b.contains("contents of"), "nothing named, nothing inlined: {b}");
+    }
+
+    #[test]
+    fn files_the_task_names_are_inlined_once_and_only_when_unambiguous() {
+        let task = "See [design](https://github.com/o/r/blob/main/docs/design/capacity.md#gates), \
+                    `server/internal/store/store.go`, `include/graph.h` and `graph.py`. Again: `server/internal/store/store.go`. \
+                    Not `graph`, which is no file.";
+        let b = brief_from(&tree(), read, task, 30_000).unwrap();
+        assert_eq!(b.matches("contents of docs/design/capacity.md").count(), 1, "{b}");
+        assert_eq!(b.matches("contents of server/internal/store/store.go").count(), 1, "named twice, given once: {b}");
+        assert!(b.contains("contents of engine/include/graph.h"), "a unique suffix is enough: {b}");
+        assert!(b.contains("contents of tools/gen/graph.py"), "{b}");
+        assert!(!b.contains("contents of engine/src/graph.cpp"), "{b}");
+    }
+
+    #[test]
+    fn a_name_that_fits_two_files_inlines_neither() {
+        let mut files = tree();
+        files.push("tools/old/graph.py".into());
+        let b = brief_from(&files, read, "`graph.py`", 30_000).unwrap();
+        assert!(!b.contains("contents of"), "{b}");
+    }
+
+    #[test]
+    fn the_brief_stays_within_its_budget() {
+        let big = |p: &str| Some(format!("{} {}", p, "x".repeat(50_000)));
+        let b = brief_from(&tree(), big, "`engine/src/graph.cpp` `firmware/src/main.c`", 8_000).unwrap();
+        assert!(b.chars().count() <= 9_000, "{}", b.chars().count());
+        assert!(b.contains("cut short"), "a clipped file says so");
+    }
 
     #[test]
     fn notes_cannot_close_their_frame_and_keep_following_prose() {

@@ -1964,6 +1964,9 @@ fn the_teams_notes_come_from_the_base_branch_and_lead_the_prompt() {
     let seen = fs::read_to_string(&prompts).unwrap();
     assert!(seen.contains("<notes>\n- Money is integer cents, never floats.\n\n- My own reminder.\n</notes>"), "{}", seen);
     assert!(seen.find("<notes>").unwrap() < seen.find("Resolve issue #7").unwrap(), "what every job shares comes first");
+    let brief = seen.find("Repository brief").expect("the worker is given the repository brief");
+    assert!(seen.find("</notes>").unwrap() < brief && brief < seen.find("Resolve issue #7").unwrap(), "{}", seen);
+    assert!(seen.contains(".forkdeck/notes.md") && seen.contains("do not search for them"), "{}", seen);
     let (ok, out) = rig.run(&["notes", "o/r"], &[]);
     assert!(ok && out.contains("the team's notes: .forkdeck/notes.md on main") && out.contains("Money is integer cents") && out.contains("My own reminder"), "{}", out);
 }
