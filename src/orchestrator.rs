@@ -46,6 +46,19 @@ pub struct Hub {
     builds: Arc<Semaphore>,
     /// Agent slots of admitted jobs, by job, so a job can lend its slot out while it builds.
     parked: Arc<Mutex<std::collections::HashMap<u32, tokio::sync::OwnedSemaphorePermit>>>,
+    /// New jobs queue for a slot one at a time, so a job back from building is never behind them.
+    entry: Arc<tokio::sync::Mutex<()>>,
+    /// Jobs waiting to take an agent slot again after building.
+    returning: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Counts a job waiting to take its agent slot back, until it has one or gives up.
+struct Returning(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Returning {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Counts a `run_job` from its start until it returns, whichever way it does.
@@ -114,7 +127,30 @@ impl Hub {
             input_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             builds: Arc::new(Semaphore::new(builds)),
             parked: Arc::new(Mutex::new(Default::default())),
+            entry: Arc::new(tokio::sync::Mutex::new(())),
+            returning: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// An agent slot for a job starting out. A job back from building goes first: it has done most
+    /// of its work and only needs its review, and must not wait behind every job still queued.
+    pub async fn admit_slot(&self) -> tokio::sync::OwnedSemaphorePermit {
+        let _entry = self.entry.lock().await;
+        loop {
+            let p = self.sem.clone().acquire_owned().await.expect("the slot semaphore is never closed");
+            if self.returning.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return p;
+            }
+            // Handing it straight back gives it to the job that is waiting to return.
+            drop(p);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn return_slot(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.returning.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _waiting = Returning(self.returning.clone());
+        self.sem.clone().acquire_owned().await.expect("the slot semaphore is never closed")
     }
 
     /// Keep an admitted job's agent slot where `run_checks` can lend it out.
@@ -749,14 +785,12 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
         let wait = async {
             // Lane first: a typed task waiting for the shared directory must not hold a slot issue jobs could use.
             let lane = if manual { Some(hub.lane.clone().lock_owned().await) } else { None };
-            let permit = hub.sem.clone().acquire_owned().await;
+            let permit = hub.admit_slot().await;
             (permit, lane)
         };
         tokio::select! {
             (permit, _lane) = wait => {
-                if let Ok(p) = permit {
-                    hub.park_slot(id, p);
-                }
+                hub.park_slot(id, permit);
                 hub.job(id, |j| j.admitted = true);
                 // One issue or review may only run so long. A deployment has its own time limits,
                 // and stopping one halfway is worse than letting it finish.
@@ -1120,7 +1154,7 @@ pub async fn run_checks_detailed(hub: &Hub, id: u32, cmds: &[String], dir: &Path
     };
     if lent {
         tokio::select! {
-            p = hub.sem.clone().acquire_owned() => if let Ok(p) = p { hub.park_slot(id, p) },
+            p = hub.return_slot() => hub.park_slot(id, p),
             _ = cancel.wait() => {}
         }
     }
@@ -2414,6 +2448,29 @@ mod tests {
         assert_eq!(hub.sem.available_permits(), 0, "job 7 has its slot back after building");
         drop(hub.unpark_slot(7));
         assert_eq!(hub.sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_job_back_from_building_goes_before_new_jobs() {
+        let cfg = Config { automation: crate::config::AutoCfg { max_parallel: 1, ..Default::default() }, ..unloaded() };
+        let hub = Hub::new(cfg, tokio::runtime::Handle::current());
+        hub.park_slot(7, hub.admit_slot().await);
+        let dir = scratch("priority");
+        let h = hub.clone();
+        let check = tokio::spawn(async move { run_checks_detailed(&h, 7, &["sleep 0.3".to_string()], &dir, &Cancel::new()).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A new job takes the lent slot and keeps it past the end of the build; another waits.
+        let first = hub.admit_slot().await;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (h, o) = (hub.clone(), order.clone());
+        let second = tokio::spawn(async move { let p = h.admit_slot().await; o.lock().unwrap().push("new job"); drop(p); });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(first);
+        assert!(matches!(check.await.unwrap(), Some(Checked::Passed)));
+        order.lock().unwrap().push("back from building");
+        drop(hub.unpark_slot(7));
+        second.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), ["back from building", "new job"]);
     }
 
     #[cfg(target_os = "linux")]
