@@ -44,6 +44,9 @@ light_keywords = ["typo", "rename", "comment", "bump", "format", "lint", "wordin
 
 [agents]
 timeout_mins = 45
+# Without your own plugins, hooks and MCP servers (the repository's settings still apply):
+# they add thousands of tokens to every call an agent makes. false loads them.
+lean = true
 
 [agents.claude]
 cmd = "claude"

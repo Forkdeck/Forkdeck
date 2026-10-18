@@ -108,6 +108,17 @@ pub struct AgentsCfg {
     pub codex: AgentCfg,
     pub copilot: CopilotCfg,
     pub timeout_mins: Option<u64>,
+    /// Run agents without the user's own plugins, hooks and MCP servers (the repository's own
+    /// settings still apply). They add tens of thousands of tokens to every call. Default on.
+    pub lean: Option<bool>,
+    /// Fill unset model tiers from the models each CLI lists for the account. Default on.
+    pub discover_models: Option<bool>,
+}
+
+impl AgentsCfg {
+    pub fn lean(&self) -> bool {
+        self.lean.unwrap_or(true)
+    }
 }
 
 /// `[agents.copilot]`: the CLI's own settings plus the profiles it can run.

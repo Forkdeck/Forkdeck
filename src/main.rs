@@ -239,7 +239,9 @@ fn main() -> anyhow::Result<()> {
     }
     cfg.demo = cli.demo;
     if !cfg.demo {
-        let chosen = catalog::fill_codex(&mut cfg);
+        // Only where agents may run: asking the CLI takes a moment.
+        let agents_run = matches!(cli.cmd, None | Some(Cmd::Once) | Some(Cmd::Run { .. }) | Some(Cmd::Resume) | Some(Cmd::Doctor));
+        let chosen = if agents_run && cfg.agents.discover_models.unwrap_or(true) { catalog::fill_codex(&mut cfg) } else { vec![] };
         if !chosen.is_empty() && matches!(cli.cmd, Some(Cmd::Doctor)) {
             println!("models    codex: {}", chosen.join(", "));
         }

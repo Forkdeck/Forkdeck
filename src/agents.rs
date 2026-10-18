@@ -189,6 +189,10 @@ pub fn command_line(cfg: &Config, spec: &RunSpec) -> CmdLine {
             if !e.effort.is_empty() {
                 args.extend(["--effort".to_string(), e.effort.clone()]);
             }
+            // The user's plugins, hooks and MCP servers are theirs, not the job's.
+            if cfg.agents.lean() && !extra.iter().any(|a| a.starts_with("--setting-sources") || a.starts_with("--mcp-config")) {
+                args.extend(["--strict-mcp-config", "--setting-sources", "project,local"].map(String::from));
+            }
             args.extend(extra);
         }
         AgentKind::Codex => {
@@ -203,6 +207,9 @@ pub fn command_line(cfg: &Config, spec: &RunSpec) -> CmdLine {
             }
             if !e.effort.is_empty() {
                 args.extend(["-c".to_string(), format!("model_reasoning_effort=\"{}\"", e.effort)]);
+            }
+            if cfg.agents.lean() {
+                args.extend(["-c".to_string(), "mcp_servers={}".to_string()]);
             }
             match resume {
                 Some((id, x)) => {
@@ -1119,6 +1126,25 @@ mod tests {
 
     fn exec_for(cli: AgentKind, model: &str) -> Exec {
         Exec { asked: crate::state::AgentRef::Kind(cli), cli, family: cli, via: None, model: model.into(), effort: String::new(), vendor: crate::pick::Vendor::Unknown }
+    }
+
+    #[test]
+    fn agents_run_lean_unless_told_otherwise() {
+        let dir = Path::new("/tmp");
+        let line = |cfg: &Config, cli| {
+            let e = exec_for(cli, "m");
+            command_line(cfg, &RunSpec { exec: &e, prompt: "p", dir, read_only: false, resume: None }).args
+        };
+        let lean: Config = toml::from_str("").unwrap();
+        let c = line(&lean, AgentKind::Claude);
+        assert!(c.contains(&"--strict-mcp-config".to_string()), "{c:?}");
+        let at = c.iter().position(|a| a == "--setting-sources").expect("user plugins and hooks left out");
+        assert_eq!(c[at + 1], "project,local");
+        let x = line(&lean, AgentKind::Codex);
+        assert!(x.windows(2).any(|w| w[0] == "-c" && w[1] == "mcp_servers={}"), "{x:?}");
+        let full: Config = toml::from_str("[agents]\nlean = false").unwrap();
+        assert!(!line(&full, AgentKind::Claude).contains(&"--strict-mcp-config".to_string()));
+        assert!(!line(&full, AgentKind::Codex).iter().any(|a| a == "mcp_servers={}"));
     }
 
     #[test]

@@ -2481,7 +2481,11 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let (h, o) = (hub.clone(), order.clone());
         let second = tokio::spawn(async move { let p = h.admit_slot().await; o.lock().unwrap().push("new job"); drop(p); });
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Hand the slot back only once job 7 has finished building and is waiting for it.
+        while hub.returning.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
         drop(first);
         assert!(matches!(check.await.unwrap(), Some(Checked::Passed)));
         order.lock().unwrap().push("back from building");

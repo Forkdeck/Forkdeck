@@ -388,12 +388,17 @@ impl Rig {
         git(&clone, &["push", "-q", "origin", "HEAD:main"]);
         fs::write(root.join("gh/issues.json"), "[]").unwrap();
         fs::write(root.join("gh/prs.json"), "[]").unwrap();
+        // Never whatever decision server happens to run on this machine, and stand-in CLIs have
+        // no model catalog to ask.
+        let pinned = [
+            if extra_config.contains("[router") { "" } else { "[router]\nkind = \"rules\"\n" },
+            if extra_config.contains("[agents]") { "" } else { "[agents]\ndiscover_models = false\n" },
+        ].concat();
         fs::write(
             root.join("home/.config/forkdeck/config.toml"),
             format!(
                 "{}{}\n[automation]\nworktree_root = \"{}\"\n[[repos]]\nprovider = \"github\"\nrepo = \"o/r\"\npath = \"{}\"\n{}\n",
-                // Never whatever decision server happens to run on this machine.
-                if extra_config.contains("[router") { "" } else { "[router]\nkind = \"rules\"\n" },
+                pinned,
                 extra_config,
                 root.join("wt").display(),
                 clone.display(),

@@ -79,6 +79,27 @@ pub fn codex_installed(cmd: &str) -> Vec<Model> {
         .filter(|o| o.status.success()).map(|o| codex_models(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default()
 }
 
+/// Fill the Codex tiers the user left unset from the models Codex lists for this account, so
+/// light, standard and heavy work go to different models instead of one default at three efforts.
+/// Returns what was chosen, for the startup log.
+pub fn fill_codex(cfg: &mut crate::config::Config) -> Vec<String> {
+    let cmd = cfg.agents.codex.cmd.clone().unwrap_or_else(|| "codex".into());
+    let found = tiers(&codex_installed(&cmd));
+    let models = cfg.agents.codex.models.get_or_insert_with(Default::default);
+    let unset = |v: &Option<String>| v.as_deref().is_none_or(str::is_empty);
+    let mut chosen = Vec::new();
+    let mut efforts = cfg.agents.codex.efforts.clone().unwrap_or_default();
+    for (i, slot) in [&mut models.light, &mut models.standard, &mut models.heavy].into_iter().enumerate() {
+        if let (true, Some((model, effort))) = (unset(slot), &found[i]) {
+            *slot = Some(model.clone());
+            let e = [&mut efforts.light, &mut efforts.standard, &mut efforts.heavy][i].get_or_insert_with(|| effort.clone()).clone();
+            chosen.push(format!("{} {} ({})", ["light", "standard", "heavy"][i], model, e));
+        }
+    }
+    cfg.agents.codex.efforts = Some(efforts);
+    chosen
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,25 +145,4 @@ mod tests {
         assert!(codex_models("not json").is_empty());
         assert_eq!(tiers(&[]), [None, None, None]);
     }
-}
-
-/// Fill the Codex tiers the user left unset from the models Codex lists for this account, so
-/// light, standard and heavy work go to different models instead of one default at three efforts.
-/// Returns what was chosen, for the startup log.
-pub fn fill_codex(cfg: &mut crate::config::Config) -> Vec<String> {
-    let cmd = cfg.agents.codex.cmd.clone().unwrap_or_else(|| "codex".into());
-    let found = tiers(&codex_installed(&cmd));
-    let models = cfg.agents.codex.models.get_or_insert_with(Default::default);
-    let unset = |v: &Option<String>| v.as_deref().is_none_or(str::is_empty);
-    let mut chosen = Vec::new();
-    let mut efforts = cfg.agents.codex.efforts.clone().unwrap_or_default();
-    for (i, slot) in [&mut models.light, &mut models.standard, &mut models.heavy].into_iter().enumerate() {
-        if let (true, Some((model, effort))) = (unset(slot), &found[i]) {
-            *slot = Some(model.clone());
-            let e = [&mut efforts.light, &mut efforts.standard, &mut efforts.heavy][i].get_or_insert_with(|| effort.clone()).clone();
-            chosen.push(format!("{} {} ({})", ["light", "standard", "heavy"][i], model, e));
-        }
-    }
-    cfg.agents.codex.efforts = Some(efforts);
-    chosen
 }
