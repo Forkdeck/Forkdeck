@@ -14,6 +14,7 @@ pub struct Config {
     pub automation: AutoCfg,
     pub team: TeamCfg,
     pub limits: LimitsCfg,
+    pub resources: ResourcesCfg,
     pub knowledge: KnowledgeCfg,
     pub remote: RemoteCfg,
     /// MCP servers by name. CI and deployment stages call tools on these.
@@ -383,6 +384,27 @@ impl Default for AutoCfg {
             draft: true,
             publish_on_failed_review: false,
         }
+    }
+}
+
+/// How much of this machine forkdeck may take. Agent turns mostly wait on a model; checks build
+/// and test, and several at once can starve the machine and fail timing-sensitive tests.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResourcesCfg {
+    /// Checks that may run at the same time. A job waiting for one lends its agent slot to other
+    /// jobs meanwhile.
+    pub builds: usize,
+    /// Niceness for checks and agent processes, so the machine stays usable. 0 leaves it alone.
+    pub nice: i32,
+    /// A check does not start while the one-minute load average is above this many times the
+    /// number of CPUs. 0 switches the wait off.
+    pub max_load: f64,
+}
+
+impl Default for ResourcesCfg {
+    fn default() -> Self {
+        ResourcesCfg { builds: 1, nice: 10, max_load: 1.0 }
     }
 }
 
@@ -976,6 +998,15 @@ impl Config {
         }
         if self.team.refresh_secs < 30 {
             anyhow::bail!("team.refresh_secs must be at least 30");
+        }
+        if self.resources.builds == 0 {
+            anyhow::bail!("resources.builds must be at least 1");
+        }
+        if !(0..=19).contains(&self.resources.nice) {
+            anyhow::bail!("resources.nice must be between 0 and 19");
+        }
+        if !(self.resources.max_load.is_finite() && self.resources.max_load >= 0.0) {
+            anyhow::bail!("resources.max_load must be 0 or more");
         }
         if !(1..=24 * 60).contains(&self.review.check_timeout_mins) {
             anyhow::bail!("review.check_timeout_mins must be between 1 and 1440");

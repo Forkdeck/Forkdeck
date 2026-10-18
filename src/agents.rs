@@ -533,7 +533,10 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
     };
     let run_dir = mirror.as_deref().or(scratch.as_ref().map(|s| s.0.as_path())).unwrap_or(dir);
     let cmd = program_for(cmd, read_only);
-    let mut child = match proc::command(&cmd)
+    let mut command = proc::command(&cmd);
+    // Agents build and test too; whatever they start must not starve the machine.
+    proc::lower_priority(&mut command, hub.cfg.resources.nice);
+    let mut child = match command
         .args(args)
         .current_dir(run_dir)
         .stdin(Stdio::piped())

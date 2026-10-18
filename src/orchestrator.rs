@@ -42,6 +42,10 @@ pub struct Hub {
     admission: Arc<tokio::sync::Mutex<()>>,
     saved: Arc<Mutex<std::collections::HashMap<u32, crate::history::JobRecord>>>,
     pub input_closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Checks that may build at once (resources.builds).
+    builds: Arc<Semaphore>,
+    /// Agent slots of admitted jobs, by job, so a job can lend its slot out while it builds.
+    parked: Arc<Mutex<std::collections::HashMap<u32, tokio::sync::OwnedSemaphorePermit>>>,
 }
 
 /// Counts a `run_job` from its start until it returns, whichever way it does.
@@ -76,6 +80,7 @@ impl Hub {
             st.repos.push(RepoStatus { name: r.repo.clone(), label: r.label.clone(), ..RepoStatus::default() });
         }
         let par = cfg.automation.max_parallel.max(1);
+        let builds = cfg.resources.builds.max(1);
         // A decision server on this machine must not be reached through HTTP_PROXY: that would hand
         // the key and the task text to the proxy.
         let mut http = reqwest::Client::builder();
@@ -107,7 +112,19 @@ impl Hub {
             admission: Arc::new(tokio::sync::Mutex::new(())),
             saved: Arc::new(Mutex::new(Default::default())),
             input_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            builds: Arc::new(Semaphore::new(builds)),
+            parked: Arc::new(Mutex::new(Default::default())),
         }
+    }
+
+    /// Keep an admitted job's agent slot where `run_checks` can lend it out.
+    pub fn park_slot(&self, id: u32, permit: tokio::sync::OwnedSemaphorePermit) {
+        self.parked.lock().unwrap_or_else(|e| e.into_inner()).insert(id, permit);
+    }
+
+    /// The job's agent slot, taken back when the job ends.
+    pub fn unpark_slot(&self, id: u32) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.parked.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)
     }
 
     /// Keep jobs in the history database. Only the program itself does this, never a test that
@@ -712,6 +729,7 @@ pub async fn run_job(hub: Hub, id: u32) {
             Ok(true) => continue,
             Ok(false) => return,
             Err(e) => {
+                drop(hub.unpark_slot(id));
                 hub.job(id, |j| { j.status = JobStatus::Failed; j.outcome = format!("job ended abnormally: {}", e); j.finished = Some(Instant::now()); j.worktree_lock = None; });
                 hub.save(id);
                 hub.log("queue", format!("#{} failed: job ended abnormally: {}", id, e));
@@ -735,7 +753,10 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
             (permit, lane)
         };
         tokio::select! {
-            _held = wait => {
+            (permit, _lane) = wait => {
+                if let Ok(p) = permit {
+                    hub.park_slot(id, p);
+                }
                 hub.job(id, |j| j.admitted = true);
                 // One issue or review may only run so long. A deployment has its own time limits,
                 // and stopping one halfway is worse than letting it finish.
@@ -777,6 +798,7 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
             _ = cancel.wait() => cancelled(),
         }
     };
+    drop(hub.unpark_slot(id));
     // A cancel that arrives late still makes the job "cancelled", but what was already written up stays written up.
     // What was already written up keeps its own account of what happened (a rollback that could not be
     // confirmed must not be reduced to the word "cancelled").
@@ -1078,10 +1100,63 @@ pub async fn run_checks_detailed(hub: &Hub, id: u32, cmds: &[String], dir: &Path
         hub.job(id, |j| j.checks = Some(true));
         return Some(Checked::Passed);
     }
+    // Building is the heavy part. While this job waits for a build slot and builds, its agent
+    // slot goes to another job's agent turn; it takes one again to carry on afterwards.
+    let lent = hub.unpark_slot(id).is_some();
+    let build = tokio::select! {
+        b = async {
+            wait_for_machine(hub, id, cancel).await;
+            hub.builds.clone().acquire_owned().await
+        } => b.ok(),
+        _ = cancel.wait() => None,
+    };
+    let res = match build {
+        Some(_build) => run_check_cmds(hub, id, cmds, dir, cancel).await,
+        None => Some(Checked::Errored("cancelled before the checks ran".into())),
+    };
+    if lent {
+        tokio::select! {
+            p = hub.sem.clone().acquire_owned() => if let Ok(p) = p { hub.park_slot(id, p) },
+            _ = cancel.wait() => {}
+        }
+    }
+    res
+}
+
+/// Whether the machine is already busier than forkdeck should add to: the one-minute load above
+/// `max_load` times the CPUs. Without a load figure, or with `max_load` 0, it never is.
+fn machine_busy(load: Option<f64>, cpus: usize, max_load: f64) -> bool {
+    max_load > 0.0 && load.is_some_and(|l| l > max_load * cpus as f64)
+}
+
+fn load_average() -> Option<f64> {
+    std::fs::read_to_string("/proc/loadavg").ok()?.split_whitespace().next()?.parse().ok()
+}
+
+/// Hold a check back while the machine is overloaded, for at most ten minutes: a machine that
+/// stays busy for other reasons must not stop every job.
+async fn wait_for_machine(hub: &Hub, id: u32, cancel: &Cancel) {
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let until = Instant::now() + Duration::from_secs(600);
+    let mut said = false;
+    while Instant::now() < until && machine_busy(load_average(), cpus, hub.cfg.resources.max_load) {
+        if !said {
+            hub.log("checks", format!("#{} waiting: load {:.0} on {} CPUs", id, load_average().unwrap_or(0.0), cpus));
+            said = true;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            _ = cancel.wait() => return,
+        }
+    }
+}
+
+async fn run_check_cmds(hub: &Hub, id: u32, cmds: &[String], dir: &Path, cancel: &Cancel) -> Option<Checked> {
     let limit = Duration::from_secs(hub.cfg.review.check_timeout_mins.clamp(1, 24 * 60) * 60);
     for c in cmds {
         let mut cmd = proc::command("sh");
         cmd.args(["-c", c]).current_dir(dir);
+        proc::lower_priority(&mut cmd, hub.cfg.resources.nice);
         // Losing the select drops the command's process group guard, which stops the whole check.
         let res = tokio::select! {
             r = proc::output_code(cmd, limit) => r,
@@ -2274,6 +2349,64 @@ mod tests {
             }
         }).await.unwrap();
         hub.job(id, |j| { assert_eq!(j.status, JobStatus::Failed); assert!(j.outcome.contains("ended abnormally")); });
+    }
+
+    fn unloaded() -> Config {
+        Config { resources: crate::config::ResourcesCfg { max_load: 0.0, ..Default::default() }, ..Config::default() }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("forkdeck-checks-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn builds_take_turns() {
+        let hub = Hub::new(unloaded(), tokio::runtime::Handle::current());
+        let dir = scratch("turns");
+        // Fails if another check holds the lock directory at the same time.
+        let cmds = vec!["mkdir held && sleep 0.4 && rmdir held".to_string()];
+        let (c1, c2) = (Cancel::new(), Cancel::new());
+        let (a, b) = tokio::join!(run_checks_detailed(&hub, 1, &cmds, &dir, &c1), run_checks_detailed(&hub, 2, &cmds, &dir, &c2));
+        assert!(matches!(a, Some(Checked::Passed)) && matches!(b, Some(Checked::Passed)), "two checks ran at once");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_job_building_lends_its_agent_slot_out() {
+        let cfg = Config { automation: crate::config::AutoCfg { max_parallel: 1, ..Default::default() }, ..unloaded() };
+        let hub = Hub::new(cfg, tokio::runtime::Handle::current());
+        hub.park_slot(7, hub.sem.clone().acquire_owned().await.unwrap());
+        let dir = scratch("lend");
+        let h = hub.clone();
+        let check = tokio::spawn(async move { run_checks_detailed(&h, 7, &["sleep 0.5".to_string()], &dir, &Cancel::new()).await });
+        // Another job's agent turn gets the only slot while job 7 builds.
+        let other = tokio::time::timeout(Duration::from_millis(400), hub.sem.clone().acquire_owned()).await.expect("slot lent out").unwrap();
+        drop(other);
+        assert!(matches!(check.await.unwrap(), Some(Checked::Passed)));
+        assert_eq!(hub.sem.available_permits(), 0, "job 7 has its slot back after building");
+        drop(hub.unpark_slot(7));
+        assert_eq!(hub.sem.available_permits(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn checks_run_at_low_priority() {
+        let hub = Hub::new(unloaded(), tokio::runtime::Handle::current());
+        let dir = scratch("nice");
+        let cmds = vec!["test \"$(awk '{print $19}' /proc/self/stat)\" -ge 10".to_string()];
+        assert!(matches!(run_checks_detailed(&hub, 1, &cmds, &dir, &Cancel::new()).await, Some(Checked::Passed)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_busy_machine_holds_builds_back() {
+        assert!(!machine_busy(Some(10.0), 24, 1.0));
+        assert!(machine_busy(Some(30.0), 24, 1.0));
+        assert!(!machine_busy(Some(30.0), 24, 0.0), "0 switches it off");
+        assert!(!machine_busy(None, 24, 1.0), "no load figure: do not wait");
     }
 
     #[test]

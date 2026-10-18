@@ -66,6 +66,20 @@ pub fn command(cmd: &str) -> Command {
     c
 }
 
+/// Start the command, and everything it starts, at niceness `nice`. 0 leaves it as it is.
+pub fn lower_priority(c: &mut Command, nice: i32) {
+    if nice <= 0 {
+        return;
+    }
+    // SAFETY: setpriority is async-signal-safe and only touches the child being started.
+    unsafe {
+        c.pre_exec(move || {
+            libc::setpriority(libc::PRIO_PROCESS as _, 0, nice);
+            Ok(())
+        });
+    }
+}
+
 /// Run to completion with a time limit, returning (success, stdout, stderr). Standard output is
 /// read whole, for parsing; more than `WHOLE_LIMIT` of it is an error, not a fragment.
 pub async fn output(c: Command, limit: Duration) -> Result<(bool, String, String), String> {
