@@ -1465,7 +1465,10 @@ async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool
             let how = if plan.options.is_empty() { "type how to go ahead".to_string() } else { format!("pick 1–{} or type your own", plan.options.len()) };
             hub.log("plan", format!("#{} {}", id, how));
             hub.job(id, |j| j.worker.push(format!("› {}", how)));
-            loop {
+            // Waiting for a person can take hours: the agent slot goes to other work meanwhile, and
+            // comes back first once the choice is made.
+            let lent = hub.unpark_slot(id).is_some();
+            let picked = loop {
                 let Some(chose) = hub.job(id, |j| j.chose.clone()) else { return Err(failed("job vanished")) };
                 if let Some(c) = hub.job(id, |j| j.plan.as_ref().and_then(|p| p.chosen.clone())).flatten() {
                     break c;
@@ -1482,7 +1485,14 @@ async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool
                     _ = chose.notified() => {}
                     _ = cancel.wait() => return Err(cancelled()),
                 }
+            };
+            if lent {
+                tokio::select! {
+                    p = hub.return_slot() => hub.park_slot(id, p),
+                    _ = cancel.wait() => return Err(cancelled()),
+                }
             }
+            picked
         }
     };
     let said = format!("Chosen: {}", plan.describe(&choice));
@@ -2396,6 +2406,31 @@ pub fn parse_verdict(text: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_job_waiting_for_a_choice_lends_its_slot_out() {
+        let cfg = Config { demo: true, automation: crate::config::AutoCfg { max_parallel: 1, ..Default::default() }, ..Config::default() };
+        let hub = Hub::new(cfg, tokio::runtime::Handle::current());
+        hub.detect_agents().await;
+        let id = hub.submit("x".into(), "x".into(), Source::Manual, PathBuf::from("."), None, Planning::Never).await.unwrap();
+        hub.job(id, |j| {
+            j.resume_from = Some(JobStatus::Choosing);
+            j.plan = Some(Plan { options: vec![PlanOption { title: "A".into(), summary: String::new(), recommended: true }], text: "plan".into(), chosen: None });
+        });
+        let waiting = || hub.job(id, |j| j.status == JobStatus::Choosing).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async { while !waiting() { tokio::time::sleep(Duration::from_millis(10)).await } }).await.unwrap();
+        // Nobody has chosen yet: the only slot is free for other work meanwhile.
+        let other = tokio::time::timeout(Duration::from_secs(2), hub.sem.clone().acquire_owned()).await.expect("slot lent out while waiting for a person").unwrap();
+        drop(other);
+        hub.choose(id, Choice::Option(0)).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if hub.job(id, |j| j.status.finished()).unwrap() && hub.settled() { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("the job carries on once chosen");
+        assert_eq!(hub.sem.available_permits(), 1, "and gives its slot back at the end");
+    }
 
     #[tokio::test]
     async fn a_panicked_runner_is_failed_instead_of_left_running() {
