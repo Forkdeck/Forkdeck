@@ -3204,3 +3204,14 @@ fn a_usage_limit_mid_issue_hands_it_back_instead_of_failing_it() {
     assert!(calls.contains("--remove-label agent:working --add-label agent:ready"), "the next pick-up retries it:\n{}\n{}", calls, out);
     assert!(!calls.contains("agent:needs-human") && !calls.contains("could not finish"), "a usage limit is nobody's failure:\n{}", calls);
 }
+
+#[test]
+fn claude_runs_without_background_tasks() {
+    // In -p mode nothing delivers a background task's result, so a worker that backgrounds its
+    // test run ends its turn with the work unfinished.
+    let cli = "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\ncat >/dev/null\necho \"$CLAUDE_CODE_DISABLE_BACKGROUND_TASKS\" > \"$FAKE_GH/bg\"\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}'\n";
+    let rig = Rig::with_agents("claude-no-bg", "", "", &[("claude", cli)]);
+    let (ok, out) = rig.run(&["run", "--agent", "claude", "fix typo"], &[]);
+    assert!(ok, "{}", out);
+    assert_eq!(fs::read_to_string(rig.root.join("gh/bg")).unwrap().trim(), "1");
+}

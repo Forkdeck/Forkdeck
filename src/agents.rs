@@ -551,6 +551,11 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
     // Their builds share output and caches with every other job on the repository.
     let cache = crate::buildcache::for_job(hub, job, dir);
     command.envs(cache.env.iter().map(|(k, v)| (k, v)));
+    if kind == AgentKind::Claude {
+        // In -p mode nothing delivers a background task's result: a worker that backgrounds its
+        // test run ends its turn with the work unfinished. It waits for its commands instead.
+        command.env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
+    }
     let mut args = args.clone();
     if kind == AgentKind::Codex && !read_only {
         if let Some(at) = args.iter().position(|a| a == "--json") {
