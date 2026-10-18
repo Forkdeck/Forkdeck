@@ -1195,7 +1195,7 @@ async fn run_check_cmds(hub: &Hub, id: u32, cmds: &[String], dir: &Path, cancel:
     for c in cmds {
         let mut attempt = 0;
         loop {
-            let ended = run_check_cmd(hub, c, dir, limit, cancel).await;
+            let ended = run_check_cmd(hub, id, c, dir, limit, cancel).await;
             let Some(bad) = ended else {
                 if attempt > 0 {
                     hub.log("checks", format!("#{} `{}` passed on run {}: flaky, not fixed", id, c, attempt + 1));
@@ -1221,9 +1221,11 @@ async fn run_check_cmds(hub: &Hub, id: u32, cmds: &[String], dir: &Path, cancel:
 }
 
 /// One check command: None when it passed, or why it did not.
-async fn run_check_cmd(hub: &Hub, c: &str, dir: &Path, limit: Duration, cancel: &Cancel) -> Option<Checked> {
+async fn run_check_cmd(hub: &Hub, id: u32, c: &str, dir: &Path, limit: Duration, cancel: &Cancel) -> Option<Checked> {
     let mut cmd = proc::command("sh");
     cmd.args(["-c", c]).current_dir(dir);
+    // The same build output the job's agent used, so the check does not compile everything again.
+    cmd.envs(crate::buildcache::for_job(hub, id, dir).env);
     proc::lower_priority(&mut cmd, hub.cfg.resources.check_nice);
     // Losing the select drops the command's process group guard, which stops the whole check.
     let res = tokio::select! {
@@ -2448,6 +2450,20 @@ mod tests {
         assert_eq!(hub.sem.available_permits(), 0, "job 7 has its slot back after building");
         drop(hub.unpark_slot(7));
         assert_eq!(hub.sem.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn checks_build_into_the_shared_cache() {
+        let hub = Hub::new(unloaded(), tokio::runtime::Handle::current());
+        let dir = scratch("cache");
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap().status.success());
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        git(&["add", "."]);
+        let cmds = vec!["case \"$CARGO_TARGET_DIR\" in */.cache/forkdeck/build/*/cargo-target) ;; *) echo \"got '$CARGO_TARGET_DIR'\"; exit 1;; esac".to_string()];
+        let res = run_checks_detailed(&hub, 1, &cmds, &dir, &Cancel::new()).await;
+        assert!(matches!(res, Some(Checked::Passed)), "{:?}", res.map(|c| match c { Checked::Failed(o) | Checked::Errored(o) => o, Checked::Passed => String::new() }));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

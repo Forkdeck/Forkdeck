@@ -536,8 +536,17 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
     let mut command = proc::command(&cmd);
     // Agents build and test too; whatever they start must not starve the machine.
     proc::lower_priority(&mut command, hub.cfg.resources.nice);
+    // Their builds share output and caches with every other job on the repository.
+    let cache = crate::buildcache::for_job(hub, job, dir);
+    command.envs(cache.env.iter().map(|(k, v)| (k, v)));
+    let mut args = args.clone();
+    if kind == AgentKind::Codex && !read_only {
+        if let Some(at) = args.iter().position(|a| a == "--json") {
+            args.splice(at..at, crate::buildcache::codex_args(&cache));
+        }
+    }
     let mut child = match command
-        .args(args)
+        .args(&args)
         .current_dir(run_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

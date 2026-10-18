@@ -404,6 +404,9 @@ pub struct ResourcesCfg {
     /// How often a failed check is run again, once the machine is quiet, before the failure goes
     /// back to the worker. A test that passes on a later run is reported as flaky, not fixed.
     pub check_retries: u32,
+    /// Share build output and toolchain caches between worktrees, and let Codex's sandbox write
+    /// to them: each job no longer compiles the project's dependencies from nothing.
+    pub build_cache: bool,
     /// A check does not start while the one-minute load average is above this many times the
     /// number of CPUs. 0 switches the wait off.
     pub max_load: f64,
@@ -411,7 +414,7 @@ pub struct ResourcesCfg {
 
 impl Default for ResourcesCfg {
     fn default() -> Self {
-        ResourcesCfg { builds: 1, nice: 10, check_nice: 0, check_retries: 1, max_load: 1.0 }
+        ResourcesCfg { builds: 1, nice: 10, check_nice: 0, check_retries: 1, build_cache: true, max_load: 1.0 }
     }
 }
 

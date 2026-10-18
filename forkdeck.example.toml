@@ -125,6 +125,9 @@ builds = 1           # checks running at the same time
 nice = 10            # niceness of agents and what they start, 0..19; 0 leaves it alone
 check_nice = 0       # niceness of checks: the check decides the job, so it gets the CPU first
 check_retries = 1    # a failed check runs again once the machine is quiet; a later pass is flaky
+build_cache = true   # share build output and toolchain caches between worktrees (Cargo, Go, Gradle, Maven,
+                     # sbt, .NET, Swift, Stack/Cabal, dune, Zig, dub, Nim, Mix, rebar3, pub, Bazel, npm, pip;
+                     # ccache/sccache when installed) and let Codex's sandbox write to them
 max_load = 1.0       # hold a check back while load > this x CPUs (at most 10 min); 0: off
 
 # How much forkdeck may pick up by itself. Counted over the last 24 hours from its
