@@ -189,6 +189,11 @@ pub fn command_line(cfg: &Config, spec: &RunSpec) -> CmdLine {
             if !e.effort.is_empty() {
                 args.extend(["--effort".to_string(), e.effort.clone()]);
             }
+            // A worker can build and run the project's tests, so it can work test first; nothing else
+            // runs without asking. A reviewer only reads.
+            if !spec.read_only && !extra.iter().any(|a| a.starts_with("--allowedTools") || a.starts_with("--allowed-tools") || a == "bypassPermissions") {
+                args.extend(["--allowedTools".to_string(), crate::buildcache::claude_allowed(spec.dir)]);
+            }
             // The user's plugins, hooks and MCP servers are theirs, not the job's.
             if cfg.agents.lean() && !extra.iter().any(|a| a.starts_with("--setting-sources") || a.starts_with("--mcp-config")) {
                 args.extend(["--strict-mcp-config", "--setting-sources", "project,local"].map(String::from));
@@ -1126,6 +1131,32 @@ mod tests {
 
     fn exec_for(cli: AgentKind, model: &str) -> Exec {
         Exec { asked: crate::state::AgentRef::Kind(cli), cli, family: cli, via: None, model: model.into(), effort: String::new(), vendor: crate::pick::Vendor::Unknown }
+    }
+
+    #[test]
+    fn claude_writers_may_run_the_projects_own_build_and_test_commands() {
+        let dir = std::env::temp_dir().join(format!("forkdeck-allowed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("web")).unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap().status.success());
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+        std::fs::write(dir.join("web/package.json"), "{}").unwrap();
+        git(&["add", "."]);
+        let cfg: Config = toml::from_str("").unwrap();
+        let line = |cli, read_only| {
+            let e = exec_for(cli, "m");
+            command_line(&cfg, &RunSpec { exec: &e, prompt: "p", dir: &dir, read_only, resume: None }).args
+        };
+        let w = line(AgentKind::Claude, false);
+        let at = w.iter().position(|a| a == "--allowedTools").expect("build commands are allowed");
+        let allowed = &w[at + 1];
+        for c in ["Bash(cargo:*)", "Bash(npm:*)", "Bash(git diff:*)"] {
+            assert!(allowed.contains(c), "{c}: {allowed}");
+        }
+        assert!(!allowed.contains("Bash(go:") && !allowed.contains("Bash(npx:") && !allowed.contains("Bash(curl"), "{allowed}");
+        assert!(!line(AgentKind::Claude, true).contains(&"--allowedTools".to_string()), "a reviewer only reads");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

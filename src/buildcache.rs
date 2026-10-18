@@ -19,34 +19,64 @@ struct Toolchain {
     names: &'static [&'static str],
     extensions: &'static [&'static str],
     caches: &'static [&'static str],
+    /// Its build and test commands, which a Claude worker may run (Bash(<command>:*)). Package
+    /// runners that fetch and execute arbitrary code (npx, uvx) are deliberately absent.
+    commands: &'static [&'static str],
 }
 
 const TOOLCHAINS: &[Toolchain] = &[
     // Rust's build output is redirected to one directory per repository, below.
-    Toolchain { names: &["Cargo.toml"], extensions: &[], caches: &[".cargo/registry", ".cargo/git"] },
-    Toolchain { names: &["go.mod", "go.work"], extensions: &[], caches: &[".cache/go-build", "go/pkg/mod"] },
-    Toolchain { names: &["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"], extensions: &[], caches: &[".gradle"] },
-    Toolchain { names: &["pom.xml"], extensions: &[], caches: &[".m2"] },
-    Toolchain { names: &["build.sbt"], extensions: &[], caches: &[".sbt", ".ivy2", ".cache/coursier"] },
-    Toolchain { names: &["global.json", "Directory.Build.props"], extensions: &[".csproj", ".fsproj", ".vbproj", ".sln"], caches: &[".nuget/packages"] },
-    Toolchain { names: &["Package.swift"], extensions: &[], caches: &[".cache/org.swift.swiftpm", ".swiftpm"] },
-    Toolchain { names: &["stack.yaml"], extensions: &[], caches: &[".stack"] },
-    Toolchain { names: &["cabal.project"], extensions: &[".cabal"], caches: &[".cabal", ".cache/cabal", ".local/state/cabal"] },
-    Toolchain { names: &["dune-project"], extensions: &[], caches: &[".cache/dune", ".opam"] },
-    Toolchain { names: &["build.zig", "build.zig.zon"], extensions: &[], caches: &[".cache/zig"] },
-    Toolchain { names: &["dub.json", "dub.sdl"], extensions: &[], caches: &[".dub"] },
-    Toolchain { names: &[], extensions: &[".nimble"], caches: &[".nimble", ".cache/nim"] },
-    Toolchain { names: &["shard.yml"], extensions: &[], caches: &[".cache/crystal", ".cache/shards"] },
-    Toolchain { names: &["mix.exs"], extensions: &[], caches: &[".mix", ".hex"] },
-    Toolchain { names: &["rebar.config"], extensions: &[], caches: &[".cache/rebar3"] },
-    Toolchain { names: &["pubspec.yaml"], extensions: &[], caches: &[".pub-cache"] },
-    Toolchain { names: &["WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"], extensions: &[], caches: &[".cache/bazel"] },
-    Toolchain { names: &["package.json"], extensions: &[], caches: &[".npm", ".cache/yarn", ".local/share/pnpm"] },
-    Toolchain { names: &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"], extensions: &[], caches: &[".cache/pip", ".cache/uv"] },
+    Toolchain { names: &["Cargo.toml"], extensions: &[], caches: &[".cargo/registry", ".cargo/git"], commands: &["cargo"] },
+    Toolchain { names: &["go.mod", "go.work"], extensions: &[], caches: &[".cache/go-build", "go/pkg/mod"], commands: &["go"] },
+    Toolchain { names: &["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"], extensions: &[], caches: &[".gradle"], commands: &["gradle", "./gradlew"] },
+    Toolchain { names: &["pom.xml"], extensions: &[], caches: &[".m2"], commands: &["mvn", "./mvnw"] },
+    Toolchain { names: &["build.sbt"], extensions: &[], caches: &[".sbt", ".ivy2", ".cache/coursier"], commands: &["sbt"] },
+    Toolchain { names: &["global.json", "Directory.Build.props"], extensions: &[".csproj", ".fsproj", ".vbproj", ".sln"], caches: &[".nuget/packages"], commands: &["dotnet"] },
+    Toolchain { names: &["Package.swift"], extensions: &[], caches: &[".cache/org.swift.swiftpm", ".swiftpm"], commands: &["swift"] },
+    Toolchain { names: &["stack.yaml"], extensions: &[], caches: &[".stack"], commands: &["stack"] },
+    Toolchain { names: &["cabal.project"], extensions: &[".cabal"], caches: &[".cabal", ".cache/cabal", ".local/state/cabal"], commands: &["cabal"] },
+    Toolchain { names: &["dune-project"], extensions: &[], caches: &[".cache/dune", ".opam"], commands: &["dune"] },
+    Toolchain { names: &["build.zig", "build.zig.zon"], extensions: &[], caches: &[".cache/zig"], commands: &["zig"] },
+    Toolchain { names: &["dub.json", "dub.sdl"], extensions: &[], caches: &[".dub"], commands: &["dub"] },
+    Toolchain { names: &[], extensions: &[".nimble"], caches: &[".nimble", ".cache/nim"], commands: &["nimble", "nim"] },
+    Toolchain { names: &["shard.yml"], extensions: &[], caches: &[".cache/crystal", ".cache/shards"], commands: &["crystal", "shards"] },
+    Toolchain { names: &["mix.exs"], extensions: &[], caches: &[".mix", ".hex"], commands: &["mix"] },
+    Toolchain { names: &["rebar.config"], extensions: &[], caches: &[".cache/rebar3"], commands: &["rebar3"] },
+    Toolchain { names: &["pubspec.yaml"], extensions: &[], caches: &[".pub-cache"], commands: &["dart", "flutter"] },
+    Toolchain { names: &["WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"], extensions: &[], caches: &[".cache/bazel"], commands: &["bazel", "bazelisk"] },
+    Toolchain { names: &["package.json"], extensions: &[], caches: &[".npm", ".cache/yarn", ".local/share/pnpm"], commands: &["npm", "pnpm", "yarn"] },
+    Toolchain { names: &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"], extensions: &[], caches: &[".cache/pip", ".cache/uv"], commands: &["pytest", "python -m pytest", "uv run pytest"] },
 ];
 
 /// Build files of C, C++, Fortran and other languages built by a native compiler, which ccache speeds up.
 const NATIVE: &[&str] = &["CMakeLists.txt", "Makefile", "GNUmakefile", "meson.build", "configure.ac", "configure"];
+const NATIVE_COMMANDS: &[&str] = &["make", "cmake", "ctest", "meson", "ninja"];
+/// Read-only git, which every worker needs to see what it changed.
+const GIT_COMMANDS: &[&str] = &["git status", "git diff", "git log", "git show"];
+
+/// The build and test commands for the toolchains in a tree, plus read-only git.
+pub fn commands(files: &[String]) -> Vec<&'static str> {
+    let names: Vec<&str> = files.iter().map(|f| f.rsplit('/').next().unwrap_or(f)).collect();
+    let mut out: Vec<&'static str> = TOOLCHAINS.iter()
+        .filter(|t| names.iter().any(|n| t.names.contains(n) || t.extensions.iter().any(|e| n.ends_with(e))))
+        .flat_map(|t| t.commands.iter().copied()).collect();
+    if names.iter().any(|n| NATIVE.contains(n)) {
+        out.extend(NATIVE_COMMANDS);
+    }
+    out.extend(GIT_COMMANDS);
+    out.dedup();
+    out
+}
+
+/// Claude's --allowedTools value for a worktree: its build and test commands and read-only git.
+pub fn claude_allowed(dir: &Path) -> String {
+    commands(&tracked(dir)).iter().map(|c| format!("Bash({}:*)", c)).collect::<Vec<_>>().join(" ")
+}
+
+fn tracked(dir: &Path) -> Vec<String> {
+    std::process::Command::new("git").arg("-C").arg(dir).args(["ls-files"]).stderr(std::process::Stdio::null()).output().ok()
+        .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect()).unwrap_or_default()
+}
 
 /// A directory name for a repository: readable, and the same every time.
 pub fn key(repo: &str) -> String {
@@ -103,8 +133,7 @@ pub fn for_job(hub: &crate::orchestrator::Hub, job: u32, dir: &Path) -> Plan {
 
 /// The plan for a worktree, from its tracked files.
 pub fn for_dir(dir: &Path, repo_key: &str) -> Plan {
-    let files: Vec<String> = std::process::Command::new("git").arg("-C").arg(dir).args(["ls-files"]).stderr(std::process::Stdio::null()).output().ok()
-        .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect()).unwrap_or_default();
+    let files = tracked(dir);
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
     let root = home.join(".cache/forkdeck/build");
     plan(&files, repo_key, &root, &home, |p| std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(p).is_file())))

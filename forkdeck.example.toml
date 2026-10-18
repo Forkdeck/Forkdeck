@@ -52,7 +52,9 @@ lean = true
 cmd = "claude"
 models = { light = "haiku", standard = "sonnet", heavy = "opus" }
 efforts = { light = "low", standard = "medium", heavy = "high" }
-# acceptEdits lets the agent edit files but not run shell commands unattended.
+# acceptEdits lets the agent edit files. A worker may also run the project's own build and
+# test commands (cargo, go, gradle, mvn, npm, pytest, make, dotnet, ... as its build files show)
+# and read-only git, so it can work test first; any other command is refused.
 # Loosen this only for repositories and issue authors you trust.
 write_args = ["--permission-mode", "acceptEdits"]
 review_args = ["--permission-mode", "plan"]
