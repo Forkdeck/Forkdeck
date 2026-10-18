@@ -395,8 +395,15 @@ pub struct ResourcesCfg {
     /// Checks that may run at the same time. A job waiting for one lends its agent slot to other
     /// jobs meanwhile.
     pub builds: usize,
-    /// Niceness for checks and agent processes, so the machine stays usable. 0 leaves it alone.
+    /// Niceness for agent processes and whatever they start (agents build and test too), so the
+    /// machine stays usable. 0 leaves it alone.
     pub nice: i32,
+    /// Niceness for checks. Lower than `nice` by default: the check decides the job, and a
+    /// timing-sensitive test must not lose its CPU to agents' own builds.
+    pub check_nice: i32,
+    /// How often a failed check is run again, once the machine is quiet, before the failure goes
+    /// back to the worker. A test that passes on a later run is reported as flaky, not fixed.
+    pub check_retries: u32,
     /// A check does not start while the one-minute load average is above this many times the
     /// number of CPUs. 0 switches the wait off.
     pub max_load: f64,
@@ -404,7 +411,7 @@ pub struct ResourcesCfg {
 
 impl Default for ResourcesCfg {
     fn default() -> Self {
-        ResourcesCfg { builds: 1, nice: 10, max_load: 1.0 }
+        ResourcesCfg { builds: 1, nice: 10, check_nice: 0, check_retries: 1, max_load: 1.0 }
     }
 }
 
@@ -1005,8 +1012,11 @@ impl Config {
         if self.resources.builds == 0 {
             anyhow::bail!("resources.builds must be at least 1");
         }
-        if !(0..=19).contains(&self.resources.nice) {
-            anyhow::bail!("resources.nice must be between 0 and 19");
+        if !(0..=19).contains(&self.resources.nice) || !(0..=19).contains(&self.resources.check_nice) {
+            anyhow::bail!("resources.nice and resources.check_nice must be between 0 and 19");
+        }
+        if self.resources.check_retries > 3 {
+            anyhow::bail!("resources.check_retries must be at most 3");
         }
         if !(self.resources.max_load.is_finite() && self.resources.max_load >= 0.0) {
             anyhow::bail!("resources.max_load must be 0 or more");

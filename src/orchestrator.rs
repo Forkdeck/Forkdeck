@@ -821,7 +821,11 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
     // Handed back to the queue by a teammate: the item and its labels are theirs to move now.
     let released = hub.job(id, |j| j.released).unwrap_or(false);
     if !manual && fin.status != JobStatus::Done && !fin.reported && !released {
-        issues::report_failure(&hub, id, &fin.outcome).await;
+        if cancel.is_shutdown() && fin.status == JobStatus::Cancelled {
+            issues::hand_back(&hub, id).await;
+        } else {
+            issues::report_failure(&hub, id, &fin.outcome).await;
+        }
     }
     // Before the job counts as finished, so that a shutdown waits for the last word to teammates.
     team::finish(&hub, id, fin.status).await;
@@ -1153,28 +1157,25 @@ async fn wait_for_machine(hub: &Hub, id: u32, cancel: &Cancel) {
 
 async fn run_check_cmds(hub: &Hub, id: u32, cmds: &[String], dir: &Path, cancel: &Cancel) -> Option<Checked> {
     let limit = Duration::from_secs(hub.cfg.review.check_timeout_mins.clamp(1, 24 * 60) * 60);
+    let retries = hub.cfg.resources.check_retries;
     for c in cmds {
-        let mut cmd = proc::command("sh");
-        cmd.args(["-c", c]).current_dir(dir);
-        proc::lower_priority(&mut cmd, hub.cfg.resources.nice);
-        // Losing the select drops the command's process group guard, which stops the whole check.
-        let res = tokio::select! {
-            r = proc::output_code(cmd, limit) => r,
-            _ = cancel.wait() => Err("cancelled".to_string()),
-        };
-        let tail = |text: &str| {
-            let lines: Vec<&str> = text.lines().collect();
-            let tail: Vec<String> = lines[lines.len().saturating_sub(60)..].iter().map(|l| clip(l, 500)).collect();
-            format!("$ {}\n{}", c, tail.join("\n"))
-        };
-        let ended = match res {
-            Ok((Some(0), _, _)) => None,
-            Ok((Some(126 | 127), out, err)) => Some(Checked::Errored(tail(&format!("{}{}", out, err)))),
-            Ok((Some(_), out, err)) => Some(Checked::Failed(tail(&format!("{}{}", out, err)))),
-            Ok((None, out, err)) => Some(Checked::Errored(tail(&format!("{}{}\nended by a signal", out, err)))),
-            Err(e) => Some(Checked::Errored(tail(&e))),
-        };
-        if let Some(bad) = ended {
+        let mut attempt = 0;
+        loop {
+            let ended = run_check_cmd(hub, c, dir, limit, cancel).await;
+            let Some(bad) = ended else {
+                if attempt > 0 {
+                    hub.log("checks", format!("#{} `{}` passed on run {}: flaky, not fixed", id, c, attempt + 1));
+                }
+                break;
+            };
+            // A failure on a busy machine is often a timing test losing its CPU. Run it again once
+            // the machine is quiet before sending the worker off to fix something it did not break.
+            if attempt < retries && !cancel.is_set() {
+                attempt += 1;
+                hub.log("checks", format!("#{} `{}` failed; running it again when the machine is quiet", id, c));
+                wait_for_machine(hub, id, cancel).await;
+                continue;
+            }
             hub.log("checks", format!("#{} `{}` {}", id, c, if matches!(bad, Checked::Failed(_)) { "failed" } else { "gave no result" }));
             hub.job(id, |j| j.checks = Some(false));
             return Some(bad);
@@ -1183,6 +1184,30 @@ async fn run_check_cmds(hub: &Hub, id: u32, cmds: &[String], dir: &Path, cancel:
     }
     hub.job(id, |j| j.checks = Some(true));
     Some(Checked::Passed)
+}
+
+/// One check command: None when it passed, or why it did not.
+async fn run_check_cmd(hub: &Hub, c: &str, dir: &Path, limit: Duration, cancel: &Cancel) -> Option<Checked> {
+    let mut cmd = proc::command("sh");
+    cmd.args(["-c", c]).current_dir(dir);
+    proc::lower_priority(&mut cmd, hub.cfg.resources.check_nice);
+    // Losing the select drops the command's process group guard, which stops the whole check.
+    let res = tokio::select! {
+        r = proc::output_code(cmd, limit) => r,
+        _ = cancel.wait() => Err("cancelled".to_string()),
+    };
+    let tail = |text: &str| {
+        let lines: Vec<&str> = text.lines().collect();
+        let tail: Vec<String> = lines[lines.len().saturating_sub(60)..].iter().map(|l| clip(l, 500)).collect();
+        format!("$ {}\n{}", c, tail.join("\n"))
+    };
+    match res {
+        Ok((Some(0), _, _)) => None,
+        Ok((Some(126 | 127), out, err)) => Some(Checked::Errored(tail(&format!("{}{}", out, err)))),
+        Ok((Some(_), out, err)) => Some(Checked::Failed(tail(&format!("{}{}", out, err)))),
+        Ok((None, out, err)) => Some(Checked::Errored(tail(&format!("{}{}\nended by a signal", out, err)))),
+        Err(e) => Some(Checked::Errored(tail(&e))),
+    }
 }
 
 /// What a round of checks and review needs to know.
@@ -2393,11 +2418,24 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn checks_run_at_low_priority() {
-        let hub = Hub::new(unloaded(), tokio::runtime::Handle::current());
+    async fn checks_run_at_their_own_priority() {
+        let mut cfg = unloaded();
+        cfg.resources.check_nice = 5;
+        let hub = Hub::new(cfg, tokio::runtime::Handle::current());
         let dir = scratch("nice");
-        let cmds = vec!["test \"$(awk '{print $19}' /proc/self/stat)\" -ge 10".to_string()];
+        let cmds = vec!["test \"$(awk '{print $19}' /proc/self/stat)\" -ge 5".to_string()];
         assert!(matches!(run_checks_detailed(&hub, 1, &cmds, &dir, &Cancel::new()).await, Some(Checked::Passed)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_check_that_fails_once_is_run_again_before_the_worker_hears_of_it() {
+        let hub = Hub::new(unloaded(), tokio::runtime::Handle::current());
+        let dir = scratch("flaky");
+        let flaky = vec!["test -f ran || { touch ran; exit 1; }".to_string()];
+        assert!(matches!(run_checks_detailed(&hub, 1, &flaky, &dir, &Cancel::new()).await, Some(Checked::Passed)), "passed on its second run");
+        let broken = vec!["echo broken; exit 1".to_string()];
+        assert!(matches!(run_checks_detailed(&hub, 2, &broken, &dir, &Cancel::new()).await, Some(Checked::Failed(out)) if out.contains("broken")), "fails both runs");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

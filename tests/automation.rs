@@ -3160,3 +3160,14 @@ printf '%s\n' '\nVERDICT: PASS"}'
     assert!(calls.contains("--body-file -") && calls.contains("ü/CLAUDE.md"), "{}", out);
     assert!(calls.len() > 128 * 1024);
 }
+
+#[test]
+fn a_stop_while_an_issue_runs_hands_it_back_to_the_queue() {
+    let rig = Rig::new("stop-handback", "", "checks = [\"touch {root}/checking; sleep 60\"]");
+    rig.issue();
+    let checking = rig.root.join("checking");
+    rig.once_then_stop(|_| checking.exists(), |_| {});
+    let calls = rig.calls();
+    assert!(calls.contains("--remove-label agent:working --add-label agent:ready"), "{}", calls);
+    assert!(!calls.contains("agent:needs-human") && !calls.contains("could not finish"), "a stop is nobody's failure:\n{}", calls);
+}

@@ -1307,6 +1307,24 @@ pub async fn pr_post(hub: &Hub, id: u32, rep: &Report<'_>) -> Result<(), String>
 }
 
 /// Tell the issue or pull request what happened and hand it back to a person.
+/// forkdeck stopped while this ran. That is nobody's failure: the item goes back to the queue
+/// without a comment, for the next start to pick up. What the attempt left stays on its local
+/// branch, and the next pick-up moves it aside as it does for any earlier attempt.
+pub async fn hand_back(hub: &Hub, id: u32) {
+    if hub.cfg.demo || !hub.job(id, |j| j.branch.is_some()).unwrap_or(false) || !team::may_report(hub, id).await {
+        return;
+    }
+    if let Some((r, n, _)) = issue_of(hub, id) {
+        if let Err(e) = relabel(&r, false, n, &r.working_label, &r.label).await {
+            hub.log("issues", e);
+        }
+    } else if let Some((r, n, _, _)) = pr_of(hub, id) {
+        if let Err(e) = review_labels(&r, n, &r.pr_label).await {
+            hub.log("issues", e);
+        }
+    }
+}
+
 pub async fn report_failure(hub: &Hub, id: u32, why: &str) {
     if hub.cfg.demo {
         return;
