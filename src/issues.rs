@@ -3,7 +3,7 @@
 
 use crate::config::RepoCfg;
 use crate::orchestrator::{strip_verdict, Hub};
-use crate::state::{clip, Planning, Provider, Source};
+use crate::state::{clip, JobStatus, Planning, Provider, Source};
 use crate::team::{self, Claimed, Target};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -454,8 +454,37 @@ fn hold_for(hub: &Hub, b: &Budget, r: &RepoCfg, taken_here: u32) -> Option<Strin
         .map(|until| format!("paused until {} after {} failed jobs in a row", clock(until), lim.pause_after_failures))
 }
 
+/// Whether a pull request is still open, from `gh pr view --json state`: None when unreadable.
+pub fn still_open(state: &str) -> Option<bool> {
+    match state.trim() {
+        "OPEN" => Some(true),
+        "MERGED" | "CLOSED" => Some(false),
+        _ => None,
+    }
+}
+
+/// Ask the forge about the pull requests of finished jobs that a person has not merged or
+/// closed yet, so the board moves them from PR REVIEW to DONE.
+async fn refresh_prs(hub: &Hub) {
+    let waiting: Vec<(u32, String)> = {
+        let st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.jobs.iter().filter(|j| j.status == JobStatus::Done && j.pr_open != Some(false))
+            .filter_map(|j| Some((j.id, j.pr_url.clone()?))).filter(|(_, u)| u.contains("github")).collect()
+    };
+    for (id, url) in waiting {
+        if let Ok(out) = sh("gh", &["pr", "view", &url, "--json", "state", "-q", ".state"], None).await {
+            if let Some(open) = still_open(&out) {
+                hub.job(id, |j| j.pr_open = Some(open));
+            }
+        }
+    }
+}
+
 pub async fn poll_once(hub: &Hub) {
     crate::cicd::deploy_poll(hub).await;
+    if !hub.cfg.demo {
+        refresh_prs(hub).await;
+    }
     let mut budget = budget(hub);
     {
         {
@@ -1379,6 +1408,15 @@ fn demo_items(hub: &Hub, idx: usize, pr: bool) -> Vec<Issue> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_pull_request_is_open_until_merged_or_closed() {
+        assert_eq!(still_open("OPEN\n"), Some(true));
+        assert_eq!(still_open("MERGED"), Some(false));
+        assert_eq!(still_open("CLOSED"), Some(false));
+        assert_eq!(still_open(""), None, "no answer leaves it as it was");
+    }
+
     use super::*;
 
     #[test]
