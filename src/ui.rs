@@ -257,12 +257,6 @@ fn factory(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
 }
 
 fn title_bar(f: &mut Frame, area: Rect, ui: &Ui) {
-    let dots = Line::from(vec![
-        Span::styled(" ●", fg(RED)),
-        Span::styled(" ●", fg(Color::Rgb(230, 190, 60))),
-        Span::styled(" ●", fg(GREEN)),
-    ]);
-    f.render_widget(Paragraph::new(dots), area);
     let dir = ui.cwd.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let t = format!("~/{} — forkdeck{} — {}x{}", dir, if ui.demo { " (demo)" } else { "" }, area.width, f.area().height);
     f.render_widget(Paragraph::new(Span::styled(t, fg(DIM))).alignment(Alignment::Center), area);
