@@ -194,6 +194,23 @@ fn lane(status: JobStatus) -> usize {
     }
 }
 
+/// The board lane a job's card is in.
+fn job_lane(j: &Job) -> usize {
+    let status = if j.status == JobStatus::Done && j.issue_plan.as_ref().is_some_and(|p| p.build_job.is_none()) { JobStatus::Planning } else { j.status };
+    lane(status)
+}
+
+/// Alt+Right (`forward`) or Alt+Left: the newest job in the next lane that has any, from the
+/// selected job's lane. At either end the selection stays where it is.
+pub fn lane_step(st: &State, selected: Option<u32>, forward: bool) -> Option<u32> {
+    let newest = |l: usize| st.jobs.iter().rev().find(|j| job_lane(j) == l).map(|j| j.id);
+    let Some(from) = selected.and_then(|id| st.jobs.iter().find(|j| j.id == id)).map(job_lane) else {
+        return (0..6).find_map(newest);
+    };
+    let next = if forward { (from + 1..6).find_map(newest) } else { (0..from).rev().find_map(newest) };
+    next.or(selected)
+}
+
 fn factory(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
     let narrow = area.width < 120;
     let rows = Layout::vertical([Constraint::Length(if narrow { 14 } else { 9 }), Constraint::Min(4)]).split(area);
@@ -204,10 +221,7 @@ fn factory(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
         let count = if narrow { 3 } else { 6 };
         let columns = Layout::horizontal(vec![Constraint::Ratio(1, count as u32); count]).split(board_rows[index / count]);
         let cell = columns[index % count];
-        let jobs: Vec<_> = st.jobs.iter().filter(|j| {
-            let status = if j.status == JobStatus::Done && j.issue_plan.as_ref().is_some_and(|p| p.build_job.is_none()) { JobStatus::Planning } else { j.status };
-            lane(status) == index
-        }).collect();
+        let jobs: Vec<_> = st.jobs.iter().filter(|j| job_lane(j) == index).collect();
         // Keep the selected card visible, even when browsing older completed jobs.
         let room = cell.height.saturating_sub(3) as usize / 2;
         let room = room.max(1);
@@ -249,7 +263,7 @@ fn factory(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
                 Line::from(Span::styled("Ready for work", bold(BRIGHT))),
                 Line::from("Type a task and press Enter. Jobs move through the board as they run."),
                 Line::from(format!("{} repositories configured · issue intake {} (Ctrl-A)", st.repos.len(), if st.automation { "on" } else { "paused" })),
-                Line::from("Alt↑↓ selects a job · F2 opens the agent tree · F4 shows the team"),
+                Line::from("Alt↑↓ selects a job · Alt←→ a lane · F2 opens the agent tree · F4 shows the team"),
             ];
             f.render_widget(Paragraph::new(lines).alignment(Alignment::Center).block(boxed("dispatch", PURPLE)), rows[1]);
         }
@@ -704,7 +718,7 @@ fn status(f: &mut Frame, area: Rect, st: &State) {
     let keys = if area.width < 110 {
         "⏎ send · ↑↓ history · ^T new · F5 choices · F6 issue plan · ^C quit"
     } else {
-        "⏎ send · ↑↓ history · Alt↑↓ job · F2 view · F5 choices · F6 issue plan · Tab agent · ^T new · ^P plan · ^R reply · ^S now · ^X stop · ^C quit "
+        "⏎ send · ↑↓ history · Alt↑↓ job · Alt←→ lane · F2 view · F5 choices · F6 issue plan · Tab agent · ^T new · ^P plan · ^R reply · ^S now · ^X stop · ^C quit "
     };
     f.render_widget(Paragraph::new(Span::styled(keys, fg(DIM))).alignment(Alignment::Right), area);
 }
@@ -856,5 +870,26 @@ mod tests {
                 assert!(text.contains("DONE 15"), "{text}");
             }
         }
+    }
+
+    #[test]
+    fn alt_left_and_right_move_between_lanes_that_have_jobs() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = crate::orchestrator::Hub::new(crate::config::Config::default(), rt.handle().clone());
+        let _slots = rt.block_on(hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel as u32)).unwrap();
+        let mut ids = Vec::new();
+        for status in [JobStatus::Queued, JobStatus::Done, JobStatus::Done, JobStatus::Failed] {
+            let id = rt.block_on(hub.submit("t".into(), "t".into(), Source::Manual, PathBuf::from("."), None, Planning::Never)).unwrap();
+            hub.job(id, |j| j.status = status);
+            ids.push(id);
+        }
+        let st = hub.state.lock().unwrap();
+        let (queued, done_old, done_new, failed) = (ids[0], ids[1], ids[2], ids[3]);
+        assert_eq!(lane_step(&st, Some(queued), true), Some(done_new), "empty lanes are skipped; the newest job is taken");
+        assert_eq!(lane_step(&st, Some(done_old), true), Some(failed));
+        assert_eq!(lane_step(&st, Some(failed), true), Some(failed), "stays at the last lane");
+        assert_eq!(lane_step(&st, Some(failed), false), Some(done_new));
+        assert_eq!(lane_step(&st, Some(queued), false), Some(queued), "stays at the first lane");
+        assert_eq!(lane_step(&st, None, true), Some(queued), "nothing selected: the first lane with jobs");
     }
 }

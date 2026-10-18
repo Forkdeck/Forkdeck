@@ -1293,6 +1293,15 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                                 u.follow = false;
                             }
                         }
+                        KeyCode::Left | KeyCode::Right if k.modifiers.contains(KeyModifiers::ALT) => {
+                            let st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(next) = ui::lane_step(&st, u.selected, k.code == KeyCode::Right) {
+                                if u.input.is_empty() { u.reply_to = None; u.new_task = false; }
+                                else if u.reply_to.is_none() { u.reply_to = ui::reply_target(&st, &u); }
+                                u.selected = Some(next);
+                                u.follow = false;
+                            }
+                        }
                         KeyCode::Up => history.older(&mut u.input),
                         KeyCode::Down => history.newer(&mut u.input),
                         KeyCode::Enter => {

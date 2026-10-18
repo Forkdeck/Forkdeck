@@ -863,6 +863,7 @@ back by hand, or with `forkdeck team release`.
 | `Tab` | force the next task to claude, codex, copilot, or back to auto |
 | `↑` `↓` | recall submitted messages; edit and press Enter to resend; Down restores your draft |
 | `Alt-↑` `Alt-↓` | select a job; `Esc` goes back to following the newest |
+| `Alt-←` `Alt-→` | select the newest job in the previous or next board lane that has one |
 | `F2` | switch between the factory board and agent tree |
 | `F5` | open planning choices for the selected task |
 | `F6` | create/link an issue plan; inspect, accept, refine or mark it ready for build |
