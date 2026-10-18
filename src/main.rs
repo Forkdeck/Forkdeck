@@ -1,5 +1,6 @@
 mod agents;
 mod buildcache;
+mod catalog;
 mod choices;
 mod cicd;
 mod config;
@@ -238,6 +239,10 @@ fn main() -> anyhow::Result<()> {
     }
     cfg.demo = cli.demo;
     if !cfg.demo {
+        let chosen = catalog::fill_codex(&mut cfg);
+        if !chosen.is_empty() && matches!(cli.cmd, Some(Cmd::Doctor)) {
+            println!("models    codex: {}", chosen.join(", "));
+        }
         if let Some((r, automation)) = config::launch_repo(&std::env::current_dir()?, &cfg)? {
             cfg.repos.push(r);
             cfg.automation.enabled |= automation;
