@@ -9,6 +9,7 @@ pub const EXAMPLE: &str = include_str!("../forkdeck.example.toml");
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub router: RouterCfg,
+    pub adaptive: crate::adaptive::Config,
     pub agents: AgentsCfg,
     pub review: ReviewCfg,
     pub automation: AutoCfg,
@@ -982,6 +983,14 @@ pub fn host_of(url: &str) -> Option<String> {
 
 impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(usd) = self.adaptive.invocation_max_usd {
+            anyhow::ensure!(usd.is_finite() && usd > 0.0, "invocation_max_usd must be finite and positive");
+            let agent = self.agents.get(AgentKind::Claude);
+            for args in [agent.write_args, agent.review_args].into_iter().flatten() {
+                anyhow::ensure!(!args.iter().any(|s| s == "--max-budget-usd" || s.starts_with("--max-budget-usd=")),
+                    "remove explicit --max-budget-usd from agent arguments before configuring invocation_max_usd");
+            }
+        }
         if !matches!(self.router.kind.as_str(), "rules" | "jev" | "auto") {
             anyhow::bail!("router.kind must be \"auto\", \"rules\" or \"jev\", got {:?}", self.router.kind);
         }
@@ -1329,6 +1338,16 @@ mod tests {
         assert_eq!((r.provider, r.repo.as_str()), (Provider::Gitlab, "g/sub/p"));
         assert!(!automation, "polling stays off unless the file asks");
         std::fs::remove_dir_all(&clone).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_invocation_budgets_at_load_validation() {
+        for value in ["0", "-1", "nan", "inf"] {
+            let cfg: Config = toml::from_str(&format!("[adaptive]\ninvocation_max_usd={value}")).unwrap();
+            assert!(cfg.validate().unwrap_err().to_string().contains("invocation_max_usd"));
+        }
+        let cfg: Config = toml::from_str("[adaptive]\ninvocation_max_usd=0.25\n[agents.claude]\nwrite_args=['--max-budget-usd=1']").unwrap();
+        assert!(cfg.validate().unwrap_err().to_string().contains("explicit --max-budget-usd"));
     }
 
     #[test]

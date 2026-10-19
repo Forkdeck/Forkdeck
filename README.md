@@ -320,8 +320,12 @@ url = "http://127.0.0.1:3000/mcp"
 headers = { Authorization = "Bearer ${PIPELINES_TOKEN}" }
 ```
 
-`${NAME}` is filled from the environment, so tokens stay out of the file. To
-find out what a server offers and what its answers look like:
+`${NAME}` is filled from the environment, so tokens stay out of the file.
+Stdio servers inherit only runtime settings (`PATH`, `HOME`, user, locale and
+temporary-directory settings). Pass credentials and other required variables
+explicitly through the server's `env` table.
+
+To find out what a server offers and what its answers look like:
 
 ```
 forkdeck mcp tools github
@@ -486,8 +490,13 @@ Other things to know:
 - **One forkdeck deploys.** The first process to start holds a lock next to the
   state file; any other (a cron `forkdeck once` while the interface is open,
   for example) still handles issues and reviews but leaves deployments alone
-  until the first has exited. One repository can have one deploy stage per
-  environment.
+  until the first has exited. Each provider/repository pair may appear only
+  once in `[[repos]]`.
+- **Retries need fresh rollout evidence.** When retrying a failed deployment of
+  the same commit, an old failure alone cannot trigger rollback. A matching
+  `pending` or `paused` status establishes that the new attempt has started;
+  success can finish it directly. Without fresh evidence, the wait times out
+  with unknown status and no rollback.
 - **State is in `~/.local/state/forkdeck/deploy.json`** (or `$XDG_STATE_HOME`).
   If the file is damaged, forkdeck says so and deploys nothing until it is
   repaired or deleted; it does not start over on its own. If a result cannot
@@ -716,6 +725,19 @@ for a dashboard or a script. The journal is also the audit trail: it is
 append-only, each line stands alone, and a damaged line is skipped without
 hiding the rest.
 
+Model-level usage is available with `forkdeck stats --by-model --json`, with
+`--role` and `--repo` filters. `forkdeck benchmark` produces paired evidence in
+isolated local clones; `forkdeck adaptive` explains proposals, reservations and
+suspensions. Adaptive worker routing is disabled by default. See
+[model metrics and adaptive routing](docs/adaptive-routing.md) for qualification,
+advisory/shadow validation, trial limits, promotion and disable controls.
+
+Worker benchmarks support `--preflight` and explicit call budgets. Use
+`forkdeck reviewer-benchmark MANIFEST --output DIRECTORY` for separate labeled
+reviewer comparisons. Adaptive policies can select `reported_cost_usd` instead of
+tokens when all end-to-end costs are reported; see the
+[runtime guide](docs/adaptive-routing.md) and [manifest templates](docs/examples/).
+
 ## Notes about a repository
 
 Each job would otherwise start knowing nothing about the project beyond what
@@ -876,6 +898,8 @@ back by hand, or with `forkdeck team release`.
 | `F4` | show what teammates are working on, and back |
 | `Ctrl-X` | cancel the selected job |
 | `Ctrl-C` / `Ctrl-Q` | quit from any view, saving the draft and stopping agents; again to quit at once |
+
+Ctrl keys work with Shift or Caps Lock held.
 
 The TUI opens on a factory board: Queue, Build, Review, Delivery, Done, and Attention. Select a job with Alt-Up/Down to inspect its checks, review result, and live worker/reviewer output. F2 switches to the detailed agent tree. Message recall keeps the last 100 accepted submissions across TUI restarts; Enter replies to the current task; Ctrl-T starts a new task and F4 opens the team view.
 

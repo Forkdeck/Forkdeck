@@ -766,6 +766,34 @@ fn a_ci_failure_goes_back_to_the_worker_and_the_fix_is_pushed() {
 }
 
 #[test]
+fn local_review_repair_does_not_consume_the_ci_repair_allowance() {
+    let rig = Rig::new("ci-after-review", &format!("{MCP_SERVER}\n[review]\nmax_fix_rounds = 1"), CI_STAGE);
+    rig.issue();
+    let agent = CLAUDE.replace("prompt=$(cat)", "prompt=$(cat)\nat=$(printf '%s' \"$prompt\" | sed -n 's/^The checkout to inspect is \\(.*\\)\\. Use absolute.*/\\1/p' | head -1)\nf=${at:-.}/by_agent.txt\nif test -f $f && test $(wc -l < $f) -eq 1; then FAKE_VERDICT=FAIL; fi");
+    fs::write(rig.root.join("bin/claude"), agent).unwrap();
+    rig.mcp_answers("ci_status", &["state=FAILED run=4411", "state=PASSED"]);
+    rig.mcp_answers("ci_logs", &["error: repair the CI failure"]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok && out.contains("CI passed"), "{out}");
+    assert_eq!(git(&rig.origin(), &["rev-list", "--count", "main..forkdeck/issue-7"]), "2");
+    assert_eq!(git(&rig.origin(), &["show", "forkdeck/issue-7:by_agent.txt"]).lines().count(), 3);
+}
+
+#[test]
+fn review_after_ci_repair_gets_a_fresh_local_allowance() {
+    let rig = Rig::new("review-after-ci", &format!("{MCP_SERVER}\n[review]\nmax_fix_rounds = 1"), CI_STAGE);
+    rig.issue();
+    let agent = CLAUDE.replace("prompt=$(cat)", "prompt=$(cat)\nat=$(printf '%s' \"$prompt\" | sed -n 's/^The checkout to inspect is \\(.*\\)\\. Use absolute.*/\\1/p' | head -1)\nf=${at:-.}/by_agent.txt\nif test -f $f; then case $(wc -l < $f) in 1|3) FAKE_VERDICT=FAIL;; esac; fi");
+    fs::write(rig.root.join("bin/claude"), agent).unwrap();
+    rig.mcp_answers("ci_status", &["state=FAILED run=4411", "state=PASSED"]);
+    rig.mcp_answers("ci_logs", &["error: repair the CI failure"]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok && out.contains("CI passed"), "{out}");
+    assert_eq!(git(&rig.origin(), &["rev-list", "--count", "main..forkdeck/issue-7"]), "2");
+    assert_eq!(git(&rig.origin(), &["show", "forkdeck/issue-7:by_agent.txt"]).lines().count(), 4);
+}
+
+#[test]
 fn ci_that_stays_red_is_handed_to_a_person_with_the_pull_request_left_open() {
     let rig = Rig::new("ci-red", MCP_SERVER, CI_STAGE);
     rig.issue();

@@ -38,6 +38,9 @@ impl Usage {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct Entry {
+    pub job_id: String,
+    pub turn: usize,
+    pub attempt_ids: Vec<String>,
     /// When the job ended, in seconds since the epoch.
     pub ts: i64,
     /// task, issue, review or deploy
@@ -95,6 +98,9 @@ pub fn entry(j: &Job, status: JobStatus, outcome: &str, learned: u32) -> Entry {
         Source::Deploy { repo, sha, .. } => ("deploy", repo.clone(), sha.chars().take(10).collect()),
     };
     Entry {
+        job_id: j.metrics_id.clone(),
+        turn: j.turns.len(),
+        attempt_ids: j.attempt_ids.clone(),
         ts: now(),
         kind: kind.into(),
         repo,

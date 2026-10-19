@@ -68,6 +68,8 @@ const MIGRATIONS: &[&str] = &["
 ", "
     ALTER TABLE jobs ADD COLUMN issue_plan TEXT;
     CREATE TABLE composer (workdir TEXT PRIMARY KEY, state TEXT NOT NULL);
+", "
+    ALTER TABLE jobs ADD COLUMN metrics TEXT;
 "];
 
 /// Who is running: this process, told apart from a later process that reuses its id by its start time.
@@ -230,6 +232,17 @@ pub struct JobRecord {
     /// The forkdeck process that runs the job, as `owner_token` wrote it.
     pub owner: Option<String>,
     pub issue_plan: Option<crate::planning::Plan>,
+    /// The job's metrics identity, its attempts this turn, and the adaptive decision (JSON).
+    pub metrics: Option<String>,
+}
+
+/// What links a job to its attempt records and adaptive decision, kept across restarts.
+#[derive(Serialize, Deserialize)]
+struct JobMetrics {
+    id: String,
+    attempt_ids: Vec<String>,
+    escalated: bool,
+    adaptive: Option<crate::adaptive::Decision>,
 }
 
 impl JobRecord {
@@ -264,6 +277,7 @@ impl JobRecord {
             inbox: j.inbox.iter().cloned().collect(),
             owner: Some(owner_token()),
             issue_plan: j.issue_plan.clone(),
+            metrics: serde_json::to_string(&JobMetrics { id: j.metrics_id.clone(), attempt_ids: j.attempt_ids.clone(), escalated: j.escalated, adaptive: j.adaptive.clone() }).ok(),
         }
     }
 
@@ -275,7 +289,17 @@ impl JobRecord {
         if status == JobStatus::Interrupted && outcome.is_empty() {
             outcome = "interrupted: forkdeck stopped while this ran".into();
         }
+        let m = self.metrics.as_deref().and_then(|m| serde_json::from_str::<JobMetrics>(m).ok());
+        let (metrics_id, attempt_ids, escalated, adaptive) = match m {
+            Some(m) => (m.id, m.attempt_ids, m.escalated, m.adaptive),
+            None => (crate::metrics::id(), Vec::new(), false, None),
+        };
         Job {
+            metrics_id,
+            queue: crate::metrics::QueueTiming::admitted(),
+            attempt_ids,
+            adaptive,
+            escalated,
             active_secs: self.active_secs,
             active_started: Instant::now(),
             restored: true,
@@ -438,7 +462,7 @@ impl History {
             ],
         )
         .map_err(|e| e.to_string())?;
-        tx.execute("UPDATE jobs SET active_secs = ?1, used = ?2, issue_plan = ?3 WHERE id = ?4", params![r.active_secs, json(&r.used), r.issue_plan.as_ref().map(|p| json(p)), r.id]).map_err(|e| e.to_string())?;
+        tx.execute("UPDATE jobs SET active_secs = ?1, used = ?2, issue_plan = ?3, metrics = ?4 WHERE id = ?5", params![r.active_secs, json(&r.used), r.issue_plan.as_ref().map(|p| json(p)), r.metrics, r.id]).map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM turns WHERE job = ?1", params![r.id]).map_err(|e| e.to_string())?;
         for (n, t) in r.turns.iter().enumerate() {
             tx.execute("INSERT INTO turns (job, n, ask, answer) VALUES (?1, ?2, ?3, ?4)", params![r.id, n as i64, t.ask, t.answer]).map_err(|e| e.to_string())?;
@@ -475,7 +499,7 @@ impl History {
         let e = |e: rusqlite::Error| e.to_string();
         let mut q = db
             .prepare(&format!(
-                "SELECT id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan, inbox, owner, active_secs, used, issue_plan
+                "SELECT id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan, inbox, owner, active_secs, used, issue_plan, metrics
                  FROM jobs WHERE source != 'null' AND {} ORDER BY id DESC LIMIT ?2",
                 filter
             ))
@@ -513,6 +537,7 @@ impl History {
                     inbox: r.get::<_, Option<String>>(23)?.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default(),
                     owner: r.get(24)?,
                     issue_plan: r.get::<_, Option<String>>(27)?.and_then(|p| serde_json::from_str(&p).ok()),
+                    metrics: r.get(28)?,
                 })
             })
             .map_err(e)?;
@@ -596,6 +621,11 @@ mod tests {
         worker.push("▸ Edit src/a.rs");
         worker.push("Done.");
         Job {
+            metrics_id: "m-1".into(),
+            queue: crate::metrics::QueueTiming::admitted(),
+            attempt_ids: vec!["a-1".into()],
+            adaptive: None,
+            escalated: true,
             active_secs: 0,
             active_started: Instant::now(),
             restored: false,
@@ -763,6 +793,7 @@ mod tests {
         assert_eq!((j.turns.len(), j.worker.tail.len(), j.worker.via.as_str(), j.forced.map(|f| f.name())), (2, 2, "copilot", Some("copilot:second".to_string())));
         assert_eq!(j.decision.unwrap().tier, Tier::Heavy);
         assert_eq!(j.inbox.iter().collect::<Vec<_>>(), ["and the docs too"], "a queued message survives a restart");
+        assert_eq!((j.metrics_id.as_str(), j.attempt_ids.as_slice(), j.escalated), ("m-1", ["a-1".to_string()].as_slice(), true), "attempts stay linked to the job");
     }
 
     #[test]

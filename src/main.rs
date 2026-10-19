@@ -1,7 +1,9 @@
+mod adaptive;
 mod agents;
 mod buildcache;
 mod catalog;
 mod choices;
+mod benchmark;
 mod cicd;
 mod config;
 mod copilot;
@@ -13,6 +15,7 @@ mod issues;
 mod journal;
 mod knowledge;
 mod mcp;
+mod metrics;
 mod orchestrator;
 mod pick;
 mod plan_ui;
@@ -58,6 +61,37 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Run paired model benchmarks in disposable local clones (executes agents)
+    Benchmark {
+        manifest: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        preflight: bool,
+    },
+    /// Compare reviewers against labeled defects and clean changes (never enables routing)
+    ReviewerBenchmark {
+        manifest: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        preflight: bool,
+    },
+    /// Inspect adaptive decisions, suspensions and durable trial reservations
+    Adaptive {
+        /// Print full audit records as JSON
+        #[arg(long)]
+        json: bool,
+        /// Evaluate a paired benchmark evidence file against configured gates
+        #[arg(long)]
+        evaluate: Option<PathBuf>,
+        /// Disable new adaptive assignments immediately, across running instances
+        #[arg(long, conflicts_with_all=["enable", "evaluate"])]
+        disable: bool,
+        /// Re-enable assignments after evidence qualification (suspensions remain binding)
+        #[arg(long, conflicts_with_all=["disable", "evaluate"])]
+        enable: bool,
+    },
     /// Run one task without the interface and print progress. Lines typed on stdin while it runs
     /// are sent to the task; a line starting with "!" stops the agent to take it at once
     Run {
@@ -99,6 +133,13 @@ enum Cmd {
     },
     /// What forkdeck has done lately: jobs, pass rates, time to a pull request, tokens
     Stats {
+        /// Group invocation usage by actual model, effort, and role
+        #[arg(long)]
+        by_model: bool,
+        #[arg(long, requires = "by_model")]
+        role: Option<String>,
+        #[arg(long, requires = "by_model")]
+        repo: Option<String>,
         /// How many days back to look
         #[arg(long, default_value_t = 7)]
         days: u32,
@@ -238,6 +279,8 @@ fn main() -> anyhow::Result<()> {
         eprintln!("note: ./forkdeck.toml is not read. Move it to {} or pass --config.", config::user_path().display());
     }
     cfg.demo = cli.demo;
+    // Evidence is matched against the configuration as written, whatever is filled in below.
+    cfg.adaptive.written = Some(adaptive::fingerprint(&cfg));
     if !cfg.demo {
         // Only where agents may run: asking the CLI takes a moment.
         let agents_run = matches!(cli.cmd, None | Some(Cmd::Once) | Some(Cmd::Run { .. }) | Some(Cmd::Resume) | Some(Cmd::Doctor));
@@ -313,9 +356,93 @@ fn main() -> anyhow::Result<()> {
             let code = rt.block_on(team_cmd(&hub, all, json, cmd));
             std::process::exit(code);
         }
-        Some(Cmd::Stats { days, jobs, json }) => {
+        Some(Cmd::ReviewerBenchmark { manifest, output, preflight }) => {
+            rt.block_on(benchmark::reviewers(&hub, &manifest, &output, preflight)).map_err(anyhow::Error::msg)
+        }
+        Some(Cmd::Benchmark { manifest, output, preflight }) => {
+            rt.block_on(benchmark::run(&hub, &manifest, &output, preflight)).map_err(anyhow::Error::msg)
+        }
+        Some(Cmd::Adaptive { json, evaluate, disable, enable }) => {
+            if disable || enable {
+                adaptive::set_disabled(&hub.cfg, disable).map_err(anyhow::Error::msg)?;
+            }
+            if let Some(path) = evaluate {
+                let q = adaptive::evaluate(&hub.cfg, &path).map_err(anyhow::Error::msg)?;
+                println!("{}", serde_json::to_string_pretty(&q)?);
+            } else {
+                let s = adaptive::status().map_err(anyhow::Error::msg)?;
+                let production = adaptive::production_reports(&hub.cfg.adaptive, &s);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({"state":s,"production":production,"fingerprint":adaptive::fingerprint(&hub.cfg)})
+                        )?
+                    );
+                } else {
+                    println!("Mode: {:?}; configuration fingerprint: {}", hub.cfg.adaptive.mode, adaptive::fingerprint(&hub.cfg));
+                    println!("Operator disable switch: {}", s.disabled);
+                    println!(
+                        "Objective: {:?}; invocation USD ceiling: {:?} (capability probed per CLI; no hard token ceiling)",
+                        hub.cfg.adaptive.objective, hub.cfg.adaptive.invocation_max_usd
+                    );
+                    for p in production {
+                        println!("Observed trial {} / {}: {} candidates, {} baseline, {} pending; savings {:?}, 95% lower {:?}; reserved {} tokens; gate {:?}",p.policy,p.cohort,p.candidate_tasks,p.baseline_tasks,p.pending,p.observed_savings,p.observed_savings_lower,p.reserved_tokens,p.gate_failure);
+                    }
+                    for (cohort, reason) in s.suspended {
+                        println!("Suspended {cohort}: {reason}");
+                    }
+                    for d in s.decisions.iter().rev().take(30) {
+                        println!(
+                            "{} {:?} {} -> {} / {}: {}; probability {}; reserved {}; observed tokens {:?}; accepted {:?}",
+                            d.id,
+                            d.mode,
+                            d.baseline.model,
+                            d.executed.model,
+                            d.executed.effort,
+                            d.reason,
+                            d.probability,
+                            d.reserved,
+                            d.tokens,
+                            d.accepted
+                        );
+                        if let Some(q) = &d.qualification {
+                            println!("  Predicted savings {:.1}% (95% interval {:.1}–{:.1}%); {} paired tasks; quality difference lower {:.3}; p90 {} ms",100.0*q.predicted_savings,100.0*q.savings_lower,100.0*q.savings_upper,q.tasks,q.quality_difference_lower,q.candidate_p90_ms);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Some(Cmd::Stats { days, jobs, json, by_model, role, repo }) => {
             let days = days.clamp(1, 3650);
-            let entries = journal::read(journal::now() - days as i64 * journal::DAY).map_err(|e| anyhow::anyhow!("the journal cannot be read: {}", e))?;
+            let entries = journal::read(journal::now() - days as i64 * journal::DAY)
+                .map_err(|e| anyhow::anyhow!("the journal cannot be read: {}", e))?;
+            if by_model {
+                let report = metrics::report(journal::now() - days as i64 * journal::DAY, role.as_deref(), repo.as_deref(), &entries)
+                    .map_err(anyhow::Error::msg)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", report.note);
+                    println!(
+                        "Damaged records: {}; historical jobs without attempts: {}",
+                        report.damaged_records, report.historical_jobs_without_attempts
+                    );
+                    for t in &report.tasks {
+                        println!(
+                            "  Cohort {:?}; reported USD/accepted {:?}; cost coverage {}/{}",
+                            t.cohort, t.reported_usd_per_accepted_task, t.complete_cost_tasks, t.tasks
+                        );
+                        println!("Task cohort {} / {} / {}: {} evaluated, {} accepted, {} unknown; {} first pass; tokens/accepted {:?} (partial: {}); {} known excluded tokens",t.repo,t.source,t.initial_model,t.evaluated,t.accepted,t.unknown_quality,t.first_pass,t.tokens_per_accepted_task_lower_bound,t.partial_usage,t.known_excluded_tokens);
+                        println!("Queue wait p90 {:?} ms; measured {}/{} tasks (live admission to dispatch)", t.p90_queue_wait_ms, t.queue_coverage, t.tasks);
+                    }
+                    for g in report.groups {
+                        println!("{} / {} / {} / {}: {} attempts, {} complete usage, {} incomplete, {} cancelled, {} errors; input {} output {} cache-read {} cache-write {}; median {:?} p90 {:?} tokens; p90 {:?} ms", g.cli,g.model,g.effort,g.role,g.attempts,g.complete_usage,g.incomplete,g.cancelled,g.errors,g.known_input,g.known_output,g.known_cache_read,g.known_cache_write,g.median_tokens,g.p90_tokens,g.p90_wall_ms);
+                    }
+                }
+                return Ok(());
+            }
             let summary = journal::summarise(&entries, days);
             if json {
                 println!("{}", serde_json::to_string_pretty(&summary)?);

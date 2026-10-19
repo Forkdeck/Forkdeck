@@ -1,0 +1,15 @@
+{
+  "version": "reviewer-comparison-1",
+  "repository": "/absolute/path/to/repository",
+  "cli": "claude",
+  "baseline": {"model": "YOUR_BASELINE_MODEL", "effort": "high"},
+  "candidate": {"model": "YOUR_CANDIDATE_MODEL", "effort": "high"},
+  "repeats": 3,
+  "max_invocations": 12,
+  "cache_state": "Describe provider cache conditions",
+  "fixture": false,
+  "cases": [
+    {"id": "known-defect", "base": "0000000000000000000000000000000000000000", "revision": "1111111111111111111111111111111111111111", "task": "Implement the selected behavior", "defect": "Incorrect boundary comparison"},
+    {"id": "clean-change", "base": "0000000000000000000000000000000000000000", "revision": "2222222222222222222222222222222222222222", "task": "Implement the selected behavior", "defect": null}
+  ]
+}

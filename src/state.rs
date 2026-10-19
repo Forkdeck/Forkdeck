@@ -423,6 +423,12 @@ pub struct Job {
     pub active_secs: u64,
     pub active_started: Instant,
     pub worktree_lock: Option<Arc<crate::proc::FileLock>>,
+    pub metrics_id: String,
+    pub queue: crate::metrics::QueueTiming,
+    pub attempt_ids: Vec<String>,
+    pub adaptive: Option<crate::adaptive::Decision>,
+    /// Once a candidate is sent back, all later worker invocations use the baseline.
+    pub escalated: bool,
     pub id: u32,
     pub title: String,
     pub prompt: String,
@@ -586,6 +592,8 @@ pub struct State {
     pub rejected_models: HashSet<String>,
     /// Copilot may play claude or codex when that CLI is missing (agents.copilot.stand_in).
     pub stand_in: bool,
+    /// First line of each CLI's `--version`: claude, codex, copilot.
+    pub cli_versions: [Option<String>; 3],
     pub next_id: u32,
     pub team: TeamView,
     /// Finished jobs the journal would not take. They are written as soon as it works again, and

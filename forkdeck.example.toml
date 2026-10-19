@@ -311,3 +311,13 @@ dir = "~/.config/forkdeck/remote"   # certificate authority, paired devices
 # url = "http://127.0.0.1:3000/mcp"
 # headers = { Authorization = "Bearer ${PIPELINES_TOKEN}" }
 # timeout_secs = 60
+
+# Optional worker-model trials: disabled unless explicitly configured.
+# See docs/adaptive-routing.md for evidence generation and all required gates.
+[adaptive]
+mode = "off"
+
+# Optional adaptive extensions (inside [adaptive]):
+# objective = "reported_cost_usd" # default: tokens; requires complete reported USD costs
+# invocation_max_usd = 1.0       # installed Claude flag when supported; not a token cap
+# cohorts = [{ definition = "prompt-proxy-v1", category = "fix", complexity = "standard", context = "prompt-small" }]

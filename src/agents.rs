@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::orchestrator::Hub;
 use crate::pick::Exec;
-use crate::state::{clip, AgentKind, Stage, StageState};
+use crate::state::{clip, AgentKind, Stage, StageState, Tier};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -26,6 +26,8 @@ pub struct RunSpec<'a> {
     pub read_only: bool,
     /// Continue this conversation of the same CLI instead of starting a new one.
     pub resume: Option<&'a str>,
+    /// The routed tier, recorded with each attempt.
+    pub tier: Tier,
 }
 
 #[derive(Default)]
@@ -425,7 +427,52 @@ pub fn parse_copilot(line: &str) -> Vec<Parsed> {
 }
 
 pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
-    let line = command_line(&hub.cfg, &spec);
+    let baseline = spec.exec;
+    // Adaptive routing changes only the worker's model and effort; the CLI and tier keep the review policy.
+    let adapted = (slot == Slot::Worker && !spec.read_only).then(|| crate::adaptive::execution(hub, job)).flatten()
+        .map(|choice| Exec { model: choice.model, effort: choice.effort, ..baseline.clone() });
+    let spec = RunSpec { exec: adapted.as_ref().unwrap_or(baseline), ..spec };
+    let mut line = command_line(&hub.cfg, &spec);
+    let limit_description = if hub.cfg.demo {
+        "demo".into()
+    } else {
+        match invocation_limit(&line.cmd, spec.exec.cli, &mut line.args, hub.cfg.adaptive.invocation_max_usd).await {
+            Ok(description) => description,
+            Err(error) => {
+                crate::adaptive::suspend(hub, job, &error);
+                return RunOut { error, ..Default::default() };
+            }
+        }
+    };
+    let role = if slot == Slot::Worker && !spec.read_only { "worker" } else { "reviewer" };
+    let cli_version = hub.state.lock().unwrap_or_else(|e| e.into_inner()).cli_versions[crate::journal::slot(spec.exec.cli)].clone();
+    let mut attempt = hub.job(job, |j| {
+        let mut a = crate::metrics::Attempt::new(j, role, spec.exec.cli, spec.tier.name(), spec.exec.model.clone(), spec.exec.effort.clone());
+        a.cli_version = cli_version;
+        a.invocation_limit = limit_description;
+        j.attempt_ids.push(a.id.clone());
+        a
+    });
+    let mut spec = spec;
+    if !hub.cfg.demo {
+        if let Some(a) = &mut attempt {
+            if let Err(err) = crate::metrics::write(a) {
+                // Without a record the trial cannot be judged: run the baseline instead.
+                hub.log("metrics", format!("attempt coverage missing: {}", err));
+                crate::adaptive::suspend(hub, job, "attempt write failed");
+                crate::adaptive::fallback(hub, job, "attempt write failed");
+                spec = RunSpec { exec: baseline, ..spec };
+                line = command_line(&hub.cfg, &spec);
+                a.configured_model = baseline.model.clone();
+                a.effort = baseline.effort.clone();
+                match invocation_limit(&line.cmd, baseline.cli, &mut line.args, hub.cfg.adaptive.invocation_max_usd).await {
+                    Ok(description) => a.invocation_limit = description,
+                    Err(error) => return RunOut { error, ..Default::default() },
+                }
+            }
+        }
+    }
+    let telemetry = std::sync::Mutex::new(crate::metrics::Stream::default());
     let start = Instant::now();
     let e = spec.exec;
     let stage = |f: &mut dyn FnMut(&mut Stage)| {
@@ -471,7 +518,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
         let limit = Duration::from_secs(hub.cfg.agents.timeout_mins.unwrap_or(45).clamp(1, 24 * 60) * 60);
         // Dropping the losing branch drops the process group guard, which kills the agent and its children.
         tokio::select! {
-            o = spawn_and_read(hub, job, slot, &line, &spec) => o,
+            o = spawn_and_read(hub, job, slot, &line, &spec, &telemetry, attempt.as_ref()) => o,
             _ = cancel.wait() => RunOut { error: "cancelled".into(), ..Default::default() },
             _ = steer.wait() => RunOut { error: "stopped to take a message".into(), interrupted: true, ..Default::default() },
             _ = tokio::time::sleep(limit) => RunOut { error: format!("timed out after {} min", limit.as_secs() / 60), ..Default::default() },
@@ -492,6 +539,31 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
         hub.state.lock().unwrap_or_else(|e| e.into_inner()).agent_cooldowns[crate::journal::slot(e.cli)] = Some(Instant::now() + Duration::from_secs(15 * 60));
         hub.log("agents", format!("{} reported a usage limit; passed over for 15 minutes: {}", e.cli.name(), clip(&out.error, 200)));
     }
+    if let Some(a) = &mut attempt {
+        let t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
+        a.first_output_ms = t.first_output_ms;
+        a.tokens = t.tokens.clone();
+        a.actual_model = t.model.clone();
+        a.terminal_usage = t.terminal;
+        a.ended = Some(crate::journal::now());
+        a.wall_ms = Some(start.elapsed().as_millis() as u64);
+        a.status = if out.ok {
+            "completed"
+        } else if out.error == "cancelled" || out.interrupted {
+            "cancelled"
+        } else if out.error.starts_with("timed out") {
+            "timeout"
+        } else {
+            "error"
+        }
+        .into();
+        if !hub.cfg.demo {
+            if let Err(err) = crate::metrics::write(a) {
+                hub.log("metrics", format!("attempt coverage missing: {}", err));
+                crate::adaptive::suspend(hub, job, "attempt write failed");
+            }
+        }
+    }
     // What this run used goes on the job's account, by the CLI that ran, whichever box it was shown in.
     hub.job(job, |j| {
         let s = j.stage(slot);
@@ -510,7 +582,15 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     out
 }
 
-async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &RunSpec<'_>) -> RunOut {
+async fn spawn_and_read(
+    hub: &Hub,
+    job: u32,
+    slot: Slot,
+    line: &CmdLine,
+    spec: &RunSpec<'_>,
+    telemetry: &std::sync::Mutex<crate::metrics::Stream>,
+    attempt: Option<&crate::metrics::Attempt>,
+) -> RunOut {
     let (kind, prompt, dir, read_only) = (spec.exec.cli, spec.prompt, spec.dir, spec.read_only);
     let (cmd, args) = (line.cmd.as_str(), &line.args);
     if let Some(f) = &line.usage_file {
@@ -586,6 +666,7 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
     });
     let err_task = proc::Pipe::read(stderr);
 
+    let output_start = Instant::now();
     let mut reader = BufReader::new(stdout);
     let mut raw: Vec<u8> = Vec::new();
     let mut last_text = String::new();
@@ -647,6 +728,25 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
         let line = owned.as_str();
         if line.is_empty() {
             continue;
+        }
+        {
+            let mut t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
+            if t.first_output_ms.is_none() {
+                t.first_output_ms = Some(output_start.elapsed().as_millis() as u64);
+            }
+            if t.observe(kind, line) {
+                if let Some(a) = attempt {
+                    let mut snapshot = a.clone();
+                    snapshot.first_output_ms = t.first_output_ms;
+                    snapshot.tokens = t.tokens.clone();
+                    snapshot.actual_model = t.model.clone();
+                    snapshot.terminal_usage = t.terminal;
+                    if let Err(e) = crate::metrics::write(&snapshot) {
+                        hub.log("metrics", format!("attempt checkpoint failed: {}", e));
+                        crate::adaptive::suspend(hub, job, "attempt checkpoint failed");
+                    }
+                }
+            }
         }
         let parsed = match kind {
             AgentKind::Claude => parse_claude(line),
@@ -908,7 +1008,7 @@ fn mirror_checkout(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// A read-only run starts in an empty directory, where a relative `cmd` such as
-/// `./scripts/claude` is not. It is taken from forkdeck's own directory, as `on_path` finds it;
+/// `./scripts/claude` is not. It is taken from forkdeck's own directory, as `version` finds it;
 /// never from the checkout under review, whose copy the change may have rewritten.
 fn program_for(cmd: &str, read_only: bool) -> String {
     let p = Path::new(cmd);
@@ -918,13 +1018,55 @@ fn program_for(cmd: &str, read_only: bool) -> String {
     cmd.to_string()
 }
 
-pub async fn on_path(cmd: &str) -> bool {
+pub async fn version(cmd: &str) -> Option<String> {
     if cmd.trim().is_empty() {
-        return false;
+        return None;
     }
     let mut c = proc::command(cmd);
     c.arg("--version");
-    matches!(proc::output(c, Duration::from_secs(15)).await, Ok((true, _, _)))
+    match proc::output(c, Duration::from_secs(15)).await {
+        Ok((true, out, _)) => Some(first_line(&out)),
+        _ => None,
+    }
+}
+
+/// Probe the installed CLI, rather than assuming a flag exists in every version.
+/// This bounds reported invocation USD spend, never token usage or tool charges.
+pub async fn invocation_limit(cmd: &str, kind: AgentKind, args: &mut Vec<String>, usd: Option<f64>) -> Result<String, String> {
+    let Some(usd) = usd else {
+        return Ok("wall-time timeout; token budget is admission-only".into());
+    };
+    if !usd.is_finite() || usd <= 0.0 {
+        return Err("invocation_max_usd must be finite and positive".into());
+    }
+    if kind != AgentKind::Claude {
+        return Ok("wall-time timeout; installed adapter has no supported hard spend/token ceiling".into());
+    }
+    // Serialize first-use probes, including failures, so concurrent jobs probe once
+    // per configured executable in this process. Restart after upgrading the CLI.
+    type ProbeResults = std::collections::HashMap<String, Result<(String, bool), String>>;
+    static PROBES: std::sync::OnceLock<tokio::sync::Mutex<ProbeResults>> = std::sync::OnceLock::new();
+    let mut probes = PROBES.get_or_init(Default::default).lock().await;
+    if !probes.contains_key(cmd) {
+        let result = async {
+            let version = version(cmd).await.ok_or("cannot probe invocation limit: CLI version unavailable")?;
+            let mut c = proc::command(cmd);
+            c.arg("--help");
+            let (ok, help, _) = proc::output(c, Duration::from_secs(15)).await?;
+            Ok((version, ok && help.split_whitespace().any(|w| w == "--max-budget-usd")))
+        }.await;
+        probes.insert(cmd.to_string(), result);
+    }
+    let (version, supported) = probes.get(cmd).unwrap().clone()?;
+    drop(probes);
+    if !supported {
+        return Ok(format!("{version}: no advertised --max-budget-usd; token budget is admission-only"));
+    }
+    if args.iter().any(|s| s == "--max-budget-usd" || s.starts_with("--max-budget-usd=")) {
+        return Err("remove explicit --max-budget-usd from agent arguments before configuring invocation_max_usd".into());
+    }
+    args.extend(["--max-budget-usd".into(), usd.to_string()]);
+    Ok(format!("{version}: --max-budget-usd={usd}; CLI-reported invocation USD spend, not a token ceiling"))
 }
 
 #[cfg(test)]
@@ -1153,7 +1295,7 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         let line = |cli, read_only| {
             let e = exec_for(cli, "m");
-            command_line(&cfg, &RunSpec { exec: &e, prompt: "p", dir: &dir, read_only, resume: None }).args
+            command_line(&cfg, &RunSpec { exec: &e, prompt: "p", dir: &dir, read_only, resume: None, tier: Tier::Standard }).args
         };
         let w = line(AgentKind::Claude, false);
         let at = w.iter().position(|a| a == "--allowedTools").expect("build commands are allowed");
@@ -1171,7 +1313,7 @@ mod tests {
         let dir = Path::new("/tmp");
         let line = |cfg: &Config, cli| {
             let e = exec_for(cli, "m");
-            command_line(cfg, &RunSpec { exec: &e, prompt: "p", dir, read_only: false, resume: None }).args
+            command_line(cfg, &RunSpec { exec: &e, prompt: "p", dir, read_only: false, resume: None, tier: Tier::Standard }).args
         };
         let lean: Config = toml::from_str("").unwrap();
         let c = line(&lean, AgentKind::Claude);
@@ -1191,7 +1333,7 @@ mod tests {
         let dir = Path::new("/tmp");
         let line = |cli, read_only, resume| {
             let e = exec_for(cli, "m");
-            command_line(&cfg, &RunSpec { exec: &e, prompt: "p", dir, read_only, resume })
+            command_line(&cfg, &RunSpec { exec: &e, prompt: "p", dir, read_only, resume, tier: Tier::Standard })
         };
         let after = |l: &CmdLine, flag: &str| l.args.iter().position(|a| a == flag).map(|i| l.args[i + 1].clone());
 

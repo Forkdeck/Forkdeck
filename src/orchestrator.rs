@@ -393,6 +393,11 @@ impl Hub {
                 active_started: Instant::now(),
                 restored: false,
                 worktree_lock: None,
+                metrics_id: crate::metrics::id(),
+                queue: crate::metrics::QueueTiming::admitted(),
+                attempt_ids: Vec::new(),
+                adaptive: None,
+                escalated: false,
                 id,
                 title: title.clone(),
                 prompt: prompt.clone(),
@@ -452,6 +457,7 @@ impl Hub {
             st.log("queue", format!("#{} {}", id, clip(&title, 90)));
             id
         };
+        self.persist_queue(id);
         let hub = self.clone();
         self.rt.spawn(async move { run_job(hub, id).await });
         self.save(id);
@@ -479,6 +485,9 @@ impl Hub {
             let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return Err("no such job".into()) };
             if !j.source.is_manual() {
                 return Err("only typed tasks take replies".into());
+            }
+            if j.status.finished() && !j.workdir.is_dir() {
+                return Err(gone(&j.workdir));
             }
             // Feedback on a tracked plan: the reviewed revision no longer stands.
             if let Some(p) = &mut j.issue_plan {
@@ -519,16 +528,21 @@ impl Hub {
                 j.used = Default::default();
                 j.active_secs = 0;
                 j.created = Instant::now();
+                j.attempt_ids.clear();
+                j.adaptive = None;
+                j.escalated = false;
             }
             j.findings.clear();
             j.over_time = false;
             j.active_started = Instant::now();
+            j.queue = crate::metrics::QueueTiming::admitted();
             j.cancel = Cancel::new();
             j.worker.push(format!("› {}", clip(&text, 300)));
             j.reviewer.state = StageState::Idle;
             st.log("queue", format!("#{} reply: {}", id, clip(&text, 90)));
         }
         self.save(id);
+        self.persist_queue(id);
         let hub = self.clone();
         self.rt.spawn(async move { run_job(hub, id).await });
         Ok(())
@@ -662,6 +676,12 @@ impl Hub {
         }
     }
 
+    fn persist_queue(&self, id: u32) {
+        if let Some(Err(e)) = self.job(id, |j| j.queue.persist(&j.metrics_id, j.turns.len())) {
+            self.log("metrics", format!("#{id} queue audit gap: {e}"));
+        }
+    }
+
     pub fn cancel(&self, id: u32) {
         if let Some(c) = self.job(id, |j| if j.status.finished() { None } else { Some(j.cancel.clone()) }).flatten() {
             c.fire();
@@ -696,18 +716,19 @@ impl Hub {
     }
 
     pub async fn detect_agents(&self) {
-        let found = if self.cfg.demo {
-            [true, true, false]
+        let found: [Option<String>; 3] = if self.cfg.demo {
+            [Some("demo".into()), Some("demo".into()), None]
         } else {
             let [cc, xc, pc] = AgentKind::ALL.map(|k| self.cfg.agents.get(k).cmd.unwrap_or_default());
-            let (c, x, p) = tokio::join!(agents::on_path(&cc), agents::on_path(&xc), agents::on_path(&pc));
+            let (c, x, p) = tokio::join!(agents::version(&cc), agents::version(&xc), agents::version(&pc));
             [c, x, p]
         };
-        let installed: std::collections::HashSet<AgentKind> = AgentKind::ALL.into_iter().zip(found).filter(|(_, f)| *f).map(|(k, _)| k).collect();
+        let installed: std::collections::HashSet<AgentKind> = AgentKind::ALL.into_iter().zip(&found).filter(|(_, f)| f.is_some()).map(|(k, _)| k).collect();
         // Which models the account may use decides what copilot can stand in for, so ask before any job starts.
         let probe = if installed.contains(&AgentKind::Copilot) { crate::copilot::probe(&self.cfg.agents.get(AgentKind::Copilot).cmd.unwrap_or_default()).await } else { Default::default() };
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.installed = installed;
+        st.cli_versions = found;
         st.copilot = probe;
         st.stand_in = self.cfg.agents.copilot.stand_in();
         if st.has(AgentKind::Copilot) {
@@ -743,6 +764,11 @@ struct Finish {
 
 fn done(m: impl Into<String>) -> Finish {
     Finish { status: JobStatus::Done, outcome: m.into(), retry: None, reported: false, wait: None }
+}
+
+/// A typed task runs where forkdeck was started, which may since have been removed (a temporary directory, say).
+fn gone(dir: &Path) -> String {
+    format!("working directory {} no longer exists; start a new task with Ctrl-T", dir.display())
 }
 
 fn failed(m: impl Into<String>) -> Finish {
@@ -792,7 +818,11 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
         tokio::select! {
             (permit, _lane) = wait => {
                 hub.park_slot(id, permit);
-                hub.job(id, |j| j.admitted = true);
+                hub.job(id, |j| {
+                    j.admitted = true;
+                    j.queue.dispatch(j.active_started.elapsed());
+                });
+                hub.persist_queue(id);
                 // One issue or review may only run so long. A deployment has its own time limits,
                 // and stopping one halfway is worse than letting it finish.
                 let limit = hub.cfg.limits.job_mins;
@@ -874,6 +904,10 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
         fin
     };
     let learned = knowledge::learn(&hub, id).await;
+    // An interrupted turn carries on later; its outcome is not known yet.
+    if fin.status != JobStatus::Interrupted {
+        crate::adaptive::settle(&hub, id, fin.status);
+    }
     let mut entry = None;
     let again = hub.job(id, |j| {
         if manual && !cancel.is_set() && !j.inbox.is_empty() {
@@ -1016,7 +1050,7 @@ pub async fn run_agent(hub: &Hub, id: u32, slot: Slot, mut exec: Exec, tier: Tie
         if slot == Slot::Worker && !read_only && exec.family != AgentKind::Copilot {
             hub.job(id, |j| if let Some(d) = &mut j.decision { d.agent = exec.family; });
         }
-        let out = agents::run(hub, id, slot, RunSpec { exec: &exec, prompt: &prompt, dir, read_only, resume: resume.as_ref().map(|(sid, _)| sid.as_str()) }).await;
+        let out = agents::run(hub, id, slot, RunSpec { exec: &exec, prompt: &prompt, dir, read_only, resume: resume.as_ref().map(|(sid, _)| sid.as_str()), tier }).await;
         // A usage limit before any tool ran: nothing was done, so another CLI can start it cleanly.
         if !out.ok && agents::quota_error(&out.error) && !hub.cfg.demo {
             let clean = hub.job(id, |j| !j.cancel.is_set() && j.stage(slot).tools == 0).unwrap_or(false);
@@ -1075,6 +1109,7 @@ async fn decide(hub: &Hub, id: u32, prompt: &str, is_issue: bool, forced: Option
         }
         d.note = format!("agent forced to {}", f.name());
     }
+    let manual = forced.is_some();
     let wanted = forced.unwrap_or(AgentRef::Kind(d.agent));
     // Work that starts from someone else's text is reviewed whatever the router says: the router
     // read that same text, so it must not be able to talk its way out of the review.
@@ -1096,6 +1131,8 @@ async fn decide(hub: &Hub, id: u32, prompt: &str, is_issue: bool, forced: Option
     if worker.family != AgentKind::Copilot {
         d.agent = worker.family;
     }
+    // A forced agent, or copilot standing in, is not the baseline adaptive routing measured.
+    crate::adaptive::select(hub, id, &d, manual || worker.cli != d.agent);
     hub.log(
         "router",
         format!(
@@ -1330,6 +1367,15 @@ async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, fresh: Option
             let used = fresh.clone().unwrap_or_else(|| prompt.clone());
             (out, ran) = run_agent(hub, id, Slot::Worker, worker.clone(), w.d.tier, &used, w.dir, false, None).await;
         }
+        // A candidate model that failed gets one more go as the baseline. That uses neither repair allowance.
+        let escalate = !out.ok && !out.interrupted && !cancel.is_set()
+            && hub.job(id, |j| !j.escalated && j.adaptive.as_ref().is_some_and(|d| d.candidate)).unwrap_or(false);
+        if escalate {
+            hub.job(id, |j| j.escalated = true);
+            set_status(hub, id, JobStatus::Fixing);
+            let retry = format!("{}\n\nThe candidate worker failed. Continue from the existing working tree.\n{}", fresh.clone().unwrap_or_else(|| prompt.clone()), out.error);
+            (out, ran) = run_agent(hub, id, Slot::Worker, worker.clone(), w.d.tier, &retry, w.dir, false, None).await;
+        }
         if let Some(sid) = &out.session {
             hub.job(id, |j| j.session = Some(Session { cli: ran.cli, id: sid.clone(), model: ran.model.clone() }));
             hub.save(id);
@@ -1415,7 +1461,8 @@ async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool
                 }
                 // A message stopped the planning (Ctrl-S, or "!" in `run`): it is guidance for the plan,
                 // not the choice. Plan again with it, in the same conversation when it can continue.
-                let Some(msg) = hub.job(id, |j| j.inbox.pop_front()).flatten() else { continue };
+                // Its stop is answered: a message queued meanwhile must not stop the next run as well.
+                let Some(msg) = hub.job(id, |j| { j.steer = crate::state::Cancel::new(); j.inbox.pop_front() }).flatten() else { continue };
                 hub.job(id, |j| j.turns.push(Turn { ask: msg.clone(), answer: String::new() }));
                 hub.save(id);
                 resume = out.session.clone().filter(|_| !hub.cfg.demo && agents::can_resume(&hub.cfg, &ran, true));
@@ -1519,6 +1566,8 @@ fn take_messages(hub: &Hub, id: u32, answer: Option<&str>) -> Option<String> {
                 t.answer = a.to_string();
             }
             let msg = j.inbox.drain(..).collect::<Vec<_>>().join("\n\n");
+            // Every message is taken, including any that stopped the agent.
+            j.steer = crate::state::Cancel::new();
             j.turns.push(Turn { ask: msg.clone(), answer: String::new() });
             j.worker.push("› taking the message");
             Some(msg)
@@ -1571,6 +1620,7 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
     let mut passed: Option<bool>;
     let mut checks_ok: Option<bool> = None;
     let mut reasons = String::new();
+    // Each review cycle, including one after CI repair, gets its own allowance.
     let mut round = 0;
     let mut stalled = false;
     // The last review that reached a verdict: what it said, who said it, and its conversation.
@@ -1684,7 +1734,7 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
             break;
         }
         round += 1;
-        hub.job(id, |j| j.rounds = round);
+        hub.job(id, |j| { j.rounds += 1; j.escalated = true; });
         set_status(hub, id, JobStatus::Fixing);
         hub.log("review", format!("#{} sent back, fix round {} of {}", id, round, hub.cfg.review.max_fix_rounds));
         let again = if round > 1 { format!(" This is fix round {}: the problems are not all solved yet. Address every point below, not only the new ones.", round) } else { String::new() };
@@ -1728,6 +1778,9 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
     }) else {
         return failed("job vanished");
     };
+    if !is_issue && !dir.is_dir() {
+        return failed(gone(&dir));
+    }
 
     // 1. Fork layer
     let (d, worker) = match decide(hub, id, &prompt, is_issue, forced).await {
@@ -1815,6 +1868,7 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
     // From here the pull request is open and the issue is labelled as such. Stopping forkdeck now
     // is not a failure of the work: say nothing on the issue and leave its labels alone.
     let stopped = || Finish { reported: true, ..cancelled() };
+    // CI has its own repair allowance, independent of local review repairs.
     let mut round = 0;
     loop {
         set_status(hub, id, JobStatus::Ci);
@@ -1839,6 +1893,7 @@ async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish
              ----- BEGIN PIPELINE OUTPUT -----\n{}\n----- END PIPELINE OUTPUT -----",
             prompt, excerpt
         );
+        hub.job(id, |j| j.escalated = true);
         let short_log = cicd::tail_chars(&log, 4000);
         let wf = Work { followup: Some(&short_log), ..Work { prompt: &prompt, dir: &dir, d: &d, worker: &worker, reviewer: &reviewer, checks: &checks, is_issue, followup: None } };
         let summary = match work_once(hub, id, &wf, &fp, None, cancel).await {
@@ -2001,6 +2056,9 @@ async fn followup(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     let Some((turns, dir, forced, known, checks)) = hub.job(id, |j| (j.turns.clone(), j.workdir.clone(), j.forced.clone(), j.decision.clone(), hub.cfg.review.checks.clone())) else {
         return failed("job vanished");
     };
+    if !dir.is_dir() {
+        return failed(gone(&dir));
+    }
     let task = match (turns.first(), turns.last()) {
         (Some(first), Some(last)) => format!("{}\n\nFollow-up request: {}", first.ask, last.ask),
         _ => return failed("job has no conversation"),
@@ -2289,7 +2347,7 @@ async fn pr_pipeline(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
 }
 
 fn short(sha: &str) -> &str {
-    &sha[..sha.len().min(10)]
+    &sha[..sha.char_indices().nth(10).map(|(i, _)| i).unwrap_or(sha.len())]
 }
 
 /// Changes are requested only when someone asked for them; a reviewer that crashed makes the result incomplete, not negative.
@@ -2334,7 +2392,7 @@ fn re_review_prompt(earlier: Option<&str>, task: Option<&str>) -> String {
     )
 }
 
-fn review_prompt(task: &str, base: Option<&str>, followup: Option<&str>) -> String {
+pub(crate) fn review_prompt(task: &str, base: Option<&str>, followup: Option<&str>) -> String {
     // The reviewer gets the task and the tree, not the author's account of what was done. The diff is
     // taken from the commit the work started at, so commits, staged and unstaged changes all show.
     let how = match base {
@@ -2627,6 +2685,13 @@ mod tests {
     }
 
     #[test]
+    fn short_revision_accepts_unicode() {
+        assert_eq!(short("abcdef012345"), "abcdef0123");
+        assert_eq!(short("abcdefghi界tail"), "abcdefghi界");
+        assert_eq!(short("界"), "界");
+    }
+
+    #[test]
     fn replies_keep_conversation_without_recounting_journal_usage() {
         // Keep spawned jobs queued: this test exercises reply admission without running agents.
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -2655,6 +2720,135 @@ mod tests {
         assert_eq!(next.claude.tokens_in, 0);
         assert_eq!(next.claude.runs, 0);
         assert!(next.secs < 60);
+    }
+
+    #[test]
+    fn a_reply_to_a_task_whose_directory_is_gone_is_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = Hub::new(Config::default(), rt.handle().clone());
+        let gone = std::env::temp_dir().join(format!("forkdeck-gone-{}", crate::metrics::id()));
+        let id = rt.block_on(hub.submit("task".into(), "task".into(), Source::Manual, gone, None, Planning::IfRouted)).unwrap();
+        hub.job(id, |j| j.status = JobStatus::Done);
+        let e = rt.block_on(hub.reply(id, "more".into())).unwrap_err();
+        assert!(e.contains("no longer exists"), "{e}");
+        assert!(hub.job(id, |j| j.status == JobStatus::Done && j.turns.len() == 1).unwrap());
+    }
+
+    #[test]
+    fn a_task_whose_directory_is_gone_fails_saying_so() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let cfg = Config { demo: true, ..Config::default() };
+            let hub = Hub::new(cfg, rt.handle().clone());
+            let gone = std::env::temp_dir().join(format!("forkdeck-gone-{}", crate::metrics::id()));
+            let id = hub.submit("task".into(), "task".into(), Source::Manual, gone, None, Planning::IfRouted).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !hub.job(id, |j| j.status.finished()).unwrap() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }).await.unwrap();
+            let (status, outcome) = hub.job(id, |j| (j.status, j.outcome.clone())).unwrap();
+            assert_eq!(status, JobStatus::Failed);
+            assert!(outcome.contains("no longer exists"), "{outcome}");
+        });
+    }
+
+    #[test]
+    fn rollback_preserves_queued_and_healthy_inflight_jobs() {
+        // Run with private process environment: other unit tests must not share this ledger.
+        const CHILD: &str = "FORKDECK_ROLLBACK_TEST_ROOT";
+        let Ok(root) = std::env::var(CHILD) else {
+            let root = std::env::temp_dir().join(crate::metrics::id());
+            std::fs::create_dir_all(&root).unwrap();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "orchestrator::tests::rollback_preserves_queued_and_healthy_inflight_jobs", "--nocapture"])
+                .env(CHILD, &root).env("XDG_STATE_HOME", root.join("state")).output().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            return;
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let root = PathBuf::from(root);
+        let agent = root.join("agent");
+        std::fs::write(&agent, r#"#!/bin/sh
+[ "$1" = '--version' ] && { echo fixture; exit 0; }
+cat >/dev/null
+touch started
+while ! test -f release; do sleep 0.02; done
+printf '{"type":"result","model":"baseline","is_error":false,"result":"Done","usage":{"input_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":5}}\n'
+"#).unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg: Config = toml::from_str(&format!(r#"
+[router]
+kind="rules"
+default_agent="claude"
+[review]
+mode="never"
+[knowledge]
+enabled=false
+[agents.claude]
+cmd={:?}
+[agents.codex]
+cmd="/nonexistent"
+[adaptive]
+mode="advisory"
+"#, agent.to_str().unwrap())).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let hub = Hub::new(cfg, rt.handle().clone());
+            hub.detect_agents().await;
+            let first = hub.submit("one".into(), "one".into(), Source::Manual, root.clone(), None, Planning::IfRouted).await.unwrap();
+            let second = hub.submit("two".into(), "two".into(), Source::Manual, root.clone(), None, Planning::IfRouted).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !root.join("started").exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            }).await.unwrap();
+            assert!(hub.job(second, |j| j.status == JobStatus::Queued && j.queue.wait_ms.is_none()).unwrap());
+            let original = hub.job(first, |j| j.adaptive.as_ref().unwrap().id.clone()).unwrap();
+            crate::adaptive::set_disabled(&hub.cfg, true).unwrap();
+            assert!(hub.job(first, |j| !j.cancel.is_set()).unwrap());
+            assert!(hub.job(second, |j| !j.cancel.is_set()).unwrap());
+            std::fs::write(root.join("release"), "go").unwrap();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while hub.state.lock().unwrap().jobs.iter().any(|j| !j.status.finished()) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            for id in [first, second] { assert!(hub.job(id, |j| j.status == JobStatus::Done).unwrap()); }
+            assert_eq!(hub.job(first, |j| j.adaptive.as_ref().unwrap().id.clone()).unwrap(), original);
+            assert_eq!(hub.job(second, |j| j.adaptive.as_ref().unwrap().reason.clone()).unwrap(), "disabled by operator");
+            let (attempts, bad) = crate::metrics::read_at(&crate::metrics::root()).unwrap();
+            assert_eq!(bad, 0);
+            assert_eq!(attempts.len(), 2);
+            assert!(attempts.iter().all(|a| a.status == "completed"));
+            assert!(attempts.iter().any(|a| a.decision.as_ref() == Some(&original)));
+        });
+    }
+
+    #[test]
+    fn queue_wait_includes_lane_delay_and_followup_gets_a_fresh_interval() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let hub = Hub::new(Config::default(), rt.handle().clone());
+            let held = hub.lane.clone().lock_owned().await;
+            let id = hub.submit("queued".into(), "queued".into(), Source::Manual, PathBuf::from("."), None, Planning::IfRouted).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert!(hub.job(id, |j| j.queue.wait_ms.is_none()).unwrap());
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if hub.job(id, |j| j.queue.wait_ms.is_some()).unwrap() { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            let q = hub.job(id, |j| j.queue.clone()).unwrap();
+            assert!(q.wait_ms.unwrap() >= 40);
+            assert!(q.dispatched_ms.is_some());
+            hub.cancel(id);
+            hub.shutdown(Duration::from_secs(2)).await;
+            hub.state.lock().unwrap().stopping = false;
+            hub.job(id, |j| j.status = JobStatus::Done);
+            hub.reply(id, "next".into()).await.unwrap();
+            assert!(hub.job(id, |j| j.queue.wait_ms.is_none()).unwrap());
+            hub.cancel(id);
+        });
     }
 
     #[test]
