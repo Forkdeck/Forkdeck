@@ -964,8 +964,11 @@ create a new issue after acceptance. Enter starts planning.
 The planner and plan reviewer both use the configured read-only agent arguments.
 They review the goal, steps, acceptance criteria, dependencies and test strategy;
 repository code checks run later during Build. A complete plan goes to review
-even when ordinary task review is disabled. A failed or incomplete review cannot
-be accepted. Numbered choices and custom replies continue on the same task.
+even when ordinary task review is disabled. A failed review goes back to the
+planner with its findings, and the revised plan is reviewed again, up to
+`review.max_fix_rounds` times; it stops sooner when the plan needs a decision from
+you, a revision changes nothing, or you have sent a message. A failed or incomplete
+review cannot be accepted. Numbered choices and custom replies continue on the same task.
 
 F6 shows the complete saved plan and reviewer feedback. Tab switches between
 them; Up/Down and PageUp/PageDown scroll. Left/Right or 1–3 selects an action,
