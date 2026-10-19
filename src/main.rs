@@ -1121,6 +1121,10 @@ fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
         tokens_per_day: hub.cfg.limits.tokens_per_day,
         spots: Default::default(),
         diff: None,
+        output_back: Default::default(),
+        log_back: Default::default(),
+        output_view: Default::default(),
+        log_view: Default::default(),
     }
 }
 
@@ -1475,6 +1479,19 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                             u.new_task = false;
                             u.plan_next = false;
                             u.follow = true;
+                        }
+                        // The session log with Shift, else the selected job's output panes.
+                        KeyCode::PageUp | KeyCode::PageDown if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                            u.log_back.set(ui::page(u.log_back.get(), u.log_view.get(), k.code == KeyCode::PageUp));
+                        }
+                        KeyCode::PageUp | KeyCode::PageDown => {
+                            if let Some(id) = u.selected {
+                                u.output_back.set(Some((id, ui::page(u.back_for(id), u.output_view.get(), k.code == KeyCode::PageUp))));
+                            }
+                        }
+                        KeyCode::End => {
+                            u.output_back.set(None);
+                            u.log_back.set(0);
                         }
                         KeyCode::Tab => {
                             // Profiles are for --agent and the config; Tab steps through the CLIs.

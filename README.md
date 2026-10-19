@@ -907,6 +907,9 @@ back by hand, or with `forkdeck team release`.
 | `↑` `↓` | recall submitted messages; edit and press Enter to resend; Down restores your draft |
 | `Alt-↑` `Alt-↓` | select a job; `Esc` goes back to following the newest |
 | `Alt-←` `Alt-→` | select the newest job in the previous or next board lane that has one |
+| `PgUp` `PgDn` | scroll the selected job's worker and reviewer output back and forth; it stops following new output until you page back to the end |
+| `Shift-PgUp` `Shift-PgDn` | scroll the session log |
+| `End` | follow the newest output and log lines again |
 | click an edit line | full-screen diff of those files against the job's starting commit, refreshed while the agent works; `↑` `↓` `PgUp` `PgDn` or the wheel scroll, `Esc` closes. Hold `Shift` to select text with the mouse |
 | `F2` | switch between the factory board and agent tree |
 | `F5` | open planning choices for the selected task |
