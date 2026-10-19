@@ -571,6 +571,8 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
         .spawn()
     {
         Ok(c) => c,
+        // A missing working directory fails the same way as a missing program; say which it was.
+        Err(_) if !run_dir.is_dir() => return fail(format!("working directory {} no longer exists", run_dir.display())),
         Err(e) => return fail(format!("cannot start {}: {}", cmd, e)),
     };
     let group = proc::Group::of(&child);

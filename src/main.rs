@@ -989,6 +989,17 @@ fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
     }
 }
 
+/// Ctrl with Shift or Caps Lock arrives as an uppercase letter; it is the same shortcut.
+fn ctrl_lowercase(event: Event) -> Event {
+    match event {
+        Event::Key(mut k) if k.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let KeyCode::Char(c) = k.code { k.code = KeyCode::Char(c.to_ascii_lowercase()); }
+            Event::Key(k)
+        }
+        e => e,
+    }
+}
+
 /// Quit is global, including when a picker has focus. Some terminals report uppercase keys.
 fn quit_key(key: event::KeyEvent) -> bool {
     key.kind != KeyEventKind::Release &&
@@ -1251,7 +1262,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                 continue;
             }
             let page = term.size().map(|s| s.height.saturating_sub(2)).unwrap_or(20);
-            let event = event::read()?;
+            let event = ctrl_lowercase(event::read()?);
             if diff_event(hub, &mut u, &event, page) {
                 continue;
             }
@@ -1401,5 +1412,16 @@ mod quit_tests {
         let mut release = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         release.kind = KeyEventKind::Release;
         assert!(!quit_key(release));
+    }
+
+    #[test]
+    fn ctrl_shortcuts_work_with_shift_or_caps_lock() {
+        let shifted = Event::Key(event::KeyEvent::new(KeyCode::Char('T'), KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        let Event::Key(k) = ctrl_lowercase(shifted) else { panic!() };
+        assert_eq!(k.code, KeyCode::Char('t'));
+        // Typed text keeps its case.
+        let typed = Event::Key(event::KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT));
+        let Event::Key(k) = ctrl_lowercase(typed) else { panic!() };
+        assert_eq!(k.code, KeyCode::Char('T'));
     }
 }
