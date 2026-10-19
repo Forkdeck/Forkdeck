@@ -144,7 +144,12 @@ Two routers ship, and a default that picks between them:
   one answers, and uses the rules quietly when none is running. On this machine
   without `FORKDECK_JEV_KEY` set it uses the key `scripts/local-jev.sh` serves
   with, so starting that server is all it takes.
-- `rules`: keyword lists from the config. No network.
+- `rules`: keyword and phrase lists from the config. No network. A keyword may
+  be a phrase ("race condition", "stack trace"), and word forms match, so "fix"
+  also matches "fixes", "fixed" and "fixing". Phrases such as "how should" or
+  "pros and cons" in a typed task ask for a choice of approaches first. The
+  built-in lists cover common phrasings; a list set in `[router.rules]`
+  replaces the built-in one.
 - `jev`: any server that speaks the Jev wire format (`POST /v1/systemone` with
   `choice`, `score` and `noul` questions). If it does not answer, the rules
   router is used and the interface says so.

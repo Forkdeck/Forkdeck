@@ -37,10 +37,15 @@ claude_is_for = "Open-ended or ambiguous work: multi-file refactors, design chan
 codex_is_for = "Well-specified work: a bug with a clear reproduction, a contained feature, tests, scripts"
 
 [router.rules]
-claude_keywords = ["refactor", "design", "architecture", "document", "docs", "readme", "explain", "plan", "restructure"]
-codex_keywords = ["bug", "fix", "test", "tests", "script", "failing", "crash", "regression", "implement", "endpoint"]
-heavy_keywords = ["architecture", "migrate", "migration", "concurrency", "race", "security", "rewrite", "redesign", "deadlock", "distributed"]
-light_keywords = ["typo", "rename", "comment", "bump", "format", "lint", "wording", "spelling"]
+# Used when no decision server answers. The built-in lists cover common phrasings;
+# a list set here replaces the built-in one. Keywords may be phrases, and word
+# forms match ("fix" also matches "fixes", "fixed" and "fixing").
+#~ claude_keywords = ["refactor", "clean up", "document", "explain", "design"]
+#~ codex_keywords = ["bug", "fix", "failing", "stack trace", "implement"]
+#~ heavy_keywords = ["migration", "race condition", "security", "rewrite"]
+#~ light_keywords = ["typo", "rename", "one line", "version bump"]
+# Typed tasks with these phrases propose approaches first (router.plan = "never" turns it off).
+#~ plan_keywords = ["how should", "which approach", "pros and cons"]
 
 [agents]
 timeout_mins = 45

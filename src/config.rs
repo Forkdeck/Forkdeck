@@ -85,19 +85,49 @@ pub struct RulesCfg {
     pub codex_keywords: Vec<String>,
     pub heavy_keywords: Vec<String>,
     pub light_keywords: Vec<String>,
+    /// Phrases that ask how to go about something: the task proposes approaches first.
+    pub plan_keywords: Vec<String>,
 }
 
-fn words(s: &str) -> Vec<String> {
-    s.split_whitespace().map(|w| w.to_string()).collect()
+/// Comma-separated keywords; a keyword may be a phrase. Word forms match too: "fix" also
+/// matches "fixes", "fixed" and "fixing".
+fn phrases(s: &str) -> Vec<String> {
+    s.split(',').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect()
 }
 
 impl Default for RulesCfg {
     fn default() -> Self {
         RulesCfg {
-            claude_keywords: words("refactor design architecture document docs readme explain plan restructure"),
-            codex_keywords: words("bug fix test tests script failing crash regression implement endpoint"),
-            heavy_keywords: words("architecture migrate migration concurrency race security rewrite redesign deadlock distributed"),
-            light_keywords: words("typo rename comment bump format lint wording spelling"),
+            claude_keywords: phrases(
+                "refactor, restructure, reorganize, reorganise, clean up, tidy up, simplify, design, architecture, \
+                 document, documentation, docs, readme, explain, describe, summarize, summarise, write up, plan, \
+                 user guide, tutorial, how to, changelog, release notes, api design, naming, error messages, \
+                 developer experience, usability, rethink, untangle, split into modules, extract a module",
+            ),
+            codex_keywords: phrases(
+                "bug, fix, test, unit test, integration test, test case, script, failing, fails, crash, panic, \
+                 regression, implement, endpoint, stack trace, traceback, exception, error when, does not work, \
+                 doesn't work, not working, broken, off by one, null pointer, segfault, flaky, benchmark, optimize, \
+                 optimise, speed up, slow, performance, cli flag, command line option, parse, parser, build fails, \
+                 compile error, compiler error, ci is red, reproduce, repro, edge case, returns the wrong, wrong result",
+            ),
+            heavy_keywords: phrases(
+                "architecture, migrate, migration, concurrency, concurrent, race, race condition, deadlock, \
+                 thread safety, security, vulnerability, authentication, authorization, permissions model, \
+                 encryption, crypto, rewrite, redesign, distributed, consensus, replication, sharding, data loss, \
+                 corruption, memory leak, breaking change, across the codebase, every module, schema change, \
+                 database migration, protocol, backwards compatible, backward compatible, lock free, from scratch",
+            ),
+            light_keywords: phrases(
+                "typo, rename, comment, bump, version bump, format, formatting, lint, clippy warning, wording, \
+                 spelling, grammar, whitespace, indentation, one line, one-line, dead code, unused import, \
+                 log message, doc comment, copyright, badge, update the version, small tweak, minor",
+            ),
+            plan_keywords: phrases(
+                "how should, what is the best way, what's the best way, which approach, options for, \
+                 pros and cons, trade-offs, tradeoffs, should we, propose, come up with, brainstorm, \
+                 compare approaches, figure out how, not sure how",
+            ),
         }
     }
 }

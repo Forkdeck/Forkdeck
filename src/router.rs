@@ -212,12 +212,51 @@ fn unit(v: f64, what: &str) -> Result<f64, String> {
     }
 }
 
-fn hits(text: &str, words: &[String]) -> usize {
-    words
+/// A word reduced to a common form, so "fixes", "fixed" and "fixing" all meet "fix", and
+/// "renamed" meets "rename". Crude on purpose: both sides go through the same reduction.
+fn stem(w: &str) -> String {
+    let mut w = w.to_string();
+    let n = w.len();
+    let mut cut = false;
+    for suffix in ["ing", "ed"] {
+        if w.ends_with(suffix) && n - suffix.len() >= 3 {
+            w.truncate(n - suffix.len());
+            cut = true;
+            break;
+        }
+    }
+    if !cut {
+        if ["sses", "xes", "ches", "shes"].iter().any(|s| w.ends_with(s)) {
+            w.truncate(n - 2);
+        } else if w.ends_with('s') && !w.ends_with("ss") && n > 3 {
+            w.truncate(n - 1);
+        }
+    }
+    // "planning" -> "plann" -> "plan"; "called" keeps its double l.
+    let b = w.as_bytes();
+    if cut && b.len() >= 4 && b[b.len() - 1] == b[b.len() - 2] && !b"aeiouslz".contains(&b[b.len() - 1]) {
+        w.pop();
+    }
+    if w.len() > 3 && w.ends_with('e') {
+        w.pop();
+    }
+    w
+}
+
+/// Lowercase words, split on anything that is not a letter or digit ("one-line" is two words).
+fn tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).map(|t| stem(&t.to_lowercase())).collect()
+}
+
+/// How many of the keywords appear in the text. A keyword may be a phrase: its words must
+/// appear next to each other.
+fn hits(text: &str, keywords: &[String]) -> usize {
+    let words = tokens(text);
+    keywords
         .iter()
-        .filter(|w| {
-            let w = w.to_lowercase();
-            text.split(|c: char| !c.is_alphanumeric()).any(|t| t == w)
+        .filter(|k| {
+            let k = tokens(k);
+            !k.is_empty() && words.windows(k.len()).any(|w| w == k.as_slice())
         })
         .count()
 }
@@ -271,6 +310,8 @@ pub fn rules(cfg: &Config, task: &str, is_issue: bool) -> Decision {
     let review_sharp = (rv - 0.5).abs() >= (th - 0.5).max(0.05);
     // Same rule as the Jev path: any unsure answer buys a review.
     let review = rv >= 0.5 || !review_sharp || !agent_sharp || !effort_sharp;
+    // A task that asks how to go about something gets a choice of approaches first.
+    let plan = cfg.router.plan != "never" && !is_issue && hits(&text, &r.plan_keywords) > 0;
     Decision {
         agent,
         tier,
@@ -283,7 +324,7 @@ pub fn rules(cfg: &Config, task: &str, is_issue: bool) -> Decision {
         source: "rules".into(),
         ms: 0,
         note: note.join("; "),
-        plan: false,
+        plan,
     }
 }
 
@@ -436,6 +477,44 @@ mod tests {
         let v = json!({"answers": {"agent": {"choice": "gemini", "confidence": 0.9},
             "effort": {"score": 1.0}, "review": {"noul": 0.5}}});
         assert!(from_answers(&cfg, &v).is_err());
+    }
+
+    #[test]
+    fn rules_match_phrases_and_word_forms() {
+        let kw = |k: &[&str]| k.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(hits("Renamed the field and fixed two failing tests", &kw(&["rename", "fix", "fail", "test"])), 4);
+        assert_eq!(hits("Planning the races", &kw(&["plan", "race"])), 2);
+        assert_eq!(hits("passed and called", &kw(&["pass", "call"])), 2);
+        // A phrase needs its words together and in order.
+        assert_eq!(hits("there is a race condition in the pool", &kw(&["race condition"])), 1);
+        assert_eq!(hits("the condition of the race", &kw(&["race condition"])), 0);
+        assert_eq!(hits("a one-line change", &kw(&["one line"])), 1);
+        // Words are whole: "fixture" is not "fix".
+        assert_eq!(hits("update the fixture", &kw(&["fix"])), 0);
+    }
+
+    #[test]
+    fn rules_cover_common_phrasings() {
+        let cfg = Config::default();
+        let d = rules(&cfg, "The importer crashes with a stack trace when the file is empty", false);
+        assert_eq!(d.agent, AgentKind::Codex);
+        let d = rules(&cfg, "Clean up and document the config module", false);
+        assert_eq!(d.agent, AgentKind::Claude);
+        let d = rules(&cfg, "There is a race condition in the job queue", false);
+        assert_eq!(d.tier, Tier::Heavy);
+        let d = rules(&cfg, "Fix the spelling in the log message", false);
+        assert_eq!(d.tier, Tier::Light);
+    }
+
+    #[test]
+    fn rules_ask_for_a_plan_only_when_the_task_asks_how() {
+        let mut cfg = Config::default();
+        assert!(rules(&cfg, "How should we split the storage layer?", false).plan);
+        assert!(!rules(&cfg, "Fix the failing parser test", false).plan);
+        // An issue's text is someone else's: it never stops for a choice by itself.
+        assert!(!rules(&cfg, "How should we split the storage layer?", true).plan);
+        cfg.router.plan = "never".into();
+        assert!(!rules(&cfg, "How should we split the storage layer?", false).plan);
     }
 
     #[test]
