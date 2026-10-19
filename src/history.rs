@@ -70,7 +70,27 @@ const MIGRATIONS: &[&str] = &["
     CREATE TABLE composer (workdir TEXT PRIMARY KEY, state TEXT NOT NULL);
 ", "
     ALTER TABLE jobs ADD COLUMN metrics TEXT;
+", "
+    CREATE TABLE routes (
+        id INTEGER PRIMARY KEY,
+        job INTEGER NOT NULL,
+        scope TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        words TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        tier TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        source TEXT NOT NULL,
+        trial_from TEXT,
+        accepted INTEGER NOT NULL,
+        tokens INTEGER,
+        finished INTEGER NOT NULL
+    );
+    CREATE INDEX routes_scope ON routes (scope, kind, finished);
 "];
+
+/// Routes kept per repository and kind of job; older ones are dropped as new ones come.
+pub const KEEP_ROUTES: i64 = 2000;
 
 /// Who is running: this process, told apart from a later process that reuses its id by its start time.
 pub fn owner_token() -> String {
@@ -470,6 +490,80 @@ impl History {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    /// Remember how a job was routed and how it went. Routes are not pruned with jobs.
+    pub fn record_route(&self, scope: &str, kind: &str, r: &crate::routemem::Route) -> Result<(), String> {
+        let e = |e: rusqlite::Error| e.to_string();
+        let text = |v: &dyn erased::Json| v.json();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(e)?;
+        tx.execute(
+            "INSERT INTO routes (job, scope, kind, words, agent, tier, decision, source, trial_from, accepted, tokens, finished)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                r.job,
+                scope,
+                kind,
+                text(&r.words),
+                r.agent.name(),
+                r.tier.name(),
+                text(&r.decision),
+                r.source,
+                r.trial_from.map(|t| t.name()),
+                r.accepted,
+                r.tokens.map(|t| t as i64),
+                r.finished as i64,
+            ],
+        )
+        .map_err(e)?;
+        tx.execute(
+            "DELETE FROM routes WHERE scope = ?1 AND kind = ?2 AND id NOT IN
+               (SELECT id FROM routes WHERE scope = ?1 AND kind = ?2 ORDER BY finished DESC, id DESC LIMIT ?3)",
+            params![scope, kind, KEEP_ROUTES],
+        )
+        .map_err(e)?;
+        tx.commit().map_err(e)
+    }
+
+    /// The remembered routes of one repository and kind of job, newest first. A row this
+    /// forkdeck cannot read (written by another version, say) is left out.
+    pub fn routes(&self, scope: &str, kind: &str) -> Result<Vec<crate::routemem::Route>, String> {
+        let e = |e: rusqlite::Error| e.to_string();
+        let db = self.db.lock().unwrap();
+        let mut q = db
+            .prepare("SELECT job, words, agent, tier, decision, source, trial_from, accepted, tokens, finished FROM routes WHERE scope = ?1 AND kind = ?2 ORDER BY finished DESC, id DESC LIMIT ?3")
+            .map_err(e)?;
+        // Stored by name, as their serde form is.
+        let tier = |s: &str| serde_json::from_value::<crate::state::Tier>(serde_json::Value::String(s.into())).ok();
+        let agent_of = |s: &str| serde_json::from_value::<AgentKind>(serde_json::Value::String(s.into())).ok();
+        let rows = q
+            .query_map(params![scope, kind, KEEP_ROUTES], |r| {
+                Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, bool>(7)?, r.get::<_, Option<i64>>(8)?, r.get::<_, i64>(9)?))
+            })
+            .map_err(e)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (job, words, agent, t, decision, source, trial_from, accepted, tokens, finished) = row.map_err(e)?;
+            let (Ok(words), Some(agent), Some(t), Ok(decision)) = (serde_json::from_str(&words), agent_of(&agent), tier(&t), serde_json::from_str::<Decision>(&decision))
+            else {
+                continue;
+            };
+            out.push(crate::routemem::Route {
+                job,
+                words,
+                agent,
+                tier: t,
+                decision,
+                source,
+                trial_from: trial_from.as_deref().and_then(tier),
+                accepted,
+                tokens: tokens.map(|t| t as u64),
+                finished: finished as u64,
+            });
+        }
+        Ok(out)
+    }
+
     /// What the input line held in a working directory when the interface last closed (JSON).
     pub fn composer(&self, workdir: &str) -> Option<String> {
         self.db.lock().unwrap().query_row("SELECT state FROM composer WHERE workdir = ?1", params![workdir], |r| r.get(0)).optional().ok().flatten()
@@ -640,7 +734,7 @@ mod tests {
             staged_tree: None,
             status,
             forced: Some(AgentRef::Profile("second".into())),
-            decision: Some(Decision { agent: AgentKind::Codex, tier: Tier::Heavy, review: true, gates: vec![Gate { name: "effort".into(), answer: "heavy".into(), value: 0.9, sharp: true }], source: "rules".into(), ms: 3, note: String::new(), plan: true }),
+            decision: Some(Decision { agent: AgentKind::Codex, tier: Tier::Heavy, review: true, gates: vec![Gate { name: "effort".into(), answer: "heavy".into(), value: 0.9, sharp: true }], source: "rules".into(), ms: 3, note: String::new(), plan: true, trial_from: None }),
             worker,
             reviewer: Stage::default(),
             extra: Vec::new(),
@@ -844,6 +938,48 @@ mod tests {
         assert_eq!(h.load(2).unwrap().iter().map(|r| r.id).collect::<Vec<_>>(), vec![4, 5], "the newest, oldest first");
         assert_eq!(h.clear().unwrap(), 3);
         assert_eq!(h.new_id().unwrap(), 6, "clearing never hands an old id out again");
+    }
+
+    fn route(job: u32, finished: u64) -> crate::routemem::Route {
+        let d = Decision { agent: AgentKind::Claude, tier: Tier::Standard, review: true, gates: vec![], source: "jev".into(), ms: 1, note: String::new(), plan: false, trial_from: Some(Tier::Heavy) };
+        crate::routemem::Route { job, words: vec![3, 1, 2], agent: AgentKind::Codex, tier: Tier::Light, decision: d, source: "memory".into(), trial_from: Some(Tier::Standard), accepted: true, tokens: Some(42), finished }
+    }
+
+    #[test]
+    fn routes_outlive_pruned_jobs_and_are_capped_per_repository() {
+        let h = History::in_memory();
+        h.record_route("o/r", "issue", &route(7, 100)).unwrap();
+        h.record_route("o/r", "task", &route(8, 100)).unwrap();
+        h.prune(0).unwrap();
+        let back = h.routes("o/r", "issue").unwrap();
+        assert_eq!(back.len(), 1, "one per scope and kind, and jobs pruning leaves them");
+        let r = &back[0];
+        assert_eq!((r.job, r.words.as_slice(), r.agent, r.tier, r.source.as_str()), (7, [3u64, 1, 2].as_slice(), AgentKind::Codex, Tier::Light, "memory"));
+        assert_eq!((r.trial_from, r.accepted, r.tokens, r.finished, r.decision.trial_from), (Some(Tier::Standard), true, Some(42), 100, Some(Tier::Heavy)));
+        for n in 0..KEEP_ROUTES as u64 + 5 {
+            h.record_route("o/r", "issue", &route(n as u32, 200 + n)).unwrap();
+        }
+        let back = h.routes("o/r", "issue").unwrap();
+        assert_eq!(back.len(), KEEP_ROUTES as usize);
+        assert_eq!(back[0].job, KEEP_ROUTES as u32 + 4, "newest first; the oldest went");
+        assert_eq!(h.routes("o/r", "task").unwrap().len(), 1, "another kind is not touched");
+    }
+
+    #[test]
+    fn a_database_from_before_route_memory_gains_it() {
+        let dir = std::env::temp_dir().join(format!("forkdeck-history-routes-{}", std::process::id()));
+        let p = dir.join("h.db");
+        {
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = Connection::open(&p).unwrap();
+            for (i, m) in MIGRATIONS[..MIGRATIONS.len() - 1].iter().enumerate() {
+                db.execute_batch(&format!("{} PRAGMA user_version = {};", m, i + 1)).unwrap();
+            }
+        }
+        let h = History::open(&p).unwrap();
+        h.record_route("o/r", "issue", &route(1, 1)).unwrap();
+        assert_eq!(h.routes("o/r", "issue").unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -22,6 +22,7 @@ mod plan_ui;
 mod planning;
 mod proc;
 mod remote;
+mod routemem;
 mod router;
 mod state;
 mod team;
@@ -333,6 +334,13 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Route { task }) => {
             let task = task.join(" ");
             anyhow::ensure!(!task.trim().is_empty(), "give a task to route");
+            // As a task typed here would be routed: memory first, for this directory.
+            let here = std::env::current_dir()?;
+            let remembered = orchestrator::route_scope(&Source::Manual, &here).and_then(|(scope, kind)| orchestrator::recall(&hub, None, &scope, kind, &task));
+            if let Some(d) = remembered {
+                println!("{}", serde_json::to_string_pretty(&d)?);
+                return Ok(());
+            }
             let r = rt.block_on(router::route(&hub.cfg, &hub.http, &task, false));
             if let Some(e) = &r.fell_back {
                 eprintln!("jev unavailable, rules used instead: {}", e);

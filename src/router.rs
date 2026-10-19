@@ -201,7 +201,7 @@ pub fn from_answers(cfg: &Config, v: &Value) -> Result<Decision, String> {
             gates.push(Gate { name: "plan first".into(), answer: if plan { "yes".into() } else { "no".into() }, value: pv, sharp });
         }
     }
-    Ok(Decision { agent, tier, review, gates, source: "jev".into(), ms: 0, note: note.join("; "), plan })
+    Ok(Decision { agent, tier, review, gates, source: "jev".into(), ms: 0, note: note.join("; "), plan, trial_from: None })
 }
 
 fn unit(v: f64, what: &str) -> Result<f64, String> {
@@ -325,6 +325,7 @@ pub fn rules(cfg: &Config, task: &str, is_issue: bool) -> Decision {
         ms: 0,
         note: note.join("; "),
         plan,
+        trial_from: None,
     }
 }
 

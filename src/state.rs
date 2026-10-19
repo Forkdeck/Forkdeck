@@ -80,7 +80,8 @@ impl Serialize for AgentRef {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+/// Ordered from cheapest to most capable.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Light,
@@ -100,6 +101,12 @@ impl Tier {
         match self {
             Tier::Light => Tier::Standard,
             _ => Tier::Heavy,
+        }
+    }
+    pub fn down(self) -> Tier {
+        match self {
+            Tier::Heavy => Tier::Standard,
+            _ => Tier::Light,
         }
     }
 }
@@ -253,6 +260,9 @@ pub struct Decision {
     /// The fork layer thinks the user should choose an approach before work starts.
     #[serde(default)]
     pub plan: bool,
+    /// Route memory tried a tier lower than its group's: the tier it stepped down from.
+    #[serde(default)]
+    pub trial_from: Option<Tier>,
 }
 
 /// Whether a job proposes approaches before it works.
@@ -529,6 +539,8 @@ pub struct RouterStats {
     pub kind: String,
     pub endpoint: String,
     pub calls: u32,
+    /// Tasks route memory answered for, without asking the decision server.
+    pub remembered: u32,
     pub fallbacks: u32,
     pub last_ms: u128,
     pub healthy: Option<bool>,

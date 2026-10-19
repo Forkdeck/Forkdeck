@@ -8,6 +8,7 @@ use crate::pick::{self, Exec};
 use crate::journal;
 use crate::knowledge;
 use crate::proc;
+use crate::routemem;
 use crate::router;
 use crate::state::*;
 use crate::team;
@@ -932,6 +933,9 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
     }).unwrap_or(false);
     if again { hub.save(id); return true; }
     // A job that was never started (a teammate holds the item) did nothing worth recording.
+    if fin.wait.is_none() && matches!(fin.status, JobStatus::Done | JobStatus::Failed) && !hub.cfg.demo {
+        remember_route(&hub, id, entry.as_ref());
+    }
     if fin.wait.is_none() && fin.status != JobStatus::Interrupted && !hub.cfg.demo {
         if let Some(e) = entry {
             if let Err(err) = journal::append(&e) {
@@ -1086,23 +1090,113 @@ fn same_vendor(worker: &Exec, reviewer: &Exec, used: &[String]) -> bool {
     !pick::differs(&worker.vendor, &reviewer.vendor) || used.iter().any(|m| !pick::differs(&worker.vendor, &pick::vendor_of_model(m)) && pick::vendor_of_model(m) != pick::Vendor::Unknown)
 }
 
+/// Which remembered routes a job is compared with: those of its repository and kind of job.
+/// A typed task's repository is the directory it runs in.
+pub fn route_scope(source: &Source, workdir: &Path) -> Option<(String, &'static str)> {
+    match source {
+        Source::Manual => Some((std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf()).display().to_string(), "task")),
+        Source::Issue { repo, .. } => Some((repo.clone(), "issue")),
+        Source::Pr { repo, .. } => Some((repo.clone(), "review")),
+        Source::Deploy { .. } => None,
+    }
+}
+
+/// What route memory says about a task, if it answers for the decision server. `id`: the job
+/// asking, which is not counted as a step-down already under way.
+pub fn recall(hub: &Hub, id: Option<u32>, scope: &str, kind: &str, task: &str) -> Option<Decision> {
+    let m = &hub.cfg.router.memory;
+    if !m.enabled || hub.cfg.demo {
+        return None;
+    }
+    let history = hub.history.as_ref()?;
+    let past = match history.routes(scope, kind) {
+        Ok(p) => p,
+        Err(e) => {
+            hub.log("router", format!("route memory unreadable: {}", e));
+            return None;
+        }
+    };
+    let words = routemem::fingerprint(task);
+    let trial_running = hub.state.lock().unwrap_or_else(|e| e.into_inner()).jobs.iter().any(|j| {
+        Some(j.id) != id
+            && !j.status.finished()
+            && j.decision.as_ref().is_some_and(|d| d.trial_from.is_some())
+            && route_scope(&j.source, &j.workdir).is_some_and(|(s, k)| s == scope && k == kind)
+            && routemem::similarity(&routemem::fingerprint(&j.prompt), &words) >= m.similarity
+    });
+    let r = routemem::recall(m, &past, &words, journal::now() as u64, trial_running)?;
+    let mut d = r.decision;
+    if let Some(t) = r.step_down {
+        d.note = format!("{}; trying {} instead of {}", d.note, t.name(), d.tier.name());
+        d.trial_from = Some(d.tier);
+        d.tier = t;
+    }
+    Some(d)
+}
+
+/// Remember how a finished job was routed and whether it went well. Only first turns that a
+/// worker actually ran, routed by the fork layer rather than forced.
+fn remember_route(hub: &Hub, id: u32, entry: Option<&journal::Entry>) {
+    let Some(history) = &hub.history else { return };
+    let Some(entry) = entry.filter(|e| e.claude.runs + e.codex.runs + e.copilot.runs > 0) else { return };
+    let found = hub.job(id, |j| {
+        let d = j.decision.clone().filter(|_| j.forced.is_none() && j.turns.len() == 1)?;
+        let (scope, kind) = route_scope(&j.source, &j.workdir)?;
+        // Went well: done at the first try, and something says so (the review, or the checks
+        // where there was no review).
+        let accepted = j.status == JobStatus::Done
+            && j.rounds == 0
+            && !j.escalated
+            && j.checks != Some(false)
+            && j.verdict != Some(false)
+            && (j.verdict == Some(true) || j.checks == Some(true));
+        let route = routemem::Route {
+            job: j.id,
+            words: routemem::fingerprint(&j.prompt),
+            agent: d.agent,
+            tier: d.tier,
+            source: d.source.clone(),
+            trial_from: d.trial_from,
+            decision: d,
+            accepted,
+            tokens: Some(entry.tokens()).filter(|t| *t > 0),
+            finished: journal::now() as u64,
+        };
+        Some((scope, kind, route))
+    });
+    if let Some(Some((scope, kind, route))) = found {
+        if let Err(e) = history.record_route(&scope, kind, &route) {
+            hub.log("router", format!("#{} route not remembered: {}", id, e));
+        }
+    }
+}
+
 /// Ask the fork layer and record the answer on the job.
 async fn decide(hub: &Hub, id: u32, prompt: &str, is_issue: bool, forced: Option<AgentRef>) -> Result<(Decision, Exec), Finish> {
     set_status(hub, id, JobStatus::Routing);
-    let routed = router::route(&hub.cfg, &hub.http, prompt, is_issue).await;
-    let mut d = routed.decision;
-    {
-        let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
-        if routed.asked_jev {
-            st.router.calls += 1;
-            st.router.last_ms = d.ms;
-            st.router.healthy = Some(routed.fell_back.is_none());
+    // Tasks like earlier ones that went well are routed the way those were, without asking.
+    let remembered = forced.is_none().then(|| hub.job(id, |j| route_scope(&j.source, &j.workdir)).flatten()).flatten()
+        .and_then(|(scope, kind)| recall(hub, Some(id), &scope, kind, prompt));
+    let mut d = match remembered {
+        Some(d) => {
+            hub.state.lock().unwrap_or_else(|e| e.into_inner()).router.remembered += 1;
+            d
         }
-        if let Some(e) = &routed.fell_back {
-            st.router.fallbacks += 1;
-            st.log("router", format!("jev unavailable, used rules: {}", e));
+        None => {
+            let routed = router::route(&hub.cfg, &hub.http, prompt, is_issue).await;
+            let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+            if routed.asked_jev {
+                st.router.calls += 1;
+                st.router.last_ms = routed.decision.ms;
+                st.router.healthy = Some(routed.fell_back.is_none());
+            }
+            if let Some(e) = &routed.fell_back {
+                st.router.fallbacks += 1;
+                st.log("router", format!("jev unavailable, used rules: {}", e));
+            }
+            routed.decision
         }
-    }
+    };
     if let Some(f) = &forced {
         if f.kind() != AgentKind::Copilot {
             d.agent = f.kind();
@@ -1370,6 +1464,18 @@ async fn work_once(hub: &Hub, id: u32, w: &Work<'_>, prompt: &str, fresh: Option
         // A candidate model that failed gets one more go as the baseline. That uses neither repair allowance.
         let escalate = !out.ok && !out.interrupted && !cancel.is_set()
             && hub.job(id, |j| !j.escalated && j.adaptive.as_ref().is_some_and(|d| d.candidate)).unwrap_or(false);
+        // A step-down that failed goes back to the tier its group worked at, once.
+        let back_to = (!out.ok && !out.interrupted && !cancel.is_set() && !escalate)
+            .then(|| hub.job(id, |j| j.decision.as_ref().and_then(|d| d.trial_from).filter(|_| !j.escalated)).flatten())
+            .flatten();
+        if let Some(tier) = back_to {
+            hub.job(id, |j| j.escalated = true);
+            set_status(hub, id, JobStatus::Fixing);
+            let exec = pick::worker_for(&hub.cfg, &avail(hub).borrow(), &worker.asked, tier).unwrap_or_else(|| worker.clone());
+            hub.log("router", format!("#{} {} at {} failed; going back to {}", id, ran.label(), w.d.tier.name(), tier.name()));
+            let retry = format!("{}\n\nAn earlier attempt failed. Continue from the existing working tree.\n{}", fresh.clone().unwrap_or_else(|| prompt.clone()), out.error);
+            (out, ran) = run_agent(hub, id, Slot::Worker, exec, tier, &retry, w.dir, false, None).await;
+        }
         if escalate {
             hub.job(id, |j| j.escalated = true);
             set_status(hub, id, JobStatus::Fixing);
@@ -2748,6 +2854,156 @@ mod tests {
             let (status, outcome) = hub.job(id, |j| (j.status, j.outcome.clone())).unwrap();
             assert_eq!(status, JobStatus::Failed);
             assert!(outcome.contains("no longer exists"), "{outcome}");
+        });
+    }
+
+    /// A decision server on loopback that counts the questions it is asked. Every answer is
+    /// claude, sure, at the effort `effort` holds (0 light, 1 standard).
+    fn counting_jev(effort: Arc<std::sync::atomic::AtomicU8>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 8192];
+                // Read the headers, then as much body as they announce.
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 { break; }
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end].lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                        if req.len() >= end + 4 + len { break; }
+                    }
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                let body = format!(r#"{{"answers":{{"agent":{{"choice":"claude","confidence":0.95}},"effort":{{"score":{},"confidence":0.95}},"review":{{"noul":0.9}}}}}}"#, effort.load(Ordering::SeqCst));
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            }
+        });
+        (url, calls)
+    }
+
+    #[test]
+    fn route_memory_answers_for_jev_and_a_failed_step_down_goes_back() {
+        // Run with private process environment: jobs write the journal and attempt records.
+        const CHILD: &str = "FORKDECK_ROUTE_MEMORY_TEST_ROOT";
+        let Ok(root) = std::env::var(CHILD) else {
+            let root = std::env::temp_dir().join(crate::metrics::id());
+            std::fs::create_dir_all(&root).unwrap();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "orchestrator::tests::route_memory_answers_for_jev_and_a_failed_step_down_goes_back", "--nocapture"])
+                .env(CHILD, &root).env("XDG_STATE_HOME", root.join("state")).output().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            return;
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+        let root = PathBuf::from(root);
+        let agent = root.join("agent");
+        std::fs::write(&agent, format!(r#"#!/bin/sh
+[ "$1" = --version ] && {{ echo fixture; exit 0; }}
+model=
+while [ $# -gt 0 ]; do case "$1" in --model) model=$2; shift 2;; *) shift;; esac; done
+prompt=$(cat)
+case "$prompt" in *'Do not modify any file'*) printf '{{"type":"result","is_error":false,"result":"Fine.\\nVERDICT: PASS"}}\n'; exit 0;; esac
+if [ "$model" = small ] && [ -f {fail:?} ]; then printf '{{"type":"result","is_error":true,"result":"too hard"}}\n'; exit 1; fi
+date +%s%N >> work.txt
+printf '{{"type":"result","is_error":false,"result":"Done","usage":{{"input_tokens":10,"output_tokens":5}}}}\n'
+"#, fail = root.join("fail-small"))).unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repo = |name: &str| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            for args in [&["init", "-q"][..], &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base"]] {
+                assert!(std::process::Command::new("git").args(args).current_dir(&dir).status().unwrap().success());
+            }
+            dir
+        };
+        let effort = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let (url, calls) = counting_jev(effort.clone());
+        let cfg: Config = toml::from_str(&format!(r#"
+[router]
+kind = "jev"
+default_agent = "claude"
+[router.jev]
+base_url = {url:?}
+api_key_env = ""
+[review]
+mode = "always"
+reviewer = "same"
+checks = ["true"]
+[knowledge]
+enabled = false
+[agents.claude]
+cmd = {agent:?}
+models = {{ light = "small", standard = "big", heavy = "big" }}
+[agents.codex]
+cmd = "/nonexistent"
+[agents.copilot]
+cmd = "/nonexistent"
+"#, agent = agent.to_str().unwrap())).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut hub = Hub::new(cfg, rt.handle().clone());
+            hub.history = Some(Arc::new(crate::history::History::in_memory()));
+            hub.detect_agents().await;
+            let run = |task: &'static str, dir: PathBuf| {
+                let hub = hub.clone();
+                async move {
+                    let id = hub.submit(task.into(), task.into(), Source::Manual, dir, None, Planning::IfRouted).await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(60), async {
+                        while !hub.job(id, |j| j.status.finished()).unwrap() { tokio::time::sleep(Duration::from_millis(20)).await; }
+                    }).await.unwrap();
+                    let (status, d, outcome) = hub.job(id, |j| (j.status, j.decision.clone().unwrap(), j.outcome.clone())).unwrap();
+                    assert!(status == JobStatus::Done, "{task}: {outcome}");
+                    (status, d)
+                }
+            };
+
+            // Two like tasks go to the decision server; the third is routed from memory.
+            let a = repo("a");
+            for task in ["Fix the typo in the README heading", "Fix a typo in the README heading"] {
+                let (status, d) = run(task, a.clone()).await;
+                assert_eq!((status, d.source.as_str()), (JobStatus::Done, "jev"));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let (status, d) = run("fix the typo in the readme heading", a.clone()).await;
+            assert_eq!((status, d.source.as_str(), d.tier), (JobStatus::Done, "memory", Tier::Light), "{}", d.note);
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "memory answered");
+            assert_eq!(hub.state.lock().unwrap().router.remembered, 1);
+            // A task unlike them is asked about.
+            let (_, d) = run("Add retries to the HTTP client", a.clone()).await;
+            assert_eq!(d.source, "jev");
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+            // Three like tasks went well at standard: the next tries light. Its worker fails, and
+            // it goes back to standard once and finishes there.
+            effort.store(1, Ordering::SeqCst);
+            let b = repo("b");
+            let task = "Document the retry settings in the configuration guide";
+            let (scope, kind) = route_scope(&Source::Manual, &b).unwrap();
+            let history = hub.history.clone().unwrap();
+            for job in 101..104 {
+                let d = Decision { agent: AgentKind::Claude, tier: Tier::Standard, review: true, gates: vec![], source: "jev".into(), ms: 1, note: String::new(), plan: false, trial_from: None };
+                let r = routemem::Route { job, words: routemem::fingerprint(task), agent: AgentKind::Claude, tier: Tier::Standard, decision: d, source: "jev".into(), trial_from: None, accepted: true, tokens: Some(100), finished: journal::now() as u64 };
+                history.record_route(&scope, kind, &r).unwrap();
+            }
+            std::fs::write(root.join("fail-small"), "").unwrap();
+            let (status, d) = run(task, b.clone()).await;
+            assert_eq!((status, d.source.as_str(), d.tier, d.trial_from), (JobStatus::Done, "memory", Tier::Light, Some(Tier::Standard)), "{}", d.note);
+            assert_eq!(calls.load(Ordering::SeqCst), 3, "memory answered");
+            let last = history.routes(&scope, kind).unwrap().remove(0);
+            assert_eq!((last.trial_from, last.accepted), (Some(Tier::Standard), false));
+            // No second try at light for a while; standard stays what memory says.
+            let d = recall(&hub, None, &scope, kind, task).unwrap();
+            assert_eq!((d.tier, d.trial_from), (Tier::Standard, None));
         });
     }
 

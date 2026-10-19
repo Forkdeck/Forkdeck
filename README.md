@@ -154,6 +154,18 @@ Two routers ship, and a default that picks between them:
   `choice`, `score` and `noul` questions). If it does not answer, the rules
   router is used and the interface says so.
 
+Before either is asked, **route memory** looks at earlier jobs in the same
+repository (or directory, for a typed task) and of the same kind. When at least
+two tasks much like this one were routed by the decision server and went well
+(done at the first try, with the review or the checks passing), and none like it
+went badly, the task is routed the same way without asking. The router line says
+`memory` and which jobs it followed; `forkdeck route "<task>"` shows the same.
+Once a kind of task has gone well three times at a tier, the next one tries a
+tier lower to spend fewer tokens. If that worker fails, it goes back to the
+usual tier once, and that kind of task is not stepped down again for 30 days.
+Only hashed words are kept, never the task's text. `[router.memory]` tunes it,
+and `enabled = false` turns it off.
+
 ### Running the decision model locally
 
 For a local RTX 3090, the repository includes a repeatable setup for

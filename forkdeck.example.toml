@@ -47,6 +47,14 @@ codex_is_for = "Well-specified work: a bug with a clear reproduction, a containe
 # Typed tasks with these phrases propose approaches first (router.plan = "never" turns it off).
 #~ plan_keywords = ["how should", "which approach", "pros and cons"]
 
+[router.memory]
+# Route a task like earlier ones that went well the way they were, without asking.
+enabled = true
+similarity = 0.8       # shared words over all words, 0 to 1
+min_matches = 2        # earlier tasks that went well before memory answers
+step_down = true       # then try a tier lower to use fewer tokens...
+step_down_after = 3    # ...once this many went well at a tier
+
 [agents]
 timeout_mins = 45
 # Without your own plugins, hooks and MCP servers (the repository's settings still apply):

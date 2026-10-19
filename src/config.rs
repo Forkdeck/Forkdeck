@@ -38,6 +38,7 @@ pub struct RouterCfg {
     pub plan: String,
     pub jev: JevCfg,
     pub rules: RulesCfg,
+    pub memory: MemoryCfg,
 }
 
 impl Default for RouterCfg {
@@ -49,6 +50,7 @@ impl Default for RouterCfg {
             plan: "auto".into(),
             jev: JevCfg::default(),
             rules: RulesCfg::default(),
+            memory: MemoryCfg::default(),
         }
     }
 }
@@ -75,6 +77,27 @@ impl Default for JevCfg {
             claude_is_for: "Open-ended or ambiguous work: multi-file refactors, design changes, documentation".into(),
             codex_is_for: "Well-specified work: a bug with a clear reproduction, a contained feature, tests, scripts".into(),
         }
+    }
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryCfg {
+    /// Route a task like earlier ones that went well the way they were, without asking Jev.
+    pub enabled: bool,
+    /// How alike two tasks must be (shared words over all words, 0 to 1).
+    pub similarity: f64,
+    /// Earlier tasks that went well needed before memory answers.
+    pub min_matches: usize,
+    /// Once a kind of task keeps going well, try the next one a tier lower.
+    pub step_down: bool,
+    /// Tasks that went well at a tier before one tier lower is tried.
+    pub step_down_after: usize,
+}
+
+impl Default for MemoryCfg {
+    fn default() -> Self {
+        MemoryCfg { enabled: true, similarity: 0.8, min_matches: 2, step_down: true, step_down_after: 3 }
     }
 }
 
@@ -1036,6 +1059,9 @@ impl Config {
         if !(0.5..=1.0).contains(&self.router.threshold) {
             anyhow::bail!("router.threshold must be between 0.5 and 1.0, got {}", self.router.threshold);
         }
+        let m = &self.router.memory;
+        anyhow::ensure!(m.similarity > 0.0 && m.similarity <= 1.0, "router.memory.similarity must be above 0 and at most 1");
+        anyhow::ensure!(m.min_matches >= 1 && m.step_down_after >= 1, "router.memory.min_matches and step_down_after must be at least 1");
         if self.router.jev.timeout_ms < 100 {
             anyhow::bail!("router.jev.timeout_ms must be at least 100");
         }
