@@ -411,7 +411,7 @@ pub async fn learn(hub: &Hub, id: u32) -> u32 {
     let dir = scratch.0.clone();
     let prompt = ask(&r.repo, &findings);
     // Through the runner that moves on to the next model when the account refuses one.
-    let (out, _) = crate::orchestrator::run_agent(hub, id, Slot::Reviewer, exec, Tier::Light, &prompt, &dir, true, None).await;
+    let (out, _) = crate::orchestrator::run_agent(hub, id, Slot::Knowledge, exec, Tier::Light, &prompt, &dir, true, None).await;
     if !out.ok {
         hub.log("notes", format!("#{} nothing learned: {}", id, clip(&out.error, 120)));
         return 0;

@@ -17,6 +17,17 @@ pub enum Slot {
     Reviewer,
     /// A pull request reviewer past the second.
     Extra(usize),
+    /// Learning notes from a finished job; shown in the reviewer's box.
+    Knowledge,
+}
+
+/// The part a run plays, as attempt records name it.
+fn role(slot: Slot, read_only: bool) -> &'static str {
+    match slot {
+        Slot::Worker if !read_only => "worker",
+        Slot::Knowledge => "knowledge",
+        _ => "reviewer",
+    }
 }
 
 pub struct RunSpec<'a> {
@@ -444,7 +455,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
             }
         }
     };
-    let role = if slot == Slot::Worker && !spec.read_only { "worker" } else { "reviewer" };
+    let role = role(slot, spec.read_only);
     let cli_version = hub.state.lock().unwrap_or_else(|e| e.into_inner()).cli_versions[crate::journal::slot(spec.exec.cli)].clone();
     let mut attempt = hub.job(job, |j| {
         let mut a = crate::metrics::Attempt::new(j, role, spec.exec.cli, spec.tier.name(), spec.exec.model.clone(), spec.exec.effort.clone());
@@ -1072,6 +1083,15 @@ pub async fn invocation_limit(cmd: &str, kind: AgentKind, args: &mut Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attempts_name_the_part_a_run_plays() {
+        assert_eq!(role(Slot::Worker, false), "worker");
+        assert_eq!(role(Slot::Worker, true), "reviewer", "planning only reads");
+        assert_eq!(role(Slot::Reviewer, true), "reviewer");
+        assert_eq!(role(Slot::Extra(0), true), "reviewer");
+        assert_eq!(role(Slot::Knowledge, true), "knowledge");
+    }
 
     #[test]
     fn a_reviewers_copy_moves_agent_configuration_aside_and_follows_no_links() {

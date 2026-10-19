@@ -507,7 +507,7 @@ impl Job {
         use crate::agents::Slot;
         match slot {
             Slot::Worker => &mut self.worker,
-            Slot::Reviewer => &mut self.reviewer,
+            Slot::Reviewer | Slot::Knowledge => &mut self.reviewer,
             Slot::Extra(i) => {
                 if self.extra.len() <= i {
                     self.extra.resize_with(i + 1, Stage::default);
