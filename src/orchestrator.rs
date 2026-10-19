@@ -728,7 +728,18 @@ impl Hub {
         }
     }
 
+    /// Which agent CLIs are installed, and what copilot's account may use. Waits for all of it.
     pub async fn detect_agents(&self) {
+        self.detect(true).await
+    }
+
+    /// As `detect_agents`, but copilot's account check (a second or more) carries on in the
+    /// background so the interface can open; copilot is offered once it has answered.
+    pub async fn detect_agents_in_background(&self) {
+        self.detect(false).await
+    }
+
+    async fn detect(&self, wait: bool) {
         let found: [Option<String>; 3] = if self.cfg.demo {
             [Some("demo".into()), Some("demo".into()), None]
         } else {
@@ -736,15 +747,40 @@ impl Hub {
             let (c, x, p) = tokio::join!(agents::version(&cc), agents::version(&xc), agents::version(&pc));
             [c, x, p]
         };
-        let installed: std::collections::HashSet<AgentKind> = AgentKind::ALL.into_iter().zip(&found).filter(|(_, f)| f.is_some()).map(|(k, _)| k).collect();
-        // Which models the account may use decides what copilot can stand in for, so ask before any job starts.
-        let probe = if installed.contains(&AgentKind::Copilot) { crate::copilot::probe(&self.cfg.agents.get(AgentKind::Copilot).cmd.unwrap_or_default()).await } else { Default::default() };
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.installed = installed;
-        st.cli_versions = found;
-        st.copilot = probe;
-        st.stand_in = self.cfg.agents.copilot.stand_in();
-        if st.has(AgentKind::Copilot) {
+        let mut installed: std::collections::HashSet<AgentKind> = AgentKind::ALL.into_iter().zip(&found).filter(|(_, f)| f.is_some()).map(|(k, _)| k).collect();
+        // Copilot joins once its account has said which models it may use: that decides what it
+        // can stand in for, and nothing may be routed to it before.
+        let copilot = installed.remove(&AgentKind::Copilot);
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.installed = installed;
+            st.cli_versions = found;
+            st.stand_in = self.cfg.agents.copilot.stand_in();
+            st.copilot_checking = copilot;
+        }
+        if !copilot {
+            self.agents_known();
+            return;
+        }
+        let cmd = self.cfg.agents.get(AgentKind::Copilot).cmd.unwrap_or_default();
+        if wait {
+            let probe = crate::copilot::probe(&cmd).await;
+            self.copilot_known(probe);
+        } else {
+            let hub = self.clone();
+            self.rt.spawn(async move {
+                let probe = crate::copilot::probe(&cmd).await;
+                hub.copilot_known(probe);
+            });
+        }
+    }
+
+    fn copilot_known(&self, probe: crate::copilot::Probe) {
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.installed.insert(AgentKind::Copilot);
+            st.copilot = probe;
+            st.copilot_checking = false;
             let who = st.copilot.login.clone().unwrap_or_else(|| "this account".into());
             let note = match (&st.copilot.error, st.copilot.seat, &st.copilot.enabled) {
                 (Some(e), _, _) => format!("copilot: could not list models ({}); configured models are tried as they come", e),
@@ -756,6 +792,12 @@ impl Hub {
                 st.log("agents", note);
             }
         }
+        self.agents_known();
+    }
+
+    /// Said once every CLI is known.
+    fn agents_known(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !st.has(AgentKind::Claude) && !st.has(AgentKind::Codex) {
             let stands_in = st.copilot_usable() && st.stand_in;
             st.log("agents", if stands_in { "claude and codex not found on PATH: copilot stands in for them" } else { "neither claude, codex nor a usable copilot was found on PATH" });
@@ -2921,6 +2963,38 @@ mod tests {
             }
         });
         (url, calls)
+    }
+
+    #[test]
+    fn the_interface_does_not_wait_for_copilots_account_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("forkdeck-copilot-slow-{}", crate::metrics::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let copilot = dir.join("copilot");
+        // Answers --version at once; the account check takes seconds and then gives up.
+        std::fs::write(&copilot, "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'GitHub Copilot CLI 0.0.1'; exit 0; }\nsleep 2\n").unwrap();
+        std::fs::set_permissions(&copilot, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg: Config = toml::from_str(&format!("[agents.claude]\ncmd = \"/nonexistent\"\n[agents.codex]\ncmd = \"/nonexistent\"\n[agents.copilot]\ncmd = {:?}\n", copilot.to_str().unwrap())).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.block_on(async {
+            let hub = Hub::new(cfg, rt.handle().clone());
+            let start = Instant::now();
+            hub.detect_agents_in_background().await;
+            assert!(start.elapsed() < Duration::from_millis(1500), "waited {:?}", start.elapsed());
+            {
+                let st = hub.state.lock().unwrap();
+                assert!(st.copilot_checking);
+                assert!(!st.has(AgentKind::Copilot), "not offered before its account is known");
+                assert_eq!(st.cli_versions[2].as_deref(), Some("GitHub Copilot CLI 0.0.1"));
+            }
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while hub.state.lock().unwrap().copilot_checking { tokio::time::sleep(Duration::from_millis(50)).await; }
+            }).await.unwrap();
+            let st = hub.state.lock().unwrap();
+            assert!(st.has(AgentKind::Copilot), "offered once the check is done");
+            assert!(st.log.iter().any(|l| l.msg.contains("neither claude, codex nor a usable copilot") || l.msg.contains("copilot")), "the outcome is logged");
+        });
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

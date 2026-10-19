@@ -574,7 +574,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Init { .. }) => unreachable!(),
         None => {
-            rt.block_on(hub.detect_agents());
+            rt.block_on(hub.detect_agents_in_background());
             if hub.cfg.remote.enabled {
                 let h = hub.clone();
                 rt.spawn(async move {

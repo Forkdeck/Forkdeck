@@ -340,7 +340,9 @@ fn title_bar(f: &mut Frame, area: Rect, ui: &Ui) {
 
 fn header(f: &mut Frame, area: Rect, st: &State) {
     let chip = |k: AgentKind, own: Color| -> Span {
-        let (word, color) = if st.has(k) && !st.agent_ready(k) {
+        let (word, color) = if k == AgentKind::Copilot && st.copilot_checking {
+            ("CHECKING", DIM)
+        } else if st.has(k) && !st.agent_ready(k) {
             ("LIMITED", DIM)
         } else if st.has(k) && (k != AgentKind::Copilot || st.copilot_usable()) {
             ("ON CALL", own)

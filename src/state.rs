@@ -612,6 +612,8 @@ pub struct State {
     pub rejected_models: HashSet<String>,
     /// Copilot may play claude or codex when that CLI is missing (agents.copilot.stand_in).
     pub stand_in: bool,
+    /// Copilot is installed and its account is still being asked what it may use.
+    pub copilot_checking: bool,
     /// First line of each CLI's `--version`: claude, codex, copilot.
     pub cli_versions: [Option<String>; 3],
     pub next_id: u32,
