@@ -900,7 +900,7 @@ back by hand, or with `forkdeck team release`.
 |---|---|
 | `Enter` | send what you typed to the task the input box names: a follow-up once it has finished, a queued message while it works, your choice while it waits for one. With nothing typed, an interrupted task resumes and a finished one carries on. After `Ctrl-T`, start a new task in the current directory |
 | `Ctrl-T` / `Ctrl-N` | make the next `Enter` start a new task, keeping your draft |
-| `Ctrl-P` | the next new task proposes approaches first, and you pick one |
+| `Ctrl-P` / `Shift-Tab` | the next new task proposes approaches first, and you pick one |
 | `Ctrl-R` | pin replies to the selected typed task, whatever is selected later |
 | `Ctrl-S` | send what you typed to the task now: its agent stops and continues with the message |
 | `Tab` | force the next task to claude, codex, copilot, or back to auto |
@@ -1040,7 +1040,7 @@ interrupted typed tasks without the interface.
 
 ### Planning first
 
-With `Ctrl-P` before `Enter` (or `forkdeck run --plan`), the agent first looks at
+With `Ctrl-P` or `Shift-Tab` before `Enter` (or `forkdeck run --plan`), the agent first looks at
 the code without changing anything and proposes two to four approaches, marking
 the one it recommends. Type a number and press Enter, or type how you want it done
 instead; the same agent then does it, in the conversation it planned in. With a
@@ -1050,6 +1050,12 @@ have nobody to ask, so they take the recommended option, and the pull request
 says which one and what else was proposed.
 
 A number sent during planning is saved as an early choice; other messages remain guidance for the worker. When headless input closes, a waiting plan takes its recommended option.
+
+If the agent asks a question instead of proposing approaches, its question is
+shown in the worker's box; type the answer and press Enter. While a task waits
+for your choice it holds nothing up: other typed tasks in the directory run
+meanwhile, and the waiting task's change is measured from where the directory
+is when it carries on.
 
 After `Enter` starts a task, the input box replies to it; `Ctrl-T` starts another.
 

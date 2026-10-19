@@ -1433,7 +1433,12 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                         KeyCode::F(5) => open_choices(hub, &mut u),
                         KeyCode::Char('t') | KeyCode::Char('n') if ctrl => { u.reply_to = None; u.new_task = true; }
                         // The next new task proposes approaches first.
+                        // Shift-Tab as in Claude Code's plan mode.
                         KeyCode::Char('p') if ctrl => {
+                            u.plan_next = !u.plan_next;
+                            if u.plan_next { u.reply_to = None; u.new_task = true; }
+                        }
+                        KeyCode::BackTab => {
                             u.plan_next = !u.plan_next;
                             if u.plan_next { u.reply_to = None; u.new_task = true; }
                         }

@@ -47,6 +47,8 @@ pub struct Hub {
     builds: Arc<Semaphore>,
     /// Agent slots of admitted jobs, by job, so a job can lend its slot out while it builds.
     parked: Arc<Mutex<std::collections::HashMap<u32, tokio::sync::OwnedSemaphorePermit>>>,
+    /// The typed-task lane, held by the typed task using it, so one waiting for a person can lend it out.
+    lanes: Arc<Mutex<std::collections::HashMap<u32, tokio::sync::OwnedMutexGuard<()>>>>,
     /// New jobs queue for a slot one at a time, so a job back from building is never behind them.
     entry: Arc<tokio::sync::Mutex<()>>,
     /// Jobs waiting to take an agent slot again after building.
@@ -128,6 +130,7 @@ impl Hub {
             input_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             builds: Arc::new(Semaphore::new(builds)),
             parked: Arc::new(Mutex::new(Default::default())),
+            lanes: Arc::new(Mutex::new(Default::default())),
             entry: Arc::new(tokio::sync::Mutex::new(())),
             returning: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -162,6 +165,15 @@ impl Hub {
     /// The job's agent slot, taken back when the job ends.
     pub fn unpark_slot(&self, id: u32) -> Option<tokio::sync::OwnedSemaphorePermit> {
         self.parked.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)
+    }
+
+    fn park_lane(&self, id: u32, lane: tokio::sync::OwnedMutexGuard<()>) {
+        self.lanes.lock().unwrap_or_else(|e| e.into_inner()).insert(id, lane);
+    }
+
+    /// The typed-task lane the job holds, if it holds it; dropping it lets the next typed task run.
+    fn unpark_lane(&self, id: u32) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.lanes.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)
     }
 
     /// Keep jobs in the history database. Only the program itself does this, never a test that
@@ -794,6 +806,7 @@ pub async fn run_job(hub: Hub, id: u32) {
             Ok(false) => return,
             Err(e) => {
                 drop(hub.unpark_slot(id));
+                drop(hub.unpark_lane(id));
                 hub.job(id, |j| { j.status = JobStatus::Failed; j.outcome = format!("job ended abnormally: {}", e); j.finished = Some(Instant::now()); j.worktree_lock = None; });
                 hub.save(id);
                 hub.log("queue", format!("#{} failed: job ended abnormally: {}", id, e));
@@ -817,8 +830,9 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
             (permit, lane)
         };
         tokio::select! {
-            (permit, _lane) = wait => {
+            (permit, lane) = wait => {
                 hub.park_slot(id, permit);
+                if let Some(l) = lane { hub.park_lane(id, l); }
                 hub.job(id, |j| {
                     j.admitted = true;
                     j.queue.dispatch(j.active_started.elapsed());
@@ -865,6 +879,7 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
         }
     };
     drop(hub.unpark_slot(id));
+    drop(hub.unpark_lane(id));
     // A cancel that arrives late still makes the job "cancelled", but what was already written up stays written up.
     // What was already written up keeps its own account of what happened (a rollback that could not be
     // confirmed must not be reduced to the word "cancelled").
@@ -1543,8 +1558,13 @@ fn choice_text(plan: &Plan, c: &Choice) -> String {
 async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool, cancel: &Cancel) -> Result<Option<(String, String)>, Finish> {
     let saved = hub.job(id, |j| j.plan.clone()).flatten();
     let plan = match saved {
-        // Planned before forkdeck was stopped: not again.
-        Some(p) => p,
+        // Planned before forkdeck was stopped: not again, but shown again while it waits.
+        Some(p) => {
+            if p.chosen.is_none() {
+                hub.job(id, |j| p.show_options(&mut j.worker));
+            }
+            p
+        }
         None => {
             set_status(hub, id, JobStatus::Planning);
             let mut prompt = plan_prompt(task);
@@ -1619,8 +1639,10 @@ async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool
             hub.log("plan", format!("#{} {}", id, how));
             hub.job(id, |j| j.worker.push(format!("› {}", how)));
             // Waiting for a person can take hours: the agent slot goes to other work meanwhile, and
-            // comes back first once the choice is made.
+            // comes back first once the choice is made. So does a typed task's lane: planning
+            // changed nothing, so other typed tasks in the directory can run in the meantime.
             let lent = hub.unpark_slot(id).is_some();
+            let lane_lent = hub.unpark_lane(id).is_some();
             let picked = loop {
                 let Some(chose) = hub.job(id, |j| j.chose.clone()) else { return Err(failed("job vanished")) };
                 if let Some(c) = hub.job(id, |j| j.plan.as_ref().and_then(|p| p.chosen.clone())).flatten() {
@@ -1639,6 +1661,18 @@ async fn plan_stage(hub: &Hub, id: u32, w: &Work<'_>, task: &str, ask_user: bool
                     _ = cancel.wait() => return Err(cancelled()),
                 }
             };
+            if lane_lent {
+                tokio::select! {
+                    l = hub.lane.clone().lock_owned() => hub.park_lane(id, l),
+                    _ = cancel.wait() => return Err(cancelled()),
+                }
+                // Another task may have committed meanwhile; this change starts from here.
+                if !hub.cfg.demo {
+                    if let Ok(sha) = issues::sh("git", &["rev-parse", "--verify", "HEAD^{commit}"], Some(w.dir)).await {
+                        hub.job(id, |j| j.base_sha = Some(sha));
+                    }
+                }
+            }
             if lent {
                 tokio::select! {
                     p = hub.return_slot() => hub.park_slot(id, p),
@@ -2887,6 +2921,83 @@ mod tests {
             }
         });
         (url, calls)
+    }
+
+    #[test]
+    fn a_task_waiting_for_a_choice_does_not_hold_up_other_typed_tasks() {
+        // Run with private process environment: jobs write the journal and attempt records.
+        const CHILD: &str = "FORKDECK_CHOICE_LANE_TEST_ROOT";
+        let Ok(root) = std::env::var(CHILD) else {
+            let root = std::env::temp_dir().join(crate::metrics::id());
+            std::fs::create_dir_all(&root).unwrap();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "orchestrator::tests::a_task_waiting_for_a_choice_does_not_hold_up_other_typed_tasks", "--nocapture"])
+                .env(CHILD, &root).env("XDG_STATE_HOME", root.join("state")).output().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            return;
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let root = PathBuf::from(root);
+        let agent = root.join("agent");
+        // Plans offer one option; "second task" commits; anything else edits a file.
+        std::fs::write(&agent, r#"#!/bin/sh
+[ "$1" = --version ] && { echo fixture; exit 0; }
+prompt=$(cat)
+case "$prompt" in
+  *'<options>'*) printf '%s\n' '{"type":"result","is_error":false,"result":"One way.\n<options>{\"options\": [{\"title\": \"Patch it\", \"summary\": \"small\", \"recommended\": true}]}</options>"}' ;;
+  *'second task'*) echo two >> two.txt; git add two.txt; git -c user.name=t -c user.email=t@t commit -qm two; printf '%s\n' '{"type":"result","is_error":false,"result":"Committed."}' ;;
+  *) echo one >> one.txt; printf '%s\n' '{"type":"result","is_error":false,"result":"Done."}' ;;
+esac
+"#).unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = root.join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [&["init", "-q"][..], &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base"]] {
+            assert!(std::process::Command::new("git").args(args).current_dir(&dir).status().unwrap().success());
+        }
+        let cfg: Config = toml::from_str(&format!(r#"
+[router]
+kind = "rules"
+default_agent = "claude"
+[review]
+mode = "never"
+[knowledge]
+enabled = false
+[agents.claude]
+cmd = {:?}
+[agents.codex]
+cmd = "/nonexistent"
+[agents.copilot]
+cmd = "/nonexistent"
+"#, agent.to_str().unwrap())).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let hub = Hub::new(cfg, rt.handle().clone());
+            hub.detect_agents().await;
+            let until = |id: u32, what: &'static str, done: fn(&Job) -> bool| {
+                let hub = hub.clone();
+                async move {
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        while !hub.job(id, |j| done(j)).unwrap() { tokio::time::sleep(Duration::from_millis(20)).await; }
+                    }).await.unwrap_or_else(|_| panic!("#{id} never {what}: {:?}", hub.job(id, |j| (j.status, j.outcome.clone()))));
+                }
+            };
+            let first = hub.submit("first".into(), "first".into(), Source::Manual, dir.clone(), None, Planning::Always).await.unwrap();
+            until(first, "waited for a choice", |j| j.status == JobStatus::Choosing).await;
+            // Nothing has changed in the directory yet: another typed task can run meanwhile.
+            let second = hub.submit("second".into(), "second task".into(), Source::Manual, dir.clone(), None, Planning::Never).await.unwrap();
+            until(second, "finished", |j| j.status.finished()).await;
+            assert_eq!(hub.job(second, |j| j.status).unwrap(), JobStatus::Done);
+            let head = String::from_utf8(std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&dir).output().unwrap().stdout).unwrap().trim().to_string();
+
+            hub.choose(first, Choice::Option(0)).unwrap();
+            until(first, "finished", |j| j.status.finished()).await;
+            assert_eq!(hub.job(first, |j| j.status).unwrap(), JobStatus::Done);
+            // Its change is measured from where the directory was when it took its turn back,
+            // so the other task's commit is not taken for its work.
+            assert_eq!(hub.job(first, |j| j.base_sha.clone()).unwrap().as_deref(), Some(head.as_str()));
+        });
     }
 
     #[test]

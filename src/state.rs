@@ -313,7 +313,15 @@ impl Choice {
 }
 
 impl Plan {
+    /// The options, or with none (the agent asked something instead), what the agent said.
     pub fn show_options(&self, stage: &mut Stage) {
+        if self.options.is_empty() {
+            let said = self.text.rfind("<options>").map(|i| &self.text[..i]).unwrap_or(&self.text);
+            for l in said.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                stage.push(clip(l, 400));
+            }
+            return;
+        }
         for (i, o) in self.options.iter().enumerate() { stage.push(format!("{}) {}{} — {}", i + 1, o.title, if o.recommended { " (recommended)" } else { "" }, o.summary)); }
     }
     /// The recommended option, else the first.
@@ -749,6 +757,20 @@ pub fn clip(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plan_without_options_shows_what_the_agent_said() {
+        let plan = Plan { options: vec![], text: "The task came through only as `+`.\nPlease send the intended change.\n\n<options>{\"options\": []}</options>".into(), chosen: None };
+        let mut s = Stage::default();
+        plan.show_options(&mut s);
+        let shown: Vec<&str> = s.tail.iter().map(String::as_str).collect();
+        assert_eq!(shown, ["The task came through only as `+`.", "Please send the intended change."]);
+        // With options, the options are what is shown.
+        let plan = Plan { options: vec![PlanOption { title: "Patch it".into(), summary: "small".into(), recommended: true }], ..plan };
+        let mut s = Stage::default();
+        plan.show_options(&mut s);
+        assert_eq!(s.tail.iter().map(String::as_str).collect::<Vec<_>>(), ["1) Patch it (recommended) — small"]);
+    }
 
     #[test]
     fn the_first_cancellation_reason_survives_shutdown() {
