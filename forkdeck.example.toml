@@ -66,10 +66,12 @@ lean = true
 #~ sandbox = true
 
 # Hosts a sandboxed worker's commands may reach. The public package registries of the
-# languages a repository uses are open by default; mirrors are added to them, or replace them
-# with public_registries = false. Point the tools at a mirror in their own settings.
+# languages a repository uses are open by default, and so are the mirrors your package managers
+# already use (found in your own .npmrc, pip.conf, settings.xml, GOPROXY, ...). List any others
+# here; public_registries = false leaves only the mirrors.
 [agents.network]
 public_registries = true
+detect_mirrors = true
 #~ mirrors = ["nexus.example.com", "artifactory.example.com"]
 
 [agents.claude]

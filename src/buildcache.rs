@@ -73,10 +73,69 @@ pub fn registries(files: &[String]) -> Vec<String> {
     out
 }
 
+/// The user's own package-manager settings that can name a mirror, under the home directory.
+const MIRROR_FILES: &[&str] = &[
+    ".npmrc", ".yarnrc", ".yarnrc.yml", ".config/pip/pip.conf", ".pip/pip.conf", ".config/uv/uv.toml",
+    ".m2/settings.xml", ".gradle/init.gradle", ".gradle/init.gradle.kts", ".gradle/gradle.properties",
+    ".cargo/config.toml", ".cargo/config", ".nuget/NuGet/NuGet.Config", ".gemrc", ".bundle/config",
+    ".config/composer/config.json", ".composer/config.json", ".condarc", ".sbt/repositories", ".ivy2/ivysettings.xml",
+    ".config/go/env", ".hex/hex.config", ".julia/config/startup.jl", ".Rprofile",
+];
+/// The same, system-wide.
+const MIRROR_SYSTEM_FILES: &[&str] = &["/etc/pip.conf", "/etc/npmrc", "/etc/xdg/pip/pip.conf", "/etc/uv/uv.toml"];
+/// Environment variables that point a package manager at a mirror.
+const MIRROR_VARS: &[&str] = &[
+    "GOPROXY", "GOSUMDB", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "UV_INDEX_URL", "UV_DEFAULT_INDEX", "UV_INDEX", "UV_EXTRA_INDEX_URL",
+    "npm_config_registry", "NPM_CONFIG_REGISTRY", "YARN_NPM_REGISTRY_SERVER", "BUNDLE_MIRROR__ALL", "HEX_MIRROR", "HEX_CDN",
+    "COMPOSER_MIRROR_PATH_REPOS", "NUGET_SOURCE", "JULIA_PKG_SERVER", "CONDA_CHANNEL_ALIAS",
+];
+
+/// The hosts of the URLs in some text, without credentials or ports.
+fn hosts_in(text: &str) -> Vec<String> {
+    static URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?i)\b(?:sparse\+)?https?://([^/\s"'<>,|;]+)"#).unwrap());
+    URL.captures_iter(text)
+        .filter_map(|c| {
+            let authority = c.get(1)?.as_str();
+            let host = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+            let host = host.split(':').next()?.trim_end_matches('.').to_ascii_lowercase();
+            (!host.is_empty() && host.contains(|ch: char| ch.is_ascii_alphanumeric())).then_some(host)
+        })
+        .collect()
+}
+
+/// The mirrors your package managers already use, read from your own settings and environment
+/// (never from a repository, whose files the work may have changed): their hosts.
+pub fn detected_mirrors(home: &Path, system: &[&str], var: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in MIRROR_FILES.iter().map(|f| home.join(f)).chain(system.iter().map(PathBuf::from)) {
+        if let Ok(text) = std::fs::read_to_string(&f) {
+            out.extend(hosts_in(&text));
+        }
+    }
+    for v in MIRROR_VARS {
+        if let Some(value) = var(v) {
+            out.extend(hosts_in(&value));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `detected_mirrors` for this machine.
+pub fn machine_mirrors() -> Vec<String> {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    detected_mirrors(&home, MIRROR_SYSTEM_FILES, |v| std::env::var(v).ok())
+}
+
 /// The hosts a sandboxed worker in `dir` may reach: the public registries of its languages
-/// (unless switched off), the configured mirrors, and what its repository adds.
+/// (unless switched off), the mirrors your package managers use, the configured mirrors, and
+/// what its repository adds.
 pub fn domains(dir: &Path, network: &crate::config::NetworkCfg, repo: &[String]) -> Vec<String> {
     let mut out = if network.public_registries { registries(&tracked(dir)) } else { Vec::new() };
+    if network.detect_mirrors {
+        out.extend(machine_mirrors());
+    }
     out.extend(network.mirrors.iter().cloned());
     out.extend(repo.iter().cloned());
     out.sort();
@@ -243,6 +302,29 @@ mod tests {
     }
 
     #[test]
+    fn mirrors_are_found_in_the_users_own_settings() {
+        let home = std::env::temp_dir().join(format!("forkdeck-mirrors-{}", std::process::id()));
+        let w = |f: &str, text: &str| {
+            let p = home.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        w(".npmrc", "registry=https://nexus.corp.example/repository/npm/\n//nexus.corp.example/:_authToken=secret\n");
+        w(".config/pip/pip.conf", "[global]\nindex-url = https://user:pw@artifactory.example:8443/api/pypi/pypi/simple\n");
+        w(".cargo/config.toml", "[source.crates-io]\nreplace-with = \"corp\"\n[source.corp]\nregistry = \"sparse+https://cargo.corp.example/index/\"\n");
+        w(".m2/settings.xml", "<settings><mirrors><mirror><url>https://maven.corp.example/repository/central</url></mirror></mirrors></settings>");
+        let env = |v: &str| match v {
+            "GOPROXY" => Some("https://goproxy.corp.example,direct".to_string()),
+            "PIP_EXTRA_INDEX_URL" => Some("https://extra.example/simple https://pypi.corp.example/simple".to_string()),
+            _ => None,
+        };
+        let found = super::detected_mirrors(&home, &[], env);
+        assert_eq!(found, ["artifactory.example", "cargo.corp.example", "extra.example", "goproxy.corp.example", "maven.corp.example", "nexus.corp.example", "pypi.corp.example"]);
+        assert!(super::detected_mirrors(&home.join("nowhere"), &[], |_| None).is_empty());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn mirrors_replace_or_join_the_public_registries() {
         let dir = std::env::temp_dir().join(format!("forkdeck-registries-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -250,7 +332,7 @@ mod tests {
         git(&["init", "-q"]);
         std::fs::write(dir.join("package.json"), "{}").unwrap();
         git(&["add", "."]);
-        let mut net = crate::config::NetworkCfg { public_registries: true, mirrors: vec!["nexus.corp".into()] };
+        let mut net = crate::config::NetworkCfg { public_registries: true, mirrors: vec!["nexus.corp".into()], detect_mirrors: false };
         let repo = vec!["api.example.com".to_string()];
         assert_eq!(super::domains(&dir, &net, &repo), ["api.example.com", "nexus.corp", "registry.npmjs.org", "registry.yarnpkg.com"]);
         net.public_registries = false;

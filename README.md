@@ -888,10 +888,15 @@ talked into things. The defaults are set with that in mind:
   of the languages the repository uses (crates.io, npm, PyPI, Maven Central,
   NuGet, Go's proxy, RubyGems, Packagist, Hex, Hackage, CRAN and others), your
   mirrors, and the hosts its `agent_domains` adds, and a command that fails in
-  there is never retried outside it. Behind Nexus, Artifactory or another
-  mirror, list it under `[agents.network]` and set `public_registries = false`;
-  the tools find it through their own settings (`.npmrc`, `settings.xml`,
-  `GOPROXY`, `pip.conf`, ...). The sandbox is passed on the command
+  there is never retried outside it. Mirrors such as Nexus or Artifactory that
+  your package managers already use are found in your own settings and opened
+  too: `.npmrc`, `pip.conf`, `uv.toml`, Maven's `settings.xml`, Gradle init
+  scripts, Cargo's `config.toml`, `NuGet.Config`, `.gemrc`, Composer's config,
+  and variables such as `GOPROXY`, `PIP_INDEX_URL` and `npm_config_registry`.
+  Only files in your home directory and `/etc` are read, never a repository's,
+  since a pull request could add one. List others under `[agents.network]`
+  `mirrors`, and set `public_registries = false` to use the mirrors alone.
+  `forkdeck doctor` shows what is open. The sandbox is passed on the command
   line, so the repository's own Claude settings cannot loosen it. Without
   bubblewrap and socat, or with `agents.sandbox = false`, a `claude` worker may
   run only the build and test commands found for the repository by name.

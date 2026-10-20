@@ -185,11 +185,14 @@ pub struct NetworkCfg {
     /// Internal mirrors and proxies (Nexus, Artifactory, a Go proxy, ...), as host names.
     /// The tools are pointed at them by their own settings (.npmrc, settings.xml, GOPROXY, ...).
     pub mirrors: Vec<String>,
+    /// Also open the mirrors your package managers already use, as your own settings files and
+    /// environment name them (never a repository's files). Default on.
+    pub detect_mirrors: bool,
 }
 
 impl Default for NetworkCfg {
     fn default() -> Self {
-        NetworkCfg { public_registries: true, mirrors: Vec::new() }
+        NetworkCfg { public_registries: true, mirrors: Vec::new(), detect_mirrors: true }
     }
 }
 

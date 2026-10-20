@@ -887,6 +887,14 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
     } else {
         println!("sandbox   off      claude workers run only the build commands found for each repository; install bubblewrap and socat to sandbox them");
     }
+    if agents::claude_sandboxed(&hub.cfg) {
+        let n = &hub.cfg.agents.network;
+        let found = if n.detect_mirrors { buildcache::machine_mirrors() } else { vec![] };
+        let mut open = vec![if n.public_registries { "the package registries of each repository's languages".to_string() } else { "no public registries".to_string() }];
+        if !found.is_empty() { open.push(format!("mirrors your package managers use: {}", found.join(", "))); }
+        if !n.mirrors.is_empty() { open.push(format!("configured mirrors: {}", n.mirrors.join(", "))); }
+        println!("network   {}", open.join("; "));
+    }
     for k in AgentKind::ALL {
         let cmd = hub.cfg.agents.get(k).cmd.unwrap_or_default();
         match issues::sh(&cmd, &["--version"], None).await {
