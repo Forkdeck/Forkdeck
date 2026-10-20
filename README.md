@@ -884,9 +884,14 @@ talked into things. The defaults are set with that in mind:
 - Workers can build and test in any language. A `claude` worker runs every
   shell command inside Claude Code's own sandbox (bubblewrap and socat on Linux,
   built in on macOS), approved without asking: it writes only to its worktree,
-  temp files and the shared build caches, reaches only the hosts the
-  repository's `agent_domains` lists (none by default), and a command that fails
-  in there is never retried outside it. The sandbox is passed on the command
+  temp files and the shared build caches, reaches only the package registries
+  of the languages the repository uses (crates.io, npm, PyPI, Maven Central,
+  NuGet, Go's proxy, RubyGems, Packagist, Hex, Hackage, CRAN and others), your
+  mirrors, and the hosts its `agent_domains` adds, and a command that fails in
+  there is never retried outside it. Behind Nexus, Artifactory or another
+  mirror, list it under `[agents.network]` and set `public_registries = false`;
+  the tools find it through their own settings (`.npmrc`, `settings.xml`,
+  `GOPROXY`, `pip.conf`, ...). The sandbox is passed on the command
   line, so the repository's own Claude settings cannot loosen it. Without
   bubblewrap and socat, or with `agents.sandbox = false`, a `claude` worker may
   run only the build and test commands found for the repository by name.

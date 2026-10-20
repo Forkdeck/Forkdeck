@@ -22,31 +22,67 @@ struct Toolchain {
     /// Its build and test commands, which a Claude worker may run (Bash(<command>:*)). Package
     /// runners that fetch and execute arbitrary code (npx, uvx) are deliberately absent.
     commands: &'static [&'static str],
+    /// The public package registries its dependencies come from, which a sandboxed worker may
+    /// reach (agents.network.public_registries). Sources fetched from git hosts are not here.
+    registries: &'static [&'static str],
 }
+
+const MAVEN: &[&str] = &["repo.maven.apache.org", "repo1.maven.org"];
 
 const TOOLCHAINS: &[Toolchain] = &[
     // Rust's build output is redirected to one directory per repository, below.
-    Toolchain { names: &["Cargo.toml"], extensions: &[], caches: &[".cargo/registry", ".cargo/git"], commands: &["cargo"] },
-    Toolchain { names: &["go.mod", "go.work"], extensions: &[], caches: &[".cache/go-build", "go/pkg/mod"], commands: &["go"] },
-    Toolchain { names: &["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"], extensions: &[], caches: &[".gradle"], commands: &["gradle", "./gradlew"] },
-    Toolchain { names: &["pom.xml"], extensions: &[], caches: &[".m2"], commands: &["mvn", "./mvnw"] },
-    Toolchain { names: &["build.sbt"], extensions: &[], caches: &[".sbt", ".ivy2", ".cache/coursier"], commands: &["sbt"] },
-    Toolchain { names: &["global.json", "Directory.Build.props"], extensions: &[".csproj", ".fsproj", ".vbproj", ".sln"], caches: &[".nuget/packages"], commands: &["dotnet"] },
-    Toolchain { names: &["Package.swift"], extensions: &[], caches: &[".cache/org.swift.swiftpm", ".swiftpm"], commands: &["swift"] },
-    Toolchain { names: &["stack.yaml"], extensions: &[], caches: &[".stack"], commands: &["stack"] },
-    Toolchain { names: &["cabal.project"], extensions: &[".cabal"], caches: &[".cabal", ".cache/cabal", ".local/state/cabal"], commands: &["cabal"] },
-    Toolchain { names: &["dune-project"], extensions: &[], caches: &[".cache/dune", ".opam"], commands: &["dune"] },
-    Toolchain { names: &["build.zig", "build.zig.zon"], extensions: &[], caches: &[".cache/zig"], commands: &["zig"] },
-    Toolchain { names: &["dub.json", "dub.sdl"], extensions: &[], caches: &[".dub"], commands: &["dub"] },
-    Toolchain { names: &[], extensions: &[".nimble"], caches: &[".nimble", ".cache/nim"], commands: &["nimble", "nim"] },
-    Toolchain { names: &["shard.yml"], extensions: &[], caches: &[".cache/crystal", ".cache/shards"], commands: &["crystal", "shards"] },
-    Toolchain { names: &["mix.exs"], extensions: &[], caches: &[".mix", ".hex"], commands: &["mix"] },
-    Toolchain { names: &["rebar.config"], extensions: &[], caches: &[".cache/rebar3"], commands: &["rebar3"] },
-    Toolchain { names: &["pubspec.yaml"], extensions: &[], caches: &[".pub-cache"], commands: &["dart", "flutter"] },
-    Toolchain { names: &["WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"], extensions: &[], caches: &[".cache/bazel"], commands: &["bazel", "bazelisk"] },
-    Toolchain { names: &["package.json"], extensions: &[], caches: &[".npm", ".cache/yarn", ".local/share/pnpm"], commands: &["npm", "pnpm", "yarn"] },
-    Toolchain { names: &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"], extensions: &[], caches: &[".cache/pip", ".cache/uv"], commands: &["pytest", "python -m pytest", "uv run pytest"] },
+    Toolchain { names: &["Cargo.toml"], extensions: &[], caches: &[".cargo/registry", ".cargo/git"], commands: &["cargo"], registries: &["crates.io", "index.crates.io", "static.crates.io"] },
+    Toolchain { names: &["go.mod", "go.work"], extensions: &[], caches: &[".cache/go-build", "go/pkg/mod"], commands: &["go"], registries: &["proxy.golang.org", "sum.golang.org"] },
+    Toolchain { names: &["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"], extensions: &[], caches: &[".gradle"], commands: &["gradle", "./gradlew"], registries: &["repo.maven.apache.org", "repo1.maven.org", "plugins.gradle.org", "plugins-artifacts.gradle.org", "services.gradle.org", "downloads.gradle.org", "dl.google.com"] },
+    Toolchain { names: &["pom.xml"], extensions: &[], caches: &[".m2"], commands: &["mvn", "./mvnw"], registries: MAVEN },
+    Toolchain { names: &["build.sbt"], extensions: &[], caches: &[".sbt", ".ivy2", ".cache/coursier"], commands: &["sbt"], registries: &["repo.maven.apache.org", "repo1.maven.org", "repo.scala-sbt.org"] },
+    Toolchain { names: &["deps.edn", "project.clj"], extensions: &[], caches: &[".m2", ".gitlibs", ".clojure", ".lein"], commands: &["clojure", "clj", "lein"], registries: &["repo.maven.apache.org", "repo1.maven.org", "repo.clojars.org", "clojars.org"] },
+    Toolchain { names: &["global.json", "Directory.Build.props"], extensions: &[".csproj", ".fsproj", ".vbproj", ".sln"], caches: &[".nuget/packages"], commands: &["dotnet"], registries: &["api.nuget.org", "globalcdn.nuget.org"] },
+    Toolchain { names: &["Package.swift"], extensions: &[], caches: &[".cache/org.swift.swiftpm", ".swiftpm"], commands: &["swift"], registries: &[] },
+    Toolchain { names: &["stack.yaml"], extensions: &[], caches: &[".stack"], commands: &["stack"], registries: &["hackage.haskell.org", "www.stackage.org"] },
+    Toolchain { names: &["cabal.project"], extensions: &[".cabal"], caches: &[".cabal", ".cache/cabal", ".local/state/cabal"], commands: &["cabal"], registries: &["hackage.haskell.org"] },
+    Toolchain { names: &["dune-project"], extensions: &[".opam"], caches: &[".cache/dune", ".opam"], commands: &["dune", "opam"], registries: &["opam.ocaml.org"] },
+    Toolchain { names: &["build.zig", "build.zig.zon"], extensions: &[], caches: &[".cache/zig"], commands: &["zig"], registries: &[] },
+    Toolchain { names: &["dub.json", "dub.sdl"], extensions: &[], caches: &[".dub"], commands: &["dub"], registries: &["code.dlang.org", "dub.pm"] },
+    Toolchain { names: &[], extensions: &[".nimble"], caches: &[".nimble", ".cache/nim"], commands: &["nimble", "nim"], registries: &[] },
+    Toolchain { names: &["shard.yml"], extensions: &[], caches: &[".cache/crystal", ".cache/shards"], commands: &["crystal", "shards"], registries: &[] },
+    Toolchain { names: &["mix.exs"], extensions: &[], caches: &[".mix", ".hex"], commands: &["mix"], registries: &["hex.pm", "repo.hex.pm", "builds.hex.pm"] },
+    Toolchain { names: &["rebar.config"], extensions: &[], caches: &[".cache/rebar3"], commands: &["rebar3"], registries: &["hex.pm", "repo.hex.pm"] },
+    Toolchain { names: &["pubspec.yaml"], extensions: &[], caches: &[".pub-cache"], commands: &["dart", "flutter"], registries: &["pub.dev", "pub.dartlang.org", "storage.googleapis.com"] },
+    Toolchain { names: &["WORKSPACE", "WORKSPACE.bazel", "MODULE.bazel"], extensions: &[], caches: &[".cache/bazel"], commands: &["bazel", "bazelisk"], registries: &["bcr.bazel.build", "mirror.bazel.build"] },
+    Toolchain { names: &["package.json"], extensions: &[], caches: &[".npm", ".cache/yarn", ".local/share/pnpm", ".bun/install/cache"], commands: &["npm", "pnpm", "yarn", "bun"], registries: &["registry.npmjs.org", "registry.yarnpkg.com"] },
+    Toolchain { names: &["deno.json", "deno.jsonc"], extensions: &[], caches: &[".cache/deno"], commands: &["deno"], registries: &["deno.land", "jsr.io", "registry.npmjs.org"] },
+    Toolchain { names: &["elm.json"], extensions: &[], caches: &[".elm"], commands: &["elm", "elm-test"], registries: &["package.elm-lang.org"] },
+    Toolchain { names: &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"], extensions: &[], caches: &[".cache/pip", ".cache/uv"], commands: &["pytest", "python -m pytest", "uv run pytest"], registries: &["pypi.org", "files.pythonhosted.org"] },
+    Toolchain { names: &["Gemfile", "Rakefile"], extensions: &[".gemspec"], caches: &[".gem", ".bundle", ".cache/bundle"], commands: &["bundle", "rake", "rspec"], registries: &["rubygems.org", "index.rubygems.org"] },
+    Toolchain { names: &["composer.json"], extensions: &[], caches: &[".cache/composer", ".composer"], commands: &["composer", "phpunit", "./vendor/bin/phpunit"], registries: &["repo.packagist.org", "packagist.org"] },
+    Toolchain { names: &["cpanfile", "Makefile.PL", "Build.PL"], extensions: &[], caches: &[".cpanm", "perl5"], commands: &["prove", "cpanm"], registries: &["cpan.metacpan.org", "fastapi.metacpan.org"] },
+    Toolchain { names: &["DESCRIPTION", "renv.lock"], extensions: &[".Rproj"], caches: &["R", ".cache/R"], commands: &["Rscript", "R CMD"], registries: &["cloud.r-project.org", "cran.r-project.org"] },
+    Toolchain { names: &["Project.toml", "JuliaProject.toml"], extensions: &[], caches: &[".julia"], commands: &["julia"], registries: &["pkg.julialang.org"] },
+    Toolchain { names: &[], extensions: &[".rockspec"], caches: &[".luarocks", ".cache/luarocks"], commands: &["luarocks", "busted"], registries: &["luarocks.org"] },
 ];
+
+/// The public package registries of the toolchains in a tree.
+pub fn registries(files: &[String]) -> Vec<String> {
+    let names: Vec<&str> = files.iter().map(|f| f.rsplit('/').next().unwrap_or(f)).collect();
+    let mut out: Vec<String> = TOOLCHAINS.iter()
+        .filter(|t| names.iter().any(|n| t.names.contains(n) || t.extensions.iter().any(|e| n.ends_with(e))))
+        .flat_map(|t| t.registries.iter().map(|r| r.to_string())).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The hosts a sandboxed worker in `dir` may reach: the public registries of its languages
+/// (unless switched off), the configured mirrors, and what its repository adds.
+pub fn domains(dir: &Path, network: &crate::config::NetworkCfg, repo: &[String]) -> Vec<String> {
+    let mut out = if network.public_registries { registries(&tracked(dir)) } else { Vec::new() };
+    out.extend(network.mirrors.iter().cloned());
+    out.extend(repo.iter().cloned());
+    out.sort();
+    out.dedup();
+    out
+}
 
 /// Build files of C, C++, Fortran and other languages built by a native compiler, which ccache speeds up.
 const NATIVE: &[&str] = &["CMakeLists.txt", "Makefile", "GNUmakefile", "meson.build", "configure.ac", "configure"];
@@ -192,6 +228,36 @@ pub fn codex_args(p: &Plan) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn each_language_brings_its_own_registries() {
+        let r = super::registries(&files(&["Cargo.toml", "web/package.json", "src/main.rs"]));
+        assert!(r.contains(&"crates.io".to_string()) && r.contains(&"registry.npmjs.org".to_string()), "{r:?}");
+        assert!(!r.contains(&"pypi.org".to_string()), "only the languages the tree uses: {r:?}");
+        for (file, host, command) in [("Gemfile", "rubygems.org", "bundle"), ("composer.json", "repo.packagist.org", "composer"), ("pyproject.toml", "files.pythonhosted.org", "pytest"),
+            ("go.mod", "proxy.golang.org", "go"), ("pom.xml", "repo1.maven.org", "mvn"), ("app.csproj", "api.nuget.org", "dotnet"), ("mix.exs", "repo.hex.pm", "mix"),
+            ("Project.toml", "pkg.julialang.org", "julia"), ("deps.edn", "repo.clojars.org", "clojure"), ("x.rockspec", "luarocks.org", "luarocks")] {
+            assert!(super::registries(&files(&[file])).contains(&host.to_string()), "{file}");
+            assert!(super::commands(&files(&[file])).contains(&command), "{file}");
+        }
+        assert!(super::registries(&files(&["README.md"])).is_empty());
+    }
+
+    #[test]
+    fn mirrors_replace_or_join_the_public_registries() {
+        let dir = std::env::temp_dir().join(format!("forkdeck-registries-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |a: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&dir).args(a).status().unwrap().success());
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("package.json"), "{}").unwrap();
+        git(&["add", "."]);
+        let mut net = crate::config::NetworkCfg { public_registries: true, mirrors: vec!["nexus.corp".into()] };
+        let repo = vec!["api.example.com".to_string()];
+        assert_eq!(super::domains(&dir, &net, &repo), ["api.example.com", "nexus.corp", "registry.npmjs.org", "registry.yarnpkg.com"]);
+        net.public_registries = false;
+        assert_eq!(super::domains(&dir, &net, &repo), ["api.example.com", "nexus.corp"], "only the mirror");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn claude_sandbox_settings_keep_writes_and_network_to_what_the_job_needs() {
         let dir = std::env::temp_dir().join(format!("forkdeck-sandbox-{}", std::process::id()));

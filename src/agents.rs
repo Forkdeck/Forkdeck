@@ -690,7 +690,8 @@ async fn spawn_and_read(
     }
     // Any language's tools run, inside the sandbox; without one, only the commands allowed by name.
     if kind == AgentKind::Claude && !read_only && claude_sandboxed(&hub.cfg) {
-        args.extend(crate::buildcache::claude_sandbox(&cache, &agent_domains(hub, job, dir)));
+        let domains = crate::buildcache::domains(dir, &hub.cfg.agents.network, &agent_domains(hub, job, dir));
+        args.extend(crate::buildcache::claude_sandbox(&cache, &domains));
     }
     let mut child = match command
         .args(&args)

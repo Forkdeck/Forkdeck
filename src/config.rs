@@ -171,6 +171,26 @@ pub struct AgentsCfg {
     /// language's tools work. Unset: whenever bubblewrap and socat are installed (Linux). false:
     /// never; workers may then run only the build commands found for the repository.
     pub sandbox: Option<bool>,
+    /// Which hosts a sandboxed worker's commands may reach.
+    pub network: NetworkCfg,
+}
+
+/// `[agents.network]`: the hosts sandboxed workers reach, beyond nothing.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkCfg {
+    /// The public package registries of the languages a repository uses (crates.io, npm, PyPI,
+    /// Maven Central, ...). Turn off when everything comes through a mirror.
+    pub public_registries: bool,
+    /// Internal mirrors and proxies (Nexus, Artifactory, a Go proxy, ...), as host names.
+    /// The tools are pointed at them by their own settings (.npmrc, settings.xml, GOPROXY, ...).
+    pub mirrors: Vec<String>,
+}
+
+impl Default for NetworkCfg {
+    fn default() -> Self {
+        NetworkCfg { public_registries: true, mirrors: Vec::new() }
+    }
 }
 
 impl AgentsCfg {
@@ -1067,6 +1087,11 @@ impl Config {
         if !(0.5..=1.0).contains(&self.router.threshold) {
             anyhow::bail!("router.threshold must be between 0.5 and 1.0, got {}", self.router.threshold);
         }
+        // The sandbox matches host names; a URL or a path would never match and quietly allow nothing.
+        let hosts = self.agents.network.mirrors.iter().chain(self.repos.iter().flat_map(|r| r.agent_domains.iter()));
+        for h in hosts {
+            anyhow::ensure!(!h.is_empty() && !h.contains("://") && !h.contains('/') && !h.contains(' '), "agents.network.mirrors and agent_domains take host names such as nexus.example.com, got {:?}", h);
+        }
         let m = &self.router.memory;
         anyhow::ensure!(m.similarity > 0.0 && m.similarity <= 1.0, "router.memory.similarity must be above 0 and at most 1");
         anyhow::ensure!(m.min_matches >= 1 && m.step_down_after >= 1, "router.memory.min_matches and step_down_after must be at least 1");
@@ -1402,6 +1427,19 @@ mod tests {
         assert_eq!((r.provider, r.repo.as_str()), (Provider::Gitlab, "g/sub/p"));
         assert!(!automation, "polling stays off unless the file asks");
         std::fs::remove_dir_all(&clone).unwrap();
+    }
+
+    #[test]
+    fn mirrors_and_agent_domains_are_host_names() {
+        let cfg: Config = toml::from_str("[agents.network]\npublic_registries = false\nmirrors = [\"nexus.example.com\"]").unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.agents.network.public_registries);
+        assert_eq!(cfg.agents.network.mirrors, ["nexus.example.com"]);
+        assert!(Config::default().agents.network.public_registries, "public registries by default");
+        for bad in ["https://nexus.example.com", "nexus.example.com/repository/npm", ""] {
+            let cfg: Config = toml::from_str(&format!("[agents.network]\nmirrors = [{bad:?}]")).unwrap();
+            assert!(cfg.validate().unwrap_err().to_string().contains("host names"), "{bad}");
+        }
     }
 
     #[test]

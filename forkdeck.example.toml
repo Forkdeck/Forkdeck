@@ -65,6 +65,13 @@ lean = true
 # found for each repository, by name.
 #~ sandbox = true
 
+# Hosts a sandboxed worker's commands may reach. The public package registries of the
+# languages a repository uses are open by default; mirrors are added to them, or replace them
+# with public_registries = false. Point the tools at a mirror in their own settings.
+[agents.network]
+public_registries = true
+#~ mirrors = ["nexus.example.com", "artifactory.example.com"]
+
 [agents.claude]
 cmd = "claude"
 models = { light = "haiku", standard = "sonnet", heavy = "opus" }
