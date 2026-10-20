@@ -193,6 +193,8 @@ pub struct Stage {
     pub tail: VecDeque<String>,
     /// Lines ever pushed, so a remote viewer can ask for the ones it has not seen.
     pub pushed: u64,
+    /// What the agent asked to run and was not allowed to, in its last run.
+    pub refused: Vec<String>,
 }
 
 impl Default for Stage {
@@ -215,6 +217,7 @@ impl Default for Stage {
             tail: VecDeque::new(),
             unprinted: 0,
             pushed: 0,
+            refused: Vec::new(),
         }
     }
 }

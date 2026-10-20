@@ -167,6 +167,10 @@ pub struct AgentsCfg {
     pub lean: Option<bool>,
     /// Fill unset model tiers from the models each CLI lists for the account. Default on.
     pub discover_models: Option<bool>,
+    /// Claude workers run every shell command in Claude Code's sandbox, without asking, so any
+    /// language's tools work. Unset: whenever bubblewrap and socat are installed (Linux). false:
+    /// never; workers may then run only the build commands found for the repository.
+    pub sandbox: Option<bool>,
 }
 
 impl AgentsCfg {
@@ -755,6 +759,10 @@ impl CallCfg {
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct RepoCfg {
+    /// Hosts the commands a sandboxed worker runs may reach, such as a package registry. None
+    /// by default.
+    #[serde(default)]
+    pub agent_domains: Vec<String>,
     pub provider: Provider,
     /// "owner/name" on GitHub, "group/project" on GitLab
     pub repo: String,

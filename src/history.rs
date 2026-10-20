@@ -214,6 +214,7 @@ impl StageRecord {
             started: None,
             elapsed: (self.secs > 0).then(|| Duration::from_secs(self.secs)),
             tail: self.tail.into(),
+            refused: Vec::new(),
         }
     }
 }

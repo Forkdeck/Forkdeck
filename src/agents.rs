@@ -137,6 +137,10 @@ pub(crate) fn record_event(s: &mut crate::state::Stage, p: &Parsed) {
                 s.push(clip(l, LINE));
             }
         }
+        Parsed::Refused(t) => {
+            s.refused.push(t.clone());
+            s.push(format!("⊘ not allowed: {}", clip(t, 300)));
+        }
         Parsed::Tool(t) => {
             s.tools += 1;
             s.push(format!("▸ {}", clip(t, LINE)));
@@ -172,7 +176,32 @@ pub enum Parsed {
     NoModels(String),
     /// The CLI named the conversation (codex does so in its first event).
     Session(String),
+    /// The agent asked to run something and was not allowed to.
+    Refused(String),
     Nothing,
+}
+
+/// Whether Claude workers run their shell commands in Claude Code's sandbox (config, else whether it can run here).
+pub fn claude_sandboxed(cfg: &Config) -> bool {
+    !cfg.demo && cfg.agents.sandbox.unwrap_or_else(crate::buildcache::sandbox_available)
+}
+
+/// The hosts a job's sandboxed commands may reach: its repository's `agent_domains`. A typed task
+/// takes them from the configured repository its directory is in.
+fn agent_domains(hub: &Hub, job: u32, dir: &Path) -> Vec<String> {
+    use crate::state::Source;
+    let idx = hub.job(job, |j| match &j.source {
+        Source::Issue { repo_idx, .. } | Source::Pr { repo_idx, .. } | Source::Deploy { repo_idx, .. } => Some(*repo_idx),
+        Source::Manual => None,
+    }).flatten();
+    let repo = match idx {
+        Some(i) => hub.cfg.repos.get(i),
+        None => {
+            let here = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+            hub.cfg.repos.iter().find(|r| r.path.canonicalize().is_ok_and(|p| here.starts_with(p)))
+        }
+    };
+    repo.map(|r| r.agent_domains.clone()).unwrap_or_default()
 }
 
 /// The prompt is not part of the command line: it is written to the agent's stdin, so its size
@@ -348,6 +377,12 @@ pub fn parse_claude(line: &str) -> Vec<Parsed> {
             }
         }
         "result" => {
+            // What it was not allowed to do, said before the final answer so it is on record first.
+            for d in v.get("permission_denials").and_then(|d| d.as_array()).into_iter().flatten() {
+                let tool = d.get("tool_name").and_then(|t| t.as_str()).unwrap_or("a tool");
+                let what = d.pointer("/tool_input/command").or_else(|| d.pointer("/tool_input/file_path")).and_then(|c| c.as_str());
+                out.push(Parsed::Refused(match what { Some(w) => format!("{tool}: {}", first_line(w)), None => tool.to_string() }));
+            }
             let u = v.get("usage").cloned().unwrap_or(Value::Null);
             let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
             out.push(Parsed::Final {
@@ -653,6 +688,10 @@ async fn spawn_and_read(
             args.splice(at..at, crate::buildcache::codex_args(&cache));
         }
     }
+    // Any language's tools run, inside the sandbox; without one, only the commands allowed by name.
+    if kind == AgentKind::Claude && !read_only && claude_sandboxed(&hub.cfg) {
+        args.extend(crate::buildcache::claude_sandbox(&cache, &agent_domains(hub, job, dir)));
+    }
     let mut child = match command
         .args(&args)
         .current_dir(run_dir)
@@ -769,6 +808,7 @@ async fn spawn_and_read(
             match p {
                 Parsed::Text(t) => last_text = t,
                 Parsed::Tool(_) => tools_seen += 1,
+                Parsed::Refused(t) => hub.log("agents", format!("#{} {} was not allowed: {}", job, kind.name(), clip(&t, 160))),
                 Parsed::Session(id) => {
                     hub.job(job, |j| {
                         j.stage(slot).session = Some(id.clone());
@@ -1083,6 +1123,18 @@ pub async fn invocation_limit(cmd: &str, kind: AgentKind, args: &mut Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_says_what_it_was_not_allowed_to_run() {
+        let l = r#"{"type":"result","is_error":false,"result":"stuck","permission_denials":[{"tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"PATH=/opt/x:$PATH cargo test\nmore"}},{"tool_name":"Write","tool_input":{"file_path":"/etc/hosts"}},{"tool_name":"Monitor"}]}"#;
+        let p = parse_claude(l);
+        assert_eq!(&p[..3], &[Parsed::Refused("Bash: PATH=/opt/x:$PATH cargo test".into()), Parsed::Refused("Write: /etc/hosts".into()), Parsed::Refused("Monitor".into())]);
+        assert!(matches!(p[3], Parsed::Final { ok: true, .. }));
+        let mut s = crate::state::Stage::default();
+        record_event(&mut s, &p[0]);
+        assert_eq!(s.refused, ["Bash: PATH=/opt/x:$PATH cargo test"]);
+        assert!(s.tail.back().unwrap().starts_with("⊘ not allowed"));
+    }
 
     #[test]
     fn attempts_name_the_part_a_run_plays() {

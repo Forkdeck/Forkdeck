@@ -60,6 +60,10 @@ timeout_mins = 45
 # Without your own plugins, hooks and MCP servers (the repository's settings still apply):
 # they add thousands of tokens to every call an agent makes. false loads them.
 lean = true
+# Claude workers run any build or test command inside Claude Code's sandbox (needs bubblewrap
+# and socat on Linux). Unset: whenever those are installed. false: only the build commands
+# found for each repository, by name.
+#~ sandbox = true
 
 [agents.claude]
 cmd = "claude"
@@ -218,6 +222,8 @@ dir = "~/.config/forkdeck/remote"   # certificate authority, paired devices
 #~ allowed_authors = ["your-name"]
 #~ # Run in the issue's worktree before any review. These run as you, on code an agent just wrote.
 #~ checks = ["cargo test --quiet"]
+#~ # Hosts a sandboxed worker's commands may reach (a package registry, say). None by default.
+#~ agent_domains = ["crates.io", "static.crates.io"]
 #~ # Pull requests with this label are reviewed and commented on, never approved or merged.
 #~ pr_label = "review:ready"
 #~ pr_working_label = "review:running"

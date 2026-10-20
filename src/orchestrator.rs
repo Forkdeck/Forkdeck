@@ -798,6 +798,13 @@ impl Hub {
     /// Said once every CLI is known.
     fn agents_known(&self) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.has(AgentKind::Claude) && !self.cfg.demo {
+            st.log("agents", if agents::claude_sandboxed(&self.cfg) {
+                "claude workers run any build or test command, inside Claude Code's sandbox"
+            } else {
+                "claude workers may run only the build commands found for each repository; install bubblewrap and socat to sandbox them instead"
+            });
+        }
         if !st.has(AgentKind::Claude) && !st.has(AgentKind::Codex) {
             let stands_in = st.copilot_usable() && st.stand_in;
             st.log("agents", if stands_in { "claude and codex not found on PATH: copilot stands in for them" } else { "neither claude, codex nor a usable copilot was found on PATH" });
@@ -1462,12 +1469,16 @@ struct Refined {
     rounds: u32,
     /// The last fix round left the tree as it was.
     stalled: bool,
+    /// What the worker was not allowed to run in its last turn.
+    refused: Vec<String>,
 }
 
 impl Refined {
     fn why_not(&self) -> String {
         // How the fixing ended, when there was any.
-        let after = if self.stalled {
+        let after = if self.stalled && !self.refused.is_empty() {
+            format!(" and the last fix changed nothing; the worker was not allowed to run {}", self.refused.iter().take(3).map(|r| format!("`{}`", clip(r, 120))).collect::<Vec<_>>().join(", "))
+        } else if self.stalled {
             " and the last fix changed nothing".to_string()
         } else if self.rounds > 0 {
             format!(" after {} fix round{}", self.rounds, if self.rounds == 1 { "" } else { "s" })
@@ -1937,7 +1948,8 @@ async fn refine(hub: &Hub, id: u32, w: &Work<'_>, mut summary: String, cancel: &
         }
     }
     let good = checks_ok != Some(false) && (!w.d.review || passed == Some(true));
-    Ok(Refined { summary, good, checks_ok, passed, reasons, rounds: round, stalled })
+    let refused = hub.job(id, |j| j.worker.refused.clone()).unwrap_or_default();
+    Ok(Refined { summary, good, checks_ok, passed, reasons, rounds: round, stalled, refused })
 }
 
 async fn pipeline(hub: &Hub, id: u32, is_issue: bool, cancel: &Cancel) -> Finish {
@@ -2871,12 +2883,15 @@ mod tests {
 
     #[test]
     fn a_failed_outcome_says_how_the_fixing_ended() {
-        let r = |rounds, stalled, checks_ok| Refined { summary: String::new(), good: false, checks_ok, passed: Some(false), reasons: "src/a.rs:3 still wrong\nVERDICT: FAIL".into(), rounds, stalled };
+        let r = |rounds, stalled, checks_ok| Refined { summary: String::new(), good: false, checks_ok, passed: Some(false), reasons: "src/a.rs:3 still wrong\nVERDICT: FAIL".into(), rounds, stalled, refused: vec![] };
         assert_eq!(r(0, false, None).why_not(), "review did not pass: src/a.rs:3 still wrong");
         assert_eq!(r(1, false, None).why_not(), "review still failing after 1 fix round: src/a.rs:3 still wrong");
         assert_eq!(r(5, false, None).why_not(), "review still failing after 5 fix rounds: src/a.rs:3 still wrong");
         assert_eq!(r(2, true, None).why_not(), "review did not pass and the last fix changed nothing: src/a.rs:3 still wrong");
         assert!(r(3, false, Some(false)).why_not().starts_with("checks failed after 3 fix rounds: "));
+        // A fix that could not run what it needed says what that was.
+        let refused = Refined { refused: vec!["Bash: PATH=/opt/x/bin:$PATH cargo test".into()], ..r(2, true, None) };
+        assert_eq!(refused.why_not(), "review did not pass and the last fix changed nothing; the worker was not allowed to run `Bash: PATH=/opt/x/bin:$PATH cargo test`: src/a.rs:3 still wrong");
     }
 
     #[test]

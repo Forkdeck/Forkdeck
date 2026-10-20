@@ -304,6 +304,7 @@ fn main() -> anyhow::Result<()> {
         cfg.automation.enabled = true;
         if cfg.repos.is_empty() {
             cfg.repos.push(config::RepoCfg {
+                agent_domains: vec![],
                 provider: Provider::Github,
                 repo: "acme/payments".into(),
                 path: PathBuf::from("."),
@@ -879,6 +880,13 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
         None => println!("config    none found, defaults in use"),
     }
     hub.detect_agents().await;
+    if agents::claude_sandboxed(&hub.cfg) {
+        println!("sandbox   on       claude workers run any command in Claude Code's sandbox");
+    } else if hub.cfg.agents.sandbox == Some(false) {
+        println!("sandbox   off      claude workers run only the build commands found for each repository (agents.sandbox = false)");
+    } else {
+        println!("sandbox   off      claude workers run only the build commands found for each repository; install bubblewrap and socat to sandbox them");
+    }
     for k in AgentKind::ALL {
         let cmd = hub.cfg.agents.get(k).cmd.unwrap_or_default();
         match issues::sh(&cmd, &["--version"], None).await {

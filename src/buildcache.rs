@@ -139,6 +139,44 @@ pub fn for_dir(dir: &Path, repo_key: &str) -> Plan {
     plan(&files, repo_key, &root, &home, |p| std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(p).is_file())))
 }
 
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(program).is_file()))
+}
+
+/// Whether Claude Code's own sandbox can run here: built in on macOS; on Linux it needs
+/// bubblewrap and socat, and bubblewrap able to start (in some containers it cannot). Asked once.
+pub fn sandbox_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if cfg!(target_os = "macos") {
+            return true;
+        }
+        cfg!(target_os = "linux") && on_path("bwrap") && on_path("socat")
+            && std::process::Command::new("bwrap").args(["--ro-bind", "/", "/", "--dev", "/dev", "true"])
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
+    })
+}
+
+/// Claude Code settings that run every shell command a worker starts in its sandbox, approved
+/// without asking, whatever the language: writes reach only the worktree, temp files and the
+/// shared build caches, the network only `domains`, and a command that fails in there is not
+/// retried outside. Given on the command line, a repository's own settings cannot loosen it.
+pub fn claude_sandbox(p: &Plan, domains: &[String]) -> Vec<String> {
+    for d in &p.writable {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let writable: Vec<String> = p.writable.iter().map(|d| d.display().to_string()).collect();
+    let settings = serde_json::json!({ "sandbox": {
+        "enabled": true,
+        "autoAllowBashIfSandboxed": true,
+        "allowUnsandboxedCommands": false,
+        "failIfUnavailable": true,
+        "filesystem": { "allowWrite": writable },
+        "network": { "allowedDomains": domains, "strictAllowlist": true },
+    }});
+    vec!["--settings".into(), settings.to_string()]
+}
+
 /// Codex arguments that let its sandbox write where the builds do. Directories that do not exist
 /// yet are created first, as the sandbox can only open up what is there.
 pub fn codex_args(p: &Plan) -> Vec<String> {
@@ -154,6 +192,23 @@ pub fn codex_args(p: &Plan) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_sandbox_settings_keep_writes_and_network_to_what_the_job_needs() {
+        let dir = std::env::temp_dir().join(format!("forkdeck-sandbox-{}", std::process::id()));
+        let p = super::Plan { env: vec![], writable: vec![dir.join("cargo-target")] };
+        let args = super::claude_sandbox(&p, &["crates.io".to_string()]);
+        assert_eq!(args[0], "--settings");
+        let v: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
+        let s = &v["sandbox"];
+        assert_eq!((s["enabled"].as_bool(), s["autoAllowBashIfSandboxed"].as_bool()), (Some(true), Some(true)));
+        assert_eq!(s["allowUnsandboxedCommands"], false, "no retry outside the sandbox");
+        assert_eq!(s["failIfUnavailable"], true, "never silently unsandboxed");
+        assert_eq!(s["filesystem"]["allowWrite"][0], dir.join("cargo-target").display().to_string());
+        assert_eq!((s["network"]["allowedDomains"][0].as_str(), s["network"]["strictAllowlist"].as_bool()), (Some("crates.io"), Some(true)));
+        assert!(dir.join("cargo-target").is_dir(), "made first, so it can be opened up");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use super::*;
 
     fn files(names: &[&str]) -> Vec<String> {

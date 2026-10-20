@@ -881,6 +881,17 @@ talked into things. The defaults are set with that in mind:
   and built-in MCP servers. Checkout hooks and agent configuration are not loaded
   on startup, including when a worker has edited them. Loosen `write_args`
   only for repositories you trust.
+- Workers can build and test in any language. A `claude` worker runs every
+  shell command inside Claude Code's own sandbox (bubblewrap and socat on Linux,
+  built in on macOS), approved without asking: it writes only to its worktree,
+  temp files and the shared build caches, reaches only the hosts the
+  repository's `agent_domains` lists (none by default), and a command that fails
+  in there is never retried outside it. The sandbox is passed on the command
+  line, so the repository's own Claude settings cannot loosen it. Without
+  bubblewrap and socat, or with `agents.sandbox = false`, a `claude` worker may
+  run only the build and test commands found for the repository by name.
+  `forkdeck doctor` says which applies. `codex` workers run in Codex's sandbox.
+  When a worker is refused something, the job log and its outcome name it.
 - Work happens in a worktree on its own branch and arrives as a draft.
 
 `checks` are shell commands from your config and run as you, outside any agent
