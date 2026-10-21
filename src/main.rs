@@ -25,6 +25,7 @@ mod remote;
 mod routemem;
 mod router;
 mod state;
+mod taskgraph;
 mod team;
 mod tracker;
 mod ui;
