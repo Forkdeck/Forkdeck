@@ -497,6 +497,8 @@ impl Rig {
             .env_clear()
             .env("PATH", format!("{}:/usr/local/bin:/usr/bin:/bin", self.root.join("bin").display()))
             .env("HOME", self.root.join("home"))
+            // The temporary directory the tests were given, which a sandbox may make the only one writable.
+            .env("TMPDIR", std::env::temp_dir())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("FAKE_GH", self.root.join("gh"));
         for (k, v) in env {
