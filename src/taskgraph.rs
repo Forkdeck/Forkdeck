@@ -236,8 +236,19 @@ pub fn validate(g: &Graph) -> Result<(), String> {
     Ok(())
 }
 
+/// A task list a planner just wrote: valid, and without issue numbers. Numbers come only from the
+/// creation transaction's own progress, so a planner cannot point a task at an existing issue.
+pub fn validate_new(g: &Graph) -> Result<(), String> {
+    validate(g)?;
+    if let Some(t) = g.tasks.iter().find(|t| t.number.is_some()) {
+        return Err(format!("Task {} carries an issue number; leave numbers out, Forkdeck assigns them.", t.id));
+    }
+    Ok(())
+}
+
 pub const OPEN: &str = "<!-- forkdeck:tasks:start -->";
 pub const CLOSE: &str = "<!-- forkdeck:tasks:end -->";
+const GRAPH_TAG: &str = "<!-- forkdeck:graph sha256=";
 const EDITED: &str = "The task list on the issue was edited by hand; re-plan to change it.";
 
 fn number_ref(t: &Task) -> String {
@@ -268,12 +279,18 @@ fn list_lines(g: &Graph, parent: Option<&str>, depth: usize, status: &dyn Fn(&Ta
     }
 }
 
+/// A fingerprint of the whole graph, numbers and fields the list never shows included.
+fn fingerprint(g: &Graph) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(serde_json::to_string(g).unwrap_or_default().as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The whole managed section, markers included. Statuses are display only and are never read back.
 pub fn render(g: &Graph, status: &dyn Fn(&Task) -> String) -> String {
     let mut lines = Vec::new();
     list_lines(g, None, 0, status, &mut lines);
     let data = serde_json::to_string(g).unwrap_or_default();
-    format!("{OPEN}\n## Tasks\n\n{}\n\n<details><summary>Plan data</summary>\n\n```json\n{data}\n```\n\n</details>\n{CLOSE}", lines.join("\n"))
+    format!("{OPEN}\n## Tasks\n\n{}\n\n<details><summary>Plan data</summary>\n\n{GRAPH_TAG}{} -->\n```json\n{data}\n```\n\n</details>\n{CLOSE}", lines.join("\n"), fingerprint(g))
 }
 
 /// Every visible line of a section around its plan data: the list and its headings before the data
@@ -311,6 +328,8 @@ pub fn read(section: &str) -> Result<Graph, String> {
     let (from, to) = data_span(section)?;
     let g: Graph = serde_json::from_str(&section[from..to]).map_err(|e| format!("The task list's plan data is unreadable: {e}"))?;
     validate(&g)?;
+    let stamp = format!("{GRAPH_TAG}{} -->", fingerprint(&g));
+    if !section.lines().any(|l| l.trim() == stamp) { return Err(EDITED.into()); }
     let rendered = render(&g, &|_| String::new());
     let (rf, rt) = data_span(&rendered)?;
     let (actual, expected) = (visible(section, from, to), visible(&rendered, rf, rt));
@@ -450,5 +469,26 @@ mod tests {
         assert!(bad(r#"{"version":1,"tasks":[{"id":"a","title":"A","kind":"work","parent":"b"},{"id":"b","title":"B","kind":"work"}]}"#).contains("group"));
         assert!(bad(r#"{"version":2,"tasks":[{"id":"a","title":"A","kind":"work"}]}"#).contains("version"));
         assert!(bad(r#"{"version":1,"tasks":[]}"#).contains("empty"));
+    }
+
+    #[test]
+    fn a_new_plan_carries_no_issue_numbers() {
+        let mut g = extract(PLAN).unwrap().unwrap();
+        validate_new(&g).unwrap();
+        g.tasks[1].number = Some(42);
+        let e = validate_new(&g).unwrap_err();
+        assert!(e.contains("issue number") && e.contains(&g.tasks[1].id), "{e}");
+        validate(&g).unwrap();
+    }
+
+    #[test]
+    fn plan_data_edited_behind_the_list_is_refused() {
+        let s = render(&numbered(), &|_| String::new());
+        // The list reads the same, but the prerequisite is now a decision a closed issue satisfies.
+        let e = read(&s.replacen("\"kind\":\"work\"", "\"kind\":\"decision\"", 1)).unwrap_err();
+        assert!(e.contains("edited"), "{e}");
+        assert!(read(&s.replacen("\"body\":\"\"", "\"body\":\"x\"", 1)).unwrap_err().contains("edited"));
+        let bare: String = s.lines().filter(|l| !l.contains("forkdeck:graph")).collect::<Vec<_>>().join("\n");
+        assert!(read(&bare).unwrap_err().contains("edited"), "no fingerprint");
     }
 }

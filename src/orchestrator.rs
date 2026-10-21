@@ -2359,7 +2359,7 @@ async fn issue_plan_turn(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
         if out.text.contains(crate::tracker::OPEN) || out.text.contains(crate::tracker::CLOSE) { return failed("the plan contains reserved issue markers; refine it before publishing"); }
         if out.text.contains(crate::taskgraph::OPEN) || out.text.contains(crate::taskgraph::CLOSE) { return failed("the plan contains reserved task list markers; refine it before publishing"); }
         // An invalid task list goes back to the planner like a failed review; the reviewer never sees it.
-        if let Err(e) = crate::taskgraph::extract(&out.text).and_then(|g| g.map_or(Ok(()), |g| crate::taskgraph::validate(&g))) {
+        if let Err(e) = crate::taskgraph::extract(&out.text).and_then(|g| g.map_or(Ok(()), |g| crate::taskgraph::validate_new(&g))) {
             if round >= hub.cfg.review.max_fix_rounds { return done(format!("The task list is invalid: {e}. Reply to refine this task.")); }
             round += 1;
             hub.log("plan", format!("#{} the task list is invalid; revising, round {} of {}", id, round, hub.cfg.review.max_fix_rounds));

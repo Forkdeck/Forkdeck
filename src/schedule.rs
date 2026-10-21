@@ -53,6 +53,8 @@ pub fn changes(r: &RepoCfg, g: &Graph, facts: &HashMap<u64, Fact>) -> Vec<Change
     for t in &g.tasks {
         let Some(n) = t.number else { continue };
         let Some(f) = facts.get(&n) else { continue };
+        // Only work is ever built: a ready label on anything else is never right.
+        if t.kind != Kind::Work && has(r, f, &r.label) { out.push(Change::Unlabel(n, "is not a task to build".into())); }
         match t.kind {
             Kind::Work => match (ready(g, &t.id, facts), done(g, &t.id, facts)) {
                 (Some(false), Some(_)) if has(r, f, &r.label) => out.push(Change::Unlabel(n, format!("waits for {} to merge", unmet(g, &t.id, facts)))),
@@ -229,7 +231,12 @@ pub async fn gate(hub: &Hub, r: &RepoCfg, n: u64) -> Result<(), String> {
         Ok(None) => Err("The issue has no task list.".to_string()),
         Err(e) => Err(e),
     }.map_err(unreadable)?;
-    if g.task(&id).is_none() { return Err(unreadable(format!("it has no task {id}"))); }
+    let Some(task) = g.task(&id) else { return Err(unreadable(format!("it has no task {id}"))) };
+    if task.kind != Kind::Work {
+        log(hub, format!("#{n}: is not a task to build"));
+        if let Err(e) = tracker::set_label(r, &n.to_string(), &r.label, false).await { log(hub, format!("#{n}: could not remove {}: {e}", r.label)); }
+        return Err(format!("{}#{n} is not a task to build", team::TAKEN));
+    }
     let facts = dependency_facts(hub, r, &g, &id).await.map_err(unreadable)?;
     let verdict = ready(&g, &id, &facts);
     if verdict == Some(true) { return Ok(()); }
@@ -356,6 +363,16 @@ mod tests {
         assert_eq!(status(&r, &g, g.task("b").unwrap(), &f), "working");
         f.insert(23, fact(true, &["agent:needs-human"], Some(PrState::None)));
         assert_eq!(changes(&r, &g, &f), vec![Change::Close(20)]);
+    }
+
+    #[test]
+    fn a_ready_label_on_a_group_or_decision_is_removed() {
+        let (r, g) = (repo(), numbered());
+        let mut f = fresh();
+        f.insert(22, fact(true, &["agent:ready"], None));
+        f.insert(25, fact(true, &["agent:ready"], None));
+        let c = changes(&r, &g, &f);
+        assert!(c.iter().any(|c| matches!(c, Change::Unlabel(22, _))) && c.iter().any(|c| matches!(c, Change::Unlabel(25, _))), "{c:?}");
     }
 
     use crate::{planning::Action, subissues::tests::{forge, isolated, number, reviewed, until}};
@@ -557,5 +574,30 @@ mod tests {
     #[test]
     fn a_label_that_cannot_be_removed_at_the_gate_is_not_started() {
         gate_survives("schedule::tests::a_label_that_cannot_be_removed_at_the_gate_is_not_started", |n| format!("DELETE repos/o/r/issues/{n}/labels"), |n| format!("#{n} waits for "));
+    }
+
+    #[test]
+    fn a_decision_labelled_ready_is_not_claimed() {
+        isolated("schedule::tests::a_decision_labelled_ready_is_not_claimed", |root| {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let (mut hub, id) = reviewed(root).await;
+                std::sync::Arc::make_mut(&mut hub.cfg).automation.worktree_root = Some(root.join("worktrees"));
+                hub.plan_action(id, Action::Publish).await.unwrap();
+                until(&hub, id).await;
+                let mut s = forge(root);
+                let d = number(&s, "Pick backend");
+                s["issues"][d.to_string()]["labels"] = serde_json::json!(["agent:ready"]);
+                std::fs::write(root.join("forge/state.json"), s.to_string()).unwrap();
+                let job = hub.submit(
+                    format!("o/r#{d} Pick backend"), String::new(),
+                    crate::state::Source::Issue { repo_idx: 0, repo: "o/r".into(), number: d, url: String::new() },
+                    hub.cfg.repos[0].path.clone(), None, crate::state::Planning::Never,
+                ).await.unwrap();
+                let err = crate::issues::prepare(&hub, job).await.unwrap_err();
+                assert!(err.starts_with(team::TAKEN) && err.contains(&format!("#{d}")), "{err}");
+                assert_eq!(forge(root)["issues"][d.to_string()]["labels"], serde_json::json!([]));
+            });
+        });
     }
 }

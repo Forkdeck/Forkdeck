@@ -89,17 +89,43 @@ async fn list(hub: &Hub, id: u32, r: &RepoCfg, root: u64) -> Result<(), String> 
     let g = planning::plan(hub, id)?.graph.ok_or("This plan has no task list.")?;
     let key = root.to_string();
     let remote = tracker::read(r, &key).await?;
-    let section = taskgraph::render(&g, &|_| String::new());
     let current = tracker::section_between(&remote.body, taskgraph::OPEN, taskgraph::CLOSE)?;
-    if current.as_ref() != Some(&section) {
+    let saved = planning::plan(hub, id)?.creation.ok_or("Creation was not started.")?;
+    let fresh = saved.section.is_none();
+    let section = match saved.section {
+        Some(s) => s,
+        None => {
+            let s = taskgraph::render(&g, &|_| String::new());
+            planning::edit(hub, id, |p| { let c = p.creation.as_mut().unwrap(); c.section = Some(s.clone()); c.before = current.clone(); });
+            planning::durable(hub, id)?;
+            s
+        }
+    };
+    // Already written: exactly as saved, or since shown with statuses by the scheduler, which is the
+    // same plan data around a list that still reads back.
+    let written = current.as_ref() == Some(&section) || current.as_deref().is_some_and(|c| taskgraph::read(c).is_ok_and(|now| now == g));
+    if !written {
+        // After a write that may have landed the old baseline proves nothing: a list that is gone or
+        // changed is a person's doing. Before one, the issue must still hold what was found.
+        if saved.writing || (!fresh && saved.before != current) {
+            return Err("The task list on the issue was edited after Forkdeck wrote it; it was left as it is. Re-plan to change it.".into());
+        }
         let body = tracker::replace_between(&remote.body, taskgraph::OPEN, taskgraph::CLOSE, &current, &section)?;
         // The forges have no conditional update for an issue body: read it once more right before
         // writing, so a person's edit made meanwhile is not overwritten. A retry starts from it.
         if tracker::read(r, &key).await?.body != remote.body {
             return Err("The issue was edited while the task list was being written; retry to write it against the latest text.".into());
         }
+        planning::edit(hub, id, |p| p.creation.as_mut().unwrap().writing = true);
         planning::durable(hub, id)?;
-        tracker::update(r, &key, &body).await?;
+        if let Err(e) = tracker::update(r, &key, &body).await {
+            // Refused outright: nothing was written, so the baseline still holds.
+            if tracker::refused(&e) {
+                planning::edit(hub, id, |p| p.creation.as_mut().unwrap().writing = false);
+                hub.persist(id)?;
+            }
+            return Err(e);
+        }
     }
     planning::durable(hub, id)?;
     tracker::set_label(r, &key, &r.plan_label, true).await?;
@@ -308,6 +334,77 @@ path = {dir:?}
                 let s = forge(root);
                 assert_eq!(s["issues"].as_object().unwrap().len(), 7, "six task issues and the root, none twice");
                 assert!(hub.job(id, |j| j.issue_plan.clone().unwrap().resolved()).unwrap());
+            });
+        });
+    }
+
+    #[test]
+    fn a_retry_never_overwrites_a_hand_edited_task_list() {
+        isolated("subissues::tests::a_retry_never_overwrites_a_hand_edited_task_list", |root| {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let (hub, id) = reviewed(root).await;
+                // The task list is written, then the plan label write on the root fails.
+                std::fs::write(root.join("forge/timeout_once"), "POST repos/o/r/issues/1/labels").unwrap();
+                hub.plan_action(id, Action::Publish).await.unwrap();
+                until(&hub, id).await;
+                assert_eq!(hub.job(id, |j| j.status).unwrap(), JobStatus::Failed);
+                let mut s = forge(root);
+                let body = s["issues"]["1"]["body"].as_str().unwrap().replace("Storage", "Storage, my way");
+                assert!(body.contains("my way"));
+                s["issues"]["1"]["body"] = body.clone().into();
+                std::fs::write(root.join("forge/state.json"), s.to_string()).unwrap();
+                hub.plan_action(id, Action::Publish).await.unwrap();
+                until(&hub, id).await;
+                assert_eq!(hub.job(id, |j| j.status).unwrap(), JobStatus::Failed);
+                assert!(hub.job(id, |j| j.outcome.clone()).unwrap().contains("edited"), "{}", hub.job(id, |j| j.outcome.clone()).unwrap());
+                assert_eq!(forge(root)["issues"]["1"]["body"].as_str().unwrap(), body, "the person's text stays");
+                assert!(!hub.job(id, |j| j.issue_plan.clone().unwrap().resolved()).unwrap());
+            });
+        });
+    }
+
+    #[test]
+    fn a_retry_never_recreates_a_deleted_task_list() {
+        isolated("subissues::tests::a_retry_never_recreates_a_deleted_task_list", |root| {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let (hub, id) = reviewed(root).await;
+                std::fs::write(root.join("forge/timeout_once"), "POST repos/o/r/issues/1/labels").unwrap();
+                hub.plan_action(id, Action::Publish).await.unwrap();
+                until(&hub, id).await;
+                assert_eq!(hub.job(id, |j| j.status).unwrap(), JobStatus::Failed);
+                let mut s = forge(root);
+                s["issues"]["1"]["body"] = "The epic, rewritten.".into();
+                std::fs::write(root.join("forge/state.json"), s.to_string()).unwrap();
+                hub.plan_action(id, Action::Publish).await.unwrap();
+                until(&hub, id).await;
+                assert_eq!(hub.job(id, |j| j.status).unwrap(), JobStatus::Failed);
+                assert!(hub.job(id, |j| j.outcome.clone()).unwrap().contains("edited"));
+                assert_eq!(forge(root)["issues"]["1"]["body"], "The epic, rewritten.", "not written back");
+            });
+        });
+    }
+
+    #[test]
+    fn the_schedulers_own_updates_do_not_strand_a_retry() {
+        isolated("subissues::tests::the_schedulers_own_updates_do_not_strand_a_retry", |root| {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let (hub, id) = reviewed(root).await;
+                // The label lands on the forge, then reports a timeout.
+                std::fs::write(root.join("forge/timeout_once"), "POST repos/o/r/issues/1/labels").unwrap();
+                hub.plan_action(id, Action::Publish).await.unwrap();
+                until(&hub, id).await;
+                assert_eq!(hub.job(id, |j| j.status).unwrap(), JobStatus::Failed);
+                // A pass now labels what is ready and shows it in the list: no person is involved.
+                crate::schedule::pass(&hub, 0).await;
+                let shown = forge(root)["issues"]["1"]["body"].as_str().unwrap().to_string();
+                assert!(shown.contains("— ready"), "{shown}");
+                hub.plan_action(id, Action::Publish).await.unwrap();
+                until(&hub, id).await;
+                assert_eq!(hub.job(id, |j| j.outcome.clone()).unwrap(), "Created 6 sub-issues under #1; 1 ready to start.");
+                assert_eq!(forge(root)["issues"]["1"]["body"], shown.as_str(), "the scheduler's list is kept");
             });
         });
     }

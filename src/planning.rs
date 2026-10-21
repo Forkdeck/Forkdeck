@@ -24,6 +24,15 @@ pub struct Creation {
     pub attempted: BTreeSet<String>,
     pub ids: BTreeMap<String, u64>,
     pub linked: bool,
+    /// The task section about to be written to the root issue, and what the issue held before it.
+    /// Saved before the write, so a retry can tell its own write from a person's edit.
+    #[serde(default)]
+    pub section: Option<String>,
+    #[serde(default)]
+    pub before: Option<String>,
+    /// The write of that section may have taken effect; the baseline no longer allows writing it.
+    #[serde(default)]
+    pub writing: bool,
     pub listed: bool,
     pub done: bool,
 }
@@ -100,7 +109,7 @@ impl Plan {
         let graph = taskgraph::extract(&self.draft)?;
         if let Some(g) = &graph {
             if self.provider != Provider::Github { return Err("Sub-issues are GitHub-only for now.".into()); }
-            taskgraph::validate(g)?;
+            taskgraph::validate_new(g)?;
         }
         self.graph = graph;
         self.creation = None;
