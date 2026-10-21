@@ -227,6 +227,8 @@ dir = "~/.config/forkdeck/remote"   # certificate authority, paired devices
 #~ jobs_per_day = 0        # limit for this repository alone; 0 leaves it to [limits]
 #~ done_label = "agent:pr-open"
 #~ failed_label = "agent:needs-human"
+#~ plan_label = "forkdeck:plan"     # marks the parent issue of a plan split into sub-issues
+#~ human_label = "needs-human"      # put on a task that needs a person before it can go on
 #~ # Only these accounts' issues and pull requests are picked up. Set this on public repositories.
 #~ allowed_authors = ["your-name"]
 #~ # Run in the issue's worktree before any review. These run as you, on code an agent just wrote.

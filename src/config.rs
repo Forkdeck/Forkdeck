@@ -801,6 +801,12 @@ pub struct RepoCfg {
     pub done_label: String,
     #[serde(default = "d_failed")]
     pub failed_label: String,
+    /// Marks the parent issue of a plan that was split into sub-issues.
+    #[serde(default = "d_plan")]
+    pub plan_label: String,
+    /// Put on a task that needs a person before it can go on.
+    #[serde(default = "d_human")]
+    pub human_label: String,
     /// Only pick up issues and pull requests opened by these accounts. Empty: anyone.
     #[serde(default)]
     pub allowed_authors: Vec<String>,
@@ -843,6 +849,12 @@ fn d_working() -> String {
 }
 fn d_review() -> String {
     "agent:pr-open".into()
+}
+fn d_plan() -> String {
+    "forkdeck:plan".into()
+}
+fn d_human() -> String {
+    "needs-human".into()
 }
 fn d_pr_ready() -> String {
     "review:ready".into()
@@ -1220,7 +1232,7 @@ impl Config {
             if !r.path.is_absolute() {
                 anyhow::bail!("repos: path for {} must be absolute or start with ~/, got {}", r.repo, r.path.display());
             }
-            for labels in [[&r.label, &r.working_label, &r.done_label, &r.failed_label], [&r.pr_label, &r.pr_working_label, &r.pr_pass_label, &r.pr_fail_label]] {
+            for labels in [vec![&r.label, &r.working_label, &r.done_label, &r.failed_label, &r.plan_label, &r.human_label], vec![&r.pr_label, &r.pr_working_label, &r.pr_pass_label, &r.pr_fail_label]] {
                 let mut seen = std::collections::HashSet::new();
                 for label in labels {
                     // GitHub label names ignore case: "Agent:Ready" and "agent:ready" are one label there.
@@ -1318,6 +1330,16 @@ mod tests {
     #[test]
     fn automation_labels_cannot_broaden_the_filter_or_conflict() {
         for bad in ["label = ''", "pr_label = 'a,b'", "working_label = 'agent:ready'", "pr_pass_label = 'review:ready'"] {
+            let c: Config = toml::from_str(&format!("[[repos]]\nprovider = 'github'\nrepo = 'o/r'\npath = '/tmp/repo'\n{}", bad)).unwrap();
+            assert!(c.validate().is_err(), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn plan_and_human_labels_default_and_stay_distinct() {
+        let cfg: Config = toml::from_str("[[repos]]\nprovider='github'\nrepo='a/b'\npath='/tmp'\n").unwrap();
+        assert_eq!((cfg.repos[0].plan_label.as_str(), cfg.repos[0].human_label.as_str()), ("forkdeck:plan", "needs-human"));
+        for bad in ["plan_label = 'agent:ready'", "human_label = 'agent:working'", "plan_label = ''"] {
             let c: Config = toml::from_str(&format!("[[repos]]\nprovider = 'github'\nrepo = 'o/r'\npath = '/tmp/repo'\n{}", bad)).unwrap();
             assert!(c.validate().is_err(), "{}", bad);
         }

@@ -314,6 +314,8 @@ fn main() -> anyhow::Result<()> {
                 working_label: "agent:working".into(),
                 done_label: "agent:review".into(),
                 failed_label: "agent:needs-human".into(),
+                plan_label: "forkdeck:plan".into(),
+                human_label: "needs-human".into(),
                 allowed_authors: vec![],
                 checks: vec!["cargo test --quiet".into()],
                 pr_label: "review:ready".into(),

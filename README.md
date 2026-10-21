@@ -260,6 +260,11 @@ branch; whatever the earlier attempt left, committed or not, is first moved to
 a local branch named `forkdeck/attempts/issue-N-<commit>` so it is never lost. Set `automation.publish_on_failed_review = true` to open
 the draft anyway.
 
+Two more labels belong to plans that are split into sub-issues: `plan_label`
+(default `forkdeck:plan`) marks the parent issue, and `human_label` (default
+`needs-human`) marks a task that needs a person before it can go on. Like the
+others they must be nonempty, comma-free and distinct from the issue labels.
+
 It never force-pushes. If `forkdeck/issue-N` already exists on the remote from
 an earlier attempt, no work is done: the issue gets a comment saying so and
 `agent:needs-human`. Delete the branch and close its pull request before
