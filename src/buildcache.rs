@@ -231,7 +231,36 @@ pub fn for_dir(dir: &Path, repo_key: &str) -> Plan {
     let files = tracked(dir);
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
     let root = home.join(".cache/forkdeck/build");
-    plan(&files, repo_key, &root, &home, |p| std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(p).is_file())))
+    let mut p = plan(&files, repo_key, &root, &home, |p| std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(p).is_file())));
+    if let Some(path) = std::env::var_os("PATH").and_then(|path| unsnapped_path(&path, &commands(&files), Path::new("/snap"))) {
+        p.env.push(("PATH".into(), path));
+    }
+    p
+}
+
+/// A PATH on which the tree's toolchain commands that resolve to snap shims resolve to the
+/// binaries behind them instead. A shim in /snap/bin cannot start inside a sandbox (snap
+/// confinement needs what the sandbox takes away), but the binary in /snap/<snap>/current/bin
+/// can: Rust installed as the rustup snap is the common case. None when nothing needs changing.
+pub fn unsnapped_path(path: &std::ffi::OsStr, commands: &[&str], snap_root: &Path) -> Option<String> {
+    let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+    let shims = snap_root.join("bin");
+    let mut found: Vec<PathBuf> = Vec::new();
+    for c in commands.iter().filter_map(|c| c.split_whitespace().next()).filter(|c| !c.contains('/')) {
+        let Some(at) = dirs.iter().find(|d| d.join(c).symlink_metadata().is_ok()) else { continue };
+        if *at != shims { continue; }
+        // `cargo -> rustup.cargo` for an app of a snap; `hugo -> /usr/bin/snap` for a snap's own command.
+        let Ok(target) = std::fs::read_link(at.join(c)) else { continue };
+        let target = target.to_string_lossy().to_string();
+        let (snap, app) = match target.split_once('.') { Some((s, a)) if !target.contains('/') => (s.to_string(), a.to_string()), _ => (c.to_string(), c.to_string()) };
+        let bin = snap_root.join(snap).join("current/bin");
+        if bin.join(&app).is_file() && !found.contains(&bin) { found.push(bin); }
+    }
+    if found.is_empty() { return None; }
+    let at = dirs.iter().position(|d| *d == shims)?;
+    let mut out = dirs.clone();
+    out.splice(at..at, found);
+    std::env::join_paths(out).ok().map(|p| p.to_string_lossy().to_string())
 }
 
 fn on_path(program: &str) -> bool {
@@ -368,6 +397,27 @@ mod tests {
         let p = plan(&files(&["Cargo.toml", "crates/a/Cargo.toml", "src/lib.rs"]), "o_r", Path::new("/c"), Path::new("/h"), |_| false);
         assert_eq!(p.env, [("CARGO_TARGET_DIR".to_string(), "/c/o_r/cargo-target".to_string())]);
         assert!(p.writable.contains(&PathBuf::from("/c/o_r/cargo-target")) && p.writable.contains(&PathBuf::from("/h/.cargo/registry")));
+    }
+
+    #[test]
+    fn snap_shims_are_bypassed_for_the_toolchains_a_tree_uses() {
+        let root = std::env::temp_dir().join(format!("forkdeck-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("rustup/current/bin")).unwrap();
+        std::fs::write(root.join("rustup/current/bin/cargo"), "").unwrap();
+        std::os::unix::fs::symlink("rustup.cargo", root.join("bin/cargo")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/snap", root.join("bin/hugo")).unwrap();
+        let bin = root.join("bin").display().to_string();
+        let path = std::ffi::OsString::from(format!("/nonexistent:{bin}"));
+        assert_eq!(unsnapped_path(&path, &["cargo", "git status"], &root), Some(format!("/nonexistent:{}:{bin}", root.join("rustup/current/bin").display())));
+        assert_eq!(unsnapped_path(&path, &["go"], &root), None, "not installed at all");
+        assert_eq!(unsnapped_path(&path, &["hugo"], &root), None, "a snap whose binary is not there is left alone");
+        // A real cargo earlier on PATH wins already: nothing to change.
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("real/cargo"), "").unwrap();
+        assert_eq!(unsnapped_path(&std::ffi::OsString::from(format!("{}:{bin}", root.join("real").display())), &["cargo"], &root), None);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

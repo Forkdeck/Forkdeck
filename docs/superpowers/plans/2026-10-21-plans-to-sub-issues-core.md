@@ -188,7 +188,7 @@ fn task_issues_say_where_they_belong() {
 Checked items: `- [x]` when the status starts with `merged` or equals `done`. A checks list renders under `**Acceptance checks**` in `task_body`. `Depends on` uses the task's own `after` numbers (groups by their own number).
 
 - [ ] **Step 2: Run** `cargo test taskgraph:: tracker::` → FAIL.
-- [ ] **Step 3: Implement.** List lines: indent two spaces per group depth; `- [x] #N Title` + (own `after` non-empty: ` · after #a, #b`) + (status non-empty: ` — status`). `read` rebuilds the skeleton by stripping `- [ ]`/`- [x]` and everything from ` — `, compares line-for-line against `render(&parsed, &|_| String::new())` stripped the same way, and errors `"The task list on the issue was edited by hand; re-plan to change it."` on any difference. JSON is pretty-printed inside a ```` ```json ```` fence in `<details>`.
+- [ ] **Step 3: Implement.** List lines: indent two spaces per group depth; `- [x] #N Title` + (own `after` non-empty: ` · after #a, #b`) + (status non-empty: ` — status`). `read` rebuilds the skeleton by stripping `- [ ]`/`- [x]` and everything from ` — `, compares line-for-line against `render(&parsed, &|_| String::new())` stripped the same way, and errors `"The task list on the issue was edited by hand; re-plan to change it."` on any difference. JSON is compact (`serde_json::to_string`, so the test's `"version":1` matches) inside a ```` ```json ```` fence in `<details>`.
 - [ ] **Step 4: Run** → PASS (the existing `preserve_human_text_and_detect_conflicts` still passes).
 - [ ] **Step 5: Commit** — `feat: plans render a readable task list with their data folded in`
 
