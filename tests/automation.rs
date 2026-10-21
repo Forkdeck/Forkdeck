@@ -578,8 +578,10 @@ impl Rig {
         git(&c, &["rev-parse", "HEAD"])
     }
 
+    /// Every `gh` call, except the read-only look for plans to schedule that each poll starts with.
     fn calls(&self) -> String {
-        fs::read_to_string(self.root.join("gh/calls.log")).unwrap_or_default()
+        let log = fs::read_to_string(self.root.join("gh/calls.log")).unwrap_or_default();
+        log.lines().filter(|l| !l.starts_with("api GET repos/o/r/issues?labels=forkdeck%3Aplan")).map(|l| format!("{l}\n")).collect()
     }
 }
 

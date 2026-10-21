@@ -118,8 +118,8 @@ pub async fn materialize(hub: &Hub, id: u32) -> Result<String, String> {
     if r.provider != crate::state::Provider::Github { return Err("Sub-issues are GitHub-only for now.".into()); }
     let graph = p.graph.as_ref().ok_or("This plan has no task list.")?;
     let root = tracker::number(&p.issue.as_ref().ok_or("Publish this plan first")?.key)?;
-    let message = format!("Created {} sub-issues under #{root}.", graph.tasks.len());
-    if p.creation.as_ref().is_some_and(|c| c.done) { return Ok(message); }
+    let message = format!("Created {} sub-issues under #{root}", graph.tasks.len());
+    if p.creation.as_ref().is_some_and(|c| c.done) { return Ok(started(hub, &p, &r, message).await); }
     if p.creation.is_none() {
         let token = format!("{}-{}", p.identity, p.revision);
         planning::edit(hub, id, |p| p.creation = Some(planning::Creation { token, ..Default::default() }));
@@ -129,11 +129,23 @@ pub async fn materialize(hub: &Hub, id: u32) -> Result<String, String> {
     if !planning::plan(hub, id)?.creation.is_some_and(|c| c.listed) { list(hub, id, &r, root).await?; }
     planning::edit(hub, id, |p| p.creation.as_mut().unwrap().done = true);
     planning::durable(hub, id)?;
-    Ok(message)
+    Ok(started(hub, &planning::plan(hub, id)?, &r, message).await)
+}
+
+/// Start whatever is ready right away and say how many tasks that is. Failing to do so is not a
+/// failure of the creation: the next poll schedules them.
+async fn started(hub: &Hub, p: &planning::Plan, r: &RepoCfg, message: String) -> String {
+    let Some(idx) = hub.cfg.repos.iter().position(|x| p.is_for(x)) else { return format!("{message}.") };
+    crate::schedule::pass(hub, idx).await;
+    let numbers: Vec<u64> = p.graph.iter().flat_map(|g| g.tasks.iter().filter_map(|t| t.number)).collect();
+    match tracker::labelled(r, &r.label).await {
+        Ok(ready) => format!("{message}; {} ready to start.", numbers_of(&ready).iter().filter(|n| numbers.contains(n)).count()),
+        Err(_) => format!("{message}."),
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{config::Config, orchestrator::Hub, planning::Action, state::*};
     use std::{path::{Path, PathBuf}, sync::Arc, time::Duration};
@@ -148,7 +160,7 @@ mod tests {
 
     /// Run `body` in a child process with a private environment: jobs write the journal and attempt
     /// records, and `gh` is the fake forge, whose state lives under `<root>/forge`.
-    fn isolated(test: &str, body: impl FnOnce(&Path)) {
+    pub(crate) fn isolated(test: &str, body: impl FnOnce(&Path)) {
         const CHILD: &str = "FORKDECK_SUBISSUES_TEST_ROOT";
         let Ok(root) = std::env::var(CHILD) else {
             let root = std::env::temp_dir().join(crate::metrics::id());
@@ -166,23 +178,23 @@ mod tests {
         body(&PathBuf::from(root));
     }
 
-    fn forge(root: &Path) -> serde_json::Value {
+    pub(crate) fn forge(root: &Path) -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(root.join("forge/state.json")).unwrap()).unwrap()
     }
 
     /// The number of the issue titled `title`.
-    fn number(state: &serde_json::Value, title: &str) -> u64 {
+    pub(crate) fn number(state: &serde_json::Value, title: &str) -> u64 {
         state["issues"].as_object().unwrap().iter().find(|(_, i)| i["title"] == title).map(|(n, _)| n.parse().unwrap()).unwrap()
     }
 
-    fn numbers(state: &serde_json::Value, key: &str, owner: u64) -> Vec<u64> {
+    pub(crate) fn numbers(state: &serde_json::Value, key: &str, owner: u64) -> Vec<u64> {
         let mut v: Vec<u64> = state[key][owner.to_string()].as_array().map(|a| a.iter().map(|n| n.as_u64().unwrap()).collect()).unwrap_or_default();
         v.sort();
         v
     }
 
     /// A reviewed task-list plan for root issue #1, linked and ready to publish.
-    async fn reviewed(root: &Path) -> (Hub, u32) {
+    pub(crate) async fn reviewed(root: &Path) -> (Hub, u32) {
         use std::os::unix::fs::PermissionsExt;
         let plan = root.join("plan.json");
         std::fs::write(&plan, serde_json::to_string(TASKS).unwrap()).unwrap();
@@ -235,7 +247,7 @@ path = {dir:?}
         (hub, id)
     }
 
-    async fn until(hub: &Hub, id: u32) {
+    pub(crate) async fn until(hub: &Hub, id: u32) {
         tokio::time::timeout(Duration::from_secs(60), async {
             while !hub.job(id, |j| j.status.finished()).unwrap() { tokio::time::sleep(Duration::from_millis(20)).await; }
         }).await.unwrap_or_else(|_| panic!("job #{id} did not finish: {:?}", hub.job(id, |j| (j.status, j.outcome.clone()))));
@@ -250,7 +262,7 @@ path = {dir:?}
                 hub.plan_action(id, Action::Publish).await.unwrap();
                 until(&hub, id).await;
                 let outcome = hub.job(id, |j| j.outcome.clone()).unwrap();
-                assert_eq!(outcome, "Created 6 sub-issues under #1.");
+                assert_eq!(outcome, "Created 6 sub-issues under #1; 1 ready to start.");
                 let s = forge(root);
                 assert_eq!(s["issues"].as_object().unwrap().len(), 7, "the root and six tasks");
                 let n = |t: &str| number(&s, t);
@@ -266,8 +278,9 @@ path = {dir:?}
                 let labels = |k: &str| -> Vec<String> { s["issues"][k]["labels"].as_array().unwrap().iter().map(|l| l.as_str().unwrap().to_string()).collect() };
                 assert_eq!(labels("1"), ["forkdeck:plan"]);
                 assert_eq!(labels(&n("Pick backend").to_string()), ["needs-human"]);
+                // Only "Records" has nothing to wait for; "Endpoint" waits on its group's dependency.
                 for t in ["Storage", "Records", "API", "Endpoint", "Sync", "Pick backend"] {
-                    assert!(!labels(&n(t).to_string()).contains(&"agent:ready".to_string()), "{t}");
+                    assert_eq!(labels(&n(t).to_string()).contains(&"agent:ready".to_string()), t == "Records", "{t}");
                 }
                 let task = s["issues"][n("Sync").to_string()]["body"].as_str().unwrap();
                 assert!(task.contains("Part of #1") && task.contains(&format!("Depends on #{}", n("Endpoint"))), "{task}");
@@ -291,7 +304,7 @@ path = {dir:?}
                 assert!(hub.job(id, |j| j.outcome.clone()).unwrap().contains("timed out"));
                 hub.plan_action(id, Action::Publish).await.unwrap();
                 until(&hub, id).await;
-                assert_eq!(hub.job(id, |j| j.outcome.clone()).unwrap(), "Created 6 sub-issues under #1.");
+                assert_eq!(hub.job(id, |j| j.outcome.clone()).unwrap(), "Created 6 sub-issues under #1; 1 ready to start.");
                 let s = forge(root);
                 assert_eq!(s["issues"].as_object().unwrap().len(), 7, "six task issues and the root, none twice");
                 assert!(hub.job(id, |j| j.issue_plan.clone().unwrap().resolved()).unwrap());

@@ -491,6 +491,7 @@ pub async fn poll_once(hub: &Hub) {
             for (idx, r) in hub.cfg.repos.iter().enumerate() {
                 if polled_before(&hub.cfg.repos[..idx], r) { continue; }
                 crate::knowledge::retry_pending(hub, idx).await;
+                if !hub.cfg.demo { crate::schedule::pass(hub, idx).await; }
                 // What a limit held back in this repository on this poll: the reason, and how many items.
                 let mut repo_hold: Option<(String, u32)> = None;
                 for pr in [false, true] {

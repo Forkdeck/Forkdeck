@@ -53,6 +53,8 @@ pub struct Hub {
     entry: Arc<tokio::sync::Mutex<()>>,
     /// Jobs waiting to take an agent slot again after building.
     returning: Arc<std::sync::atomic::AtomicUsize>,
+    /// Task branches known to have merged, with the pull request, so the forge is asked once.
+    pub merged: Arc<Mutex<std::collections::HashSet<(String, u64)>>>,
 }
 
 /// Counts a job waiting to take its agent slot back, until it has one or gives up.
@@ -133,6 +135,7 @@ impl Hub {
             lanes: Arc::new(Mutex::new(Default::default())),
             entry: Arc::new(tokio::sync::Mutex::new(())),
             returning: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            merged: Arc::new(Mutex::new(Default::default())),
         }
     }
 

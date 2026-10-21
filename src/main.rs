@@ -24,6 +24,7 @@ mod proc;
 mod remote;
 mod routemem;
 mod router;
+mod schedule;
 mod state;
 mod subissues;
 mod taskgraph;
