@@ -4,7 +4,7 @@
   sub_issues  {"<parent>": [numbers]}
   blocked_by  {"<number>": [numbers]}
   pulls       [{number, state, merged_at, base: {ref}, head: {ref}}]
-Every call is appended to $FAKE_FORGE/calls.log as "METHOD path". If $FAKE_FORGE/timeout_once holds a
+`gh issue view` is answered too, for the claim check. Every call is appended to $FAKE_FORGE/calls.log as "METHOD path". If $FAKE_FORGE/timeout_once holds a
 "METHOD path" prefix (or "METHOD path #N" for the Nth identical call), the first matching call takes effect and then fails with "timed out" (an
 uncertain write)."""
 import json, os, re, sys
@@ -12,6 +12,13 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 root = os.environ["FAKE_FORGE"]
 args = sys.argv[1:]
+if args[:2] == ["issue", "view"]:
+    # `gh issue view <n> --json state,labels`, as the claim check asks it.
+    with open(os.path.join(root, "calls.log"), "a") as f:
+        f.write(f"VIEW issue {args[2]}\n")
+    it = json.load(open(os.path.join(root, "state.json")))["issues"][args[2]]
+    print(json.dumps({"state": it.get("state", "open").upper(), "labels": [{"name": l} for l in it.get("labels", [])]}))
+    sys.exit(0)
 if not args or args[0] != "api":
     sys.exit("fake-forge: only `api` is supported")
 args = args[1:]

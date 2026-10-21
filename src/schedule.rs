@@ -1,6 +1,6 @@
 //! Decides which tasks of a plan may start: the task list on the parent issue says what waits on
 //! what, the forge says what merged, and the ready label is the output.
-use crate::{config::RepoCfg, orchestrator::Hub, state::Provider, taskgraph::{self, Graph, Kind, Task}, tracker::{self, PrState}};
+use crate::{config::RepoCfg, orchestrator::Hub, state::Provider, team, taskgraph::{self, Graph, Kind, Task}, tracker::{self, PrState}};
 use std::{collections::HashMap, sync::{LazyLock, Mutex}};
 
 /// What the forge says about one issue of a plan.
@@ -194,6 +194,53 @@ async fn plan(hub: &Hub, r: &RepoCfg, root: &tracker::RemoteIssue) {
         }
     }
     note(hub, r, rn, if problems.is_empty() { None } else { Some(problems.join("; ")) });
+}
+
+/// The tasks whose facts decide whether `id` is done: itself, or what is under it.
+fn leaves<'a>(g: &'a Graph, id: &str, out: &mut Vec<&'a Task>) {
+    let Some(t) = g.task(id) else { return };
+    if t.kind == Kind::Group { for c in g.children(Some(id)) { leaves(g, &c.id, out); } } else { out.push(t); }
+}
+
+/// Everything needed to judge the dependencies of the task `id`, read fresh from the forge.
+async fn dependency_facts(hub: &Hub, r: &RepoCfg, g: &Graph, id: &str) -> Result<HashMap<u64, Fact>, String> {
+    let mut needed = Vec::new();
+    for a in g.effective_after(id) { leaves(g, &a, &mut needed); }
+    let mut facts = HashMap::new();
+    for t in needed {
+        let Some(n) = t.number else { continue };
+        let mut f = fact_of(&tracker::read(r, &n.to_string()).await?);
+        if t.kind == Kind::Work { f.pr = Some(pull_request(hub, r, n).await?); }
+        facts.insert(n, f);
+    }
+    Ok(facts)
+}
+
+/// Right before a task is claimed: is everything it depends on merged? A label alone is not proof,
+/// it may be stale or put on by hand. Issues that are not tasks of a plan always pass.
+pub async fn gate(hub: &Hub, r: &RepoCfg, n: u64) -> Result<(), String> {
+    if r.provider != Provider::Github { return Ok(()); }
+    let unreadable = |e: String| format!("{}#{n} cannot start: its task list cannot be read: {e}", team::TAKEN);
+    let issue = tracker::read(r, &n.to_string()).await.map_err(unreadable)?;
+    let Some((_, id, root)) = taskgraph::parse_task_marker(&issue.body) else { return Ok(()) };
+    let parent = tracker::read(r, &root.to_string()).await.map_err(unreadable)?;
+    let g = match tracker::section_between(&parent.body, taskgraph::OPEN, taskgraph::CLOSE) {
+        Ok(Some(s)) => taskgraph::read(&s),
+        Ok(None) => Err("The issue has no task list.".to_string()),
+        Err(e) => Err(e),
+    }.map_err(unreadable)?;
+    if g.task(&id).is_none() { return Err(unreadable(format!("it has no task {id}"))); }
+    let facts = dependency_facts(hub, r, &g, &id).await.map_err(unreadable)?;
+    let verdict = ready(&g, &id, &facts);
+    if verdict == Some(true) { return Ok(()); }
+    let list = unmet(&g, &id, &facts);
+    // Only a definite "not yet" takes the label away; a fact that could not be read leaves it for the next try.
+    if verdict == Some(false) {
+        log(hub, format!("#{n}: waits for {list} to merge"));
+        // Not started either way; a label that stays is taken away again by the next scheduling pass.
+        if let Err(e) = tracker::set_label(r, &n.to_string(), &r.label, false).await { log(hub, format!("#{n}: could not remove {}: {e}", r.label)); }
+    }
+    Err(format!("{}#{n} waits for {list} to merge", team::TAKEN))
 }
 
 /// Write the list into the issue, unless a person edited the issue since it was read.
@@ -434,5 +481,81 @@ mod tests {
                 assert_eq!(mutations(root), before, "the list was right the first time");
             });
         });
+    }
+
+    #[test]
+    fn a_hand_labelled_blocked_task_is_not_claimed() {
+        isolated("schedule::tests::a_hand_labelled_blocked_task_is_not_claimed", |root| {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let (mut hub, id) = reviewed(root).await;
+                std::sync::Arc::make_mut(&mut hub.cfg).automation.worktree_root = Some(root.join("worktrees"));
+                hub.plan_action(id, Action::Publish).await.unwrap();
+                until(&hub, id).await;
+                let mut s = forge(root);
+                let (records, endpoint, sync) = (number(&s, "Records"), number(&s, "Endpoint"), number(&s, "Sync"));
+                // "Records" is already being worked on, so the poll has nothing of its own to start.
+                s["issues"][records.to_string()]["labels"] = serde_json::json!(["agent:working"]);
+                s["issues"][sync.to_string()]["labels"] = serde_json::json!(["agent:ready"]);
+                std::fs::write(root.join("forge/state.json"), s.to_string()).unwrap();
+                crate::issues::poll_once(&hub).await;
+                let labels = |s: &serde_json::Value, n: u64| s["issues"][n.to_string()]["labels"].clone();
+                assert_eq!(labels(&forge(root), sync), serde_json::json!([]), "the poll removed the label");
+                // The label comes back just before the claim.
+                let mut s = forge(root);
+                s["issues"][sync.to_string()]["labels"] = serde_json::json!(["agent:ready"]);
+                std::fs::write(root.join("forge/state.json"), s.to_string()).unwrap();
+                let job = hub.submit(
+                    format!("o/r#{sync} Sync"), String::new(),
+                    crate::state::Source::Issue { repo_idx: 0, repo: "o/r".into(), number: sync, url: String::new() },
+                    hub.cfg.repos[0].path.clone(), None, crate::state::Planning::Never,
+                ).await.unwrap();
+                let before = std::fs::read_to_string(root.join("forge/calls.log")).unwrap_or_default().lines().count();
+                let err = crate::issues::prepare(&hub, job).await.unwrap_err();
+                assert!(err.starts_with(team::TAKEN), "{err}");
+                assert!(err.contains(&format!("#{sync} waits for ")) && err.contains(&format!("#{endpoint}")) && err.ends_with(" to merge"), "{err}");
+                let s = forge(root);
+                assert_eq!(labels(&s, sync), serde_json::json!([]));
+                let calls = std::fs::read_to_string(root.join("forge/calls.log")).unwrap_or_default();
+                assert!(calls.lines().skip(before).all(|l| !l.contains("working") && !l.contains("/comments")), "{calls}");
+                assert!(s["issues"][sync.to_string()]["comments"].as_array().is_none_or(|c| c.is_empty()));
+            });
+        });
+    }
+
+    /// A forge call at the gate fails once, uncertainly: the claim must come back as "not started".
+    fn gate_survives(test: &str, fail: fn(u64) -> String, said: fn(u64) -> String) {
+        isolated(test, |root| {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let (mut hub, id) = reviewed(root).await;
+                std::sync::Arc::make_mut(&mut hub.cfg).automation.worktree_root = Some(root.join("worktrees"));
+                hub.plan_action(id, Action::Publish).await.unwrap();
+                until(&hub, id).await;
+                let mut s = forge(root);
+                let sync = number(&s, "Sync");
+                s["issues"][sync.to_string()]["labels"] = serde_json::json!(["agent:ready"]);
+                std::fs::write(root.join("forge/state.json"), s.to_string()).unwrap();
+                let job = hub.submit(
+                    format!("o/r#{sync} Sync"), String::new(),
+                    crate::state::Source::Issue { repo_idx: 0, repo: "o/r".into(), number: sync, url: String::new() },
+                    hub.cfg.repos[0].path.clone(), None, crate::state::Planning::Never,
+                ).await.unwrap();
+                std::fs::write(root.join("forge/timeout_once"), fail(sync)).unwrap();
+                let err = crate::issues::prepare(&hub, job).await.unwrap_err();
+                assert!(err.starts_with(team::TAKEN), "{err}");
+                assert!(err.contains(&said(sync)), "{err}");
+            });
+        });
+    }
+
+    #[test]
+    fn a_forge_that_cannot_be_read_at_the_gate_is_not_started() {
+        gate_survives("schedule::tests::a_forge_that_cannot_be_read_at_the_gate_is_not_started", |n| format!("GET repos/o/r/issues/{n}"), |n| format!("#{n} cannot start: its task list cannot be read"));
+    }
+
+    #[test]
+    fn a_label_that_cannot_be_removed_at_the_gate_is_not_started() {
+        gate_survives("schedule::tests::a_label_that_cannot_be_removed_at_the_gate_is_not_started", |n| format!("DELETE repos/o/r/issues/{n}/labels"), |n| format!("#{n} waits for "));
     }
 }

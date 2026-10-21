@@ -134,6 +134,11 @@ if [ "$1" = "api" ]; then
       printf '{"permission":"%s"}\n' "$permission" ;;
     GET\ repos/*/commits\?*) cat "$FAKE_GH/commits.json" 2>/dev/null || echo "[]" ;;
     GET\ *)
+      # The issue itself, as the claim check reads its task marker: a plain one, with no body.
+      case "${bare#repos/*/issues/}" in
+        "$bare"|*/*) ;;
+        [0-9]*) n=${bare##*/}; printf '{"number":%s,"id":%s,"title":"","body":"","state":"open","labels":[],"html_url":"https://github.com/o/r/issues/%s"}\n' "$n" "$n" "$n"; exit 0 ;;
+      esac
       d="$FAKE_GH/c/$key"; printf '['; sep=""
       for id in $(ls "$d" 2>/dev/null | sed -n 's/\.json$//p' | sort -n); do
         printf '%s{"id":%s,"user":{"login":"%s"},"author_association":"%s","updated_at":"%s",%s' "$sep" "$id" "$(cat "$d/$id.who")" "$(cat "$d/$id.assoc" 2>/dev/null || echo MEMBER)" "$(cat "$d/$id.at")" "$(sed 's/^{//' "$d/$id.json")"
@@ -1330,7 +1335,9 @@ fn sharing_is_off_unless_asked_for() {
     rig.issue();
     let (ok, out) = rig.once(&[]);
     assert!(ok, "{}", out);
-    assert!(!rig.calls().contains("api "), "nothing extra is said on the forge:\n{}", rig.calls());
+    // Reading the issue before the claim (to see whether it is a task of a plan) says nothing.
+    let said: Vec<String> = rig.calls().lines().filter(|l| l.starts_with("api ") && !l.starts_with("api GET repos/o/r/issues/7")).map(str::to_string).collect();
+    assert!(said.is_empty(), "nothing extra is said on the forge:\n{}", rig.calls());
     assert!(!rig.calls().contains("--add-assignee"));
 }
 

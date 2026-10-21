@@ -771,6 +771,7 @@ pub async fn prepare(hub: &Hub, id: u32) -> Result<(), String> {
     }
     lock_worktree(hub, id, &dir)?;
     still_requested(&r, false, n).await?;
+    crate::schedule::gate(hub, &r, n).await?;
     write_guard(hub, id).await?;
     let held = claim_first(hub, &r, Target::Issue(n), "issue").await?;
     if let Err(e) = relabel(&r, false, n, &r.label, &r.working_label).await {
