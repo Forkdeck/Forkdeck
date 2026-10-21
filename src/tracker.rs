@@ -1,6 +1,4 @@
 //! Forge boundary for issue plans. Keys stay opaque outside this adapter.
-// The sub-issue calls have no callers yet; the next tasks add them and drop this allow.
-#![allow(dead_code)]
 use crate::{config::RepoCfg, issues, state::Provider, team};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

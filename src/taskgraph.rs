@@ -1,6 +1,4 @@
 //! The task list a plan carries: parse, validate and order. Pure; no forge calls.
-// Nothing outside the tests calls this yet; the callers arrive with the next tasks, which drop this allow.
-#![allow(dead_code)]
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
