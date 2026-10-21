@@ -95,11 +95,24 @@ each forge write:
 The graph and its progress are kept until every task is finished, independent of the 200-job history
 limit.
 
-*Claude's call:* the approved graph is also written to a managed, machine-readable section of the
-parent issue (like the plan section `tracker.rs` already manages), and that copy is authoritative.
-Teammates' Forkdeck instances, which already claim work through the forge, read it there, so any
-instance enforces the same order without a locally saved plan. The local copy is a cache plus
-transaction progress.
+The approved graph is also written to a managed section of the parent issue (like the plan section
+`tracker.rs` already manages), and that copy is authoritative (*Claude's call*). Teammates' Forkdeck
+instances, which already claim work through the forge, read it there, so any instance enforces the
+same order without a locally saved plan. The local copy is a cache plus transaction progress.
+
+The section is visible (user's choice): a readable task list Forkdeck keeps current, with the
+machine-readable JSON folded underneath in a collapsed `<details>` "Plan data" block:
+
+```
+- [x] #20 Persisted home records
+- [ ] #21 Home record API · after #20
+- [ ] #22 Home sync worker · after #21 · PR #71 (waiting on #21)
+- [ ] #23 Pick storage backend · needs you
+```
+
+The list is Forkdeck's output, not an input: order changes go through a re-plan. If the list or the
+data has been edited by hand and no longer matches, Forkdeck stops scheduling that plan and tells the
+user instead of guessing.
 
 ### Scheduling
 
