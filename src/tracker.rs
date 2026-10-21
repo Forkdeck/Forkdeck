@@ -23,18 +23,24 @@ pub struct RemoteIssue {
     pub open: bool,
 }
 
-pub fn section(body: &str) -> Result<Option<String>, String> {
-    let starts: Vec<_> = body.match_indices(OPEN).collect();
-    let ends: Vec<_> = body.match_indices(CLOSE).collect();
+pub fn section(body: &str) -> Result<Option<String>, String> { section_between(body, OPEN, CLOSE) }
+
+pub fn section_between(body: &str, open: &str, close: &str) -> Result<Option<String>, String> {
+    let starts: Vec<_> = body.match_indices(open).collect();
+    let ends: Vec<_> = body.match_indices(close).collect();
     match (starts.as_slice(), ends.as_slice()) {
         ([], []) => Ok(None),
-        ([(a, _)], [(b, _)]) if a < b => Ok(Some(body[*a..*b + CLOSE.len()].into())),
+        ([(a, _)], [(b, _)]) if a < b => Ok(Some(body[*a..*b + close.len()].into())),
         _ => Err("The issue has ambiguous plan markers; repair them on the forge before publishing.".into()),
     }
 }
 
 pub fn replace(body: &str, expected: &Option<String>, replacement: &str) -> Result<String, String> {
-    let current = section(body)?;
+    replace_between(body, OPEN, CLOSE, expected, replacement)
+}
+
+pub fn replace_between(body: &str, open: &str, close: &str, expected: &Option<String>, replacement: &str) -> Result<String, String> {
+    let current = section_between(body, open, close)?;
     if &current != expected { return Err("The issue plan changed remotely. Refine against the latest issue before accepting again.".into()); }
     Ok(match current {
         Some(old) => body.replacen(&old, replacement, 1),

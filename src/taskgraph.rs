@@ -238,6 +238,112 @@ pub fn validate(g: &Graph) -> Result<(), String> {
     Ok(())
 }
 
+pub const OPEN: &str = "<!-- forkdeck:tasks:start -->";
+pub const CLOSE: &str = "<!-- forkdeck:tasks:end -->";
+const EDITED: &str = "The task list on the issue was edited by hand; re-plan to change it.";
+
+fn number_ref(t: &Task) -> String {
+    t.number.map_or("#?".into(), |n| format!("#{n}"))
+}
+
+fn line_text(g: &Graph, t: &Task) -> String {
+    let mut s = format!("{} {}", number_ref(t), t.title.replace('\n', " "));
+    if !t.after.is_empty() {
+        let refs: Vec<String> = t.after.iter().map(|a| g.task(a).map_or(format!("#{a}"), number_ref)).collect();
+        s.push_str(&format!(" · after {}", refs.join(", ")));
+    }
+    s
+}
+
+fn list_lines(g: &Graph, parent: Option<&str>, depth: usize, status: &dyn Fn(&Task) -> String, out: &mut Vec<String>) {
+    for t in g.children(parent) {
+        let st = status(t);
+        let done = st.starts_with("merged") || st == "done";
+        let mut line = format!("{}- [{}] {}", "  ".repeat(depth), if done { 'x' } else { ' ' }, line_text(g, t));
+        if !st.is_empty() {
+            line.push_str(&format!(" — {st}"));
+        }
+        out.push(line);
+        if t.kind == Kind::Group {
+            list_lines(g, Some(&t.id), depth + 1, status, out);
+        }
+    }
+}
+
+/// The whole managed section, markers included. Statuses are display only and are never read back.
+pub fn render(g: &Graph, status: &dyn Fn(&Task) -> String) -> String {
+    let mut lines = Vec::new();
+    list_lines(g, None, 0, status, &mut lines);
+    let data = serde_json::to_string(g).unwrap_or_default();
+    format!("{OPEN}\n## Tasks\n\n{}\n\n<details><summary>Plan data</summary>\n\n```json\n{data}\n```\n\n</details>\n{CLOSE}", lines.join("\n"))
+}
+
+/// Every visible line of a section around its plan data: the list and its headings before the data
+/// fence, and the closing text after it. Blank lines carry no meaning.
+fn visible(section: &str, from: usize, to: usize) -> Vec<&str> {
+    section[..from].lines().chain(section[to..].lines()).filter(|l| !l.trim().is_empty()).collect()
+}
+
+/// Do two visible lines agree? Task lines may differ in checkbox and trailing status only.
+fn same_line(actual: &str, expected: &str) -> bool {
+    match (unboxed(actual), unboxed(expected)) {
+        (Some((ai, ar)), Some((ei, er))) => ai == ei && (ar == er || ar.strip_prefix(er).is_some_and(|tail| tail.starts_with(" — "))),
+        (None, None) => actual == expected,
+        _ => false,
+    }
+}
+
+/// Indent and the text after a valid `- [ ] ` or `- [x] ` checkbox; None for any other line.
+fn unboxed(line: &str) -> Option<(usize, &str)> {
+    let rest = line.trim_start();
+    let text = rest.strip_prefix("- [ ] ").or_else(|| rest.strip_prefix("- [x] "))?;
+    Some((line.len() - rest.len(), text))
+}
+
+/// The byte range of the plan data inside a section.
+fn data_span(section: &str) -> Result<(usize, usize), String> {
+    let fence = "```json\n";
+    let from = section.find(fence).ok_or("The task list on the issue has no plan data; re-plan to restore it.")? + fence.len();
+    let to = section[from..].find("\n```").ok_or("The task list on the issue has unreadable plan data; re-plan to restore it.")? + from;
+    Ok((from, to))
+}
+
+/// The task list from a section, refused when anything visible no longer matches its data.
+pub fn read(section: &str) -> Result<Graph, String> {
+    let (from, to) = data_span(section)?;
+    let g: Graph = serde_json::from_str(&section[from..to]).map_err(|e| format!("The task list's plan data is unreadable: {e}"))?;
+    validate(&g)?;
+    let rendered = render(&g, &|_| String::new());
+    let (rf, rt) = data_span(&rendered)?;
+    let (actual, expected) = (visible(section, from, to), visible(&rendered, rf, rt));
+    let same = actual.len() == expected.len() && actual.iter().zip(&expected).all(|(a, e)| same_line(a, e));
+    if same { Ok(g) } else { Err(EDITED.into()) }
+}
+
+pub fn task_marker(token: &str, id: &str, root: u64) -> String {
+    format!("<!-- forkdeck:task {token} {id} root={root} -->")
+}
+
+pub fn parse_task_marker(body: &str) -> Option<(String, String, u64)> {
+    static MARKER: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?s)<!-- forkdeck:task (\S+) (.*?) root=(\d+) -->").unwrap());
+    let c = MARKER.captures(body)?;
+    Some((c[1].to_string(), c[2].to_string(), c[3].parse().ok()?))
+}
+
+pub fn task_body(t: &Task, g: &Graph, token: &str, root: u64) -> String {
+    let mut s = format!("{}\n\n{}\n\nPart of #{root}", task_marker(token, &t.id, root), t.body);
+    let deps: Vec<String> = t.after.iter().filter_map(|a| g.task(a)?.number).map(|n| format!("#{n}")).collect();
+    if !deps.is_empty() {
+        s.push_str(&format!("\n\nDepends on {}", deps.join(", ")));
+    }
+    if !t.checks.is_empty() {
+        s.push_str("\n\n**Acceptance checks**\n");
+        s.push_str(&t.checks.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n"));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +355,53 @@ mod tests {
  {\"id\":\"b\",\"title\":\"Endpoint\",\"kind\":\"work\",\"parent\":\"g1\"},\
  {\"id\":\"c\",\"title\":\"Sync\",\"kind\":\"work\",\"parent\":\"g1\",\"after\":[\"b\"]},\
  {\"id\":\"d\",\"title\":\"Pick backend\",\"kind\":\"decision\"}]}\n```\n\nPLAN: READY";
+
+    fn numbered() -> Graph {
+        let mut g = extract(PLAN).unwrap().unwrap();
+        for (i, t) in g.tasks.iter_mut().enumerate() {
+            t.number = Some(20 + i as u64);
+        }
+        g
+    }
+
+    #[test]
+    fn the_list_reads_like_the_design_and_reads_back() {
+        let g = numbered();
+        let s = render(&g, &|t| if t.id == "a" { "merged in PR #71".into() } else { String::new() });
+        assert!(s.starts_with(OPEN) && s.ends_with(CLOSE));
+        assert!(s.contains("- [x] #21 Records — merged in PR #71"));
+        assert!(s.contains("  - [ ] #24 Sync · after #23"), "nested under its group, own deps only:\n{s}");
+        assert!(s.contains("- [ ] #22 API · after #20"));
+        assert!(s.contains("<details><summary>Plan data</summary>"));
+        assert_eq!(read(&s).unwrap(), g);
+        // Statuses change on every pass; they are not an edit.
+        assert_eq!(read(&render(&g, &|_| "PR #9 open".into())).unwrap(), g);
+    }
+
+    #[test]
+    fn a_hand_edited_list_is_refused() {
+        let s = render(&numbered(), &|_| String::new());
+        assert!(read(&s.replace("#24 Sync", "#24 Sync faster")).unwrap_err().contains("edited"));
+        assert!(read(&s.replace(" · after #23", "")).unwrap_err().contains("edited"));
+        // A line the list would not have rendered is an edit, even one that merely looks like another task.
+        assert!(read(&s.replace("- [ ] #24 Sync", "- [---#24 Sync")).unwrap_err().contains("edited"));
+        assert!(read(&s.replace("- [ ] #24 Sync", "- [y] #24 Sync")).unwrap_err().contains("edited"));
+        assert!(read(&s.replace("\n\n<details>", "\n+ [ ] #99 New prerequisite\n\n<details>")).unwrap_err().contains("edited"));
+        assert!(read(&s.replace("</details>", "</details>\n- [ ] #99 New prerequisite")).unwrap_err().contains("edited"));
+        assert!(read(&s.replace("\"version\":1", "\"version\":1,")).is_err(), "broken JSON");
+    }
+
+    #[test]
+    fn task_issues_say_where_they_belong() {
+        let g = numbered();
+        let body = task_body(g.task("c").unwrap(), &g, "tok-3", 7);
+        assert_eq!(parse_task_marker(&body), Some(("tok-3".into(), "c".into(), 7)));
+        assert!(body.contains("Part of #7") && body.contains("Depends on #23"));
+        assert_eq!(parse_task_marker("plain issue"), None);
+        for id in ["sync records", "", " padded ", "a  b"] {
+            assert_eq!(parse_task_marker(&task_marker("tok", id, 9)), Some(("tok".into(), id.into(), 9)), "id {id:?}");
+        }
+    }
 
     #[test]
     fn a_plan_carries_one_task_list() {
