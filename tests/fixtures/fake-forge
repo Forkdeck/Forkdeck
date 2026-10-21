@@ -5,7 +5,7 @@
   blocked_by  {"<number>": [numbers]}
   pulls       [{number, state, merged_at, base: {ref}, head: {ref}}]
 Every call is appended to $FAKE_FORGE/calls.log as "METHOD path". If $FAKE_FORGE/timeout_once holds a
-"METHOD path" prefix, the first matching call takes effect and then fails with "timed out" (an
+"METHOD path" prefix (or "METHOD path #N" for the Nth identical call), the first matching call takes effect and then fails with "timed out" (an
 uncertain write)."""
 import json, os, re, sys
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -63,7 +63,14 @@ def finish(v):
     flag = os.path.join(root, "timeout_once")
     if os.path.exists(flag):
         prefix = open(flag).read().strip()
-        if f"{method} {path}".startswith(prefix):
+        # "METHOD path #N" fires on the Nth identical call instead of the first match.
+        counted = re.fullmatch(r"(.*) #(\d+)", prefix)
+        if counted:
+            seen = sum(1 for l in open(os.path.join(root, "calls.log")) if l.strip() == counted[1])
+            hit = f"{method} {path}" == counted[1] and seen == int(counted[2])
+        else:
+            hit = f"{method} {path}".startswith(prefix)
+        if hit:
             os.remove(flag)
             print("gh api: timed out", file=sys.stderr)
             sys.exit(1)

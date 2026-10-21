@@ -504,7 +504,7 @@ impl Hub {
             }
             // Feedback on a tracked plan: the reviewed revision no longer stands.
             if let Some(p) = &mut j.issue_plan {
-                if p.pending.is_some() && j.status.finished() {
+                if (p.pending.is_some() || p.creating()) && j.status.finished() {
                     return Err("reconcile the publication first: F6, Accept / retry".into());
                 }
                 p.invalidate();
@@ -2305,7 +2305,14 @@ async fn issue_plan_turn(hub: &Hub, id: u32, cancel: &Cancel) -> Finish {
     let Some(p) = hub.job(id, |j| j.issue_plan.clone()).flatten() else { return failed("issue plan missing") };
     if p.action != Action::Draft {
         set_status(hub, id, JobStatus::Publishing);
-        let result = if p.action == Action::Publish { planning::publish(hub, id).await } else { planning::ready(hub, id).await };
+        let result = if p.action == Action::Publish {
+            // A retry of an unfinished creation has nothing left to publish.
+            let published = if p.pending.is_some() { planning::publish(hub, id).await } else { Ok(String::new()) };
+            match published {
+                Ok(message) if p.graph.is_some() => { let _ = message; crate::subissues::materialize(hub, id).await }
+                other => other,
+            }
+        } else { planning::ready(hub, id).await };
         return match result { Ok(message) => done(message), Err(e) => failed(e) };
     }
     set_status(hub, id, JobStatus::Planning);

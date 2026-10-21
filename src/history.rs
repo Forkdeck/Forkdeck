@@ -9,9 +9,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A job whose issue plan is still in progress: a publication pending, or not yet marked ready for build.
-/// Resolved is what `Plan::ready_for_intake` says: ready, nothing pending, and the current revision
+/// Resolved is what `Plan::resolved` says: all its sub-issues created, or what `Plan::ready_for_intake` says: ready, nothing pending, and the current revision
 /// reviewed, accepted and published.
-const UNRESOLVED_PLAN: &str = "(issue_plan IS NOT NULL AND NOT (json_extract(issue_plan, '$.ready') IS 1 \
+const UNRESOLVED_PLAN: &str = "(issue_plan IS NOT NULL AND json_extract(issue_plan, '$.creation.done') IS NOT 1 \
+    AND NOT (json_extract(issue_plan, '$.ready') IS 1 \
     AND json_extract(issue_plan, '$.pending') IS NULL \
     AND json_extract(issue_plan, '$.reviewed') IS json_extract(issue_plan, '$.revision') \
     AND json_extract(issue_plan, '$.accepted') IS json_extract(issue_plan, '$.revision') \
@@ -814,6 +815,27 @@ mod tests {
         h.prune(2).unwrap();
         let titles: Vec<String> = h.load(2).unwrap().into_iter().map(|r| r.title).collect();
         assert_eq!(titles, ["unresolved", "b", "c"], "the plan in progress is kept and loaded; the finished one is history");
+    }
+
+    #[test]
+    fn a_finished_creation_resolves_a_plan_but_an_unfinished_one_is_kept() {
+        let h = History::in_memory();
+        let cfg: crate::config::Config = toml::from_str("[[repos]]\nprovider='github'\nrepo='a/b'\npath='/tmp'\n").unwrap();
+        let plan = crate::planning::Plan::new(&cfg.repos[0], "7").unwrap();
+        let (mut created, mut partial) = (plan.clone(), plan);
+        created.creation = Some(crate::planning::Creation { done: true, ..Default::default() });
+        partial.creation = Some(crate::planning::Creation::default());
+        assert!(created.resolved() && !partial.resolved());
+        for (plan, title) in [(Some(partial), "partial"), (Some(created), "created"), (None, "a"), (None, "b"), (None, "c")] {
+            let id = h.new_id().unwrap();
+            let mut j = job(id, Source::Manual, JobStatus::Done);
+            j.title = title.into();
+            j.issue_plan = plan;
+            h.save(&JobRecord::of(&j)).unwrap();
+        }
+        h.prune(2).unwrap();
+        let titles: Vec<String> = h.load(2).unwrap().into_iter().map(|r| r.title).collect();
+        assert_eq!(titles, ["partial", "b", "c"]);
     }
 
     #[test]
