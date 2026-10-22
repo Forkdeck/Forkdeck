@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Forkdeck — Board</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap">
+<style>
+body{margin:0;background:#0F1115}
+a{color:#F2A541}a:hover{color:#FFC67A}
+</style>
+</helmet>
+<div style="min-height: 100vh; background: #0F1115; color: #E6E8EC; font-family: 'IBM Plex Sans', system-ui, sans-serif; font-size: 14px; display: flex; flex-direction: column">
+
+<header style="display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 12px 24px; border-bottom: 1px solid #2A2F3A; background: #12151B">
+<div style="display: flex; align-items: center; gap: 10px">
+<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#F2A541" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5" r="2"></circle><circle cx="6" cy="19" r="2"></circle><circle cx="18" cy="12" r="2"></circle><path d="M6 7v10M6 12h4a4 4 0 0 0 4-4V7M14 12h2"></path></svg>
+<span style="font-family: 'IBM Plex Mono', monospace; font-weight: 500; font-size: 16px; letter-spacing: 0.02em">forkdeck</span>
+</div>
+<label style="display: flex; align-items: center; gap: 8px; color: #9AA3B2; font-size: 13px">Workspace
+<select style="background: #1E222B; color: #E6E8EC; border: 1px solid #2A2F3A; border-radius: 6px; padding: 6px 10px; font: inherit; min-height: 32px">
+<option>justin · local</option>
+<option>Forkdeck team</option>
+</select>
+</label>
+<div style="flex: 1 1 auto"></div>
+<div style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: #9AA3B2">
+<span style="width: 8px; height: 8px; border-radius: 4px; background: #4FD1C5"></span>Live · 2 slots of 3 busy
+</div>
+<button type="button" onClick="{{toggleAuto}}" style="display: flex; align-items: center; gap: 8px; background: #1E222B; color: #E6E8EC; border: 1px solid #2A2F3A; border-radius: 6px; padding: 8px 12px; font: inherit; font-size: 13px; cursor: pointer; min-height: 36px">
+<span style="{{autoDot}}"></span>Issue intake {{autoLabel}}
+</button>
+<button type="button" aria-label="Account" style="width: 36px; height: 36px; border-radius: 18px; background: #2A2F3A; color: #E6E8EC; border: none; font: inherit; font-weight: 600; cursor: pointer">J</button>
+</header>
+
+<div style="display: flex; flex-wrap: wrap; flex: 1 1 auto; min-height: 0">
+
+<nav aria-label="Main" style="flex: 0 0 200px; padding: 16px 12px; border-right: 1px solid #2A2F3A; display: flex; flex-direction: column; gap: 4px">
+<a href="#" style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 6px; background: #1E222B; color: #E6E8EC; text-decoration: none; font-weight: 500">Board</a>
+<a href="Plan.dc.html" style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 6px; color: #9AA3B2; text-decoration: none">Plans</a>
+<a href="#" style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 6px; color: #9AA3B2; text-decoration: none">Repositories</a>
+<a href="#" style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 6px; color: #9AA3B2; text-decoration: none">Deployments</a>
+<a href="#" style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 6px; color: #9AA3B2; text-decoration: none">Stats</a>
+<a href="#" style="display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 6px; color: #9AA3B2; text-decoration: none">Doctor &amp; settings</a>
+<div style="margin-top: 24px; padding: 12px; border: 1px solid #2A2F3A; border-radius: 8px; font-size: 12px; color: #9AA3B2; line-height: 1.5">
+<div style="color: #E6E8EC; font-weight: 500; margin-bottom: 4px">Agents</div>
+claude · ready<br>codex · ready<br>copilot · no seat
+</div>
+</nav>
+
+<main style="flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column; gap: 16px; padding: 20px 24px">
+
+<form style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center; background: #171A21; border: 1px solid #2A2F3A; border-radius: 10px; padding: 12px">
+<label for="task" style="position: absolute; width: 1px; height: 1px; overflow: hidden">New task</label>
+<input id="task" placeholder="New task… (Enter to queue, Ctrl-Enter to send now)" style="flex: 1 1 320px; min-width: 0; background: #0F1115; color: #E6E8EC; border: 1px solid #2A2F3A; border-radius: 6px; padding: 10px 12px; font: inherit; min-height: 44px; box-sizing: border-box">
+<label style="display: flex; align-items: center; gap: 6px; color: #9AA3B2; font-size: 13px">Agent
+<select style="background: #1E222B; color: #E6E8EC; border: 1px solid #2A2F3A; border-radius: 6px; padding: 8px; font: inherit; min-height: 44px">
+<option>Auto (fork layer)</option><option>claude</option><option>codex</option>
+</select>
+</label>
+<label style="display: flex; align-items: center; gap: 8px; color: #E6E8EC; font-size: 13px; min-height: 44px; cursor: pointer">
+<input type="checkbox" checked style="width: 18px; height: 18px; accent-color: #F2A541">Plan first
+</label>
+<button type="button" style="background: #F2A541; color: #141413; border: none; border-radius: 6px; padding: 0 20px; font: inherit; font-weight: 600; min-height: 44px; cursor: pointer">Start</button>
+</form>
+
+<div style="overflow-x: auto; flex: 1 1 auto">
+<div style="display: grid; grid-template-columns: repeat(6, minmax(190px, 1fr)); gap: 12px; min-width: 1180px">
+<sc-for list="{{lanes}}" as="lane" hint-placeholder-count="6">
+<section style="background: #13161C; border: 1px solid #22262F; border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 8px; min-height: 420px">
+<div style="display: flex; align-items: center; justify-content: space-between; padding: 4px 4px 6px">
+<h2 style="margin: 0; font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #9AA3B2">{{lane.name}}</h2>
+<span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #9AA3B2">{{lane.count}}</span>
+</div>
+<sc-for list="{{lane.jobs}}" as="job" hint-placeholder-count="2">
+<button type="button" onClick="{{job.pick}}" style="{{job.cardStyle}}">
+<div style="display: flex; align-items: center; gap: 8px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #9AA3B2">
+<span>#{{job.id}}</span><span style="{{job.pillStyle}}">{{job.state}}</span>
+</div>
+<div style="font-size: 13px; line-height: 1.35; color: #E6E8EC; font-weight: 500">{{job.title}}</div>
+<div style="font-size: 12px; color: #9AA3B2">{{job.meta}}</div>
+</button>
+</sc-for>
+</section>
+</sc-for>
+</div>
+</div>
+</main>
+
+<aside aria-label="Job detail" style="flex: 1 1 420px; max-width: 520px; border-left: 1px solid #2A2F3A; background: #12151B; display: flex; flex-direction: column; min-width: 0">
+<div style="padding: 20px 20px 12px; display: flex; flex-direction: column; gap: 8px; border-bottom: 1px solid #2A2F3A">
+<div style="display: flex; align-items: center; gap: 10px; font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #9AA3B2">
+<span>#{{sel.id}}</span><span style="{{sel.pillStyle}}">{{sel.state}}</span><span>{{sel.elapsed}}</span>
+</div>
+<h1 style="margin: 0; font-size: 18px; line-height: 1.3; font-weight: 600">{{sel.title}}</h1>
+<div style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #9AA3B2">{{sel.route}}</div>
+<div style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px">
+<sc-for list="{{sel.stages}}" as="st" hint-placeholder-count="5">
+<span style="{{st.style}}">{{st.label}}</span>
+</sc-for>
+</div>
+<sc-if value="{{sel.warn}}" hint-placeholder-val="{{ true }}">
+<div style="margin-top: 8px; padding: 10px 12px; border-radius: 8px; background: #2A1E10; border: 1px solid #6B4A1C; color: #FFD9A8; font-size: 13px; line-height: 1.45">{{sel.warn}}</div>
+</sc-if>
+</div>
+<div role="tablist" style="display: flex; gap: 4px; padding: 10px 20px 0">
+<sc-for list="{{tabs}}" as="tab" hint-placeholder-count="3">
+<button type="button" role="tab" onClick="{{tab.pick}}" style="{{tab.style}}">{{tab.label}}</button>
+</sc-for>
+</div>
+<div style="flex: 1 1 auto; margin: 10px 20px; background: #0B0D11; border: 1px solid #22262F; border-radius: 8px; padding: 12px; overflow: auto; min-height: 260px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; line-height: 1.6">
+<sc-for list="{{log}}" as="line" hint-placeholder-count="8">
+<div style="display: flex; gap: 10px"><span style="color: #7D8696; flex: 0 0 auto">{{line.t}}</span><span style="{{line.style}}">{{line.text}}</span></div>
+</sc-for>
+</div>
+<form style="display: flex; flex-wrap: wrap; gap: 8px; padding: 0 20px 20px">
+<label for="reply" style="position: absolute; width: 1px; height: 1px; overflow: hidden">Reply to this task</label>
+<input id="reply" placeholder="Reply… (queued until the agent finishes)" style="flex: 1 1 200px; min-width: 0; background: #0F1115; color: #E6E8EC; border: 1px solid #2A2F3A; border-radius: 6px; padding: 10px 12px; font: inherit; min-height: 44px; box-sizing: border-box">
+<button type="button" style="background: #1E222B; color: #E6E8EC; border: 1px solid #2A2F3A; border-radius: 6px; padding: 0 14px; font: inherit; min-height: 44px; cursor: pointer">Queue</button>
+<button type="button" style="background: #F2A541; color: #141413; border: none; border-radius: 6px; padding: 0 14px; font: inherit; font-weight: 600; min-height: 44px; cursor: pointer">Send now</button>
+<button type="button" style="background: transparent; color: #FF9A8A; border: 1px solid #5A2A24; border-radius: 6px; padding: 0 14px; font: inherit; min-height: 44px; cursor: pointer">Stop</button>
+</form>
+</aside>
+
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this.state = { picked: 72, tab: 'Worker', auto: true };
+  }
+  renderVals() {
+    var TONE = {
+      queued:   ['#2A2F3A', '#C9CFDA'],
+      waiting:  ['#2A2F3A', '#C9CFDA'],
+      planning: ['#2B2440', '#CDB8FF'],
+      working:  ['#123331', '#7FE3D8'],
+      reviewing:['#1B2640', '#A9C1FF'],
+      'PR open':['#1B2640', '#A9C1FF'],
+      done:     ['#1C2A1C', '#A8E0A0'],
+      unverified:['#3A2A12', '#FFC67A'],
+      failed:   ['#3A1A18', '#FF9A8A']
+    };
+    var pill = function (s) { var t = TONE[s] || TONE.queued; return 'padding: 2px 8px; border-radius: 10px; font-size: 11px; background: ' + t[0] + '; color: ' + t[1]; };
+    var JOBS = [
+      { id: 74, lane: 'Queue', state: 'waiting', title: 'semantic-context#24 Home sync worker', meta: 'blocked by #23 · not merged', elapsed: 'queued 12m', route: 'not routed yet', stages: [0,0,0,0,0], log: [['09:02:10','sched','#24 waits for #23 to merge; removed agent:ready']] },
+      { id: 75, lane: 'Queue', state: 'planning', title: 'Web UI: read-only board (milestone 2)', meta: 'plan first · claude', elapsed: '3m', route: 'claude · deep · review yes (memory: 3 similar)', stages: [2,1,0,0,0], log: [['09:10:41','router','#75 → claude · deep · review yes (memory, 0 ms)'],['09:10:43','worker','Reading src/remote/feed.rs and crates/remote-proto…']] },
+      { id: 72, lane: 'Build', state: 'working', title: 'semantic-context#22 Home record API', meta: 'claude · standard · 6m', elapsed: '6m 12s', route: 'claude · standard · review yes (jev, 1436 ms)', stages: [2,1,0,0,0], log: [
+        ['09:04:02','issues','o/semantic-context#22 claimed, working on forkdeck/issue-22'],
+        ['09:04:03','router','#72 → claude · standard · review yes (jev, 1436 ms)'],
+        ['09:04:20','worker','▸ Read crates/helix-ha/src/home/records.rs'],
+        ['09:05:11','worker','▸ Edit crates/helix-ha/src/home/api.rs'],
+        ['09:06:40','worker','▸ Bash cargo test --offline --locked home::api'],
+        ['09:07:58','worker','test result: ok. 14 passed; 0 failed'],
+        ['09:08:30','worker','▸ Bash cargo clippy --offline --locked --all-targets -- -D warnings'],
+        ['09:10:14','worker','Adding the 404 path for an unknown record id…']] },
+      { id: 73, lane: 'Review', state: 'reviewing', title: 'Forkdeck: unverified work never reads as done', meta: 'codex review · round 1', elapsed: '18m', route: 'claude · standard · review yes · reviewer codex', stages: [2,2,2,1,0], log: [['08:58:01','checks','cargo clippy … && cargo test --bin forkdeck · passed in 41s'],['09:09:12','review','I’ll inspect all changes since the starting commit…'],['09:10:30','review','▸ shell git diff 843aa9a']] },
+      { id: 60, lane: 'Delivery', state: 'PR open', title: 'semantic-context#21 Persisted home records', meta: 'PR !71 · CI running', elapsed: '1d', route: 'codex · standard · review yes', stages: [2,2,2,2,1], log: [['yesterday','issues','PR !71 opened, draft'],['08:40:02','ci','pipeline 4411 running: build, test, adapter']] },
+      { id: 70, lane: 'Done', state: 'done', title: 'Fix four ways a task could start early', meta: 'committed 2803c77 · checks passed', elapsed: '18m', route: 'claude · standard · review yes', stages: [2,2,2,2,2], log: [['00:13:53','review','codex: PASS'],['00:13:53','queue','#70 done']] },
+      { id: 69, lane: 'Done', state: 'done', title: 'Planners split multi-PR work into a task list', meta: 'committed 0e6ecf1', elapsed: '9m', route: 'claude · standard · review yes', stages: [2,2,2,2,2], log: [['23:48:51','review','codex: PASS']] },
+      { id: 62, lane: 'Attention', state: 'unverified', title: 'Plans render a readable task list (first try)', meta: 'review passed · nothing built or tested', elapsed: '4m', route: 'claude · standard · review yes', stages: [2,2,3,2,0], warn: 'Not built or tested: no checks are configured here, and the worker was not allowed to run `cargo test`. Review passed on the code alone.', log: [['21:04:37','agents','claude was not allowed: Bash: export PATH=… cargo test'],['21:07:43','review','codex: PASS (gate results remain unverified)'],['21:07:43','queue','#62 needs you: unverified']] },
+      { id: 61, lane: 'Attention', state: 'failed', title: 'A plan can carry a validated task list', meta: 'review did not pass · fix changed nothing', elapsed: '25m', route: 'claude · standard · review yes', stages: [2,2,3,4,0], warn: 'Review did not pass and the last fix changed nothing. Reply to steer the worker, or retry.', log: [['20:54:20','review','codex: FAIL'],['20:55:58','review','the fix changed nothing, stopping']] }
+    ];
+    var STAGE_NAMES = ['Route', 'Work', 'Checks', 'Review', 'Deliver'];
+    var STAGE_TONE = [['#1E222B','#9AA3B2','○ '],['#123331','#7FE3D8','● '],['#1C2A1C','#A8E0A0','✓ '],['#3A2A12','#FFC67A','– '],['#3A1A18','#FF9A8A','✕ ']];
+    var self = this;
+    var picked = this.state.picked;
+    var jobs = JOBS.map(function (j) {
+      var on = j.id === picked;
+      return Object.assign({}, j, {
+        pillStyle: pill(j.state),
+        cardStyle: 'all: unset; box-sizing: border-box; width: 100%; display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 8px; cursor: pointer; background: ' + (on ? '#1E222B' : '#171A21') + '; border: 1px solid ' + (on ? '#F2A541' : '#2A2F3A'),
+        pick: function () { self.setState({ picked: j.id }); }
+      });
+    });
+    var laneNames = ['Queue', 'Build', 'Review', 'Delivery', 'Done', 'Attention'];
+    var lanes = laneNames.map(function (n) {
+      var js = jobs.filter(function (j) { return j.lane === n; });
+      return { name: n, count: js.length, jobs: js };
+    });
+    var sel = jobs.filter(function (j) { return j.id === picked; })[0] || jobs[0];
+    var selOut = Object.assign({}, sel, {
+      warn: sel.warn || '',
+      stages: sel.stages.map(function (s, i) { var t = STAGE_TONE[s]; return { label: t[2] + STAGE_NAMES[i], style: 'padding: 4px 10px; border-radius: 12px; font-size: 12px; background: ' + t[0] + '; color: ' + t[1] }; })
+    });
+    var tabNames = ['Worker', 'Reviewer', 'Conversation'];
+    var tab = this.state.tab;
+    var tabs = tabNames.map(function (n) {
+      var on = n === tab;
+      return { label: n, pick: function () { self.setState({ tab: n }); }, style: 'background: ' + (on ? '#1E222B' : 'transparent') + '; color: ' + (on ? '#E6E8EC' : '#9AA3B2') + '; border: 1px solid ' + (on ? '#2A2F3A' : 'transparent') + '; border-radius: 6px; padding: 0 14px; min-height: 36px; font: inherit; font-size: 13px; cursor: pointer' };
+    });
+    var WHO = { worker: '#E6E8EC', review: '#A9C1FF', router: '#CDB8FF', checks: '#A8E0A0', agents: '#FFC67A', sched: '#FFC67A', issues: '#9AA3B2', ci: '#9AA3B2', queue: '#9AA3B2' };
+    var lines = sel.log.filter(function (l) {
+      if (tab === 'Reviewer') return l[1] === 'review';
+      if (tab === 'Conversation') return l[1] === 'queue' || l[1] === 'issues';
+      return l[1] !== 'review';
+    });
+    if (lines.length === 0) lines = [['', 'queue', 'Nothing here yet.']];
+    var log = lines.map(function (l) { return { t: l[0], text: (l[1] === 'worker' ? '' : l[1] + '  ') + l[2], style: 'color: ' + (WHO[l[1]] || '#E6E8EC') + '; white-space: pre-wrap; overflow-wrap: anywhere' }; });
+    var auto = this.state.auto;
+    return {
+      lanes: lanes,
+      sel: selOut,
+      tabs: tabs,
+      log: log,
+      autoLabel: auto ? 'on' : 'paused',
+      autoDot: 'width: 8px; height: 8px; border-radius: 4px; background: ' + (auto ? '#4FD1C5' : '#7D8696'),
+      toggleAuto: function () { self.setState({ auto: !auto }); }
+    };
+  }
+}
+</script>
+</body>
+</html>

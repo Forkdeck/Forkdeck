@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Forkdeck — Issue plan</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;display=swap">
+<style>
+body{margin:0;background:#0F1115}
+a{color:#F2A541}a:hover{color:#FFC67A}
+</style>
+</helmet>
+<div style="min-height: 100vh; background: #0F1115; color: #E6E8EC; font-family: 'IBM Plex Sans', system-ui, sans-serif; font-size: 14px; display: flex; flex-direction: column">
+
+<header style="display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 12px 24px; border-bottom: 1px solid #2A2F3A; background: #12151B">
+<a href="Main.dc.html" style="display: flex; align-items: center; gap: 10px; color: #E6E8EC; text-decoration: none; min-height: 36px">
+<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#F2A541" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="5" r="2"></circle><circle cx="6" cy="19" r="2"></circle><circle cx="18" cy="12" r="2"></circle><path d="M6 7v10M6 12h4a4 4 0 0 0 4-4V7M14 12h2"></path></svg>
+<span style="font-family: 'IBM Plex Mono', monospace; font-weight: 500; font-size: 16px">forkdeck</span>
+</a>
+<span style="color: #9AA3B2; font-size: 13px">Plans</span>
+<div style="flex: 1 1 auto"></div>
+<button type="button" style="background: #F2A541; color: #141413; border: none; border-radius: 6px; padding: 0 16px; font: inherit; font-weight: 600; min-height: 40px; cursor: pointer">New plan</button>
+</header>
+
+<div style="display: flex; flex-wrap: wrap; flex: 1 1 auto; min-height: 0">
+
+<nav aria-label="Plans" style="flex: 0 0 280px; padding: 16px 12px; border-right: 1px solid #2A2F3A; display: flex; flex-direction: column; gap: 6px">
+<h2 style="margin: 0 8px 6px; font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #9AA3B2">Issue plans</h2>
+<a href="#" style="display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border-radius: 8px; background: #1E222B; border: 1px solid #F2A541; color: #E6E8EC; text-decoration: none">
+<span style="font-weight: 500">Home records and sync</span>
+<span style="font-size: 12px; color: #9AA3B2">semantic-context #20 · r3 · scheduling</span>
+</a>
+<a href="#" style="display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border-radius: 8px; border: 1px solid #2A2F3A; color: #E6E8EC; text-decoration: none">
+<span style="font-weight: 500">Web UI and server mode</span>
+<span style="font-size: 12px; color: #9AA3B2">Forkdeck · r1 · reviewed — accept or refine</span>
+</a>
+<a href="#" style="display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border-radius: 8px; border: 1px solid #2A2F3A; color: #E6E8EC; text-decoration: none">
+<span style="font-weight: 500">Unverified work never reads as done</span>
+<span style="font-size: 12px; color: #9AA3B2">Forkdeck #88 · r2 · building #73</span>
+</a>
+</nav>
+
+<main style="flex: 999 1 560px; min-width: 0; padding: 24px 28px; display: flex; flex-direction: column; gap: 18px">
+<div style="display: flex; flex-wrap: wrap; align-items: flex-start; gap: 16px">
+<div style="flex: 1 1 400px; min-width: 0; display: flex; flex-direction: column; gap: 6px">
+<div style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #9AA3B2">o/semantic-context#20 · revision 3 · plan review passed (codex)</div>
+<h1 style="margin: 0; font-size: 24px; font-weight: 600">Home records and sync</h1>
+<div style="font-size: 13px; color: #9AA3B2">Accepted and created as 5 sub-issues. Tasks start by themselves when what they depend on has merged.</div>
+</div>
+<div style="display: flex; gap: 8px; flex-wrap: wrap">
+<button type="button" style="background: #1E222B; color: #E6E8EC; border: 1px solid #2A2F3A; border-radius: 6px; padding: 0 14px; font: inherit; min-height: 40px; cursor: pointer">Re-plan…</button>
+<a href="#" style="display: flex; align-items: center; background: #1E222B; color: #E6E8EC; border: 1px solid #2A2F3A; border-radius: 6px; padding: 0 14px; min-height: 40px; text-decoration: none">Open #20 on GitHub</a>
+</div>
+</div>
+
+<div role="tablist" style="display: flex; gap: 4px; border-bottom: 1px solid #2A2F3A; padding-bottom: 8px">
+<sc-for list="{{tabs}}" as="tab" hint-placeholder-count="3">
+<button type="button" role="tab" onClick="{{tab.pick}}" style="{{tab.style}}">{{tab.label}}</button>
+</sc-for>
+</div>
+
+<sc-if value="{{showTasks}}" hint-placeholder-val="{{ true }}">
+<div style="display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-start">
+<section aria-label="Task list" style="flex: 2 1 520px; min-width: 0; background: #13161C; border: 1px solid #22262F; border-radius: 10px; padding: 8px">
+<sc-for list="{{tasks}}" as="t" hint-placeholder-count="7">
+<div style="{{t.rowStyle}}">
+<span style="{{t.boxStyle}}" aria-hidden="true">{{t.box}}</span>
+<span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #9AA3B2; flex: 0 0 auto">#{{t.n}}</span>
+<span style="{{t.titleStyle}}">{{t.title}}</span>
+<span style="font-size: 12px; color: #9AA3B2; flex: 0 0 auto">{{t.after}}</span>
+<span style="{{t.pillStyle}}">{{t.status}}</span>
+</div>
+</sc-for>
+</section>
+<section aria-label="Scheduler" style="flex: 1 1 280px; min-width: 0; display: flex; flex-direction: column; gap: 12px">
+<div style="background: #171A21; border: 1px solid #2A2F3A; border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px">
+<h2 style="margin: 0; font-size: 13px; font-weight: 600">Scheduler</h2>
+<div style="font-size: 13px; color: #9AA3B2; line-height: 1.5">Last pass 40 s ago · list matches its data (sha256 verified) · 1 ready, 1 working, 2 waiting, 1 needs you</div>
+</div>
+<div style="background: #2A1E10; border: 1px solid #6B4A1C; border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px">
+<h2 style="margin: 0; font-size: 13px; font-weight: 600; color: #FFD9A8">#25 needs you: Pick storage backend</h2>
+<div style="font-size: 13px; color: #FFD9A8; line-height: 1.5">Your answer goes into the instructions of every task that depends on it.</div>
+<label for="answer" style="font-size: 12px; color: #FFD9A8">Your decision</label>
+<input id="answer" placeholder="e.g. SQLite now, Postgres behind a trait" style="background: #0F1115; color: #E6E8EC; border: 1px solid #6B4A1C; border-radius: 6px; padding: 10px 12px; font: inherit; min-height: 44px; box-sizing: border-box">
+<button type="button" style="background: #F2A541; color: #141413; border: none; border-radius: 6px; font: inherit; font-weight: 600; min-height: 44px; cursor: pointer">Answer and close #25</button>
+</div>
+</section>
+</div>
+</sc-if>
+
+<sc-if value="{{showDraft}}" hint-placeholder-val="{{ false }}">
+<article style="background: #13161C; border: 1px solid #22262F; border-radius: 10px; padding: 20px 24px; line-height: 1.6; max-width: 820px">
+<h2 style="margin: 0 0 8px; font-size: 16px">Goal</h2>
+<p style="margin: 0 0 16px; color: #C9CFDA">Persist home records, expose them through the API, and keep peers in sync, delivered as reviewable pull requests that each merge on their own.</p>
+<h2 style="margin: 0 0 8px; font-size: 16px">Steps</h2>
+<ol style="margin: 0 0 16px; padding-left: 20px; color: #C9CFDA">
+<li>Storage: persisted home records with migrations.</li>
+<li>API: endpoint over the records, then the sync worker.</li>
+<li>Decision: which storage backend to commit to.</li>
+</ol>
+<div style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #9AA3B2">forkdeck-tasks: 5 tasks · validated · no cycles</div>
+</article>
+</sc-if>
+
+<sc-if value="{{showReview}}" hint-placeholder-val="{{ false }}">
+<article style="background: #13161C; border: 1px solid #22262F; border-radius: 10px; padding: 20px 24px; line-height: 1.6; max-width: 820px; font-size: 13px; color: #C9CFDA">
+<div style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #A9C1FF; margin-bottom: 8px">codex · plan review · revision 3</div>
+<p style="margin: 0 0 10px">Every work task is one reviewable pull request, and each `after` lists what must merge first. The sync worker correctly waits on the endpoint.</p>
+<p style="margin: 0; font-family: 'IBM Plex Mono', monospace; color: #A8E0A0">VERDICT: PASS</p>
+</article>
+</sc-if>
+</main>
+
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this.state = { tab: 'Tasks' };
+  }
+  renderVals() {
+    var self = this;
+    var tab = this.state.tab;
+    var tabs = ['Tasks', 'Plan', 'Review'].map(function (n) {
+      var on = n === tab;
+      return { label: n, pick: function () { self.setState({ tab: n }); }, style: 'background: ' + (on ? '#1E222B' : 'transparent') + '; color: ' + (on ? '#E6E8EC' : '#9AA3B2') + '; border: 1px solid ' + (on ? '#2A2F3A' : 'transparent') + '; border-radius: 6px; padding: 0 16px; min-height: 36px; font: inherit; font-size: 13px; cursor: pointer' };
+    });
+    var TONE = {
+      merged: ['#1C2A1C', '#A8E0A0'], working: ['#123331', '#7FE3D8'], ready: ['#2B2440', '#CDB8FF'],
+      waiting: ['#2A2F3A', '#C9CFDA'], you: ['#3A2A12', '#FFC67A'], group: ['#1E222B', '#9AA3B2']
+    };
+    var T = [
+      { n: 26, title: 'Storage', depth: 0, group: true, after: '', status: '1 of 1 merged', tone: 'group', done: true },
+      { n: 21, title: 'Persisted home records', depth: 1, after: '', status: 'merged in PR !71', tone: 'merged', done: true },
+      { n: 27, title: 'API', depth: 0, group: true, after: 'after #26', status: '0 of 2', tone: 'group' },
+      { n: 22, title: 'Home record API', depth: 1, after: '', status: 'working · job #72', tone: 'working' },
+      { n: 24, title: 'Home sync worker', depth: 1, after: 'after #22', status: 'waiting for #22', tone: 'waiting' },
+      { n: 25, title: 'Pick storage backend', depth: 0, after: '', status: 'needs you', tone: 'you' },
+      { n: 28, title: 'Docs for the home API', depth: 0, after: 'after #22', status: 'waiting for #22', tone: 'waiting' }
+    ];
+    var tasks = T.map(function (t) {
+      var c = TONE[t.tone];
+      return {
+        n: t.n, title: t.title, after: t.after, status: t.status,
+        box: t.done ? '✓' : '',
+        boxStyle: 'flex: 0 0 18px; height: 18px; border-radius: 4px; border: 1px solid ' + (t.done ? '#A8E0A0' : '#4A5160') + '; color: #A8E0A0; font-size: 12px; display: flex; align-items: center; justify-content: center',
+        rowStyle: 'display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 12px; padding-left: ' + (12 + t.depth * 28) + 'px; border-bottom: 1px solid #1E222B',
+        titleStyle: 'flex: 1 1 200px; min-width: 0; font-weight: ' + (t.group ? '600' : '400') + '; color: #E6E8EC',
+        pillStyle: 'padding: 3px 10px; border-radius: 10px; font-size: 12px; background: ' + c[0] + '; color: ' + c[1]
+      };
+    });
+    return { tabs: tabs, tasks: tasks, showTasks: tab === 'Tasks', showDraft: tab === 'Plan', showReview: tab === 'Review' };
+  }
+}
+</script>
+</body>
+</html>
