@@ -3,3 +3,6 @@
 /dist
 *.cdx.json
 /.local/
+
+/web/node_modules/
+/.forkdeck-serve.lock
