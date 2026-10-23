@@ -76,6 +76,19 @@ pub enum Which {
     Reviewer,
 }
 
+/// Board fields projected from a job, shared by every browser viewport.
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, Debug, Default, Clone, PartialEq)]
+pub struct BoardProjection {
+    pub lane: String,
+    pub state: String,
+    pub meta: String,
+    pub elapsed: String,
+    pub route: String,
+    pub stages: Vec<u8>,
+    pub log: Vec<Vec<String>>,
+    pub warn: String,
+}
+
 /// One row of the job list.
 #[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 pub struct JobSummary {
@@ -498,7 +511,7 @@ pub fn web_contracts() -> String {
     use ts_rs::TS;
     let cfg = ts_rs::Config::default().with_large_int("number");
     let mut out = String::from("// Generated from crates/remote-proto. Run npm run contracts to refresh.\n");
-    for declaration in [Agent::decl(&cfg), Status::decl(&cfg), StageState::decl(&cfg), Which::decl(&cfg), JobSummary::decl(&cfg), StageView::decl(&cfg), GateView::decl(&cfg), DecisionView::decl(&cfg), TurnView::decl(&cfg), JobDetail::decl(&cfg), LogLine::decl(&cfg), RepoView::decl(&cfg), Snapshot::decl(&cfg), ServerInfo::decl(&cfg), Event::decl(&cfg)] {
+    for declaration in [BoardProjection::decl(&cfg), Agent::decl(&cfg), Status::decl(&cfg), StageState::decl(&cfg), Which::decl(&cfg), JobSummary::decl(&cfg), StageView::decl(&cfg), GateView::decl(&cfg), DecisionView::decl(&cfg), TurnView::decl(&cfg), JobDetail::decl(&cfg), LogLine::decl(&cfg), RepoView::decl(&cfg), Snapshot::decl(&cfg), ServerInfo::decl(&cfg), Event::decl(&cfg)] {
         out.push_str(&format!("export {declaration}\n"));
     }
     out

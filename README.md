@@ -1181,9 +1181,16 @@ so the cookie belongs to that origin. Vite proxies `/api` and `/auth` to the dae
 7420; HMR and frontend source stay on Vite. The code is still one-use, so use a fresh
 daemon if it has already been exchanged.
 
-After building both frontend and binary, `node web/scripts/screenshots.mjs` starts a
-temporary `forkdeck serve --demo` on 7420, authenticates Chromium, and captures the
-board at 1440×900, plans at 1440×900, and responsive board at 390×844 under
-`docs/web-ui-mockup/screenshots/`. Set `CHROMIUM_PATH` if Chromium is installed elsewhere.
-It also renders the approved mockups with the same local fonts into `/tmp` for visual
-comparison. No agents, forge writes, or pushes are involved in demo mode.
+After building both frontend and binary, `node web/scripts/screenshots.mjs` starts
+temporary servers on ephemeral ports and authenticates Chromium. It captures native
+seeded jobs with `forkdeck serve --demo`, then regular `forkdeck serve` against a
+private copy of `~/.local/state/forkdeck/forkdeck.db` and its WAL in a temporary
+`XDG_STATE_HOME`. The real-history capture disables agent executables and issue
+intake; original database hashes must remain unchanged. Both paths use the same API
+views. Screenshots at 1440×900 and 390×844, including unverified job detail, are saved
+under `docs/web-ui-mockup/screenshots/`. The script also checks that reply controls
+stay inside the viewport. Set `CHROMIUM_PATH` if Chromium is installed elsewhere.
+It renders the approved mockups with the same local fonts into `/tmp`; run
+`python3 web/scripts/compare-screenshots.py` (Pillow required) to refresh the measured
+comparison. See [capture notes](docs/web-ui-mockup/screenshots/README.md) for the
+remaining content differences from the references.

@@ -1,26 +1,70 @@
-[
-  {
-    "mockup": "Main.dc.html",
-    "screenshot": "board-1440x900.png",
-    "width": 1440,
-    "height": 900,
-    "different_pixels": 0,
-    "sha256": "7b242e1772c10013152e91406f2268ec855d6d9cb4226bffe74ee43b76d2222a"
-  },
-  {
-    "mockup": "Plan.dc.html",
-    "screenshot": "plans-1440x900.png",
-    "width": 1440,
-    "height": 900,
-    "different_pixels": 0,
-    "sha256": "527cce2f2e99cc85f3005225313a78a10215324b33cd4894df9a346053b994db"
-  },
-  {
-    "mockup": "Phone.dc.html",
-    "screenshot": "board-390x844.png",
-    "width": 390,
-    "height": 844,
-    "different_pixels": 0,
-    "sha256": "2cbf06351ccea38785c68afd963951b186c2e3349431743d6216fc9cab6732e4"
-  }
-]
+{
+  "note": "Content is derived from native Hub state. Differences include honest live metadata and filters; see README.md.",
+  "reference_comparisons": [
+    {
+      "capture": "board-1440x900.png",
+      "reference": "Main.dc.html",
+      "different_pixels": 6727,
+      "total_pixels": 1296000,
+      "different_percent": 0.519
+    },
+    {
+      "capture": "plans-1440x900.png",
+      "reference": "Plan.dc.html",
+      "different_pixels": 8655,
+      "total_pixels": 1296000,
+      "different_percent": 0.668
+    },
+    {
+      "capture": "board-390x844.png",
+      "reference": "Phone.dc.html",
+      "different_pixels": 49328,
+      "total_pixels": 329160,
+      "different_percent": 14.986
+    }
+  ],
+  "captures": [
+    {
+      "path": "board-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "86827104b77e213cd28523f1f9fc4359995085959b422824601220507ed17e89"
+    },
+    {
+      "path": "board-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "39b7d5de6ad1af5bf8937a208eff826d6dba6b6a90e81a4fe7f58f09715fff0d"
+    },
+    {
+      "path": "plans-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "ee1e09b203d081e0efe28c95f7b02224f1709e2084f230958a824d1c984b50c2"
+    },
+    {
+      "path": "real-board-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "67553c5766e1c537e3001d280d9fbdcc5d3eb94584b710be39a9d012de89d913"
+    },
+    {
+      "path": "real-board-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "f360863d980754cf4115c47645d8bd1d72ca1f09961d59654aaae7be9990121f"
+    },
+    {
+      "path": "real-detail-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "ece2e326f35e8ca22e8812d81e3a98a349cc8a51626ef1daaf8b4665c35822bf"
+    },
+    {
+      "path": "unverified-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "d5932d13a01621b790b488aea8ccb5d925f3057624de1f9311a1316e7c366351"
+    }
+  ]
+}

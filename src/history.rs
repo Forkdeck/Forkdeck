@@ -162,6 +162,8 @@ pub struct StageRecord {
     pub cost: f64,
     pub secs: u64,
     pub tail: Vec<String>,
+    #[serde(default)]
+    pub tail_times: Vec<String>,
 }
 
 impl StageRecord {
@@ -186,6 +188,7 @@ impl StageRecord {
             cost: s.cost,
             secs: s.secs(),
             tail: s.tail.iter().cloned().collect(),
+            tail_times: s.tail_times.iter().cloned().collect(),
         }
     }
     fn stage(self) -> Stage {
@@ -215,6 +218,7 @@ impl StageRecord {
             started: None,
             elapsed: (self.secs > 0).then(|| Duration::from_secs(self.secs)),
             tail: self.tail.into(),
+            tail_times: self.tail_times.into(),
             refused: Vec::new(),
         }
     }
@@ -908,6 +912,8 @@ mod tests {
         assert_eq!(h.load(10).unwrap().len(), 4);
         let j = back[0].clone().job();
         assert_eq!((j.turns.len(), j.worker.tail.len(), j.worker.via.as_str(), j.forced.map(|f| f.name())), (2, 2, "copilot", Some("copilot:second".to_string())));
+        assert_eq!(j.worker.tail_times, saved[0].worker.tail_times);
+        assert!(j.worker.tail_times.iter().all(|time| !time.is_empty()));
         assert_eq!(j.decision.unwrap().tier, Tier::Heavy);
         assert_eq!(j.inbox.iter().collect::<Vec<_>>(), ["and the docs too"], "a queued message survives a restart");
         assert_eq!((j.metrics_id.as_str(), j.attempt_ids.as_slice(), j.escalated), ("m-1", ["a-1".to_string()].as_slice(), true), "attempts stay linked to the job");

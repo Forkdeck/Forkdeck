@@ -526,10 +526,12 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     };
     stage(&mut |s| {
         let keep = std::mem::take(&mut s.tail);
+        let times = std::mem::take(&mut s.tail_times);
         let unprinted = s.unprinted;
         let pushed = s.pushed;
         *s = Stage::default();
         s.tail = keep;
+        s.tail_times = times;
         s.unprinted = unprinted;
         s.pushed = pushed;
         s.agent = Some(e.family);

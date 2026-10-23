@@ -1,6 +1,7 @@
 mod auth;
 mod http;
 mod view;
+mod seed;
 
 use crate::{orchestrator::Hub, remote::feed::Feed};
 use std::{sync::Arc, time::Duration};
@@ -12,7 +13,7 @@ pub fn run(rt: &tokio::runtime::Runtime, hub: Hub) -> anyhow::Result<()> {
     anyhow::ensure!(hub.cfg.demo || hub.history.is_some(), "server needs working history storage");
     rt.block_on(hub.detect_agents());
     if hub.cfg.demo {
-        view::seed_demo(&hub)?;
+        seed::seed_demo(&hub)?;
     } else {
         hub.start_autosave();
         for id in hub.restore() {

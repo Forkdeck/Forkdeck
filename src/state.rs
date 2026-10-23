@@ -191,6 +191,8 @@ pub struct Stage {
     pub started: Option<Instant>,
     pub elapsed: Option<Duration>,
     pub tail: VecDeque<String>,
+    /// Clock time of each retained tail line; empty for older history without timestamps.
+    pub tail_times: VecDeque<String>,
     /// Lines ever pushed, so a remote viewer can ask for the ones it has not seen.
     pub pushed: u64,
     /// What the agent asked to run and was not allowed to, in its last run.
@@ -215,6 +217,7 @@ impl Default for Stage {
             started: None,
             elapsed: None,
             tail: VecDeque::new(),
+            tail_times: VecDeque::new(),
             unprinted: 0,
             pushed: 0,
             refused: Vec::new(),
@@ -224,6 +227,11 @@ impl Default for Stage {
 
 impl Stage {
     pub fn push(&mut self, line: impl Into<String>) {
+        self.push_at(chrono::Local::now().format("%H:%M:%S").to_string(), line);
+    }
+    pub fn push_at(&mut self, time: impl Into<String>, line: impl Into<String>) {
+        self.tail_times.resize(self.tail.len(), String::new());
+        self.tail_times.push_back(time.into());
         let line = line.into();
         self.last = line.clone();
         self.tail.push_back(line);
@@ -231,6 +239,7 @@ impl Stage {
         self.pushed += 1;
         while self.tail.len() > 200 {
             self.tail.pop_front();
+            self.tail_times.pop_front();
         }
     }
     pub fn secs(&self) -> u64 {

@@ -138,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn authenticated_snapshot_and_sse_resume() {
         let hub = Hub::new(crate::config::Config { demo: true, ..Default::default() }, tokio::runtime::Handle::current());
-        view::seed_demo(&hub).unwrap();
+        crate::server::seed::seed_demo(&hub).unwrap();
         let feed = Arc::new(Feed::new());
         let (auth, code) = Auth::new().unwrap();
         let auth = Arc::new(Mutex::new(auth));
