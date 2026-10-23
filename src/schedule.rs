@@ -98,6 +98,23 @@ pub fn status(r: &RepoCfg, g: &Graph, t: &Task, facts: &HashMap<u64, Fact>) -> S
     }
 }
 
+/// Read model of the scheduler's last actual forge observation. A missing/stale observation
+/// never turns an unknown dependency into a ready task.
+#[derive(Clone, serde::Serialize)]
+pub struct ReadView {
+    pub id: String,
+    pub title: String,
+    pub repo: String,
+    pub issue: tracker::IssueRef,
+    pub graph: Graph,
+    pub draft: String,
+    pub tasks: Vec<serde_json::Value>,
+    pub observed_unix: u64,
+    pub error: Option<String>,
+}
+
+pub fn view_key(host: &str, repo: &str, root: &str) -> String { format!("{host}|{repo}#{root}") }
+
 /// The last problem logged for each plan, so a problem that stays is said once, not on every poll.
 static LOGGED: LazyLock<Mutex<HashMap<(String, u64), String>>> = LazyLock::new(Default::default);
 
@@ -106,6 +123,7 @@ fn log(hub: &Hub, msg: String) {
 }
 
 fn note(hub: &Hub, r: &RepoCfg, root: u64, problem: Option<String>) {
+    if let Some(view) = hub.schedule_views.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&view_key(&r.host, &r.repo, &root.to_string())) { view.error = problem.clone(); }
     let mut seen = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
     let key = (r.repo.clone(), root);
     match problem {
@@ -195,6 +213,18 @@ async fn plan(hub: &Hub, r: &RepoCfg, root: &tracker::RemoteIssue) {
             if let Err(e) = show(r, root, &section, &shown).await { problems.push(format!("#{rn}: {e}")); }
         }
     }
+    let key = view_key(&r.host, &r.repo, &rn.to_string());
+    let tasks = g.tasks.iter().map(|t| {
+        let status = status(r, &g, t, &facts);
+        serde_json::json!({"task": t, "after": g.effective_after(&t.id), "status": if status.is_empty() { "unknown" } else { &status }})
+    }).collect();
+    let view = ReadView {
+        id: crate::remote::pki::sha256_hex(key.as_bytes())[..16].into(), title: root.title.clone(),
+        repo: r.repo.clone(), issue: root.reference.clone(), graph: g, draft: root.body.clone(), tasks,
+        observed_unix: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+        error: None,
+    };
+    hub.schedule_views.lock().unwrap_or_else(|e| e.into_inner()).insert(key, view);
     note(hub, r, rn, if problems.is_empty() { None } else { Some(problems.join("; ")) });
 }
 

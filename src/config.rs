@@ -18,6 +18,7 @@ pub struct Config {
     pub resources: ResourcesCfg,
     pub knowledge: KnowledgeCfg,
     pub remote: RemoteCfg,
+    pub web: WebCfg,
     /// MCP servers by name. CI and deployment stages call tools on these.
     pub mcp: HashMap<String, McpServerCfg>,
     pub repos: Vec<RepoCfg>,
@@ -1636,4 +1637,13 @@ tool = "rollback"
         assert!(check("[agents.copilot]\ntypo = 1").is_err());
         assert!(check("[agents.copilot]\nmodels = { standard = \"auto\" }").is_ok(), "auto is fine for copilot itself");
     }
+}
+
+/// Browser HTTP stays on loopback; phone networking is configured separately.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebCfg { pub port: u16 }
+
+impl Default for WebCfg {
+    fn default() -> Self { Self { port: 7420 } }
 }

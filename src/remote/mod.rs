@@ -41,14 +41,18 @@ struct Ctx {
 
 /// Start listening. Runs until the process ends; errors before the listener is up are returned.
 pub async fn serve(hub: Hub) -> anyhow::Result<()> {
+    let feed = Arc::new(feed::Feed::new());
+    tokio::spawn(feed.clone().run(hub.clone(), Duration::from_millis(200)));
+    serve_with_feed(hub, feed).await
+}
+
+pub async fn serve_with_feed(hub: Hub, feed: Arc<feed::Feed>) -> anyhow::Result<()> {
     let cfg = hub.cfg.remote.clone();
     let ca = pki::Ca::load_or_create(&cfg.dir)?;
     let mut ips: Vec<IpAddr> = pair::interfaces().into_iter().map(|i| i.ip).collect();
     ips.sort();
     let (tls_tx, tls) = watch::channel(ca.server_config(&ips)?);
     let listener = TcpListener::bind(&cfg.listen).await?;
-    let feed = Arc::new(feed::Feed::new());
-    tokio::spawn(feed.clone().run(hub.clone(), Duration::from_millis(200)));
     let paired = devices::Registry::new(&cfg.dir).list().len();
     hub.log("remote", format!("listening on {} ({} phone(s) paired)", listener.local_addr()?, paired));
     let ctx = Arc::new(Ctx { hub: hub.clone(), feed, ca, devices: devices::Registry::new(&cfg.dir), dir: cfg.dir.clone(), tls });

@@ -13,6 +13,9 @@ members = [".", "crates/remote-proto"]
 
 [dependencies]
 anyhow = "1"
+axum = "0.8"
+rust-embed = { version = "8", features = ["debug-embed"] }
+mime_guess = "2"
 forkdeck-remote-proto = { path = "crates/remote-proto" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"

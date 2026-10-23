@@ -249,7 +249,8 @@ fn lane(status: JobStatus) -> usize {
 }
 
 /// The board lane a job's card is in.
-fn job_lane(j: &Job) -> usize {
+pub(crate) fn job_lane(j: &Job) -> usize {
+    if j.status == JobStatus::Done && j.checks.is_none() && j.issue_plan.is_none() { return 5; }
     // A pull request still open is work a person has to review, not work that is done.
     if j.status == JobStatus::Done && j.pr_url.is_some() && j.pr_open != Some(false) {
         return 3;
@@ -1015,7 +1016,7 @@ mod tests {
         let _slots = rt.block_on(hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel as u32)).unwrap();
         for index in 0..15 {
             let id = rt.block_on(hub.submit(format!("TASK-{}", index), "task".into(), Source::Manual, PathBuf::from("."), None, Planning::Never)).unwrap();
-            hub.job(id, |j| j.status = JobStatus::Done);
+            hub.job(id, |j| { j.status = JobStatus::Done; j.checks = Some(true); });
             if index == 0 { ui.selected = Some(id); }
         }
         for (width, height) in [(180, 50), (120, 40), (80, 30), (40, 12)] {
@@ -1036,8 +1037,11 @@ mod tests {
         let _slots = rt.block_on(hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel as u32)).unwrap();
         let id = rt.block_on(hub.submit("t".into(), "t".into(), Source::Manual, PathBuf::from("."), None, Planning::Never)).unwrap();
         let lane_now = || hub.job(id, |j| job_lane(j)).unwrap();
-        hub.job(id, |j| j.status = JobStatus::Done);
-        assert_eq!(lane_now(), 4, "done without a pull request is done");
+        hub.job(id, |j| { j.status = JobStatus::Done; j.checks = Some(true); });
+        assert_eq!(lane_now(), 4, "verified work without a pull request is done");
+        hub.job(id, |j| j.checks = None);
+        assert_eq!(lane_now(), 5, "finished work without checks needs attention");
+        hub.job(id, |j| j.checks = Some(true));
         hub.job(id, |j| j.pr_url = Some("https://github.com/o/r/pull/9".into()));
         assert_eq!(lane_now(), 3, "a person still has to review it");
         hub.job(id, |j| j.pr_open = Some(true));
@@ -1059,7 +1063,7 @@ mod tests {
         let mut ids = Vec::new();
         for status in [JobStatus::Queued, JobStatus::Done, JobStatus::Done, JobStatus::Failed] {
             let id = rt.block_on(hub.submit("t".into(), "t".into(), Source::Manual, PathBuf::from("."), None, Planning::Never)).unwrap();
-            hub.job(id, |j| j.status = status);
+            hub.job(id, |j| { j.status = status; j.checks = Some(true); });
             ids.push(id);
         }
         let st = hub.state.lock().unwrap();

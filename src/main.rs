@@ -25,6 +25,7 @@ mod remote;
 mod routemem;
 mod router;
 mod schedule;
+mod server;
 mod state;
 mod subissues;
 mod taskgraph;
@@ -65,6 +66,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Run the local web UI and orchestration daemon
+    Serve,
     /// Run paired model benchmarks in disposable local clones (executes agents)
     Benchmark {
         manifest: PathBuf,
@@ -287,7 +290,7 @@ fn main() -> anyhow::Result<()> {
     cfg.adaptive.written = Some(adaptive::fingerprint(&cfg));
     if !cfg.demo {
         // Only where agents may run: asking the CLI takes a moment.
-        let agents_run = matches!(cli.cmd, None | Some(Cmd::Once) | Some(Cmd::Run { .. }) | Some(Cmd::Resume) | Some(Cmd::Doctor));
+        let agents_run = matches!(cli.cmd, None | Some(Cmd::Once) | Some(Cmd::Run { .. }) | Some(Cmd::Resume) | Some(Cmd::Doctor) | Some(Cmd::Serve) | Some(Cmd::Remote { cmd: RemoteCmd::Serve }));
         let chosen = if agents_run && cfg.agents.discover_models.unwrap_or(true) { catalog::fill_codex(&mut cfg) } else { vec![] };
         if !chosen.is_empty() && matches!(cli.cmd, Some(Cmd::Doctor)) {
             println!("models    codex: {}", chosen.join(", "));
@@ -522,31 +525,9 @@ fn main() -> anyhow::Result<()> {
             RemoteCmd::Pair { iface, ttl } => remote::pair_cmd(&hub.cfg, iface.as_deref(), ttl),
             RemoteCmd::Devices => remote::devices_cmd(&hub.cfg),
             RemoteCmd::Revoke { name } => remote::revoke_cmd(&hub.cfg, &name),
-            RemoteCmd::Serve => {
-                anyhow::ensure!(hub.cfg.remote.enabled, "[remote] enabled = false in the config");
-                rt.block_on(hub.detect_agents());
-                // As the interface does: earlier tasks come back for the phone to see and reply to,
-                // cut-off ones continue, and running ones are saved as they go.
-                hub.start_autosave();
-                for id in hub.restore() {
-                    if let Err(e) = rt.block_on(hub.resume(id)) {
-                        hub.log("queue", format!("#{} not resumed: {}", id, e));
-                    }
-                }
-                rt.spawn(issues::poll_loop(hub.clone()));
-                rt.spawn(team::watch_loop(hub.clone()));
-                let stopped = rt.block_on(async {
-                    tokio::select! {
-                        r = remote::serve(hub.clone()) => r,
-                        _ = stop_signal() => Ok(()),
-                    }
-                });
-                rt.block_on(hub.shutdown(Duration::from_secs(45)));
-                record_owed(&hub);
-                proc::kill_all();
-                stopped
-            }
+            RemoteCmd::Serve => server::run(&rt, hub),
         },
+        Some(Cmd::Serve) => server::run(&rt, hub),
         Some(Cmd::Doctor) => {
             let ok = rt.block_on(doctor(&hub, cfg_path));
             std::process::exit(if ok { 0 } else { 1 });

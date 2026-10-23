@@ -23,6 +23,8 @@ pub struct Hub {
     pub state: Arc<Mutex<State>>,
     pub cfg: Arc<Config>,
     pub sem: Arc<Semaphore>,
+    /// Latest scheduler observations, shared by all read-only clients.
+    pub schedule_views: Arc<Mutex<std::collections::HashMap<String, crate::schedule::ReadView>>>,
     /// Jobs typed into the prompt share one working directory, so they run one at a time.
     pub lane: Arc<tokio::sync::Mutex<()>>,
     pub http: reqwest::Client,
@@ -118,6 +120,7 @@ impl Hub {
             state: Arc::new(Mutex::new(st)),
             cfg: Arc::new(cfg),
             sem: Arc::new(Semaphore::new(par)),
+            schedule_views: Arc::new(Mutex::new(Default::default())),
             lane: Arc::new(tokio::sync::Mutex::new(())),
             http: http.build().unwrap_or_default(),
             rt,
