@@ -1123,3 +1123,67 @@ worker for another round. Interrupted typed tasks already resume as described ab
 ## License
 
 MIT
+
+## Web UI and daemon
+
+`forkdeck serve` owns one workspace's Hub, restores and resumes eligible jobs, starts
+issue polling and team watchers, and serves the read-only browser UI at
+`http://127.0.0.1:7420`. `forkdeck remote serve` remains an alias; enabling `[remote]`
+also starts the existing paired-phone transport over the same event feed. A second
+daemon in the same working directory refuses to start. SIGINT/SIGTERM perform the
+normal job shutdown and persistence.
+
+```sh
+forkdeck serve --demo
+# Open the one-use login URL printed on stdout, within two minutes.
+```
+
+The login code is exchanged by POST for a 12-hour HttpOnly, SameSite=Strict session
+cookie. The daemon holds only hashes of codes and session tokens; restarting it
+revokes sessions and prints a fresh login URL. Each `/api` route requires a session.
+No CORS is enabled. HTTP always binds to loopback; configure its port with:
+
+```toml
+[web]
+port = 7420
+```
+
+The board, job details (`/jobs/:id`), plans (`/plans`, `/plans/:id`), log tabs, and
+phone filters are live. SSE uses the native feed's sequence numbers, bounded replay,
+Last-Event-ID, heartbeats, and resnapshot after gaps/restarts. The intake indicator
+reflects actual automation state. Scheduler observations retain unknown forge status
+and freshness. Finished work without checks appears as **unverified** in Attention.
+Composer, replies, automation changes, and plan actions are read-only in this milestone;
+disabled controls have the title “Coming in the next milestone”.
+
+Build the frontend before compiling Rust after UI changes:
+
+```sh
+cd web
+npm ci
+npm run check
+npm run build
+cd ..
+cargo build
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+`web/dist` is checked in so a Rust-only checkout builds without Node. Both debug and
+release binaries embed the built assets, including local IBM Plex Sans/Mono fonts;
+hashed assets receive immutable caching. Commit rebuilt `web/dist` with source changes.
+No font CDN is used at runtime. `npm run contracts` in `web/` regenerates TypeScript
+contracts from `crates/remote-proto`; the Rust protocol tests check for drift.
+
+For frontend development, run `forkdeck serve --demo`, then `cd web && npm run dev`.
+Open its printed login URL through the Vite origin instead (replace `7420` with `5173`)
+so the cookie belongs to that origin. Vite proxies `/api` and `/auth` to the daemon on
+7420; HMR and frontend source stay on Vite. The code is still one-use, so use a fresh
+daemon if it has already been exchanged.
+
+After building both frontend and binary, `node web/scripts/screenshots.mjs` starts a
+temporary `forkdeck serve --demo` on 7420, authenticates Chromium, and captures the
+board at 1440×900, plans at 1440×900, and responsive board at 390×844 under
+`docs/web-ui-mockup/screenshots/`. Set `CHROMIUM_PATH` if Chromium is installed elsewhere.
+It also renders the approved mockups with the same local fonts into `/tmp` for visual
+comparison. No agents, forge writes, or pushes are involved in demo mode.

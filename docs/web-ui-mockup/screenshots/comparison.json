@@ -1,0 +1,26 @@
+[
+  {
+    "mockup": "Main.dc.html",
+    "screenshot": "board-1440x900.png",
+    "width": 1440,
+    "height": 900,
+    "different_pixels": 0,
+    "sha256": "7b242e1772c10013152e91406f2268ec855d6d9cb4226bffe74ee43b76d2222a"
+  },
+  {
+    "mockup": "Plan.dc.html",
+    "screenshot": "plans-1440x900.png",
+    "width": 1440,
+    "height": 900,
+    "different_pixels": 0,
+    "sha256": "527cce2f2e99cc85f3005225313a78a10215324b33cd4894df9a346053b994db"
+  },
+  {
+    "mockup": "Phone.dc.html",
+    "screenshot": "board-390x844.png",
+    "width": 390,
+    "height": 844,
+    "different_pixels": 0,
+    "sha256": "2cbf06351ccea38785c68afd963951b186c2e3349431743d6216fc9cab6732e4"
+  }
+]

@@ -351,3 +351,7 @@ mode = "off"
 # objective = "reported_cost_usd" # default: tokens; requires complete reported USD costs
 # invocation_max_usd = 1.0       # installed Claude flag when supported; not a token cap
 # cohorts = [{ definition = "prompt-proxy-v1", category = "fix", complexity = "standard", context = "prompt-small" }]
+
+# Browser UI: forkdeck serve prints a one-use login URL. Always binds to 127.0.0.1.
+[web]
+port = 7420
