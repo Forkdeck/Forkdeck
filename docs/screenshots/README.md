@@ -6,7 +6,7 @@ has no login; no browser response fixtures, sample view patches or interceptors 
 Build and capture from the repository root:
 
 ```sh
-npm run build --prefix web
+pnpm --dir web run build
 cargo build
 node web/scripts/screenshots.mjs
 python3 web/scripts/compare-screenshots.py

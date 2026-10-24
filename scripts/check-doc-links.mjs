@@ -1,4 +1,4 @@
-// Use the frontend's existing Markdown parser; install with npm ci --prefix web.
+// Use the frontend's existing Markdown parser; install with pnpm install --frozen-lockfile --dir web.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';

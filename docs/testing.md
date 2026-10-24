@@ -10,8 +10,8 @@ Run each command directly, without piping its output:
 cargo clippy --all-targets -- -D warnings
 cargo test
 cd web
-npm run check
-npm run build
+pnpm run check
+pnpm run build
 cd ..
 ```
 
@@ -20,7 +20,7 @@ Commit the rebuilt `web/dist` together with frontend changes. Rust stays hand-fo
 ## Documentation links
 
 ```sh
-npm ci --prefix web
+pnpm install --frozen-lockfile --dir web
 node --test tests/doc_links.mjs
 node scripts/check-doc-links.mjs
 ```

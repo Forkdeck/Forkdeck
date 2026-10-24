@@ -19,8 +19,8 @@ Verification:
 cargo clippy --all-targets -- -D warnings
 cargo test
 cd web
-npm run check
-npm run build
+pnpm run check
+pnpm run build
 cd ..
 node tests/web_markdown.mjs
 FORKDECK_WEB_URL=http://127.0.0.1:17420 node tests/web_pages.mjs

@@ -13,9 +13,9 @@ Build the frontend before compiling Rust after UI changes:
 
 ```sh
 cd web
-npm ci
-npm run check
-npm run build
+pnpm install --frozen-lockfile
+pnpm run check
+pnpm run build
 cd ..
 cargo build
 cargo clippy --all-targets -- -D warnings
@@ -25,10 +25,10 @@ cargo test
 `web/dist` is checked in so a Rust-only checkout builds without Node. Both debug and
 release binaries embed the built assets, including local IBM Plex Sans/Mono fonts;
 hashed assets receive immutable caching. Commit rebuilt `web/dist` with source changes.
-No font CDN is used at runtime. `npm run contracts` in `web/` regenerates TypeScript
+No font CDN is used at runtime. `pnpm run contracts` in `web/` regenerates TypeScript
 contracts from `crates/remote-proto`; the Rust protocol tests check for drift.
 
-For frontend development, run `forkdeck serve --demo`, then `cd web && npm run dev` and
+For frontend development, run `forkdeck serve --demo`, then `cd web && pnpm run dev` and
 open http://localhost:5173. Vite proxies `/api` to the daemon on 7420; HMR and frontend
 source stay on Vite.
 

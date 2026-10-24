@@ -1,4 +1,4 @@
-// Generated from crates/remote-proto. Run npm run contracts to refresh.
+// Generated from crates/remote-proto. Run pnpm run contracts to refresh.
 export type BoardProjection = { lane: string, state: string, meta: string, elapsed: string, route: string, stages: Array<number>, log: Array<Array<string>>, warn: string, };
 export type Agent = "Auto" | "Claude" | "Codex";
 export type Status = "Queued" | "Routing" | "Working" | "Reviewing" | "Fixing" | "Publishing" | "Ci" | "Deploying" | "RollingBack" | "Done" | "Failed" | "Cancelled";

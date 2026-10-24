@@ -510,7 +510,7 @@ mod tests {
 pub fn web_contracts() -> String {
     use ts_rs::TS;
     let cfg = ts_rs::Config::default().with_large_int("number");
-    let mut out = String::from("// Generated from crates/remote-proto. Run npm run contracts to refresh.\n");
+    let mut out = String::from("// Generated from crates/remote-proto. Run pnpm run contracts to refresh.\n");
     for declaration in [BoardProjection::decl(&cfg), Agent::decl(&cfg), Status::decl(&cfg), StageState::decl(&cfg), Which::decl(&cfg), JobSummary::decl(&cfg), StageView::decl(&cfg), GateView::decl(&cfg), DecisionView::decl(&cfg), TurnView::decl(&cfg), JobDetail::decl(&cfg), LogLine::decl(&cfg), RepoView::decl(&cfg), Snapshot::decl(&cfg), ServerInfo::decl(&cfg), Event::decl(&cfg)] {
         out.push_str(&format!("export {declaration}\n"));
     }
@@ -521,6 +521,6 @@ pub fn web_contracts() -> String {
 mod web_contract_tests {
     #[test]
     fn typescript_contracts_match_the_shared_dtos() {
-        assert_eq!(super::web_contracts(), include_str!("../../../web/src/contracts.ts"), "run npm run contracts in web/");
+        assert_eq!(super::web_contracts(), include_str!("../../../web/src/contracts.ts"), "run pnpm run contracts in web/");
     }
 }
