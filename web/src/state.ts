@@ -52,6 +52,8 @@ interface Snapshot extends Omit<NativeSnapshot, "jobs"> {
   busy: number;
   router: { kind: string; calls: number; last_ms: number };
   agents: { claude: boolean; codex: boolean; copilot: boolean };
+  /** Board order; a job's `lane` is the id, the label is what the configuration calls it. */
+  lanes: { id: string; label: string }[];
 }
 export const snapshot = signal<Snapshot | null>(null);
 export const details = signal<Record<number, JobDetail>>({});

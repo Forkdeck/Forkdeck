@@ -359,3 +359,12 @@ mode = "off"
 [web]
 bind = "127.0.0.1"
 port = 7420
+
+# What the board calls its lanes. Only the names change; which jobs land in each lane does not.
+[web.lanes]
+queue = "Queue"
+build = "Build"
+review = "Review"
+delivery = "Delivery"
+done = "Done"
+attention = "Attention"

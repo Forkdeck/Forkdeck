@@ -15,6 +15,7 @@ interface Props {
   capacity: number;
   workspace: string;
   router: string;
+  lanes: { id: string; label: string }[];
 }
 export function BoardWide({
   data,
@@ -27,6 +28,7 @@ export function BoardWide({
   capacity,
   workspace,
   router,
+  lanes: laneNames,
 }: Props) {
   const { route } = useLocation();
   const [activeTab, setTab] = useState("Worker");
@@ -50,16 +52,9 @@ export function BoardWide({
     cardClass: `job-card${open && j.id === picked ? " selected" : ""}`,
     pick: () => route(`/jobs/${j.id}`),
   }));
-  const lanes = [
-    "Queue",
-    "Build",
-    "Review",
-    "Delivery",
-    "Done",
-    "Attention",
-  ].map((name) => {
-    const inLane = jobs.filter((j) => j.lane === name);
-    return { name, count: inLane.length, jobs: inLane };
+  const lanes = laneNames.map(({ id, label }) => {
+    const inLane = jobs.filter((j) => j.lane === id);
+    return { name: label, count: inLane.length, jobs: inLane };
   });
   const selected = jobs.find((j) => j.id === picked) ?? jobs[0];
   const sel = { ...selected, stages: selected.stages.map(stageChip) };

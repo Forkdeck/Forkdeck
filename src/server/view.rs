@@ -28,6 +28,8 @@ pub fn snapshot(hub: &Hub, feed: &Feed) -> Value {
     snap["capacity"] = json!(hub.cfg.automation.max_parallel);
     snap["busy"] = json!(st.jobs.iter().filter(|j| j.admitted).count());
     snap["router"] = json!({"kind":st.router.kind,"calls":st.router.calls,"last_ms":st.router.last_ms});
+    // Jobs carry the lane's fixed id; what the board calls each lane is configured.
+    snap["lanes"] = Value::Array(LANES.iter().zip(hub.cfg.web.lanes.in_order()).map(|(id, label)| json!({"id": id, "label": label})).collect());
     snap
 }
 
@@ -213,6 +215,25 @@ mod tests {
         hub.job(72, |j| { j.status = JobStatus::Done; j.finished = Some(std::time::Instant::now()); j.checks = None; });
         let changed = snapshot(&hub, &feed);
         assert_eq!(changed["jobs"].as_array().unwrap().iter().find(|j| j["id"] == 72).unwrap()["state"], "unverified");
+    }
+
+    #[test]
+    fn lane_names_come_from_the_configuration_and_ids_stay_fixed() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.web.lanes.queue = "Backlog".into();
+        cfg.web.lanes.attention = "Needs a human".into();
+        cfg.web.check().unwrap();
+        let hub = Hub::new(cfg, rt.handle().clone());
+        let snap = snapshot(&hub, &Feed::new());
+        let lanes = snap["lanes"].as_array().unwrap();
+        assert_eq!(lanes.len(), 6);
+        assert_eq!(lanes[0], json!({"id": "Queue", "label": "Backlog"}));
+        assert_eq!(lanes[1], json!({"id": "Build", "label": "Build"}));
+        assert_eq!(lanes[5], json!({"id": "Attention", "label": "Needs a human"}));
+        let mut blank = crate::config::Config::default();
+        blank.web.lanes.done = "  ".into();
+        assert!(blank.web.check().unwrap_err().to_string().contains("web.lanes.done"));
     }
 
     #[test]
