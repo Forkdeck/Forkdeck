@@ -1,3 +1,5 @@
+import { Markdown } from "./Markdown";
+import { Navigation } from "./Operational";
 import { Fragment } from "preact";
 import { useState } from "preact/hooks";
 import { tabClass } from "./ui";
@@ -85,6 +87,7 @@ export function PlansView({
       </header>
       <div class="app-body">
         <nav aria-label="Plans" class="plans-sidebar">
+          <Navigation />
           <h2 class="plans-label">Issue plans</h2>
           {allPlans.map((p) => (
             <a
@@ -122,6 +125,20 @@ export function PlansView({
                 class="issue-link"
               >{`Open #${plan.plan.issue?.key ?? ""} on ${plan.plan.provider === "gitlab" ? "GitLab" : "GitHub"}`}</a>
             </div>
+          </div>
+          <div class="revision-flags" aria-label="Revision status">
+            {["reviewed", "accepted", "published"].map((flag) => (
+              <span
+                class={`task-pill ${plan.plan[flag as "reviewed"] === plan.plan.revision ? "tone-merged" : "tone-waiting"}`}
+              >
+                {flag}:{" "}
+                {plan.plan[flag as "reviewed"] === plan.plan.revision
+                  ? "yes"
+                  : plan.plan[flag as "reviewed"] == null
+                    ? "no"
+                    : `r${plan.plan[flag as "reviewed"]}`}
+              </span>
+            ))}
           </div>
           <div role="tablist" class="plan-tabs">
             {tabs.map((label) => (
@@ -200,12 +217,27 @@ export function PlansView({
           )}
           {showDraft && (
             <article class="plan-prose">
-              {plan.plan.draft || "No draft yet."}
+              <Markdown text={plan.draft_display || "No draft yet."} />
             </article>
           )}
           {showReview && (
             <article class="plan-prose">
-              {plan.plan.review || "No review yet."}
+              {plan.plan.review.match(/^VERDICT:\s*(PASS|FAIL)\s*$/im)?.[1] && (
+                <span
+                  class={`task-pill ${/^VERDICT:\s*PASS\s*$/im.test(plan.plan.review) ? "tone-merged" : "tone-you"}`}
+                >
+                  {plan.plan.review
+                    .match(/^VERDICT:\s*(PASS|FAIL)\s*$/im)?.[1]
+                    ?.toUpperCase()}
+                </span>
+              )}
+              {plan.plan.reviewed !== plan.plan.revision && (
+                <p class="mono-muted">
+                  This revision has no recorded review. Any text below is
+                  retained from an earlier review.
+                </p>
+              )}
+              <Markdown text={plan.plan.review || "No review yet."} />
             </article>
           )}
         </main>

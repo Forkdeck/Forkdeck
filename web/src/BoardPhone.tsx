@@ -1,3 +1,4 @@
+import { Navigation } from "./Operational";
 import { Fragment } from "preact";
 import { useState } from "preact/hooks";
 import { useLocation } from "preact-iso";
@@ -47,6 +48,7 @@ export function BoardPhone({
           {live}
         </span>
       </header>
+      <Navigation />
       <div role="tablist" class="phone-tabs">
         {filters.map((f) => (
           <Fragment key={f.label}>

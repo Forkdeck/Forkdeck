@@ -1,9 +1,40 @@
 mod http;
 mod view;
-mod seed;
+pub(crate) mod seed;
+mod operations;
 
 use crate::{orchestrator::Hub, remote::feed::Feed};
 use std::{sync::Arc, time::Duration};
+
+/// An isolated native record source. Normal service reads durable storage; seeding installs an
+/// in-memory source, so sample history can never enter the journal's pending-write queue.
+#[derive(Default)]
+pub(crate) struct ReadRecords {
+    pub entries: Vec<crate::journal::Entry>,
+    pub attempts: Vec<crate::metrics::Attempt>,
+    pub deployments: std::collections::HashMap<String, crate::cicd::Saved>,
+}
+
+impl Hub {
+    pub(crate) fn read_journal(&self, since: i64) -> Result<Vec<crate::journal::Entry>, String> {
+        match self.read_records.lock().unwrap().as_ref() {
+            Some(records) => Ok(records.entries.iter().filter(|e| e.ts >= since).cloned().collect()),
+            None => crate::journal::read(since),
+        }
+    }
+    pub(crate) fn read_metrics(&self, since: i64, entries: &[crate::journal::Entry]) -> Result<crate::metrics::Report, String> {
+        match self.read_records.lock().unwrap().as_ref() {
+            Some(records) => crate::metrics::report_from(records.attempts.clone(),0,since,None,None,entries),
+            None => crate::metrics::report(since,None,None,entries),
+        }
+    }
+    pub(crate) fn read_deployments(&self) -> Result<std::collections::HashMap<String, crate::cicd::Saved>, String> {
+        match self.read_records.lock().unwrap().as_ref() {
+            Some(records) => Ok(records.deployments.clone()),
+            None => crate::cicd::load_saved(),
+        }
+    }
+}
 
 /// One daemon owns this workspace, including its native and browser transports.
 pub fn run(rt: &tokio::runtime::Runtime, hub: Hub) -> anyhow::Result<()> {

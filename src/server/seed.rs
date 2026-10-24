@@ -137,8 +137,8 @@ pub fn seed_demo(hub: &Hub) -> anyhow::Result<()> {
         reviewed: None, accepted: None, published: None, base: None, remote_context: String::new(),
         pending: None, action: crate::planning::Action::Draft, ready: false, build_job: None, graph: None, creation: None,
     };
-    p.draft = "Goal\n\nPersist home records, expose them through the API, and keep peers in sync, delivered as reviewable pull requests that each merge on their own.\n\nSteps\n1. Storage: persisted home records with migrations.\n2. API: endpoint over the records, then the sync worker.\n3. Decision: which storage backend to commit to.".into();
-    p.review = "codex · plan review · revision 3\n\nEvery work task is one reviewable pull request, and each after lists what must merge first. The sync worker correctly waits on the endpoint.\n\nVERDICT: PASS".into();
+    p.draft = "# Home records and sync\n\n## Goal\nPersist home records and expose a stable API before adding peer synchronisation. Each task is an independently reviewable pull request.\n\n## Storage and migration\n- Add a versioned records table with an idempotent migration.\n- Keep existing installations readable during upgrade.\n- Test a second migration run against the same database.\n\n## API contract\n1. Add `GET /homes/:id` over persisted records.\n2. Return a documented 404 for an unknown record.\n3. Add the sync worker after the endpoint has merged.\n\n```rust\nfn find_home(id: HomeId) -> Result<Option<Home>, StoreError>;\n```\n\n## Verification\nRun storage migration tests, API contract tests and an interrupted-sync recovery test. See [SQLite transactions](https://www.sqlite.org/lang_transaction.html).\n\n## Rollout and risks\nShip storage first, then the API. Keep sync disabled until the backend decision is closed. Retain the prior database backup until verification completes.\n".into();
+    p.review = "# Plan review\n\n## Scope and ordering\nEvery work task is one reviewable pull request. The sync worker waits for the endpoint and the backend decision.\n\n## Verification\n- Migration replay is covered.\n- Unknown-record behaviour is explicit.\n- Recovery from interrupted sync is an acceptance check.\n\n## Risk\nKeep the previous database backup until rollout verification passes.\n\nVERDICT: PASS".into();
     p.revision = 3;
     p.reviewed = Some(3);
     p.accepted = Some(3);
@@ -147,6 +147,7 @@ pub fn seed_demo(hub: &Hub) -> anyhow::Result<()> {
     let rows = [("storage", "Storage", "group", None, 26), ("records", "Persisted home records", "work", Some("storage"), 21), ("api", "API", "group", None, 27), ("endpoint", "Home record API", "work", Some("api"), 22), ("sync", "Home sync worker", "work", Some("api"), 24), ("backend", "Pick storage backend", "decision", None, 25), ("docs", "Docs for the home API", "work", None, 28)];
     let tasks: Vec<Value> = rows.iter().map(|(id, title, kind, parent, number)| json!({"id":id,"title":title,"kind":kind,"parent":parent,"number":number,"after":match *id { "api" => vec!["storage"], "sync" | "docs" => vec!["endpoint"], _ => vec![] }})).collect();
     p.graph = Some(serde_json::from_value(json!({"version":1,"tasks":tasks}))?);
+    p.draft.push_str(&format!("\n```forkdeck-tasks\n{}\n```\n", serde_json::to_string(p.graph.as_ref().unwrap())?));
     let rec = crate::history::JobRecord { id: 100, title: "Home records and sync".into(), status: JobStatus::Done, ..Default::default() };
     let mut job = rec.job();
     let graph = crate::taskgraph::read(&crate::taskgraph::render(p.graph.as_ref().unwrap(), &|_| String::new())).map_err(anyhow::Error::msg)?;
@@ -177,6 +178,8 @@ path = "."
         plan.accepted = None;
         plan.published = None;
         plan.graph = None;
+        plan.draft = format!("# {title}\n\n## Scope\nDeliver the next reviewable milestone while preserving existing workflows.\n\n## Implementation\n1. Inspect the current state and shared contracts.\n2. Add the missing projection and user-facing behaviour.\n3. Verify failure paths and restart behaviour.\n\n## Verification\nRun the Rust gates and the browser checks before accepting revision {revision}.\n");
+        plan.review = format!("# Revision {revision} review\n\nThe scope is bounded and the verification covers the affected workflows.\n\nVERDICT: PASS");
         plan.creation = None;
         plan.build_job = build;
         let mut job = crate::history::JobRecord { id, title: title.into(), status: JobStatus::Done, ..Default::default() }.job();
@@ -184,5 +187,73 @@ path = "."
         job.issue_plan = Some(plan);
         st.jobs.push(job);
     }
+    st.repos[0].last_poll = Some(Instant::now() - Duration::from_secs(40));
+    st.repos[0].hold = Some("waiting for the single recovery probe".into());
+    st.repos[0].last_error = Some("Forge rate limit on previous poll; recovered".into());
+    st.team.at = Some(Instant::now() - Duration::from_secs(30));
+    st.team.rows.push(crate::team::Row { repo: "o/semantic-context".into(), kind: "issue", item: "#22".into(), title: "Home record API".into(), url: "https://github.com/o/semantic-context/issues/22".into(), who: "alex".into(), host: "workstation".into(), agent: "claude".into(), stage: "working".into(), pr: String::new(), running_secs: Some(372), idle_secs: Some(20), stale: false, mine: false });
+    for (id, sha, status, outcome, seconds) in [(110,"b41c92e",JobStatus::Failed,"Health check failed; rolled back to a06de31",3600),(111,"c78f0a2",JobStatus::Deploying,"Rollout: 2 of 3 replicas ready",180)] {
+        let mut j = crate::history::JobRecord { id, title: format!("staging: {sha}"), status: JobStatus::Done, ..Default::default() }.job();
+        j.source = crate::state::Source::Deploy { repo_idx: 0, repo: "o/semantic-context".into(), sha: sha.into() };
+        j.status = status;
+        j.created = Instant::now() - Duration::from_secs(seconds);
+        j.finished = (status == JobStatus::Failed).then(|| Instant::now() - Duration::from_secs(3000));
+        j.checks = (status == JobStatus::Failed).then_some(false);
+        j.worker.label = "pipeline".into(); j.worker.state = StageState::Ok;
+        j.worker.push_at("08:20:00", "Build and contract tests passed");
+        j.reviewer.label = if status == JobStatus::Failed { "rollback" } else { "rollout" }.into();
+        j.reviewer.state = if status == JobStatus::Failed { StageState::Ok } else { StageState::Running };
+        j.reviewer.push_at("08:30:00", outcome);
+        j.outcome = outcome.into();
+        st.jobs.push(j);
+    }
+    let mut read_records = super::ReadRecords::default();
+    read_records.deployments.insert(crate::cicd::saved_key(&hub.cfg.repos[0],hub.cfg.repos[0].deploy.as_ref().unwrap()),crate::cicd::Saved { seen: "b41c92e".into(),last_good:"a06de31".into(),in_progress:Some("c78f0a2".into()),tries:1,rolling_back:None });
+    for (id, status, issue, pr, rounds) in [(112,JobStatus::Done,Some(19),true,0),(113,JobStatus::Failed,Some(18),false,2),(114,JobStatus::Cancelled,None,false,0)] {
+        let mut j = crate::history::JobRecord { id, title: "Validate recovery and migration".into(), status: JobStatus::Done, ..Default::default() }.job();
+        if let Some(number) = issue { j.source = crate::state::Source::Issue {repo_idx:0,repo:hub.cfg.repos[0].repo.clone(),number,url:format!("https://github.com/o/semantic-context/issues/{number}")}; }
+        j.status = status;
+        j.finished = Some(Instant::now() - Duration::from_secs(600));
+        j.created = Instant::now() - Duration::from_secs(4800);
+        j.active_started = j.created;
+        j.verdict = (status == JobStatus::Done).then_some(true);
+        j.rounds = rounds;
+        if pr { j.pr_url = Some("https://github.com/o/semantic-context/pull/70".into()); }
+        st.jobs.push(j);
+    }
+    // The journal and attempt reports consume native records, just as normal operation does.
+    let records = st.jobs.iter().filter(|j| j.status.finished() && j.issue_plan.is_none()).map(|j| crate::journal::entry(j,j.status,&j.outcome,0)).collect::<Vec<_>>();
+    read_records.entries = records;
+    let now = crate::journal::now();
+    for (index,e) in read_records.entries.iter_mut().enumerate() {
+        e.job_id = format!("demo-{index}");
+        let id = format!("demo-attempt-{index}");
+        e.attempt_ids = vec![id.clone()];
+        let mut a: crate::metrics::Attempt = serde_json::from_value(json!({"schema":2,"id":id,"job":e.job_id,"turn":e.turn,"parent":null,"role":"worker","retry":e.rounds,"repo":e.repo,"source":e.kind,"tier":"standard","cli":"claude","configured_model":"sonnet","actual_model":"sonnet","effort":"medium","adapter":"demo","started":now-1200,"ended":now-60,"wall_ms":1140000,"status":"done","tokens":{"input":120000,"output":3400,"cost_usd":null},"terminal_usage":true,"decision":null}))?;
+        a.queue = Some(crate::metrics::QueueTiming {admitted_ms:(now-1201)*1000,dispatched_ms:Some((now-1200)*1000),wait_ms:Some(1000),provenance:"process-monotonic-admission-v1".into()});
+        a.cohort = crate::metrics::Cohort {definition:"prompt-proxy-v1".into(),category:"fix".into(),complexity:"standard".into(),context:"prompt-medium".into()};
+        e.claude = crate::journal::Usage {runs:1,tokens_in:120000,tokens_out:3400,cost:0.0};
+        read_records.attempts.push(a);
+    }
+    *hub.read_records.lock().unwrap() = Some(read_records);
     Ok(())
+}
+
+/// Configure the demo before Hub builds repository state. No fixture data lives in views.
+pub fn configure(cfg: &mut crate::config::Config) {
+    let repo: crate::config::RepoCfg = toml::from_str(r#"
+provider = "github"
+repo = "o/semantic-context"
+path = "."
+base = "main"
+jobs_per_day = 12
+[deploy]
+server = "delivery"
+environment = "staging"
+[deploy.status]
+tool = "rollout_status"
+success = "healthy"
+"#).expect("valid demo repository");
+    cfg.repos = vec![repo];
+    cfg.automation.enabled = true;
 }

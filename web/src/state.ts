@@ -19,10 +19,14 @@ export interface PlanView {
   status: string;
   scheduler: string;
   description: string;
+  draft_display: string;
   decision?: { number: number; title: string };
   plan: {
     repo: string;
     revision: number;
+    reviewed?: number | null;
+    accepted?: number | null;
+    published?: number | null;
     issue?: { key: string; url: string };
     provider: string;
     draft: string;

@@ -23,6 +23,10 @@ pub struct Hub {
     pub state: Arc<Mutex<State>>,
     pub cfg: Arc<Config>,
     pub sem: Arc<Semaphore>,
+    /// In-memory native attempt/deployment records, populated only by server demo seeding.
+    pub read_records: Arc<Mutex<Option<crate::server::ReadRecords>>>,
+    /// Loaded configuration location for read-only diagnostics.
+    pub config_path: Arc<Mutex<Option<PathBuf>>>,
     /// Latest scheduler observations, shared by all read-only clients.
     pub schedule_views: Arc<Mutex<std::collections::HashMap<String, crate::schedule::ReadView>>>,
     /// Jobs typed into the prompt share one working directory, so they run one at a time.
@@ -120,6 +124,8 @@ impl Hub {
             state: Arc::new(Mutex::new(st)),
             cfg: Arc::new(cfg),
             sem: Arc::new(Semaphore::new(par)),
+            read_records: Default::default(),
+            config_path: Default::default(),
             schedule_views: Arc::new(Mutex::new(Default::default())),
             lane: Arc::new(tokio::sync::Mutex::new(())),
             http: http.build().unwrap_or_default(),

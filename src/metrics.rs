@@ -367,6 +367,11 @@ pub fn percentile(v: &mut [u64], percent: usize) -> Option<u64> {
 }
 pub fn report(since: i64, role: Option<&str>, repo: Option<&str>, entries: &[crate::journal::Entry]) -> Result<Report, String> {
     let (attempts, bad) = read_at(&root())?;
+    report_from(attempts, bad, since, role, repo, entries)
+}
+
+/// Project already observed attempts without consulting storage (also used by the demo Hub).
+pub fn report_from(attempts: Vec<Attempt>, bad: usize, since: i64, role: Option<&str>, repo: Option<&str>, entries: &[crate::journal::Entry]) -> Result<Report, String> {
     let task_groups = task_groups(&attempts, entries, repo);
     let mut groups: BTreeMap<(String, String, String, String), Vec<Attempt>> = BTreeMap::new();
     for a in attempts.into_iter().filter(|a| a.started >= since && role.is_none_or(|r| a.role == r) && repo.is_none_or(|r| a.repo == r)) {

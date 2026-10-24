@@ -3,6 +3,7 @@ import { useEffect, useState } from "preact/hooks";
 import { LocationProvider, Router, Route } from "preact-iso";
 import { BoardWide } from "./BoardWide";
 import { BoardPhone } from "./BoardPhone";
+import { Operational, Navigation } from "./Operational";
 import { PlansView } from "./PlansView";
 import {
   snapshot,
@@ -39,7 +40,7 @@ function Board({ id }: { id?: string }) {
   if (!snap.jobs.length)
     return (
       <div class="empty">
-        <a href="/plans">Plans</a>
+        <Navigation />
         <h1>No jobs yet</h1>
         <p>Jobs started from Forkdeck appear here live.</p>
       </div>
@@ -70,7 +71,7 @@ function Plans({ id }: { id?: string }) {
   if (!all.length)
     return (
       <div class="empty">
-        <a href="/">← Board</a>
+        <Navigation />
         <h1>Issue plans</h1>
         <p>No issue plans yet.</p>
       </div>
@@ -79,7 +80,7 @@ function Plans({ id }: { id?: string }) {
   if (!plan)
     return (
       <div class="empty">
-        <a href="/plans">Plans</a>
+        <Navigation />
         <h1>Plan not found</h1>
       </div>
     );
@@ -102,6 +103,13 @@ function App() {
         <Route path="/jobs/:id" component={Board} />
         <Route path="/plans" component={Plans} />
         <Route path="/plans/:id" component={Plans} />
+        <Route path="/repos" component={() => <Operational page="repos" />} />
+        <Route
+          path="/deploys"
+          component={() => <Operational page="deploys" />}
+        />
+        <Route path="/stats" component={() => <Operational page="stats" />} />
+        <Route path="/doctor" component={() => <Operational page="doctor" />} />
         <Route default component={Status} />
       </Router>
     </LocationProvider>

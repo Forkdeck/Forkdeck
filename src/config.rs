@@ -1,11 +1,11 @@
 use crate::state::{AgentKind, AgentRef, Provider, Tier};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub const EXAMPLE: &str = include_str!("../forkdeck.example.toml");
 
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub router: RouterCfg,
@@ -26,7 +26,7 @@ pub struct Config {
     pub demo: bool,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct RouterCfg {
     /// "rules" or "jev"
@@ -56,7 +56,7 @@ impl Default for RouterCfg {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct JevCfg {
     pub base_url: String,
@@ -81,7 +81,7 @@ impl Default for JevCfg {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryCfg {
     /// Route a task like earlier ones that went well the way they were, without asking Jev.
@@ -102,7 +102,7 @@ impl Default for MemoryCfg {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct RulesCfg {
     pub claude_keywords: Vec<String>,
@@ -156,7 +156,7 @@ impl Default for RulesCfg {
     }
 }
 
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentsCfg {
     pub claude: AgentCfg,
@@ -177,7 +177,7 @@ pub struct AgentsCfg {
 }
 
 /// `[agents.network]`: the hosts sandboxed workers reach, beyond nothing.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkCfg {
     /// The public package registries of the languages a repository uses (crates.io, npm, PyPI,
@@ -204,7 +204,7 @@ impl AgentsCfg {
 }
 
 /// `[agents.copilot]`: the CLI's own settings plus the profiles it can run.
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct CopilotCfg {
     pub cmd: Option<String>,
@@ -225,7 +225,7 @@ impl CopilotCfg {
 }
 
 /// A set of models copilot runs under one name, used as `copilot:<name>`.
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProfileCfg {
     /// Needed when the model IDs do not say it (claude-* is anthropic, gpt-* and o<digit>* openai).
@@ -235,7 +235,7 @@ pub struct ProfileCfg {
 }
 
 /// A model preference list per tier: the first one the account allows is used.
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct TierLists {
     pub light: Option<OneOrMany>,
@@ -243,7 +243,7 @@ pub struct TierLists {
     pub heavy: Option<OneOrMany>,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(untagged)]
 pub enum OneOrMany {
     One(String),
@@ -338,7 +338,7 @@ impl AgentsCfg {
 }
 
 /// A value per effort tier. A tier left out of the config keeps its built-in value.
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Tiers {
     pub light: Option<String>,
@@ -364,7 +364,7 @@ impl Tiers {
     }
 }
 
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentCfg {
     pub cmd: Option<String>,
@@ -413,7 +413,7 @@ impl AgentCfg {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReviewCfg {
     /// "auto" (router decides), "always" or "never"
@@ -454,7 +454,7 @@ impl Default for ReviewCfg {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutoCfg {
     /// Start with issue polling switched on.
@@ -482,7 +482,7 @@ impl Default for AutoCfg {
 
 /// How much of this machine forkdeck may take. Agent turns mostly wait on a model; checks build
 /// and test, and several at once can starve the machine and fail timing-sensitive tests.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct ResourcesCfg {
     /// Checks that may run at the same time. A job waiting for one lends its agent slot to other
@@ -512,7 +512,7 @@ impl Default for ResourcesCfg {
 }
 
 /// Sharing what this machine is working on with teammates, through comments on the forge.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct TeamCfg {
     /// Claim issues and reviews with a status comment, and refuse what a teammate already holds.
@@ -540,7 +540,7 @@ impl Default for TeamCfg {
 
 /// How much forkdeck may do by itself. Counted over the last 24 hours from the journal, so a
 /// restart does not reset anything. 0 switches a limit off.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsCfg {
     /// Issues and reviews picked up per 24 hours, over all repositories.
@@ -561,7 +561,7 @@ impl Default for LimitsCfg {
 }
 
 /// Control from a paired phone on the local network, over mutual TLS.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct RemoteCfg {
     pub enabled: bool,
@@ -588,7 +588,7 @@ impl Default for RemoteCfg {
 }
 
 /// Notes about each repository that are given to the worker with every issue.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct KnowledgeCfg {
     /// Hand the notes to the worker. Without a notes file this does nothing.
@@ -626,7 +626,7 @@ impl AutoCfg {
 
 /// How to reach one MCP server: a command to run (stdio) or a URL (Streamable HTTP).
 /// `${NAME}` in args, env values, the url and header values is replaced from the environment.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpServerCfg {
     pub command: Option<String>,
@@ -652,7 +652,7 @@ impl Default for McpServerCfg {
 ///
 /// The answer is read as text. `failure`, `pending` and `success` are regular expressions tried in
 /// that order; an answer none of them matches counts as pending. A tool error is a failure.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct CallCfg {
     /// Defaults to the stage's server.
@@ -696,7 +696,7 @@ fn empty_table() -> toml::Value {
 }
 
 /// Watch CI on a pull request forkdeck opened, and send failures back to the worker.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct CiCfg {
     pub server: String,
@@ -718,7 +718,7 @@ pub struct CiCfg {
 }
 
 /// Deploy the base branch when it moves, watch the result, and roll back if it goes wrong.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct DeployCfg {
     pub server: String,
@@ -780,7 +780,7 @@ impl CallCfg {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct RepoCfg {
     /// Hosts the commands a sandboxed worker runs may reach, such as a package registry. None
@@ -1642,7 +1642,7 @@ tool = "rollback"
 
 /// The browser UI. It has no login of its own: on loopback (the default) only this machine reaches
 /// it; on any other address it is open to whoever can reach that address.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebCfg {
     /// Address to listen on: 127.0.0.1 (this machine only), or e.g. 0.0.0.0 on a server.

@@ -993,3 +993,158 @@ select:focus-visible {
   z-index: 1;
   flex-shrink: 0;
 }
+.markdown {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.markdown pre {
+  background: var(--background);
+  padding: 16px;
+  overflow: auto;
+  border-radius: 6px;
+}
+.markdown code {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+}
+.markdown h1,
+.markdown h2,
+.markdown h3 {
+  line-height: 1.3;
+}
+.revision-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.operations-sidebar {
+  flex: 0 0 204px;
+  border-right: 1px solid var(--border);
+  padding: 16px 12px;
+  box-sizing: border-box;
+}
+.operations-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.operations-nav a {
+  padding: 10px 12px;
+  border-radius: 6px;
+  color: var(--muted);
+  text-decoration: none;
+  min-height: 24px;
+}
+.operations-nav a[aria-current="page"],
+.operations-nav a:hover {
+  background: var(--selected);
+  color: var(--accent);
+}
+.operations-main {
+  flex: 1;
+  min-width: 0;
+  padding: 24px 28px;
+  max-width: 1200px;
+}
+.operations-main h1 {
+  font-size: 24px;
+  margin: 0 0 18px;
+}
+.operation-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px 24px;
+  margin-bottom: 18px;
+  overflow-wrap: anywhere;
+}
+.operation-panel h2 {
+  font-size: 17px;
+  margin: 0 0 16px;
+}
+.operation-panel h3 {
+  font-size: 14px;
+  color: var(--muted);
+  margin-top: 24px;
+}
+.fields {
+  margin: 12px 0;
+}
+.fields > div {
+  display: grid;
+  grid-template-columns: minmax(130px, 1fr) minmax(0, 3fr);
+  gap: 16px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--tone-22262f);
+}
+.fields dt {
+  color: var(--muted);
+}
+.fields dd {
+  margin: 0;
+  min-width: 0;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+}
+.record-row {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+.outcome-chart {
+  display: flex;
+  height: 14px;
+  background: var(--card);
+  border-radius: 7px;
+  overflow: hidden;
+}
+.bar.done {
+  background: var(--green);
+}
+.bar.failed {
+  background: var(--red);
+}
+.bar.cancelled {
+  background: var(--muted);
+}
+.metrics-note {
+  color: var(--muted);
+  line-height: 1.6;
+}
+@media (max-width: 699px) {
+  .operations-sidebar {
+    flex: 1 0 100%;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding: 8px;
+  }
+  .operations-nav {
+    flex-direction: row;
+    overflow-x: auto;
+  }
+  .operations-nav a {
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .operations-main {
+    padding: 20px 12px;
+  }
+  .operation-panel {
+    padding: 16px;
+  }
+  .fields > div {
+    grid-template-columns: minmax(90px, 1fr) minmax(0, 2fr);
+    gap: 8px;
+  }
+  .fields .fields > div {
+    display: block;
+  }
+  .stats-grid {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+}

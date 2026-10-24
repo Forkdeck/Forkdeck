@@ -138,36 +138,16 @@ export function BoardWide({
           <a href="/plans" class="nav-link">
             Plans
           </a>
-          <a
-            href="#"
-            aria-disabled="true"
-            title="Coming in the next milestone"
-            class="nav-link"
-          >
+          <a href="/repos" class="nav-link">
             Repositories
           </a>
-          <a
-            href="#"
-            aria-disabled="true"
-            title="Coming in the next milestone"
-            class="nav-link"
-          >
+          <a href="/deploys" class="nav-link">
             Deployments
           </a>
-          <a
-            href="#"
-            aria-disabled="true"
-            title="Coming in the next milestone"
-            class="nav-link"
-          >
+          <a href="/stats" class="nav-link">
             Stats
           </a>
-          <a
-            href="#"
-            aria-disabled="true"
-            title="Coming in the next milestone"
-            class="nav-link"
-          >
+          <a href="/doctor" class="nav-link">
             Doctor & settings
           </a>
           <div class="agent-status">

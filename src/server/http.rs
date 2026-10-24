@@ -55,6 +55,14 @@ async fn plan(State(app): State<App>, Path(id): Path<String>) -> Response {
     match view::plans(&app.hub).into_iter().find(|p| p["id"].as_str().map(str::to_owned).unwrap_or_else(|| p["id"].to_string()) == id) { Some(p) => Json(p).into_response(), None => StatusCode::NOT_FOUND.into_response() }
 }
 
+async fn repos(State(app): State<App>) -> Json<serde_json::Value> { Json(super::operations::repos(&app.hub)) }
+async fn deploys(State(app): State<App>) -> Json<serde_json::Value> { Json(super::operations::deploys(&app.hub)) }
+#[derive(Deserialize)]
+struct StatsWindow { days: Option<u32> }
+async fn stats(State(app): State<App>, Query(window): Query<StatsWindow>) -> Json<serde_json::Value> { Json(super::operations::stats(&app.hub, window.days.unwrap_or(7).clamp(1,3650))) }
+async fn doctor(State(app): State<App>) -> Json<serde_json::Value> { Json(super::operations::doctor(&app.hub).await) }
+async fn settings(State(app): State<App>) -> Json<serde_json::Value> { Json(super::operations::settings(&app.hub)) }
+
 #[derive(Deserialize)]
 struct Cursor { since: Option<u64> }
 
@@ -106,6 +114,11 @@ fn router(app: App) -> Router {
         .route("/v1/plans", get(plans))
         .route("/v1/plans/{id}", get(plan))
         .route("/v1/events", get(events))
+        .route("/v1/repos", get(repos))
+        .route("/v1/deploys", get(deploys))
+        .route("/v1/stats", get(stats))
+        .route("/v1/doctor", get(doctor))
+        .route("/v1/settings", get(settings))
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(middleware::from_fn(no_store));
     Router::new().nest("/api", api)
@@ -139,7 +152,9 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_and_sse_resume_without_a_login() {
-        let hub = Hub::new(crate::config::Config { demo: true, ..Default::default() }, tokio::runtime::Handle::current());
+        let mut cfg = crate::config::Config { demo: true, ..Default::default() };
+        crate::server::seed::configure(&mut cfg);
+        let hub = Hub::new(cfg, tokio::runtime::Handle::current());
         crate::server::seed::seed_demo(&hub).unwrap();
         let feed = Arc::new(Feed::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -166,6 +181,23 @@ mod tests {
         assert!(snap["automation"].is_boolean());
         assert!(snap["agents"].is_object());
         assert!(snap["jobs"].as_array().unwrap().iter().any(|j| j["state"] == "unverified" && j["lane"] == "Attention"));
+        for (endpoint, field) in [("repos", ""), ("deploys", "repositories"), ("stats", "summary"), ("doctor", "checks"), ("settings", "agents")] {
+            let response = client.get(format!("{base}/api/v1/{endpoint}")).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let body: serde_json::Value = response.json().await.unwrap();
+            if field.is_empty() { assert!(!body.as_array().unwrap().is_empty()); }
+            else { assert!(!body[field].is_null(), "{endpoint}: {body}"); }
+            assert_eq!(client.post(format!("{base}/api/v1/{endpoint}")).send().await.unwrap().status(), StatusCode::METHOD_NOT_ALLOWED);
+        }
+        let plans: serde_json::Value = client.get(format!("{base}/api/v1/plans/100")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(plans["plan"]["revision"], 3);
+        assert_eq!(plans["plan"]["reviewed"], 3);
+        assert_eq!(plans["plan"]["accepted"], 3);
+        assert_eq!(plans["plan"]["published"], 3);
+        assert!(plans["plan"]["draft"].as_str().unwrap().contains("forkdeck-tasks"));
+        assert!(!plans["draft_display"].as_str().unwrap().contains("forkdeck-tasks"));
+        assert!(plans["plan"]["review"].as_str().unwrap().contains("VERDICT: PASS"));
         hub.log("test", "resume me");
         feed.tick(&hub);
         let mut response = client.get(format!("{base}/api/v1/events")).header("last-event-id", snap["seq"].to_string()).send().await.unwrap();

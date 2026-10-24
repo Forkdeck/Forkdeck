@@ -335,8 +335,10 @@ fn main() -> anyhow::Result<()> {
             });
         }
     }
+    if cfg.demo && matches!(cli.cmd, Some(Cmd::Serve) | Some(Cmd::Remote { cmd: RemoteCmd::Serve })) { server::seed::configure(&mut cfg); }
     let rt = tokio::runtime::Runtime::new()?;
     let hub = Hub::new(cfg, rt.handle().clone()).with_history();
+    *hub.config_path.lock().unwrap() = cfg_path.clone();
     let cwd = std::env::current_dir()?;
 
     match cli.cmd {

@@ -57,12 +57,12 @@ pub fn plans(hub: &Hub) -> Vec<Value> {
             None => scheduler_summary(v),
         }).unwrap_or_else(|| "No scheduler pass observed yet; forge status unknown".into());
         let decision = tasks.iter().find(|t| t["task"]["kind"] == "decision" && t["status"] == "needs you").map(|t| t["task"].clone());
-        Some(json!({"id": j.id, "title": j.title, "status": plan_state(p), "plan": p, "tasks": tasks, "freshness": observation.map(|v| v.observed_unix), "scheduler": scheduler, "description": plan_description(p), "subtitle": format!("{}{} · r{} · {}", p.repo, p.issue.as_ref().map(|i| format!(" #{}", i.key)).unwrap_or_default(), p.revision, plan_state(p)), "decision": decision}))
+        Some(json!({"id": j.id, "title": j.title, "status": plan_state(p), "plan": p, "draft_display": crate::taskgraph::strip(&p.draft), "tasks": tasks, "freshness": observation.map(|v| v.observed_unix), "scheduler": scheduler, "description": plan_description(p), "subtitle": format!("{}{} · r{} · {}", p.repo, p.issue.as_ref().map(|i| format!(" #{}", i.key)).unwrap_or_default(), p.revision, plan_state(p)), "decision": decision}))
     }).collect();
     for v in observed.values() {
         if st.jobs.iter().any(|j| j.issue_plan.as_ref().is_some_and(|p| p.repo == v.repo && p.issue.as_ref() == Some(&v.issue))) { continue; }
         let decision = v.tasks.iter().find(|t| t["task"]["kind"] == "decision" && t["status"] == "needs you").map(|t| t["task"].clone());
-        plans.push(json!({"id":v.id,"title":v.title,"status":"scheduling","description":"Tasks start when their dependencies have merged.","plan":{"repo":v.repo,"revision":0,"issue":v.issue,"provider":v.issue.provider,"draft":v.draft,"review":"","graph":v.graph},"tasks":task_views(v.tasks.clone(), &st.jobs, &v.repo),"freshness":v.observed_unix,"scheduler":scheduler_summary(v),"decision":decision}));
+        plans.push(json!({"id":v.id,"title":v.title,"status":"scheduling","draft_display":crate::taskgraph::strip(&v.draft),"description":"Tasks start when their dependencies have merged.","plan":{"repo":v.repo,"revision":0,"issue":v.issue,"provider":v.issue.provider,"draft":v.draft,"review":"","graph":v.graph},"tasks":task_views(v.tasks.clone(), &st.jobs, &v.repo),"freshness":v.observed_unix,"scheduler":scheduler_summary(v),"decision":decision}));
     }
     plans
 }
@@ -172,7 +172,9 @@ mod tests {
     #[test]
     fn seeded_jobs_use_the_real_projection_without_a_mode_flag() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut hub = Hub::new(crate::config::Config { demo: true, ..Default::default() }, rt.handle().clone());
+        let mut cfg = crate::config::Config { demo: true, ..Default::default() };
+        crate::server::seed::configure(&mut cfg);
+        let mut hub = Hub::new(cfg, rt.handle().clone());
         crate::server::seed::seed_demo(&hub).unwrap();
         // Opening history is avoided in this unit test; projection cannot depend on this flag.
         std::sync::Arc::make_mut(&mut hub.cfg).demo = false;
