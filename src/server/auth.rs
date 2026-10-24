@@ -21,6 +21,10 @@ pub struct Principal {
     pub role: String,
 }
 
+pub(super) fn can_write(principal: Option<&Principal>) -> bool {
+    principal.is_none_or(|p| matches!(p.role.as_str(), "operator" | "admin"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Extra { #[serde(flatten)] claims: HashMap<String, serde_json::Value> }
 impl AdditionalClaims for Extra {}

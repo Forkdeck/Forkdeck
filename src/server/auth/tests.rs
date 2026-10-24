@@ -268,3 +268,31 @@ async fn viewer_cannot_write_but_operator_and_admin_can() {
         assert_eq!(response.status(),status,"{mode}");
     }
 }
+
+#[tokio::test]
+async fn oidc_viewer_cannot_connect_or_add_a_repository() {
+    let f = Fixture::new("userinfo").await;
+    let cookie = f.session().await;
+    let cfg = toml::from_str(r#"
+[web.forges.github]
+client_id = "fixture"
+client_secret_env = "FORKDECK_FORGE_ROLE_TEST_SECRET"
+redirect_url = "https://forkdeck.example/forges/github/callback"
+"#).unwrap();
+    let hub = crate::orchestrator::Hub::new(cfg,tokio::runtime::Handle::current());
+    let app = crate::server::http::App { hub, feed:Arc::new(crate::remote::feed::Feed::new()),loopback:true,auth:Some(f.auth.clone()),writes:Default::default(),forges:Default::default() };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}",listener.local_addr().unwrap());
+    let router = crate::server::http::router(app);
+    let task = tokio::spawn(async move { axum::serve(listener,router).await.unwrap(); });
+    for path in ["/forges/github/connect","/forges/github/callback?code=x&state=x"] {
+        assert_eq!(f.client.get(format!("{base}{path}")).header(header::COOKIE,&cookie).send().await.unwrap().status(),StatusCode::FORBIDDEN);
+    }
+    let body: Value = f.client.get(format!("{base}/api/v1/forges")).header(header::COOKIE,&cookie).send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["can_add"],false);
+    let response = f.client.post(format!("{base}/api/v1/actions")).header(header::COOKIE,&cookie)
+        .header(header::ORIGIN,"https://forkdeck.example").header("idempotency-key","viewer-add")
+        .json(&json!({"action":"add_repo","picker":"missing","repo":"owner/repo"})).send().await.unwrap();
+    assert_eq!(response.status(),StatusCode::FORBIDDEN);
+    task.abort();
+}

@@ -1,5 +1,6 @@
 pub(crate) mod http;
 mod auth;
+mod forges;
 mod view;
 mod wire;
 pub(crate) mod seed;

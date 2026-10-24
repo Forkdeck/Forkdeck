@@ -929,6 +929,39 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
     Ok((cfg, None))
 }
 
+#[derive(Clone, Serialize)]
+pub struct RepoEntry {
+    pub provider: Provider,
+    pub repo: String,
+    pub path: PathBuf,
+    pub base: String,
+}
+
+/// Append only; editors' existing bytes and ordering are never serialized back out.
+pub fn append_repo(path: &Path, entry: &RepoEntry) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    static APPENDS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = APPENDS.lock().unwrap();
+    let mut file = std::fs::OpenOptions::new().read(true).append(true).open(path)?;
+    let mut previous = Vec::new();
+    file.read_to_end(&mut previous)?;
+    let block = format!("\n[[repos]]\n{}",toml::to_string(entry)?);
+    let result = (|| -> anyhow::Result<()> {
+        file.write_all(block.as_bytes())?;
+        file.sync_all()?;
+        load(Some(path))?;
+        let current = std::fs::read(path)?;
+        anyhow::ensure!(current.starts_with(&previous) && current[previous.len()..].starts_with(block.as_bytes()), "configuration changed during repository append");
+        Ok(())
+    })();
+    if let Err(error) = result {
+        file.set_len(previous.len() as u64)?;
+        file.sync_all()?;
+        return Err(error);
+    }
+    Ok(())
+}
+
 impl RepoCfg {
     /// The repository as `gh -R` takes it: with its host when the clone names one, so `GH_HOST`
     /// cannot send the request to the same name on another server. Same rule as `host_args`.
@@ -1248,6 +1281,12 @@ impl Config {
             }
         }
         self.web.check()?;
+        for (provider, app) in [("github", &self.web.forges.github), ("gitlab", &self.web.forges.gitlab)] {
+            if let Some(app) = app {
+                anyhow::ensure!(!self.demo, "--demo refuses web.forges.{provider}");
+                app.validate(provider)?;
+            }
+        }
         if let Some(oidc) = &self.web.oidc { oidc.validate()?; }
         if self.remote.listen.parse::<std::net::SocketAddr>().is_err() {
             anyhow::bail!("remote.listen must be an address and port such as 0.0.0.0:7443, got {:?}", self.remote.listen);
@@ -1313,6 +1352,90 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_appends_preserve_bytes_serialize_and_restore_on_invalid_edits() {
+        let root = std::env::temp_dir().join(format!("forkdeck-append-{}",crate::metrics::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let initial = "# Keep this comment and spacing.\n[web]\nport = 17435\n";
+        std::fs::write(&path,initial).unwrap();
+        let entry = |name: &str| RepoEntry { provider:Provider::Github,repo:format!("owner/{name}"),path:root.join(name),base:"main".into() };
+        append_repo(&path,&entry("one")).unwrap();
+        let block = format!("\n[[repos]]\nprovider = \"github\"\nrepo = \"owner/one\"\npath = {:?}\nbase = \"main\"\n",root.join("one").to_str().unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),format!("{initial}{block}"));
+        let a = entry("two");
+        let b = entry("three");
+        let paths = [path.clone(),path.clone()];
+        let threads: Vec<_> = [a,b].into_iter().zip(paths).map(|(entry,path)| std::thread::spawn(move || append_repo(&path,&entry).unwrap())).collect();
+        for thread in threads { thread.join().unwrap(); }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(&format!("{initial}{block}")));
+        assert_eq!(text.matches("[[repos]]").count(),3);
+        assert_eq!(load(Some(&path)).unwrap().0.repos.len(),3);
+        let mut invalid = entry("invalid");
+        invalid.base.clear();
+        assert!(append_repo(&path,&invalid).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),text);
+        let edited = format!("{text}\nmanual = [");
+        std::fs::write(&path,&edited).unwrap();
+        assert!(append_repo(&path,&entry("after-edit")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),edited);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn forge_config() -> Config {
+        toml::from_str(r#"
+[web.forges.github]
+client_id = "github-app"
+client_secret_env = "FORKDECK_TEST_FORGE_SECRET"
+redirect_url = "http://127.0.0.1:17435/forges/github/callback"
+[web.forges.gitlab]
+client_id = "gitlab-app"
+client_secret_env = "FORKDECK_TEST_FORGE_SECRET"
+redirect_url = "https://forkdeck.example/forges/gitlab/callback"
+"#).unwrap()
+    }
+
+    #[test]
+    fn forge_loopback_ipv6_endpoints_are_allowed() {
+        std::env::set_var("FORKDECK_TEST_FORGE_SECRET", "test-secret");
+        let mut cfg = forge_config();
+        let app = cfg.web.forges.github.as_mut().unwrap();
+        app.redirect_url = "http://[::1]:17435/forges/github/callback".into();
+        app.base_url = "http://[::1]:9080".into();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn forge_apps_defaults_and_validation() {
+        std::env::set_var("FORKDECK_TEST_FORGE_SECRET", "test-secret");
+        let cfg = forge_config();
+        let github = cfg.web.forges.github.as_ref().unwrap();
+        assert_eq!(github.host, "github.com");
+        assert!(!github.private);
+        assert!(github.clone_dir.is_absolute());
+        assert_eq!(cfg.web.forges.gitlab.as_ref().unwrap().host, "gitlab.com");
+        cfg.validate().unwrap();
+        for (key, value) in [("client_id", ""), ("client_secret_env", "FORKDECK_UNSET_FORGE_SECRET"), ("client_secret_env", "FORKDECK_EMPTY_FORGE_SECRET"), ("redirect_url", "http://public.example/forges/github/callback"), ("redirect_url", "https://public.example/wrong"), ("redirect_url", "not a URL"), ("base_url", "http://public.example"), ("host", "evil.example/path")] {
+            std::env::set_var("FORKDECK_EMPTY_FORGE_SECRET", "");
+            let mut bad = cfg.clone();
+            let app = bad.web.forges.github.as_mut().unwrap();
+            match key {
+                "client_id" => app.client_id = value.into(),
+                "client_secret_env" => app.client_secret_env = value.into(),
+                "redirect_url" => app.redirect_url = value.into(),
+                "base_url" => app.base_url = value.into(),
+                "host" => app.host = value.into(),
+                _ => unreachable!(),
+            }
+            assert!(bad.validate().unwrap_err().to_string().contains(&format!("web.forges.github.{key}")), "{key}: {value}");
+        }
+        let mut demo = cfg;
+        demo.demo = true;
+        assert!(demo.validate().unwrap_err().to_string().contains("--demo"));
+        toml::from_str::<Config>(EXAMPLE).unwrap().validate().unwrap();
+    }
 
     #[test]
     fn gh_is_told_the_host_only_for_github_enterprise() {
@@ -1650,10 +1773,11 @@ pub struct WebCfg {
     pub port: u16,
     pub oidc: Option<OidcCfg>,
     pub lanes: LaneNames,
+    pub forges: ForgeApps,
 }
 
 impl Default for WebCfg {
-    fn default() -> Self { Self { bind: "127.0.0.1".into(), port: 7420, oidc: None, lanes: LaneNames::default() } }
+    fn default() -> Self { Self { bind: "127.0.0.1".into(), port: 7420, oidc: None, lanes: LaneNames::default(), forges: ForgeApps::default() } }
 }
 
 /// What the board's six lanes are called. Which jobs go in which lane does not change.
@@ -1743,6 +1867,69 @@ impl OidcCfg {
         let groups: Vec<_> = self.roles.viewer.iter().chain(&self.roles.operator).chain(&self.roles.admin).collect();
         anyhow::ensure!(!groups.is_empty() && groups.iter().all(|g| !g.trim().is_empty()), "web.oidc.roles must allow at least one nonempty group");
         anyhow::ensure!(self.session_lifetime_secs > 0 && self.session_lifetime_secs <= 365 * 86400, "web.oidc.session_lifetime_secs must be 1..31536000");
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ForgeApps {
+    #[serde(deserialize_with = "github_app")]
+    pub github: Option<ForgeAppCfg>,
+    #[serde(deserialize_with = "gitlab_app")]
+    pub gitlab: Option<ForgeAppCfg>,
+}
+
+fn forge_app<'de, D: serde::Deserializer<'de>>(d: D, host: &str) -> Result<Option<ForgeAppCfg>, D::Error> {
+    let mut app = Option::<ForgeAppCfg>::deserialize(d)?;
+    if let Some(app) = &mut app {
+        if app.host.is_empty() { app.host = host.into(); }
+        app.clone_dir = expand(&app.clone_dir);
+    }
+    Ok(app)
+}
+fn github_app<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<ForgeAppCfg>, D::Error> { forge_app(d, "github.com") }
+fn gitlab_app<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<ForgeAppCfg>, D::Error> { forge_app(d, "gitlab.com") }
+fn forge_clone_dir() -> PathBuf { expand(Path::new("~/.local/share/forkdeck/repos")) }
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ForgeAppCfg {
+    #[serde(default)]
+    pub host: String,
+    pub client_id: String,
+    pub client_secret_env: String,
+    pub redirect_url: String,
+    #[serde(default)]
+    pub private: bool,
+    #[serde(default = "forge_clone_dir")]
+    pub clone_dir: PathBuf,
+    /// Loopback provider override for tests.
+    #[serde(default)]
+    pub base_url: String,
+}
+
+impl ForgeAppCfg {
+    pub fn secret(&self) -> anyhow::Result<String> {
+        std::env::var(&self.client_secret_env).ok().filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("client_secret_env must refer to a nonempty environment variable"))
+    }
+
+    fn validate(&self, provider: &str) -> anyhow::Result<()> {
+        let key = format!("web.forges.{provider}");
+        anyhow::ensure!(!self.client_id.trim().is_empty(), "{key}.client_id is required");
+        anyhow::ensure!(!self.client_secret_env.is_empty() && self.client_secret_env.bytes().enumerate().all(|(i,b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())), "{key}.client_secret_env must name an environment variable");
+        self.secret().map_err(|_| anyhow::anyhow!("{key}.client_secret_env must refer to a nonempty environment variable"))?;
+        let host = reqwest::Url::parse(&format!("https://{}", self.host)).ok();
+        anyhow::ensure!(host.is_some_and(|u| u.host_str().is_some() && u.username().is_empty() && u.password().is_none() && u.port().is_none() && u.path() == "/" && u.query().is_none() && u.fragment().is_none()) && !self.host.contains(['/', '?', '#', '@', ':']), "{key}.host must be a host name");
+        for (name, value) in [("redirect_url", self.redirect_url.as_str()), ("base_url", self.base_url.as_str())] {
+            if name == "base_url" && value.is_empty() { continue; }
+            let u = reqwest::Url::parse(value).map_err(|_| anyhow::anyhow!("{key}.{name} must be a valid URL"))?;
+            let local = u.host_str().is_some_and(|h| h == "localhost" || h.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+            anyhow::ensure!(u.host_str().is_some() && u.username().is_empty() && u.password().is_none() && u.query().is_none() && u.fragment().is_none() && (u.scheme() == "https" || (local && u.scheme() == "http")), "{key}.{name} must be HTTPS (HTTP allowed on loopback)");
+            anyhow::ensure!(if name == "redirect_url" { u.path() == format!("/forges/{provider}/callback") } else { u.path() == "/" }, "{key}.{name} has an invalid path");
+        }
+        anyhow::ensure!(self.clone_dir.is_absolute(), "{key}.clone_dir must be absolute");
         Ok(())
     }
 }
