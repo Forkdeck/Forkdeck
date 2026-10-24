@@ -24,6 +24,8 @@ export function apply(current: Board | null, frame: Frame): {
     return { next: { seq, snapshot, jobs, automation: snapshot.automation() }, resync: false };
   }
   if (!current) return { next: current, resync: false };
+  // A snapshot reloaded mid-stream already holds everything up to its seq.
+  if (seq <= current.seq) return { next: current, resync: false };
   const next = { ...current, seq };
   switch (frame.bodyType()) {
     case Body.JobChanged: {
@@ -79,6 +81,25 @@ export function connect(): () => void {
     delay = Math.min(delay * 2, 10000);
   };
   let needsSnapshot = true;
+  // Slots busy, router counts, agents and jobs that left the daemon arrive in no event; a fresh
+  // snapshot after each burst of frames carries them. One older than the board is dropped.
+  let reloading: ReturnType<typeof setTimeout> | undefined;
+  const reloadSoon = () => {
+    if (reloading) return;
+    reloading = setTimeout(async () => {
+      reloading = undefined;
+      try {
+        const response = await fetch("/api/v1/snapshot", { signal: abort.signal });
+        if (!response.ok) return;
+        const frame = decode(await response.arrayBuffer());
+        if (stopped || frame.bodyType() !== Body.Snapshot) return;
+        if (board.value && Number(frame.seq()) < board.value.seq) return;
+        board.value = apply(board.value, frame).next;
+      } catch {
+        // A lost connection is reported by the socket.
+      }
+    }, 100);
+  };
   const open = () => {
     if (stopped) return;
     const url = new URL("/api/v1/live", location.href);
@@ -99,7 +120,10 @@ export function connect(): () => void {
         const result = apply(board.value, frame);
         board.value = result.next;
         if (result.tail) mergeTail(result.tail);
-        if (frame.bodyType() !== Body.Snapshot) scheduleRefresh();
+        if (frame.bodyType() !== Body.Snapshot) {
+          scheduleRefresh();
+          if (!result.resync) reloadSoon();
+        }
         if (result.resync) {
           needsSnapshot = true;
           socket = undefined;
@@ -142,6 +166,7 @@ export function connect(): () => void {
     stopped = true;
     abort.abort();
     clearTimeout(retry);
+    clearTimeout(reloading);
     stopRefresh();
     socket?.close();
     connection.value = "Disconnected";

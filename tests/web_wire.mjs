@@ -62,6 +62,15 @@ test('resync preserves board even when daemon sequence has gone backwards', () =
   assert.equal(restarted.seq, 2);
   assert.equal(restarted.jobs.length, 2);
 });
+test('frames already folded into a newer snapshot are ignored', () => {
+  const current = apply(null, snapshot(12)).next;
+  const stale = apply(current, frame(Body.JobChanged, 12, b => JobChanged.createJobChanged(b, job(b, 72, 'done'))));
+  assert.equal(stale.next, current);
+  assert.equal(stale.next.jobs[1].state(), 'working');
+  assert.equal(stale.tail, undefined);
+  const fresh = apply(current, frame(Body.JobChanged, 13, b => JobChanged.createJobChanged(b, job(b, 72, 'done')))).next;
+  assert.equal(fresh.jobs[1].state(), 'done');
+});
 test('tail returns detail data and advances resume cursor', () => {
   const result = apply(initial(), frame(Body.Tail, 10, b => Tail.createTail(b, 72, true, 500n, Tail.createLinesVector(b, [b.createString('line — 🚀'), b.createString('next')]))));
   assert.deepEqual(result.tail, { id:72, worker:true, from:500, lines:['line — 🚀','next'] });
@@ -125,14 +134,17 @@ test('socket retries resume, back off, reload on Resync and stop cleanly', async
     assert.equal(sockets.length, 1);
     t.mock.timers.tick(1);
     assert.match(sockets[1].url, /since=8$/);
-    assert.equal(requests.filter(p => p === '/api/v1/snapshot').length, 1);
+    // The Automation frame scheduled a snapshot reload; the older snapshot it got (seq 2) was dropped.
+    assert.equal(requests.filter(p => p === '/api/v1/snapshot').length, 2);
+    assert.equal(board.value.seq, 8);
+    assert.equal(board.value.automation, false);
     sockets[1].onopen();
     sockets[1].message(frame(Body.Resync, 1, b => { Resync.startResync(b); return Resync.endResync(b); }));
     await settle();
     assert.equal(sockets[1].closed, true);
     assert.match(sockets[2].url, /since=2$/);
     assert.equal(board.value.seq, 2);
-    assert.equal(requests.filter(p => p === '/api/v1/snapshot').length, 2);
+    assert.equal(requests.filter(p => p === '/api/v1/snapshot').length, 3);
     stop();
     t.mock.timers.tick(10000);
     assert.equal(sockets.length, 3);
