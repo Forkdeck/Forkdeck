@@ -789,12 +789,18 @@ fn log_panel(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+pub(crate) fn prompt_title(j: &Job) -> String {
+    match j.status {
+        JobStatus::Choosing => format!("Choose for #{} · a number, or your own approach · F5 options · Ctrl-T new task", j.id),
+        JobStatus::Interrupted => format!("Reply to #{} · Enter with nothing typed resumes it · Ctrl-T new task", j.id),
+        s if !s.finished() => format!("Message #{} · {} queued · Enter to queue · Ctrl-S now · Ctrl-T new task", j.id, j.inbox.len()),
+        _ => format!("Reply to #{} · {} queued · Enter to send · Ctrl-T new task", j.id, j.inbox.len()),
+    }
+}
+
 fn prompt(f: &mut Frame, area: Rect, ui: &Ui, target: Option<&Job>) {
     let title = match target {
-        Some(j) if j.status == JobStatus::Choosing => format!("Choose for #{} · a number, or your own approach · F5 options · Ctrl-T new task", j.id),
-        Some(j) if j.status == JobStatus::Interrupted => format!("Reply to #{} · Enter with nothing typed resumes it · Ctrl-T new task", j.id),
-        Some(j) if !j.status.finished() => format!("Message #{} · {} queued · Enter to queue · Ctrl-S now · Ctrl-T new task", j.id, j.inbox.len()),
-        Some(j) => format!("Reply to #{} · {} queued · Enter to send · Ctrl-T new task", j.id, j.inbox.len()),
+        Some(j) => prompt_title(j),
         None => format!("{} · {} · Enter to start", if ui.plan_next { "New task, planned first" } else { "Quick task" }, ui.forced.as_ref().map(|a| a.name()).unwrap_or_else(|| "auto".into())),
     };
     let room = area.width.saturating_sub(5) as usize;
