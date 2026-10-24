@@ -1,4 +1,3 @@
-mod auth;
 mod http;
 mod view;
 mod seed;

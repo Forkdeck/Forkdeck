@@ -1135,18 +1135,22 @@ normal job shutdown and persistence.
 
 ```sh
 forkdeck serve --demo
-# Open the one-use login URL printed on stdout, within two minutes.
+# Forkdeck web UI: http://127.0.0.1:7420/
 ```
 
-The login code is exchanged by POST for a 12-hour HttpOnly, SameSite=Strict session
-cookie. The daemon holds only hashes of codes and session tokens; restarting it
-revokes sessions and prints a fresh login URL. Each `/api` route requires a session.
-No CORS is enabled. HTTP always binds to loopback; configure its port with:
+There is no login. By default the UI listens on 127.0.0.1, so only this machine can open
+it, and requests naming any other host are refused, which stops another site's page from
+reaching it through DNS rebinding. On a server, set the address to listen on:
 
 ```toml
 [web]
+bind = "0.0.0.0"   # default 127.0.0.1
 port = 7420
 ```
+
+Anyone who can reach that address sees every job, log and plan, and `forkdeck serve`
+prints a warning saying so. Keep it behind a firewall, a VPN, or a reverse proxy that
+does the authentication. No CORS is enabled.
 
 The board, job details (`/jobs/:id`), plans (`/plans`, `/plans/:id`), log tabs, and
 phone filters are live. SSE uses the native feed's sequence numbers, bounded replay,
@@ -1175,14 +1179,12 @@ hashed assets receive immutable caching. Commit rebuilt `web/dist` with source c
 No font CDN is used at runtime. `npm run contracts` in `web/` regenerates TypeScript
 contracts from `crates/remote-proto`; the Rust protocol tests check for drift.
 
-For frontend development, run `forkdeck serve --demo`, then `cd web && npm run dev`.
-Open its printed login URL through the Vite origin instead (replace `7420` with `5173`)
-so the cookie belongs to that origin. Vite proxies `/api` and `/auth` to the daemon on
-7420; HMR and frontend source stay on Vite. The code is still one-use, so use a fresh
-daemon if it has already been exchanged.
+For frontend development, run `forkdeck serve --demo`, then `cd web && npm run dev` and
+open http://localhost:5173. Vite proxies `/api` to the daemon on 7420; HMR and frontend
+source stay on Vite.
 
 After building both frontend and binary, `node web/scripts/screenshots.mjs` starts
-temporary servers on ephemeral ports and authenticates Chromium. It captures native
+temporary servers on ephemeral ports and opens them in Chromium. It captures native
 seeded jobs with `forkdeck serve --demo`, then regular `forkdeck serve` against a
 private copy of `~/.local/state/forkdeck/forkdeck.db` and its WAL in a temporary
 `XDG_STATE_HOME`. The real-history capture disables agent executables and issue

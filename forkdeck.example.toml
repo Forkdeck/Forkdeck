@@ -352,6 +352,9 @@ mode = "off"
 # invocation_max_usd = 1.0       # installed Claude flag when supported; not a token cap
 # cohorts = [{ definition = "prompt-proxy-v1", category = "fix", complexity = "standard", context = "prompt-small" }]
 
-# Browser UI: forkdeck serve prints a one-use login URL. Always binds to 127.0.0.1.
+# Browser UI served by forkdeck serve. It has no login: on 127.0.0.1 only this machine can
+# open it. On a server, bind 0.0.0.0 and keep it behind a firewall, VPN or an authenticating
+# reverse proxy; anyone who reaches the port sees every job, log and plan.
 [web]
+bind = "127.0.0.1"
 port = 7420

@@ -60,8 +60,6 @@ let selected: number | undefined;
 
 async function read<T>(path: string): Promise<T> {
   const response = await fetch("/api/v1/" + path);
-  if (response.status === 401)
-    throw new Error("Open the one-use login URL printed by forkdeck serve.");
   if (!response.ok)
     throw new Error(`Could not load ${path} (${response.status})`);
   return response.json();

@@ -1247,6 +1247,7 @@ impl Config {
                 }
             }
         }
+        self.web.address()?;
         if self.remote.listen.parse::<std::net::SocketAddr>().is_err() {
             anyhow::bail!("remote.listen must be an address and port such as 0.0.0.0:7443, got {:?}", self.remote.listen);
         }
@@ -1639,11 +1640,24 @@ tool = "rollback"
     }
 }
 
-/// Browser HTTP stays on loopback; phone networking is configured separately.
+/// The browser UI. It has no login of its own: on loopback (the default) only this machine reaches
+/// it; on any other address it is open to whoever can reach that address.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
-pub struct WebCfg { pub port: u16 }
+pub struct WebCfg {
+    /// Address to listen on: 127.0.0.1 (this machine only), or e.g. 0.0.0.0 on a server.
+    pub bind: String,
+    pub port: u16,
+}
 
 impl Default for WebCfg {
-    fn default() -> Self { Self { port: 7420 } }
+    fn default() -> Self { Self { bind: "127.0.0.1".into(), port: 7420 } }
+}
+
+impl WebCfg {
+    pub fn address(&self) -> anyhow::Result<std::net::SocketAddr> {
+        let ip: std::net::IpAddr = self.bind.trim().trim_start_matches('[').trim_end_matches(']').parse()
+            .map_err(|_| anyhow::anyhow!("web.bind must be an IP address such as 127.0.0.1 or 0.0.0.0, got {:?}", self.bind))?;
+        Ok(std::net::SocketAddr::new(ip, self.port))
+    }
 }

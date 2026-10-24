@@ -1,5 +1,5 @@
 // Build web/ and the Rust binary first. Capture native seeded jobs and a private
-// copy of real history through the same authenticated serve endpoints.
+// copy of real history through the same serve endpoints.
 import { chromium } from "@playwright/test";
 import fs from "node:fs";
 import os from "node:os";
@@ -168,7 +168,7 @@ cmd = "/unavailable-for-history-capture"
   try {
     const login = await new Promise((resolve, reject) => {
       const timeout = setTimeout(
-        () => reject(new Error("No login URL")),
+        () => reject(new Error("No server address")),
         30000,
       );
       server.once("exit", (code) => {
@@ -178,7 +178,7 @@ cmd = "/unavailable-for-history-capture"
       server.stdout.on("data", (data) => {
         text += data;
         const match = text.match(
-          /http:\/\/127\.0\.0\.1:\d+\/auth\/login\?code=[a-f0-9]+/,
+          /http:\/\/127\.0\.0\.1:\d+\//,
         );
         if (match) {
           clearTimeout(timeout);
@@ -192,8 +192,7 @@ cmd = "/unavailable-for-history-capture"
     });
     const errors = [];
     page.on("pageerror", (e) => errors.push(String(e)));
-    await page.goto(login);
-    await page.waitForURL(base + "/");
+    await page.goto(base + "/");
     await page.waitForSelector(".job-card");
     const snapshot = await page.evaluate(async () =>
       (await fetch("/api/v1/snapshot")).json(),

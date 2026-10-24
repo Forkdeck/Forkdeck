@@ -21,8 +21,8 @@ fn serve_and_legacy_alias_own_the_workspace_and_stop_on_sigterm() {
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) { let _ = tx.send(line); }
         });
-        let line = rx.recv_timeout(Duration::from_secs(15)).expect("server prints login URL");
-        assert!(line.contains("http://127.0.0.1:") && line.contains("/auth/login?code="), "{line}");
+        let line = rx.recv_timeout(Duration::from_secs(15)).expect("server prints its address");
+        assert!(line.starts_with("Forkdeck web UI: http://127.0.0.1:") && !line.contains("code="), "{line}");
         let second = Command::new(BIN).args(["--demo", "--config"]).arg(&config).arg("serve").current_dir(&dir).output().unwrap();
         assert!(!second.status.success());
         assert!(String::from_utf8_lossy(&second.stderr).contains("locked"));

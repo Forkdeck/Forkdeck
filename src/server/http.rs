@@ -1,54 +1,48 @@
-use super::{auth::Auth, view};
+use super::view;
 use crate::{orchestrator::Hub, remote::feed::{Feed, Numbered}};
 use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
-    response::{sse::{Event, KeepAlive, Sse}, Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
-    Form, Json, Router,
+    response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
+    routing::get,
+    Json, Router,
 };
 use serde::Deserialize;
-use std::{collections::VecDeque, convert::Infallible, sync::{Arc, Mutex}, time::Duration};
+use std::{collections::VecDeque, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
+/// There is no login: whoever reaches the address sees everything. `loopback` says the server
+/// listens on this machine only, where the one remaining risk is another site's page reaching it.
 #[derive(Clone)]
-struct App { hub: Hub, feed: Arc<Feed>, auth: Arc<Mutex<Auth>> }
+struct App { hub: Hub, feed: Arc<Feed>, loopback: bool }
 
 #[derive(rust_embed::RustEmbed)]
 #[folder = "web/dist/"]
 struct Assets;
 
-fn session(headers: &HeaderMap) -> Option<&str> {
-    headers.get(header::COOKIE)?.to_str().ok()?.split(';').find_map(|part| part.trim().strip_prefix("forkdeck_session="))
+/// On a loopback address, a page from another site can still reach the server by pointing its own
+/// name at 127.0.0.1 (DNS rebinding); its requests then carry that name as their Host. Only the
+/// machine's own names are answered.
+fn local_host(host: &str) -> bool {
+    let port = |p: &str| p.is_empty() || p.strip_prefix(':').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let name = match host.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') { Some((name, after)) if port(after) => name, _ => return false },
+        None => host.rsplit_once(':').map_or(host, |(name, p)| if port(&format!(":{p}")) { name } else { host }),
+    };
+    name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-async fn authenticated(State(app): State<App>, req: Request<Body>, next: Next) -> Response {
-    if !session(req.headers()).is_some_and(|s| app.auth.lock().unwrap().valid(s)) {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Login using the URL printed by forkdeck serve"}))).into_response();
+async fn same_machine(State(app): State<App>, req: Request<Body>, next: Next) -> Response {
+    if app.loopback && !req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).is_some_and(local_host) {
+        return StatusCode::FORBIDDEN.into_response();
     }
+    next.run(req).await
+}
+
+async fn no_store(req: Request<Body>, next: Next) -> Response {
     let mut response = next.run(req).await;
     response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    response
-}
-
-#[derive(Deserialize)]
-struct Login { code: String }
-
-async fn login(Query(login): Query<Login>) -> Html<String> {
-    // Only hex tokens enter markup. Exchanging is a POST, never a state-changing GET.
-    let code = if login.code.len() == 64 && login.code.bytes().all(|b| b.is_ascii_hexdigit()) { login.code } else { String::new() };
-    Html(format!("<!doctype html><html lang=\"en\"><head><meta name=\"referrer\" content=\"same-origin\"><title>Forkdeck login</title></head><body><form action=\"/auth/exchange\" method=\"post\"><input type=\"hidden\" name=\"code\" value=\"{code}\"><button>Open Forkdeck</button></form><script src=\"/auth/login.js\"></script></body></html>"))
-}
-
-async fn exchange(State(app): State<App>, headers: HeaderMap, Form(login): Form<Login>) -> Response {
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        let expected = headers.get(header::HOST).and_then(|h| h.to_str().ok()).map(|h| format!("http://{h}"));
-        if origin.to_str().ok() != expected.as_deref() { return StatusCode::FORBIDDEN.into_response(); }
-    }
-    let Some(token) = app.auth.lock().unwrap().exchange(&login.code) else { return StatusCode::UNAUTHORIZED.into_response() };
-    let mut response = Redirect::to("/").into_response();
-    response.headers_mut().insert(header::SET_COOKIE, format!("forkdeck_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200").parse().unwrap());
     response
 }
 
@@ -67,9 +61,7 @@ struct Cursor { since: Option<u64> }
 async fn events(State(app): State<App>, Query(cursor): Query<Cursor>, headers: HeaderMap) -> impl IntoResponse {
     let since = headers.get("last-event-id").and_then(|s| s.to_str().ok()).and_then(|s| s.parse().ok()).or(cursor.since).unwrap_or(0);
     let (backlog, rx) = app.feed.subscribe(since);
-    let token = session(&headers).unwrap_or_default().to_string();
-    let stream = futures::stream::unfold((VecDeque::from(backlog), rx, app, token), |(mut queue, mut rx, app, token)| async move {
-        if !app.auth.lock().unwrap().valid(&token) { return None; }
+    let stream = futures::stream::unfold((VecDeque::from(backlog), rx), |(mut queue, mut rx)| async move {
         let item: Option<Numbered> = if let Some(e) = queue.pop_front() { Some(e) } else {
             match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
                 Ok(Ok(e)) => Some(e),
@@ -82,7 +74,7 @@ async fn events(State(app): State<App>, Query(cursor): Query<Cursor>, headers: H
             Some((seq, event)) => Event::default().id(seq.to_string()).json_data(event).unwrap(),
             None => Event::default().event("freshness").data("{}"),
         };
-        Some((Ok::<_, Infallible>(event), (queue, rx, app, token)))
+        Some((Ok::<_, Infallible>(event), (queue, rx)))
     });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10)).text("heartbeat"))
 }
@@ -115,19 +107,23 @@ fn router(app: App) -> Router {
         .route("/v1/plans/{id}", get(plan))
         .route("/v1/events", get(events))
         .fallback(|| async { StatusCode::NOT_FOUND })
-        .layer(middleware::from_fn_with_state(app.clone(), authenticated));
+        .layer(middleware::from_fn(no_store));
     Router::new().nest("/api", api)
-        .route("/auth/login", get(login))
-        .route("/auth/login.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript")], "const data=new URLSearchParams(new FormData(document.querySelector('form')));history.replaceState(null,'','/auth/login');fetch('/auth/exchange',{method:'POST',body:data}).then(r=>{if(r.ok)location.replace('/');else document.body.textContent='Login expired or already used. Restart forkdeck serve for a new URL.'});") }))
-        .route("/auth/exchange", post(exchange))
-        .fallback(assets).with_state(app).layer(middleware::from_fn(security))
+        .fallback(assets)
+        .layer(middleware::from_fn_with_state(app.clone(), same_machine))
+        .with_state(app).layer(middleware::from_fn(security))
 }
 
 pub async fn serve(hub: Hub, feed: Arc<Feed>) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, hub.cfg.web.port)).await?;
-    let (auth, code) = Auth::new()?;
-    println!("Open Forkdeck (one use, expires in 2 minutes): http://{}/auth/login?code={}", listener.local_addr()?, code);
-    axum::serve(listener, router(App { hub, feed, auth: Arc::new(Mutex::new(auth)) })).await?;
+    let at: SocketAddr = hub.cfg.web.address()?;
+    let listener = tokio::net::TcpListener::bind(at).await?;
+    let local = listener.local_addr()?;
+    let loopback = local.ip().is_loopback();
+    println!("Forkdeck web UI: http://{local}/");
+    if !loopback {
+        eprintln!("warning: the web UI has no login and listens on {local}: anyone who can reach that address sees every job, log and plan. Keep it behind a firewall, VPN or an authenticating reverse proxy.");
+    }
+    axum::serve(listener, router(App { hub, feed, loopback })).await?;
     Ok(())
 }
 
@@ -135,16 +131,20 @@ pub async fn serve(hub: Hub, feed: Arc<Feed>) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_this_machines_names_count_as_local() {
+        for host in ["127.0.0.1:7420", "localhost:7420", "LOCALHOST", "[::1]:7420", "127.0.0.2"] { assert!(local_host(host), "{host}"); }
+        for host in ["evil.example:7420", "evil.example", "10.0.0.5:7420", "localhost.evil.example", "[::1].evil:80"] { assert!(!local_host(host), "{host}"); }
+    }
+
     #[tokio::test]
-    async fn authenticated_snapshot_and_sse_resume() {
+    async fn snapshot_and_sse_resume_without_a_login() {
         let hub = Hub::new(crate::config::Config { demo: true, ..Default::default() }, tokio::runtime::Handle::current());
         crate::server::seed::seed_demo(&hub).unwrap();
         let feed = Arc::new(Feed::new());
-        let (auth, code) = Auth::new().unwrap();
-        let auth = Arc::new(Mutex::new(auth));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let app = router(App { hub: hub.clone(), feed: feed.clone(), auth });
+        let app = router(App { hub: hub.clone(), feed: feed.clone(), loopback: true });
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
         let index = client.get(format!("{base}/")).send().await.unwrap();
@@ -155,26 +155,24 @@ mod tests {
         let asset = client.get(format!("{base}/{asset}")).send().await.unwrap();
         assert_eq!(asset.headers()[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
         assert!(!asset.headers().contains_key("access-control-allow-origin"));
-        for path in ["snapshot", "jobs/72", "plans", "plans/1", "events"] {
-            assert_eq!(client.get(format!("{base}/api/v1/{path}")).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        // A page from another site that rebinds its own name to 127.0.0.1 is refused.
+        for path in ["", "api/v1/snapshot", "api/v1/events"] {
+            assert_eq!(client.get(format!("{base}/{path}")).header(header::HOST, "evil.example").send().await.unwrap().status(), StatusCode::FORBIDDEN);
         }
-        assert_eq!(client.post(format!("{base}/auth/exchange")).header(header::ORIGIN, "https://elsewhere.example").form(&[("code", &code)]).send().await.unwrap().status(), StatusCode::FORBIDDEN);
-        let response = client.post(format!("{base}/auth/exchange")).form(&[("code", &code)]).send().await.unwrap();
-        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
-        assert!(response.headers()[header::SET_COOKIE].to_str().unwrap().contains("HttpOnly; SameSite=Strict"));
-        assert_eq!(client.post(format!("{base}/auth/exchange")).form(&[("code", &code)]).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
-        let snap: serde_json::Value = client.get(format!("{base}/api/v1/snapshot")).header(header::COOKIE, &cookie).send().await.unwrap().json().await.unwrap();
+        let snapshot = client.get(format!("{base}/api/v1/snapshot")).send().await.unwrap();
+        assert_eq!(snapshot.headers()[header::CACHE_CONTROL], "no-store");
+        let snap: serde_json::Value = snapshot.json().await.unwrap();
         assert!(snap["seq"].is_u64());
         assert!(snap["automation"].is_boolean());
         assert!(snap["agents"].is_object());
         assert!(snap["jobs"].as_array().unwrap().iter().any(|j| j["state"] == "unverified" && j["lane"] == "Attention"));
         hub.log("test", "resume me");
         feed.tick(&hub);
-        let mut response = client.get(format!("{base}/api/v1/events")).header(header::COOKIE, &cookie).header("last-event-id", snap["seq"].to_string()).send().await.unwrap();
+        let mut response = client.get(format!("{base}/api/v1/events")).header("last-event-id", snap["seq"].to_string()).send().await.unwrap();
         let chunk = tokio::time::timeout(Duration::from_secs(2), response.chunk()).await.unwrap().unwrap().unwrap();
         let chunk = String::from_utf8(chunk.to_vec()).unwrap();
         assert!(chunk.contains("id:") && chunk.contains("resume me"), "{chunk}");
-        let mut response = client.get(format!("{base}/api/v1/events")).header(header::COOKIE, &cookie).header("last-event-id", "1").send().await.unwrap();
+        let mut response = client.get(format!("{base}/api/v1/events")).header("last-event-id", "1").send().await.unwrap();
         let chunk = response.chunk().await.unwrap().unwrap();
         assert!(String::from_utf8(chunk.to_vec()).unwrap().contains("Resync"));
         server.abort();
