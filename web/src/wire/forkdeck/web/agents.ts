@@ -4,6 +4,9 @@
 
 import * as flatbuffers from 'flatbuffers';
 
+import { AgentWord } from '../../forkdeck/web/agent-word.ts';
+
+
 export class Agents {
   bb: flatbuffers.ByteBuffer|null = null;
   bb_pos = 0;
@@ -37,8 +40,18 @@ copilot():boolean {
   return offset ? !!this.bb!.readInt8(this.bb_pos + offset) : false;
 }
 
+words(index: number, obj?:AgentWord):AgentWord|null {
+  const offset = this.bb!.__offset(this.bb_pos, 10);
+  return offset ? (obj || new AgentWord()).__init(this.bb!.__indirect(this.bb!.__vector(this.bb_pos + offset) + index * 4), this.bb!) : null;
+}
+
+wordsLength():number {
+  const offset = this.bb!.__offset(this.bb_pos, 10);
+  return offset ? this.bb!.__vector_len(this.bb_pos + offset) : 0;
+}
+
 static startAgents(builder:flatbuffers.Builder) {
-  builder.startObject(3);
+  builder.startObject(4);
 }
 
 static addClaude(builder:flatbuffers.Builder, claude:boolean) {
@@ -53,16 +66,33 @@ static addCopilot(builder:flatbuffers.Builder, copilot:boolean) {
   builder.addFieldInt8(2, +copilot, +false);
 }
 
+static addWords(builder:flatbuffers.Builder, wordsOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(3, wordsOffset, 0);
+}
+
+static createWordsVector(builder:flatbuffers.Builder, data:flatbuffers.Offset[]):flatbuffers.Offset {
+  builder.startVector(4, data.length, 4);
+  for (let i = data.length - 1; i >= 0; i--) {
+    builder.addOffset(data[i]!);
+  }
+  return builder.endVector();
+}
+
+static startWordsVector(builder:flatbuffers.Builder, numElems:number) {
+  builder.startVector(4, numElems, 4);
+}
+
 static endAgents(builder:flatbuffers.Builder):flatbuffers.Offset {
   const offset = builder.endObject();
   return offset;
 }
 
-static createAgents(builder:flatbuffers.Builder, claude:boolean, codex:boolean, copilot:boolean):flatbuffers.Offset {
+static createAgents(builder:flatbuffers.Builder, claude:boolean, codex:boolean, copilot:boolean, wordsOffset:flatbuffers.Offset):flatbuffers.Offset {
   Agents.startAgents(builder);
   Agents.addClaude(builder, claude);
   Agents.addCodex(builder, codex);
   Agents.addCopilot(builder, copilot);
+  Agents.addWords(builder, wordsOffset);
   return Agents.endAgents(builder);
 }
 }

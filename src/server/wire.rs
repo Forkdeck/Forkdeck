@@ -22,7 +22,7 @@ fn job<'a>(b: &mut flatbuffers::FlatBufferBuilder<'a>, id: u32, title: &str, p: 
         fb::LogEntry::create(b, &fb::LogEntryArgs { time: Some(time), who: Some(who), text: Some(text) })
     }).collect();
     let log = b.create_vector(&log);
-    fb::Job::create(b, &fb::JobArgs { id, title: Some(title), lane: Some(lane), state: Some(state), meta: Some(meta), elapsed: Some(elapsed), route: Some(route), stages: Some(stages), log: Some(log), warn: Some(warn) })
+    fb::Job::create(b, &fb::JobArgs { id, title: Some(title), lane: Some(lane), state: Some(state), meta: Some(meta), elapsed: Some(elapsed), route: Some(route), stages: Some(stages), log: Some(log), warn: Some(warn), ..Default::default() })
 }
 
 pub fn board(hub: &Hub, feed: &Feed) -> Vec<u8> {
@@ -49,9 +49,9 @@ pub fn board(hub: &Hub, feed: &Feed) -> Vec<u8> {
     let workspace = std::env::current_dir().ok().and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned())).unwrap_or_default();
     let workspace = b.create_string(&workspace);
     let kind = b.create_string(&st.router.kind);
-    let router = fb::Router::create(&mut b, &fb::RouterArgs { kind: Some(kind), calls: st.router.calls.into(), last_ms: st.router.last_ms as u64 });
-    let agents = fb::Agents::create(&mut b, &fb::AgentsArgs { claude: st.agent_ready(crate::state::AgentKind::Claude), codex: st.agent_ready(crate::state::AgentKind::Codex), copilot: st.copilot_usable() });
-    let snapshot = fb::Snapshot::create(&mut b, &fb::SnapshotArgs { automation: native.automation, workspace: Some(workspace), capacity: hub.cfg.automation.max_parallel as u32, busy: st.jobs.iter().filter(|j| j.admitted).count() as u32, router: Some(router), agents: Some(agents), lanes: Some(lanes), jobs: Some(jobs), workspaces: Some(workspaces) });
+    let router = fb::Router::create(&mut b, &fb::RouterArgs { kind: Some(kind), calls: st.router.calls.into(), last_ms: st.router.last_ms as u64, ..Default::default() });
+    let agents = fb::Agents::create(&mut b, &fb::AgentsArgs { claude: st.agent_ready(crate::state::AgentKind::Claude), codex: st.agent_ready(crate::state::AgentKind::Codex), copilot: st.copilot_usable(), ..Default::default() });
+    let snapshot = fb::Snapshot::create(&mut b, &fb::SnapshotArgs { automation: native.automation, workspace: Some(workspace), capacity: hub.cfg.automation.max_parallel as u32, busy: st.jobs.iter().filter(|j| j.admitted).count() as u32, router: Some(router), agents: Some(agents), lanes: Some(lanes), jobs: Some(jobs), workspaces: Some(workspaces), ..Default::default() });
     let frame = fb::Frame::create(&mut b, &fb::FrameArgs { seq: native.seq, body_type: fb::Body::Snapshot, body: Some(snapshot.as_union_value()) });
     fb::finish_frame_buffer(&mut b, frame);
     b.finished_data().to_vec()

@@ -7,10 +7,15 @@ import * as flatbuffers from 'flatbuffers';
 import { Agents } from '../../forkdeck/web/agents.ts';
 import { Job } from '../../forkdeck/web/job.ts';
 import { Lane } from '../../forkdeck/web/lane.ts';
+import { LogEntry } from '../../forkdeck/web/log-entry.ts';
 import { Router } from '../../forkdeck/web/router.ts';
 import { Workspace } from '../../forkdeck/web/workspace.ts';
 
 
+/**
+ * Fields after `workspaces` are the TUI status line and title: running and queued job counts,
+ * jobs and tokens in the last 24 hours, demo mode, and the newest session log lines (oldest first).
+ */
 export class Snapshot {
   bb: flatbuffers.ByteBuffer|null = null;
   bb_pos = 0;
@@ -91,8 +96,43 @@ workspacesLength():number {
   return offset ? this.bb!.__vector_len(this.bb_pos + offset) : 0;
 }
 
+running():number {
+  const offset = this.bb!.__offset(this.bb_pos, 22);
+  return offset ? this.bb!.readUint32(this.bb_pos + offset) : 0;
+}
+
+queued():number {
+  const offset = this.bb!.__offset(this.bb_pos, 24);
+  return offset ? this.bb!.readUint32(this.bb_pos + offset) : 0;
+}
+
+spentJobs():number {
+  const offset = this.bb!.__offset(this.bb_pos, 26);
+  return offset ? this.bb!.readUint32(this.bb_pos + offset) : 0;
+}
+
+spentTokens():bigint {
+  const offset = this.bb!.__offset(this.bb_pos, 28);
+  return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
+}
+
+demo():boolean {
+  const offset = this.bb!.__offset(this.bb_pos, 30);
+  return offset ? !!this.bb!.readInt8(this.bb_pos + offset) : false;
+}
+
+log(index: number, obj?:LogEntry):LogEntry|null {
+  const offset = this.bb!.__offset(this.bb_pos, 32);
+  return offset ? (obj || new LogEntry()).__init(this.bb!.__indirect(this.bb!.__vector(this.bb_pos + offset) + index * 4), this.bb!) : null;
+}
+
+logLength():number {
+  const offset = this.bb!.__offset(this.bb_pos, 32);
+  return offset ? this.bb!.__vector_len(this.bb_pos + offset) : 0;
+}
+
 static startSnapshot(builder:flatbuffers.Builder) {
-  builder.startObject(9);
+  builder.startObject(15);
 }
 
 static addAutomation(builder:flatbuffers.Builder, automation:boolean) {
@@ -164,6 +204,42 @@ static createWorkspacesVector(builder:flatbuffers.Builder, data:flatbuffers.Offs
 }
 
 static startWorkspacesVector(builder:flatbuffers.Builder, numElems:number) {
+  builder.startVector(4, numElems, 4);
+}
+
+static addRunning(builder:flatbuffers.Builder, running:number) {
+  builder.addFieldInt32(9, running, 0);
+}
+
+static addQueued(builder:flatbuffers.Builder, queued:number) {
+  builder.addFieldInt32(10, queued, 0);
+}
+
+static addSpentJobs(builder:flatbuffers.Builder, spentJobs:number) {
+  builder.addFieldInt32(11, spentJobs, 0);
+}
+
+static addSpentTokens(builder:flatbuffers.Builder, spentTokens:bigint) {
+  builder.addFieldInt64(12, spentTokens, BigInt('0'));
+}
+
+static addDemo(builder:flatbuffers.Builder, demo:boolean) {
+  builder.addFieldInt8(13, +demo, +false);
+}
+
+static addLog(builder:flatbuffers.Builder, logOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(14, logOffset, 0);
+}
+
+static createLogVector(builder:flatbuffers.Builder, data:flatbuffers.Offset[]):flatbuffers.Offset {
+  builder.startVector(4, data.length, 4);
+  for (let i = data.length - 1; i >= 0; i--) {
+    builder.addOffset(data[i]!);
+  }
+  return builder.endVector();
+}
+
+static startLogVector(builder:flatbuffers.Builder, numElems:number) {
   builder.startVector(4, numElems, 4);
 }
 

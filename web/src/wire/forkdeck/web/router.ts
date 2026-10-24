@@ -4,6 +4,10 @@
 
 import * as flatbuffers from 'flatbuffers';
 
+/**
+ * `label` is the TUI header word ("RULES ROUTER", "JEV DOWN · RULES", or the kind in capitals);
+ * `healthy` is 0 unknown, 1 answering, 2 down.
+ */
 export class Router {
   bb: flatbuffers.ByteBuffer|null = null;
   bb_pos = 0;
@@ -39,8 +43,37 @@ lastMs():bigint {
   return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
 }
 
+label():string|null
+label(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
+label(optionalEncoding?:any):string|Uint8Array|null {
+  const offset = this.bb!.__offset(this.bb_pos, 10);
+  return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
+}
+
+healthy():number {
+  const offset = this.bb!.__offset(this.bb_pos, 12);
+  return offset ? this.bb!.readUint8(this.bb_pos + offset) : 0;
+}
+
+fallbacks():bigint {
+  const offset = this.bb!.__offset(this.bb_pos, 14);
+  return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
+}
+
+remembered():bigint {
+  const offset = this.bb!.__offset(this.bb_pos, 16);
+  return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
+}
+
+endpoint():string|null
+endpoint(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
+endpoint(optionalEncoding?:any):string|Uint8Array|null {
+  const offset = this.bb!.__offset(this.bb_pos, 18);
+  return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
+}
+
 static startRouter(builder:flatbuffers.Builder) {
-  builder.startObject(3);
+  builder.startObject(8);
 }
 
 static addKind(builder:flatbuffers.Builder, kindOffset:flatbuffers.Offset) {
@@ -55,16 +88,41 @@ static addLastMs(builder:flatbuffers.Builder, lastMs:bigint) {
   builder.addFieldInt64(2, lastMs, BigInt('0'));
 }
 
+static addLabel(builder:flatbuffers.Builder, labelOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(3, labelOffset, 0);
+}
+
+static addHealthy(builder:flatbuffers.Builder, healthy:number) {
+  builder.addFieldInt8(4, healthy, 0);
+}
+
+static addFallbacks(builder:flatbuffers.Builder, fallbacks:bigint) {
+  builder.addFieldInt64(5, fallbacks, BigInt('0'));
+}
+
+static addRemembered(builder:flatbuffers.Builder, remembered:bigint) {
+  builder.addFieldInt64(6, remembered, BigInt('0'));
+}
+
+static addEndpoint(builder:flatbuffers.Builder, endpointOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(7, endpointOffset, 0);
+}
+
 static endRouter(builder:flatbuffers.Builder):flatbuffers.Offset {
   const offset = builder.endObject();
   return offset;
 }
 
-static createRouter(builder:flatbuffers.Builder, kindOffset:flatbuffers.Offset, calls:bigint, lastMs:bigint):flatbuffers.Offset {
+static createRouter(builder:flatbuffers.Builder, kindOffset:flatbuffers.Offset, calls:bigint, lastMs:bigint, labelOffset:flatbuffers.Offset, healthy:number, fallbacks:bigint, remembered:bigint, endpointOffset:flatbuffers.Offset):flatbuffers.Offset {
   Router.startRouter(builder);
   Router.addKind(builder, kindOffset);
   Router.addCalls(builder, calls);
   Router.addLastMs(builder, lastMs);
+  Router.addLabel(builder, labelOffset);
+  Router.addHealthy(builder, healthy);
+  Router.addFallbacks(builder, fallbacks);
+  Router.addRemembered(builder, remembered);
+  Router.addEndpoint(builder, endpointOffset);
   return Router.endRouter(builder);
 }
 }

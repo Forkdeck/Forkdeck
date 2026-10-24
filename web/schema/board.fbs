@@ -1,21 +1,36 @@
 namespace forkdeck.web;
 
 table LogEntry { time: string; who: string; text: string; }
+/// Fields after `warn` follow the TUI card and status line: `kind` is "manual", "issue", "pr",
+/// "deploy" or "plan" (a planning job, whose page is /plans/<id>); `status` is the native
+/// status name; `queued` is the number of messages waiting for the job (the TUI's ✉N).
 table Job { id: uint; title: string; lane: string; state: string; meta: string;
-            elapsed: string; route: string; stages: [ubyte]; log: [LogEntry]; warn: string; }
+            elapsed: string; route: string; stages: [ubyte]; log: [LogEntry]; warn: string;
+            kind: string; status: string; agent: string; queued: uint; }
 table Lane { id: string; label: string; }
-table Agents { claude: bool; codex: bool; copilot: bool; }
-table Router { kind: string; calls: ulong; last_ms: ulong; }
+/// `word` is the TUI chip word: "ON CALL", "LIMITED", "MISSING", "VIA COPILOT", "CHECKING" or "NO ACCESS".
+table AgentWord { agent: string; word: string; }
+table Agents { claude: bool; codex: bool; copilot: bool; words: [AgentWord]; }
+/// `label` is the TUI header word ("RULES ROUTER", "JEV DOWN · RULES", or the kind in capitals);
+/// `healthy` is 0 unknown, 1 answering, 2 down.
+table Router { kind: string; calls: ulong; last_ms: ulong;
+               label: string; healthy: ubyte; fallbacks: ulong; remembered: ulong; endpoint: string; }
 /// Where a new task can run: `id` is the opaque value the submit action takes.
 table Workspace { id: string; name: string; }
+/// Fields after `workspaces` are the TUI status line and title: running and queued job counts,
+/// jobs and tokens in the last 24 hours, demo mode, and the newest session log lines (oldest first).
 table Snapshot { automation: bool; workspace: string; capacity: uint; busy: uint;
                  router: Router; agents: Agents; lanes: [Lane]; jobs: [Job];
-                 workspaces: [Workspace]; }
+                 workspaces: [Workspace];
+                 running: uint; queued: uint; spent_jobs: uint; spent_tokens: ulong; demo: bool;
+                 log: [LogEntry]; }
 table JobChanged { job: Job; }
 table Tail { id: uint; worker: bool; from: ulong; lines: [string]; }
 table Automation { on: bool; }
 table Resync {}
 table Changed {}
-union Body { Snapshot, JobChanged, Tail, Automation, Resync, Changed }
+/// New session log lines, appended to the snapshot's `log` in order.
+table Log { lines: [LogEntry]; }
+union Body { Snapshot, JobChanged, Tail, Automation, Resync, Changed, Log }
 table Frame { seq: ulong; body: Body; }
 root_type Frame;

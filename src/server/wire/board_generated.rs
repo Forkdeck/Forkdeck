@@ -29,10 +29,10 @@ pub mod web {
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 pub const ENUM_MIN_BODY: u8 = 0;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
-pub const ENUM_MAX_BODY: u8 = 6;
+pub const ENUM_MAX_BODY: u8 = 7;
 #[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
 #[allow(non_camel_case_types)]
-pub const ENUM_VALUES_BODY: [Body; 7] = [
+pub const ENUM_VALUES_BODY: [Body; 8] = [
   Body::NONE,
   Body::Snapshot,
   Body::JobChanged,
@@ -40,6 +40,7 @@ pub const ENUM_VALUES_BODY: [Body; 7] = [
   Body::Automation,
   Body::Resync,
   Body::Changed,
+  Body::Log,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -54,9 +55,10 @@ impl Body {
   pub const Automation: Self = Self(4);
   pub const Resync: Self = Self(5);
   pub const Changed: Self = Self(6);
+  pub const Log: Self = Self(7);
 
   pub const ENUM_MIN: u8 = 0;
-  pub const ENUM_MAX: u8 = 6;
+  pub const ENUM_MAX: u8 = 7;
   pub const ENUM_VALUES: &'static [Self] = &[
     Self::NONE,
     Self::Snapshot,
@@ -65,6 +67,7 @@ impl Body {
     Self::Automation,
     Self::Resync,
     Self::Changed,
+    Self::Log,
   ];
   /// Returns the variant's name or "" if unknown.
   pub fn variant_name(self) -> Option<&'static str> {
@@ -76,6 +79,7 @@ impl Body {
       Self::Automation => Some("Automation"),
       Self::Resync => Some("Resync"),
       Self::Changed => Some("Changed"),
+      Self::Log => Some("Log"),
       _ => None,
     }
   }
@@ -267,6 +271,9 @@ impl core::fmt::Debug for LogEntry<'_> {
 pub enum JobOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
+/// Fields after `warn` follow the TUI card and status line: `kind` is "manual", "issue", "pr",
+/// "deploy" or "plan" (a planning job, whose page is /plans/<id>); `status` is the native
+/// status name; `queued` is the number of messages waiting for the job (the TUI's ✉N).
 pub struct Job<'a> {
   pub _tab: flatbuffers::Table<'a>,
 }
@@ -290,6 +297,10 @@ impl<'a> Job<'a> {
   pub const VT_STAGES: flatbuffers::VOffsetT = 18;
   pub const VT_LOG: flatbuffers::VOffsetT = 20;
   pub const VT_WARN: flatbuffers::VOffsetT = 22;
+  pub const VT_KIND: flatbuffers::VOffsetT = 24;
+  pub const VT_STATUS: flatbuffers::VOffsetT = 26;
+  pub const VT_AGENT: flatbuffers::VOffsetT = 28;
+  pub const VT_QUEUED: flatbuffers::VOffsetT = 30;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -301,6 +312,10 @@ impl<'a> Job<'a> {
     args: &'args JobArgs<'args>
   ) -> flatbuffers::WIPOffset<Job<'bldr>> {
     let mut builder = JobBuilder::new(_fbb);
+    builder.add_queued(args.queued);
+    if let Some(x) = args.agent { builder.add_agent(x); }
+    if let Some(x) = args.status { builder.add_status(x); }
+    if let Some(x) = args.kind { builder.add_kind(x); }
     if let Some(x) = args.warn { builder.add_warn(x); }
     if let Some(x) = args.log { builder.add_log(x); }
     if let Some(x) = args.stages { builder.add_stages(x); }
@@ -385,6 +400,34 @@ impl<'a> Job<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Job::VT_WARN, None)}
   }
+  #[inline]
+  pub fn kind(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Job::VT_KIND, None)}
+  }
+  #[inline]
+  pub fn status(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Job::VT_STATUS, None)}
+  }
+  #[inline]
+  pub fn agent(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Job::VT_AGENT, None)}
+  }
+  #[inline]
+  pub fn queued(&self) -> u32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u32>(Job::VT_QUEUED, Some(0)).unwrap()}
+  }
 }
 
 impl flatbuffers::Verifiable for Job<'_> {
@@ -404,6 +447,10 @@ impl flatbuffers::Verifiable for Job<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("stages", Self::VT_STAGES, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<LogEntry>>>>("log", Self::VT_LOG, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<&str>>("warn", Self::VT_WARN, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("kind", Self::VT_KIND, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("status", Self::VT_STATUS, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("agent", Self::VT_AGENT, false)?
+     .visit_field::<u32>("queued", Self::VT_QUEUED, false)?
      .finish();
     Ok(())
   }
@@ -419,6 +466,10 @@ pub struct JobArgs<'a> {
     pub stages: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
     pub log: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<LogEntry<'a>>>>>,
     pub warn: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub kind: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub status: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub agent: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub queued: u32,
 }
 impl<'a> Default for JobArgs<'a> {
   #[inline]
@@ -434,6 +485,10 @@ impl<'a> Default for JobArgs<'a> {
       stages: None,
       log: None,
       warn: None,
+      kind: None,
+      status: None,
+      agent: None,
+      queued: 0,
     }
   }
 }
@@ -484,6 +539,22 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> JobBuilder<'a, 'b, A> {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Job::VT_WARN, warn);
   }
   #[inline]
+  pub fn add_kind(&mut self, kind: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Job::VT_KIND, kind);
+  }
+  #[inline]
+  pub fn add_status(&mut self, status: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Job::VT_STATUS, status);
+  }
+  #[inline]
+  pub fn add_agent(&mut self, agent: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Job::VT_AGENT, agent);
+  }
+  #[inline]
+  pub fn add_queued(&mut self, queued: u32) {
+    self.fbb_.push_slot::<u32>(Job::VT_QUEUED, queued, 0);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> JobBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     JobBuilder {
@@ -511,6 +582,10 @@ impl core::fmt::Debug for Job<'_> {
       ds.field("stages", &self.stages());
       ds.field("log", &self.log());
       ds.field("warn", &self.warn());
+      ds.field("kind", &self.kind());
+      ds.field("status", &self.status());
+      ds.field("agent", &self.agent());
+      ds.field("queued", &self.queued());
       ds.finish()
   }
 }
@@ -628,6 +703,121 @@ impl core::fmt::Debug for Lane<'_> {
       ds.finish()
   }
 }
+pub enum AgentWordOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+/// `word` is the TUI chip word: "ON CALL", "LIMITED", "MISSING", "VIA COPILOT", "CHECKING" or "NO ACCESS".
+pub struct AgentWord<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for AgentWord<'a> {
+  type Inner = AgentWord<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: unsafe { flatbuffers::Table::new(buf, loc) } }
+  }
+}
+
+impl<'a> AgentWord<'a> {
+  pub const VT_AGENT: flatbuffers::VOffsetT = 4;
+  pub const VT_WORD: flatbuffers::VOffsetT = 6;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    AgentWord { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args AgentWordArgs<'args>
+  ) -> flatbuffers::WIPOffset<AgentWord<'bldr>> {
+    let mut builder = AgentWordBuilder::new(_fbb);
+    if let Some(x) = args.word { builder.add_word(x); }
+    if let Some(x) = args.agent { builder.add_agent(x); }
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn agent(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(AgentWord::VT_AGENT, None)}
+  }
+  #[inline]
+  pub fn word(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(AgentWord::VT_WORD, None)}
+  }
+}
+
+impl flatbuffers::Verifiable for AgentWord<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("agent", Self::VT_AGENT, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("word", Self::VT_WORD, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct AgentWordArgs<'a> {
+    pub agent: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub word: Option<flatbuffers::WIPOffset<&'a str>>,
+}
+impl<'a> Default for AgentWordArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    AgentWordArgs {
+      agent: None,
+      word: None,
+    }
+  }
+}
+
+pub struct AgentWordBuilder<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> AgentWordBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_agent(&mut self, agent: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(AgentWord::VT_AGENT, agent);
+  }
+  #[inline]
+  pub fn add_word(&mut self, word: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(AgentWord::VT_WORD, word);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> AgentWordBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    AgentWordBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<AgentWord<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for AgentWord<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("AgentWord");
+      ds.field("agent", &self.agent());
+      ds.field("word", &self.word());
+      ds.finish()
+  }
+}
 pub enum AgentsOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -647,6 +837,7 @@ impl<'a> Agents<'a> {
   pub const VT_CLAUDE: flatbuffers::VOffsetT = 4;
   pub const VT_CODEX: flatbuffers::VOffsetT = 6;
   pub const VT_COPILOT: flatbuffers::VOffsetT = 8;
+  pub const VT_WORDS: flatbuffers::VOffsetT = 10;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -655,9 +846,10 @@ impl<'a> Agents<'a> {
   #[allow(unused_mut)]
   pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: flatbuffers::Allocator + 'bldr>(
     _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr, A>,
-    args: &'args AgentsArgs
+    args: &'args AgentsArgs<'args>
   ) -> flatbuffers::WIPOffset<Agents<'bldr>> {
     let mut builder = AgentsBuilder::new(_fbb);
+    if let Some(x) = args.words { builder.add_words(x); }
     builder.add_copilot(args.copilot);
     builder.add_codex(args.codex);
     builder.add_claude(args.claude);
@@ -686,6 +878,13 @@ impl<'a> Agents<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<bool>(Agents::VT_COPILOT, Some(false)).unwrap()}
   }
+  #[inline]
+  pub fn words(&self) -> Option<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<AgentWord<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<AgentWord>>>>(Agents::VT_WORDS, None)}
+  }
 }
 
 impl flatbuffers::Verifiable for Agents<'_> {
@@ -698,22 +897,25 @@ impl flatbuffers::Verifiable for Agents<'_> {
      .visit_field::<bool>("claude", Self::VT_CLAUDE, false)?
      .visit_field::<bool>("codex", Self::VT_CODEX, false)?
      .visit_field::<bool>("copilot", Self::VT_COPILOT, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<AgentWord>>>>("words", Self::VT_WORDS, false)?
      .finish();
     Ok(())
   }
 }
-pub struct AgentsArgs {
+pub struct AgentsArgs<'a> {
     pub claude: bool,
     pub codex: bool,
     pub copilot: bool,
+    pub words: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<AgentWord<'a>>>>>,
 }
-impl<'a> Default for AgentsArgs {
+impl<'a> Default for AgentsArgs<'a> {
   #[inline]
   fn default() -> Self {
     AgentsArgs {
       claude: false,
       codex: false,
       copilot: false,
+      words: None,
     }
   }
 }
@@ -736,6 +938,10 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> AgentsBuilder<'a, 'b, A> {
     self.fbb_.push_slot::<bool>(Agents::VT_COPILOT, copilot, false);
   }
   #[inline]
+  pub fn add_words(&mut self, words: flatbuffers::WIPOffset<flatbuffers::Vector<'b , flatbuffers::ForwardsUOffset<AgentWord<'b >>>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Agents::VT_WORDS, words);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> AgentsBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     AgentsBuilder {
@@ -756,12 +962,15 @@ impl core::fmt::Debug for Agents<'_> {
       ds.field("claude", &self.claude());
       ds.field("codex", &self.codex());
       ds.field("copilot", &self.copilot());
+      ds.field("words", &self.words());
       ds.finish()
   }
 }
 pub enum RouterOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
+/// `label` is the TUI header word ("RULES ROUTER", "JEV DOWN · RULES", or the kind in capitals);
+/// `healthy` is 0 unknown, 1 answering, 2 down.
 pub struct Router<'a> {
   pub _tab: flatbuffers::Table<'a>,
 }
@@ -778,6 +987,11 @@ impl<'a> Router<'a> {
   pub const VT_KIND: flatbuffers::VOffsetT = 4;
   pub const VT_CALLS: flatbuffers::VOffsetT = 6;
   pub const VT_LAST_MS: flatbuffers::VOffsetT = 8;
+  pub const VT_LABEL: flatbuffers::VOffsetT = 10;
+  pub const VT_HEALTHY: flatbuffers::VOffsetT = 12;
+  pub const VT_FALLBACKS: flatbuffers::VOffsetT = 14;
+  pub const VT_REMEMBERED: flatbuffers::VOffsetT = 16;
+  pub const VT_ENDPOINT: flatbuffers::VOffsetT = 18;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -789,9 +1003,14 @@ impl<'a> Router<'a> {
     args: &'args RouterArgs<'args>
   ) -> flatbuffers::WIPOffset<Router<'bldr>> {
     let mut builder = RouterBuilder::new(_fbb);
+    builder.add_remembered(args.remembered);
+    builder.add_fallbacks(args.fallbacks);
     builder.add_last_ms(args.last_ms);
     builder.add_calls(args.calls);
+    if let Some(x) = args.endpoint { builder.add_endpoint(x); }
+    if let Some(x) = args.label { builder.add_label(x); }
     if let Some(x) = args.kind { builder.add_kind(x); }
+    builder.add_healthy(args.healthy);
     builder.finish()
   }
 
@@ -817,6 +1036,41 @@ impl<'a> Router<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<u64>(Router::VT_LAST_MS, Some(0)).unwrap()}
   }
+  #[inline]
+  pub fn label(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Router::VT_LABEL, None)}
+  }
+  #[inline]
+  pub fn healthy(&self) -> u8 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u8>(Router::VT_HEALTHY, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn fallbacks(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(Router::VT_FALLBACKS, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn remembered(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(Router::VT_REMEMBERED, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn endpoint(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Router::VT_ENDPOINT, None)}
+  }
 }
 
 impl flatbuffers::Verifiable for Router<'_> {
@@ -829,6 +1083,11 @@ impl flatbuffers::Verifiable for Router<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<&str>>("kind", Self::VT_KIND, false)?
      .visit_field::<u64>("calls", Self::VT_CALLS, false)?
      .visit_field::<u64>("last_ms", Self::VT_LAST_MS, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("label", Self::VT_LABEL, false)?
+     .visit_field::<u8>("healthy", Self::VT_HEALTHY, false)?
+     .visit_field::<u64>("fallbacks", Self::VT_FALLBACKS, false)?
+     .visit_field::<u64>("remembered", Self::VT_REMEMBERED, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("endpoint", Self::VT_ENDPOINT, false)?
      .finish();
     Ok(())
   }
@@ -837,6 +1096,11 @@ pub struct RouterArgs<'a> {
     pub kind: Option<flatbuffers::WIPOffset<&'a str>>,
     pub calls: u64,
     pub last_ms: u64,
+    pub label: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub healthy: u8,
+    pub fallbacks: u64,
+    pub remembered: u64,
+    pub endpoint: Option<flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for RouterArgs<'a> {
   #[inline]
@@ -845,6 +1109,11 @@ impl<'a> Default for RouterArgs<'a> {
       kind: None,
       calls: 0,
       last_ms: 0,
+      label: None,
+      healthy: 0,
+      fallbacks: 0,
+      remembered: 0,
+      endpoint: None,
     }
   }
 }
@@ -867,6 +1136,26 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> RouterBuilder<'a, 'b, A> {
     self.fbb_.push_slot::<u64>(Router::VT_LAST_MS, last_ms, 0);
   }
   #[inline]
+  pub fn add_label(&mut self, label: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Router::VT_LABEL, label);
+  }
+  #[inline]
+  pub fn add_healthy(&mut self, healthy: u8) {
+    self.fbb_.push_slot::<u8>(Router::VT_HEALTHY, healthy, 0);
+  }
+  #[inline]
+  pub fn add_fallbacks(&mut self, fallbacks: u64) {
+    self.fbb_.push_slot::<u64>(Router::VT_FALLBACKS, fallbacks, 0);
+  }
+  #[inline]
+  pub fn add_remembered(&mut self, remembered: u64) {
+    self.fbb_.push_slot::<u64>(Router::VT_REMEMBERED, remembered, 0);
+  }
+  #[inline]
+  pub fn add_endpoint(&mut self, endpoint: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Router::VT_ENDPOINT, endpoint);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> RouterBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     RouterBuilder {
@@ -887,6 +1176,11 @@ impl core::fmt::Debug for Router<'_> {
       ds.field("kind", &self.kind());
       ds.field("calls", &self.calls());
       ds.field("last_ms", &self.last_ms());
+      ds.field("label", &self.label());
+      ds.field("healthy", &self.healthy());
+      ds.field("fallbacks", &self.fallbacks());
+      ds.field("remembered", &self.remembered());
+      ds.field("endpoint", &self.endpoint());
       ds.finish()
   }
 }
@@ -1008,6 +1302,8 @@ impl core::fmt::Debug for Workspace<'_> {
 pub enum SnapshotOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
+/// Fields after `workspaces` are the TUI status line and title: running and queued job counts,
+/// jobs and tokens in the last 24 hours, demo mode, and the newest session log lines (oldest first).
 pub struct Snapshot<'a> {
   pub _tab: flatbuffers::Table<'a>,
 }
@@ -1030,6 +1326,12 @@ impl<'a> Snapshot<'a> {
   pub const VT_LANES: flatbuffers::VOffsetT = 16;
   pub const VT_JOBS: flatbuffers::VOffsetT = 18;
   pub const VT_WORKSPACES: flatbuffers::VOffsetT = 20;
+  pub const VT_RUNNING: flatbuffers::VOffsetT = 22;
+  pub const VT_QUEUED: flatbuffers::VOffsetT = 24;
+  pub const VT_SPENT_JOBS: flatbuffers::VOffsetT = 26;
+  pub const VT_SPENT_TOKENS: flatbuffers::VOffsetT = 28;
+  pub const VT_DEMO: flatbuffers::VOffsetT = 30;
+  pub const VT_LOG: flatbuffers::VOffsetT = 32;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -1041,6 +1343,11 @@ impl<'a> Snapshot<'a> {
     args: &'args SnapshotArgs<'args>
   ) -> flatbuffers::WIPOffset<Snapshot<'bldr>> {
     let mut builder = SnapshotBuilder::new(_fbb);
+    builder.add_spent_tokens(args.spent_tokens);
+    if let Some(x) = args.log { builder.add_log(x); }
+    builder.add_spent_jobs(args.spent_jobs);
+    builder.add_queued(args.queued);
+    builder.add_running(args.running);
     if let Some(x) = args.workspaces { builder.add_workspaces(x); }
     if let Some(x) = args.jobs { builder.add_jobs(x); }
     if let Some(x) = args.lanes { builder.add_lanes(x); }
@@ -1049,6 +1356,7 @@ impl<'a> Snapshot<'a> {
     builder.add_busy(args.busy);
     builder.add_capacity(args.capacity);
     if let Some(x) = args.workspace { builder.add_workspace(x); }
+    builder.add_demo(args.demo);
     builder.add_automation(args.automation);
     builder.finish()
   }
@@ -1117,6 +1425,48 @@ impl<'a> Snapshot<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Workspace>>>>(Snapshot::VT_WORKSPACES, None)}
   }
+  #[inline]
+  pub fn running(&self) -> u32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u32>(Snapshot::VT_RUNNING, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn queued(&self) -> u32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u32>(Snapshot::VT_QUEUED, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn spent_jobs(&self) -> u32 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u32>(Snapshot::VT_SPENT_JOBS, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn spent_tokens(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(Snapshot::VT_SPENT_TOKENS, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn demo(&self) -> bool {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<bool>(Snapshot::VT_DEMO, Some(false)).unwrap()}
+  }
+  #[inline]
+  pub fn log(&self) -> Option<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<LogEntry<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<LogEntry>>>>(Snapshot::VT_LOG, None)}
+  }
 }
 
 impl flatbuffers::Verifiable for Snapshot<'_> {
@@ -1135,6 +1485,12 @@ impl flatbuffers::Verifiable for Snapshot<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Lane>>>>("lanes", Self::VT_LANES, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Job>>>>("jobs", Self::VT_JOBS, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Workspace>>>>("workspaces", Self::VT_WORKSPACES, false)?
+     .visit_field::<u32>("running", Self::VT_RUNNING, false)?
+     .visit_field::<u32>("queued", Self::VT_QUEUED, false)?
+     .visit_field::<u32>("spent_jobs", Self::VT_SPENT_JOBS, false)?
+     .visit_field::<u64>("spent_tokens", Self::VT_SPENT_TOKENS, false)?
+     .visit_field::<bool>("demo", Self::VT_DEMO, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<LogEntry>>>>("log", Self::VT_LOG, false)?
      .finish();
     Ok(())
   }
@@ -1149,6 +1505,12 @@ pub struct SnapshotArgs<'a> {
     pub lanes: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Lane<'a>>>>>,
     pub jobs: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Job<'a>>>>>,
     pub workspaces: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Workspace<'a>>>>>,
+    pub running: u32,
+    pub queued: u32,
+    pub spent_jobs: u32,
+    pub spent_tokens: u64,
+    pub demo: bool,
+    pub log: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<LogEntry<'a>>>>>,
 }
 impl<'a> Default for SnapshotArgs<'a> {
   #[inline]
@@ -1163,6 +1525,12 @@ impl<'a> Default for SnapshotArgs<'a> {
       lanes: None,
       jobs: None,
       workspaces: None,
+      running: 0,
+      queued: 0,
+      spent_jobs: 0,
+      spent_tokens: 0,
+      demo: false,
+      log: None,
     }
   }
 }
@@ -1209,6 +1577,30 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> SnapshotBuilder<'a, 'b, A> {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Snapshot::VT_WORKSPACES, workspaces);
   }
   #[inline]
+  pub fn add_running(&mut self, running: u32) {
+    self.fbb_.push_slot::<u32>(Snapshot::VT_RUNNING, running, 0);
+  }
+  #[inline]
+  pub fn add_queued(&mut self, queued: u32) {
+    self.fbb_.push_slot::<u32>(Snapshot::VT_QUEUED, queued, 0);
+  }
+  #[inline]
+  pub fn add_spent_jobs(&mut self, spent_jobs: u32) {
+    self.fbb_.push_slot::<u32>(Snapshot::VT_SPENT_JOBS, spent_jobs, 0);
+  }
+  #[inline]
+  pub fn add_spent_tokens(&mut self, spent_tokens: u64) {
+    self.fbb_.push_slot::<u64>(Snapshot::VT_SPENT_TOKENS, spent_tokens, 0);
+  }
+  #[inline]
+  pub fn add_demo(&mut self, demo: bool) {
+    self.fbb_.push_slot::<bool>(Snapshot::VT_DEMO, demo, false);
+  }
+  #[inline]
+  pub fn add_log(&mut self, log: flatbuffers::WIPOffset<flatbuffers::Vector<'b , flatbuffers::ForwardsUOffset<LogEntry<'b >>>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Snapshot::VT_LOG, log);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> SnapshotBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     SnapshotBuilder {
@@ -1235,6 +1627,12 @@ impl core::fmt::Debug for Snapshot<'_> {
       ds.field("lanes", &self.lanes());
       ds.field("jobs", &self.jobs());
       ds.field("workspaces", &self.workspaces());
+      ds.field("running", &self.running());
+      ds.field("queued", &self.queued());
+      ds.field("spent_jobs", &self.spent_jobs());
+      ds.field("spent_tokens", &self.spent_tokens());
+      ds.field("demo", &self.demo());
+      ds.field("log", &self.log());
       ds.finish()
   }
 }
@@ -1738,6 +2136,104 @@ impl core::fmt::Debug for Changed<'_> {
       ds.finish()
   }
 }
+pub enum LogOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+/// New session log lines, appended to the snapshot's `log` in order.
+pub struct Log<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for Log<'a> {
+  type Inner = Log<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: unsafe { flatbuffers::Table::new(buf, loc) } }
+  }
+}
+
+impl<'a> Log<'a> {
+  pub const VT_LINES: flatbuffers::VOffsetT = 4;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    Log { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args LogArgs<'args>
+  ) -> flatbuffers::WIPOffset<Log<'bldr>> {
+    let mut builder = LogBuilder::new(_fbb);
+    if let Some(x) = args.lines { builder.add_lines(x); }
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn lines(&self) -> Option<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<LogEntry<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<LogEntry>>>>(Log::VT_LINES, None)}
+  }
+}
+
+impl flatbuffers::Verifiable for Log<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<LogEntry>>>>("lines", Self::VT_LINES, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct LogArgs<'a> {
+    pub lines: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<LogEntry<'a>>>>>,
+}
+impl<'a> Default for LogArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    LogArgs {
+      lines: None,
+    }
+  }
+}
+
+pub struct LogBuilder<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> LogBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_lines(&mut self, lines: flatbuffers::WIPOffset<flatbuffers::Vector<'b , flatbuffers::ForwardsUOffset<LogEntry<'b >>>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Log::VT_LINES, lines);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> LogBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    LogBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<Log<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for Log<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("Log");
+      ds.field("lines", &self.lines());
+      ds.finish()
+  }
+}
 pub enum FrameOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -1886,6 +2382,21 @@ impl<'a> Frame<'a> {
     }
   }
 
+  #[inline]
+  #[allow(non_snake_case)]
+  pub fn body_as_log(&self) -> Option<Log<'a>> {
+    if self.body_type() == Body::Log {
+      self.body().map(|t| {
+       // Safety:
+       // Created from a valid Table for this object
+       // Which contains a valid union in this slot
+       unsafe { Log::init_from_table(t) }
+     })
+    } else {
+      None
+    }
+  }
+
 }
 
 impl flatbuffers::Verifiable for Frame<'_> {
@@ -1904,6 +2415,7 @@ impl flatbuffers::Verifiable for Frame<'_> {
           Body::Automation => v.verify_union_variant::<flatbuffers::ForwardsUOffset<Automation>>("Body::Automation", pos),
           Body::Resync => v.verify_union_variant::<flatbuffers::ForwardsUOffset<Resync>>("Body::Resync", pos),
           Body::Changed => v.verify_union_variant::<flatbuffers::ForwardsUOffset<Changed>>("Body::Changed", pos),
+          Body::Log => v.verify_union_variant::<flatbuffers::ForwardsUOffset<Log>>("Body::Log", pos),
           _ => Ok(()),
         }
      })?
@@ -2002,6 +2514,13 @@ impl core::fmt::Debug for Frame<'_> {
         },
         Body::Changed => {
           if let Some(x) = self.body_as_changed() {
+            ds.field("body", &x)
+          } else {
+            ds.field("body", &"InvalidFlatbuffer: Union discriminant does not match value.")
+          }
+        },
+        Body::Log => {
+          if let Some(x) = self.body_as_log() {
             ds.field("body", &x)
           } else {
             ds.field("body", &"InvalidFlatbuffer: Union discriminant does not match value.")

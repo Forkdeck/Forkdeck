@@ -7,6 +7,11 @@ import * as flatbuffers from 'flatbuffers';
 import { LogEntry } from '../../forkdeck/web/log-entry.ts';
 
 
+/**
+ * Fields after `warn` follow the TUI card and status line: `kind` is "manual", "issue", "pr",
+ * "deploy" or "plan" (a planning job, whose page is /plans/<id>); `status` is the native
+ * status name; `queued` is the number of messages waiting for the job (the TUI's ✉N).
+ */
 export class Job {
   bb: flatbuffers.ByteBuffer|null = null;
   bb_pos = 0;
@@ -104,8 +109,34 @@ warn(optionalEncoding?:any):string|Uint8Array|null {
   return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
 }
 
+kind():string|null
+kind(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
+kind(optionalEncoding?:any):string|Uint8Array|null {
+  const offset = this.bb!.__offset(this.bb_pos, 24);
+  return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
+}
+
+status():string|null
+status(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
+status(optionalEncoding?:any):string|Uint8Array|null {
+  const offset = this.bb!.__offset(this.bb_pos, 26);
+  return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
+}
+
+agent():string|null
+agent(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
+agent(optionalEncoding?:any):string|Uint8Array|null {
+  const offset = this.bb!.__offset(this.bb_pos, 28);
+  return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
+}
+
+queued():number {
+  const offset = this.bb!.__offset(this.bb_pos, 30);
+  return offset ? this.bb!.readUint32(this.bb_pos + offset) : 0;
+}
+
 static startJob(builder:flatbuffers.Builder) {
-  builder.startObject(10);
+  builder.startObject(14);
 }
 
 static addId(builder:flatbuffers.Builder, id:number) {
@@ -172,12 +203,28 @@ static addWarn(builder:flatbuffers.Builder, warnOffset:flatbuffers.Offset) {
   builder.addFieldOffset(9, warnOffset, 0);
 }
 
+static addKind(builder:flatbuffers.Builder, kindOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(10, kindOffset, 0);
+}
+
+static addStatus(builder:flatbuffers.Builder, statusOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(11, statusOffset, 0);
+}
+
+static addAgent(builder:flatbuffers.Builder, agentOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(12, agentOffset, 0);
+}
+
+static addQueued(builder:flatbuffers.Builder, queued:number) {
+  builder.addFieldInt32(13, queued, 0);
+}
+
 static endJob(builder:flatbuffers.Builder):flatbuffers.Offset {
   const offset = builder.endObject();
   return offset;
 }
 
-static createJob(builder:flatbuffers.Builder, id:number, titleOffset:flatbuffers.Offset, laneOffset:flatbuffers.Offset, stateOffset:flatbuffers.Offset, metaOffset:flatbuffers.Offset, elapsedOffset:flatbuffers.Offset, routeOffset:flatbuffers.Offset, stagesOffset:flatbuffers.Offset, logOffset:flatbuffers.Offset, warnOffset:flatbuffers.Offset):flatbuffers.Offset {
+static createJob(builder:flatbuffers.Builder, id:number, titleOffset:flatbuffers.Offset, laneOffset:flatbuffers.Offset, stateOffset:flatbuffers.Offset, metaOffset:flatbuffers.Offset, elapsedOffset:flatbuffers.Offset, routeOffset:flatbuffers.Offset, stagesOffset:flatbuffers.Offset, logOffset:flatbuffers.Offset, warnOffset:flatbuffers.Offset, kindOffset:flatbuffers.Offset, statusOffset:flatbuffers.Offset, agentOffset:flatbuffers.Offset, queued:number):flatbuffers.Offset {
   Job.startJob(builder);
   Job.addId(builder, id);
   Job.addTitle(builder, titleOffset);
@@ -189,6 +236,10 @@ static createJob(builder:flatbuffers.Builder, id:number, titleOffset:flatbuffers
   Job.addStages(builder, stagesOffset);
   Job.addLog(builder, logOffset);
   Job.addWarn(builder, warnOffset);
+  Job.addKind(builder, kindOffset);
+  Job.addStatus(builder, statusOffset);
+  Job.addAgent(builder, agentOffset);
+  Job.addQueued(builder, queued);
   return Job.endJob(builder);
 }
 }

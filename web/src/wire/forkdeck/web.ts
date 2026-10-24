@@ -2,6 +2,7 @@
 
 /* eslint-disable @typescript-eslint/no-unused-vars, @typescript-eslint/no-explicit-any, @typescript-eslint/no-non-null-assertion */
 
+export { AgentWord } from './web/agent-word.ts';
 export { Agents } from './web/agents.ts';
 export { Automation } from './web/automation.ts';
 export { Body } from './web/body.ts';
@@ -10,6 +11,7 @@ export { Frame } from './web/frame.ts';
 export { Job } from './web/job.ts';
 export { JobChanged } from './web/job-changed.ts';
 export { Lane } from './web/lane.ts';
+export { Log } from './web/log.ts';
 export { LogEntry } from './web/log-entry.ts';
 export { Resync } from './web/resync.ts';
 export { Router } from './web/router.ts';
