@@ -1,9 +1,14 @@
-import type { BoardJob } from "./state";
-export interface PresentedJob extends BoardJob {
+import type { Job } from "./wire/forkdeck/web.ts";
+export interface PresentedJob {
+  job: Job;
   group: string;
 }
-export function pill(state: string): string {
-  return `pill tone-${state.replaceAll(" ", "-").toLowerCase()}`;
+export function present(job: Job): PresentedJob {
+  const lane = job.lane() ?? "";
+  return { job, group: ["Build", "Review", "Delivery", "Queue"].includes(lane) ? "Active" : lane };
+}
+export function pill(state: string | null): string {
+  return `pill tone-${(state ?? "").replaceAll(" ", "-").toLowerCase()}`;
 }
 export function stageChip(state: number, index: number) {
   const mark = ["○ ", "● ", "✓ ", "– ", "✕ "][state] ?? "○ ";

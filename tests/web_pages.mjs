@@ -35,8 +35,23 @@ try {
     assert.match(await page.locator('.plan-prose .task-pill').innerText(),/PASS|FAIL/);
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`plans overflow at ${width}`);
     await page.screenshot({path:`/tmp/forkdeck-plan-${width}.png`,fullPage:false});
+    const requests=[], sockets=[], snapshots=[];
+    page.on('request', request=>requests.push(request.url()));
+    page.on('websocket', socket=>sockets.push(socket.url()));
+    page.on('response', response=>{
+      if (new URL(response.url()).pathname === '/api/v1/snapshot') snapshots.push(response);
+    });
     await page.goto(base);
     await page.locator(`nav a[href="/repos"]`).first().waitFor();
+    await page.waitForFunction(()=>[...document.querySelectorAll('.connection,.phone-connection')].some(el=>el.textContent.includes('Live')));
+    assert.equal(requests.some(url=>new URL(url).pathname === '/api/v1/events'),false);
+    assert.ok(sockets.some(url=>new URL(url).pathname === '/api/v1/live'));
+    assert.ok(snapshots.length);
+    for (const response of snapshots) {
+      assert.equal(response.status(),200);
+      assert.equal((await response.allHeaders())['content-type'],'application/octet-stream');
+    }
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,`board overflow at ${width}`);
     assert.deepEqual(errors,[]);
     await page.close();
     console.log(`Operational pages and plans at ${width}px: passed`);

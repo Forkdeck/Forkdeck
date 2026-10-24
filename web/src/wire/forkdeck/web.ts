@@ -15,3 +15,4 @@ export { Resync } from './web/resync.ts';
 export { Router } from './web/router.ts';
 export { Snapshot } from './web/snapshot.ts';
 export { Tail } from './web/tail.ts';
+export { Workspace } from './web/workspace.ts';

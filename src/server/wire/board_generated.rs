@@ -890,6 +890,121 @@ impl core::fmt::Debug for Router<'_> {
       ds.finish()
   }
 }
+pub enum WorkspaceOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+/// Where a new task can run: `id` is the opaque value the submit action takes.
+pub struct Workspace<'a> {
+  pub _tab: flatbuffers::Table<'a>,
+}
+
+impl<'a> flatbuffers::Follow<'a> for Workspace<'a> {
+  type Inner = Workspace<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: unsafe { flatbuffers::Table::new(buf, loc) } }
+  }
+}
+
+impl<'a> Workspace<'a> {
+  pub const VT_ID: flatbuffers::VOffsetT = 4;
+  pub const VT_NAME: flatbuffers::VOffsetT = 6;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+    Workspace { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args WorkspaceArgs<'args>
+  ) -> flatbuffers::WIPOffset<Workspace<'bldr>> {
+    let mut builder = WorkspaceBuilder::new(_fbb);
+    if let Some(x) = args.name { builder.add_name(x); }
+    if let Some(x) = args.id { builder.add_id(x); }
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn id(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Workspace::VT_ID, None)}
+  }
+  #[inline]
+  pub fn name(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Workspace::VT_NAME, None)}
+  }
+}
+
+impl flatbuffers::Verifiable for Workspace<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut flatbuffers::Verifier, pos: usize
+  ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+    use self::flatbuffers::Verifiable;
+    v.visit_table(pos)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("id", Self::VT_ID, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("name", Self::VT_NAME, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct WorkspaceArgs<'a> {
+    pub id: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub name: Option<flatbuffers::WIPOffset<&'a str>>,
+}
+impl<'a> Default for WorkspaceArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    WorkspaceArgs {
+      id: None,
+      name: None,
+    }
+  }
+}
+
+pub struct WorkspaceBuilder<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> WorkspaceBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_id(&mut self, id: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Workspace::VT_ID, id);
+  }
+  #[inline]
+  pub fn add_name(&mut self, name: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Workspace::VT_NAME, name);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> WorkspaceBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    WorkspaceBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> flatbuffers::WIPOffset<Workspace<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl core::fmt::Debug for Workspace<'_> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let mut ds = f.debug_struct("Workspace");
+      ds.field("id", &self.id());
+      ds.field("name", &self.name());
+      ds.finish()
+  }
+}
 pub enum SnapshotOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -914,6 +1029,7 @@ impl<'a> Snapshot<'a> {
   pub const VT_AGENTS: flatbuffers::VOffsetT = 14;
   pub const VT_LANES: flatbuffers::VOffsetT = 16;
   pub const VT_JOBS: flatbuffers::VOffsetT = 18;
+  pub const VT_WORKSPACES: flatbuffers::VOffsetT = 20;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -925,6 +1041,7 @@ impl<'a> Snapshot<'a> {
     args: &'args SnapshotArgs<'args>
   ) -> flatbuffers::WIPOffset<Snapshot<'bldr>> {
     let mut builder = SnapshotBuilder::new(_fbb);
+    if let Some(x) = args.workspaces { builder.add_workspaces(x); }
     if let Some(x) = args.jobs { builder.add_jobs(x); }
     if let Some(x) = args.lanes { builder.add_lanes(x); }
     if let Some(x) = args.agents { builder.add_agents(x); }
@@ -993,6 +1110,13 @@ impl<'a> Snapshot<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Job>>>>(Snapshot::VT_JOBS, None)}
   }
+  #[inline]
+  pub fn workspaces(&self) -> Option<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Workspace<'a>>>> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Workspace>>>>(Snapshot::VT_WORKSPACES, None)}
+  }
 }
 
 impl flatbuffers::Verifiable for Snapshot<'_> {
@@ -1010,6 +1134,7 @@ impl flatbuffers::Verifiable for Snapshot<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<Agents>>("agents", Self::VT_AGENTS, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Lane>>>>("lanes", Self::VT_LANES, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Job>>>>("jobs", Self::VT_JOBS, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Workspace>>>>("workspaces", Self::VT_WORKSPACES, false)?
      .finish();
     Ok(())
   }
@@ -1023,6 +1148,7 @@ pub struct SnapshotArgs<'a> {
     pub agents: Option<flatbuffers::WIPOffset<Agents<'a>>>,
     pub lanes: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Lane<'a>>>>>,
     pub jobs: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Job<'a>>>>>,
+    pub workspaces: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Workspace<'a>>>>>,
 }
 impl<'a> Default for SnapshotArgs<'a> {
   #[inline]
@@ -1036,6 +1162,7 @@ impl<'a> Default for SnapshotArgs<'a> {
       agents: None,
       lanes: None,
       jobs: None,
+      workspaces: None,
     }
   }
 }
@@ -1078,6 +1205,10 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> SnapshotBuilder<'a, 'b, A> {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Snapshot::VT_JOBS, jobs);
   }
   #[inline]
+  pub fn add_workspaces(&mut self, workspaces: flatbuffers::WIPOffset<flatbuffers::Vector<'b , flatbuffers::ForwardsUOffset<Workspace<'b >>>>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Snapshot::VT_WORKSPACES, workspaces);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> SnapshotBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     SnapshotBuilder {
@@ -1103,6 +1234,7 @@ impl core::fmt::Debug for Snapshot<'_> {
       ds.field("agents", &self.agents());
       ds.field("lanes", &self.lanes());
       ds.field("jobs", &self.jobs());
+      ds.field("workspaces", &self.workspaces());
       ds.finish()
   }
 }

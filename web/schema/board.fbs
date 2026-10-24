@@ -6,8 +6,11 @@ table Job { id: uint; title: string; lane: string; state: string; meta: string;
 table Lane { id: string; label: string; }
 table Agents { claude: bool; codex: bool; copilot: bool; }
 table Router { kind: string; calls: ulong; last_ms: ulong; }
+/// Where a new task can run: `id` is the opaque value the submit action takes.
+table Workspace { id: string; name: string; }
 table Snapshot { automation: bool; workspace: string; capacity: uint; busy: uint;
-                 router: Router; agents: Agents; lanes: [Lane]; jobs: [Job]; }
+                 router: Router; agents: Agents; lanes: [Lane]; jobs: [Job];
+                 workspaces: [Workspace]; }
 table JobChanged { job: Job; }
 table Tail { id: uint; worker: bool; from: ulong; lines: [string]; }
 table Automation { on: bool; }
