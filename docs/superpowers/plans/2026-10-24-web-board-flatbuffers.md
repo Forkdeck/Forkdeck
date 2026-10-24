@@ -4,7 +4,7 @@
 
 **Goal:** The browser board stops using JSON: its snapshot and live updates arrive as FlatBuffers over a WebSocket and the board reads fields straight from the received bytes (zero copy).
 
-**Architecture:** One schema, `web/schema/board.fbs`, generates Rust and TypeScript code with a pinned `flatc`. The server encodes the board snapshot (`GET /api/v1/board`) and every feed event (`GET /api/v1/live`, WebSocket, binary frames) as a `Frame`. The client keeps the received `Snapshot`/`Job` tables and renders from their accessors; it never converts them to plain objects.
+**Architecture:** One schema, `web/schema/board.fbs`, generates Rust and TypeScript code with a pinned `flatc`. The server encodes the board snapshot (`GET /api/v1/snapshot`, which stops serving JSON) and every feed event (`GET /api/v1/live`, WebSocket, binary frames) as a `Frame`. The client keeps the received `Snapshot`/`Job` tables and renders from their accessors; it never converts them to plain objects.
 
 **Tech Stack:** Rust (axum 0.8 with `ws`, `flatbuffers` crate), Preact + TypeScript (`flatbuffers` npm), `flatc` 25.9.23.
 
@@ -24,7 +24,7 @@
 ## Review Focus
 
 1. **Cross-site WebSocket.** A page on another site can open `ws://127.0.0.1:7420/api/v1/live`; its Host header is the loopback name, so the existing Host check passes. The upgrade must be refused (403) when an `Origin` header is present and its host:port differs from the request's Host. No `Origin` (curl, tests) is allowed. Test in Task 3.
-2. **Daemon restarted under an open tab.** The client resumes with a `since` above the new daemon's seq; `Feed::subscribe` already answers `Resync`. The client must then reload `/api/v1/board` and resubscribe from the new seq, not loop. Test in Task 4 (reducer) and Task 3 (server sends Resync).
+2. **Daemon restarted under an open tab.** The client resumes with a `since` above the new daemon's seq; `Feed::subscribe` already answers `Resync`. The client must then reload `/api/v1/snapshot` and resubscribe from the new seq, not loop. Test in Task 4 (reducer) and Task 3 (server sends Resync).
 3. **Slow tab / lagged subscriber.** `RecvError::Lagged` must become a `Resync` frame, never a closed socket with no frame. Test in Task 3.
 4. **A job the snapshot has not seen.** A `JobChanged` for an unknown id must add the job to the board in its lane, not be dropped. Test in Task 4.
 5. **Non-ASCII and long text.** Titles and log lines with `—`, `·`, emoji, and a 500-line log must survive encode and decode unchanged. Test in Task 2.
@@ -36,7 +36,7 @@
 - `scripts/flatc.sh` — downloads the pinned `flatc` into `.local/flatc/` (already git-ignored), verifies its sha256, prints its path.
 - `web/schema/board.fbs` — the only schema.
 - `src/server/wire/board_generated.rs` (generated), `src/server/wire.rs` — encoding the board and feed events into `Frame` bytes.
-- `src/server/http.rs` — `GET /api/v1/board`, `GET /api/v1/live` (WebSocket); the SSE route `/api/v1/events` is removed.
+- `src/server/http.rs` — `GET /api/v1/snapshot` (now FlatBuffers), `GET /api/v1/live` (WebSocket); the SSE route `/api/v1/events` is removed.
 - `web/src/wire/` (generated), `web/src/live.ts` — decoding, the board state signal, the WebSocket connection and the reducer.
 - `web/src/state.ts`, `web/src/main.tsx`, `web/src/BoardWide.tsx`, `web/src/BoardPhone.tsx`, `web/src/ui.ts` — read the board from `live.ts` instead of JSON.
 - `tests/web_wire.mjs` — reducer and decoding tests (Node 24 runs `.ts` imports directly, like `tests/web_markdown.mjs`).
@@ -81,14 +81,14 @@ root_type Frame;
 ### Task 2: Encode the board and feed events
 
 **Files:**
-- Modify: `src/server/wire.rs`, `src/server/view.rs` (make `board` and `LANES` `pub(super)`), `src/server/http.rs` (route `GET /v1/board`)
+- Modify: `src/server/wire.rs`, `src/server/view.rs` (make `board` and `LANES` `pub(super)`), `src/server/http.rs` (the `/v1/snapshot` handler serves FlatBuffers)
 
 **Interfaces:**
 - Consumes: Task 1 generated types; `view::board(&Job, &State) -> BoardProjection`; `Feed::snapshot(&Hub).seq`; `hub.cfg.web.lanes.in_order()`.
 - Produces:
   - `pub fn board(hub: &Hub, feed: &Feed) -> Vec<u8>` — a `Frame` whose `seq` is the feed snapshot's seq and whose body is `Snapshot`, built from the same data as `view::snapshot` (same jobs in the same order, same filter on `issue_plan`, same `waiting`/`blocked by` override, same `agents`, `workspace`, `capacity`, `busy`, `router`, `lanes`). Factor the shared job projection out of `view::snapshot` rather than duplicating it.
   - `pub fn event(hub: &Hub, seq: u64, event: &forkdeck_remote_proto::Event) -> Vec<u8>` — `Job { job }` becomes `JobChanged` with the full projection of that job looked up in hub state (a job no longer in state, or one with `issue_plan`, becomes `Changed`); `Tail` maps field for field (`worker` = `which == Which::Worker`); `Automation`, `Resync` map directly; `Stage` and `Log` become `Changed`.
-  - `GET /api/v1/board` → 200, body `wire::board(..)`, `content-type: application/octet-stream`, `cache-control: no-store` (the existing `no_store` layer).
+  - `GET /api/v1/snapshot` → 200, body `wire::board(..)`; the JSON handler is removed, while `view::snapshot` stays as an internal function (`view::detail` and tests use it); `content-type: application/octet-stream`, `cache-control: no-store` (the existing `no_store` layer).
 
 - [ ] **Step 1: Write the failing tests** in `src/server/wire.rs`, seeding like `view::tests::seeded_jobs_use_the_real_projection_without_a_mode_flag`:
   - `the_board_frame_matches_the_json_snapshot`: decode `board(&hub, &feed)`; for every job, `id`, `title`, `lane`, `state`, `meta`, `elapsed`, `route`, `stages`, `warn` and every log entry equal the corresponding values in `view::snapshot(&hub, &feed)["jobs"]`; job 72 has lane `"Build"`, state `"working"`, stages `[2,1,0,0,0]`; job 74 has state `"waiting"` and meta `"blocked by #22 · not merged"`; `lanes` equals the six configured `{id,label}` pairs; frame seq equals the snapshot's `seq`.
@@ -96,7 +96,7 @@ root_type Frame;
   - `text_survives_encoding` (Review Focus 5): set a job title to `"Plans — sync · 🚀"` and push 500 worker tail lines; the decoded title is identical and the decoded log holds all of them in order.
 - [ ] **Step 2:** Run `cargo test wire::` — fails (functions missing).
 - [ ] **Step 3:** Implement `board` and `event`, add the route.
-- [ ] **Step 4:** Add to `http.rs` tests: `GET /api/v1/board` returns 200, `application/octet-stream`, `no-store`, and decodes to a `Snapshot` whose job count equals `/api/v1/snapshot`'s. Run `cargo test` — passes.
+- [ ] **Step 4:** Change the `http.rs` tests that read `/api/v1/snapshot` as JSON to decode it instead: 200, `application/octet-stream`, `no-store`, and a `Snapshot` whose jobs equal `view::snapshot(..)["jobs"]` by id, lane and state. Run `cargo test` — passes.
 - [ ] **Step 5:** Gate, commit `feat(server): encode the board and feed events as FlatBuffers`.
 
 ### Task 3: WebSocket live feed
@@ -131,7 +131,7 @@ root_type Frame;
   - `export interface Board { seq: number; snapshot: Snapshot; jobs: Job[] }` — `jobs` is board order: snapshot jobs with `JobChanged` replacements applied in place and unknown ids appended. Tables are kept, never copied into objects.
   - `export const board = signal<Board | null>(null)`.
   - `export function apply(current: Board | null, frame: Frame): { next: Board | null; resync: boolean; tail?: { id: number; worker: boolean; from: number; lines: string[] } }` — pure reducer: `Snapshot` replaces the board; `JobChanged` replaces/appends; `Automation` is applied by keeping a separate `automation` override field on `Board` (add `automation: boolean` to `Board`, initialised from the snapshot); `Resync` → `resync: true`; `Tail` → returned for `state.ts` to merge into `details` as today; `Changed` → no change (the caller schedules the debounced refresh as now).
-  - `export function connect(): () => void` — `fetch('/api/v1/board')` as `arrayBuffer`, decode, set `board`, then open `new WebSocket(<ws or wss of location>/api/v1/live?since=<seq>)` with `binaryType = 'arraybuffer'`; on message decode and `apply`; on `resync` reload the board and reconnect from its seq; on close reconnect with backoff 1 s doubling to 10 s, resuming from the last seq seen; sets `connection` to `"Live"`, `"Reconnecting"`, `"Disconnected"` as the EventSource did; the debounced refresh of `plans` and the selected job's detail stays (100 ms) and is triggered by every frame except `Snapshot`.
+  - `export function connect(): () => void` — `fetch('/api/v1/snapshot')` as `arrayBuffer`, decode, set `board`, then open `new WebSocket(<ws or wss of location>/api/v1/live?since=<seq>)` with `binaryType = 'arraybuffer'`; on message decode and `apply`; on `resync` reload the board and reconnect from its seq; on close reconnect with backoff 1 s doubling to 10 s, resuming from the last seq seen; sets `connection` to `"Live"`, `"Reconnecting"`, `"Disconnected"` as the EventSource did; the debounced refresh of `plans` and the selected job's detail stays (100 ms) and is triggered by every frame except `Snapshot`.
 - Components read accessors directly: `job.title()`, `job.lane()`, `job.stagesArray()`, `job.log(i)`, `snapshot.lanes(i).label()`, etc. `PresentedJob`/`present()` become a thin view over a `Job` table (the phone `group` is computed from `job.lane()`); no component receives plain-object copies of board jobs. The job detail page still takes its data from `details` (JSON) as today.
 
 - [ ] **Step 1: Write the failing tests** in `tests/web_wire.mjs` (import `../web/src/live.ts` and the generated builders): build frames with the generated builders and assert:
@@ -142,5 +142,5 @@ root_type Frame;
   - `Automation { on: false }` → `next.automation === false`.
 - [ ] **Step 2:** Run `node tests/web_wire.mjs` — fails (module missing).
 - [ ] **Step 3:** Implement `live.ts`, switch `main.tsx` and both boards to it, trim `state.ts`.
-- [ ] **Step 4:** `node tests/web_wire.mjs` passes; extend `tests/web_pages.mjs`: on the board page record every request URL; assert none matches `/api/v1/(snapshot|events)` and that `/api/v1/board` and a WebSocket to `/api/v1/live` were made; existing 1440/390 checks still pass against `forkdeck --demo serve`.
-- [ ] **Step 5:** Update `docs/web-ui-operations.md` (API list: `/api/v1/board`, `/api/v1/live`; SSE gone; the schema, `npm run schema`, `npm run schema:check`). Gate plus `node tests/web_markdown.mjs`, `node tests/web_wire.mjs`, `tests/web_pages.mjs` against a demo server; commit `feat(web): the board reads FlatBuffers over a WebSocket`.
+- [ ] **Step 4:** `node tests/web_wire.mjs` passes; extend `tests/web_pages.mjs`: on the board page record every request URL; assert none matches `/api/v1/events`, that `/api/v1/snapshot` answered `application/octet-stream`, and that a WebSocket to `/api/v1/live` were made; existing 1440/390 checks still pass against `forkdeck --demo serve`.
+- [ ] **Step 5:** Update `docs/web-ui-operations.md` (API list: `/api/v1/snapshot` is FlatBuffers, `/api/v1/live`; SSE gone; the schema, `npm run schema`, `npm run schema:check`). Gate plus `node tests/web_markdown.mjs`, `node tests/web_wire.mjs`, `tests/web_pages.mjs` against a demo server; commit `feat(web): the board reads FlatBuffers over a WebSocket`.
