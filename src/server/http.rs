@@ -1,4 +1,4 @@
-use super::view;
+use super::{view, wire};
 use crate::{orchestrator::Hub, remote::feed::{Feed, Numbered}};
 use axum::{
     body::Body,
@@ -46,7 +46,7 @@ async fn no_store(req: Request<Body>, next: Next) -> Response {
     response
 }
 
-async fn snapshot(State(app): State<App>) -> Json<serde_json::Value> { Json(view::snapshot(&app.hub, &app.feed)) }
+async fn snapshot(State(app): State<App>) -> impl IntoResponse { ([(header::CONTENT_TYPE, "application/octet-stream")], wire::board(&app.hub, &app.feed)) }
 async fn detail(State(app): State<App>, Path(id): Path<u32>) -> Response {
     match view::detail(&app.hub, &app.feed, id) { Some(v) => Json(v).into_response(), None => StatusCode::NOT_FOUND.into_response() }
 }
@@ -176,11 +176,19 @@ mod tests {
         }
         let snapshot = client.get(format!("{base}/api/v1/snapshot")).send().await.unwrap();
         assert_eq!(snapshot.headers()[header::CACHE_CONTROL], "no-store");
-        let snap: serde_json::Value = snapshot.json().await.unwrap();
-        assert!(snap["seq"].is_u64());
-        assert!(snap["automation"].is_boolean());
-        assert!(snap["agents"].is_object());
-        assert!(snap["jobs"].as_array().unwrap().iter().any(|j| j["state"] == "unverified" && j["lane"] == "Attention"));
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        assert_eq!(snapshot.headers()[header::CONTENT_TYPE], "application/octet-stream");
+        let bytes = snapshot.bytes().await.unwrap();
+        let frame = super::super::wire::board_generated::forkdeck::web::root_as_frame(&bytes).unwrap();
+        let board = frame.body_as_snapshot().unwrap();
+        let expected = view::snapshot(&hub, &feed);
+        let jobs = board.jobs().unwrap();
+        assert_eq!(jobs.len(), expected["jobs"].as_array().unwrap().len());
+        for (job, expected) in jobs.iter().zip(expected["jobs"].as_array().unwrap()) {
+            assert_eq!(job.id() as u64, expected["id"].as_u64().unwrap());
+            assert_eq!(job.lane(), expected["lane"].as_str());
+            assert_eq!(job.state(), expected["state"].as_str());
+        }
         for (endpoint, field) in [("repos", ""), ("deploys", "repositories"), ("stats", "summary"), ("doctor", "checks"), ("settings", "agents")] {
             let response = client.get(format!("{base}/api/v1/{endpoint}")).send().await.unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
@@ -200,7 +208,7 @@ mod tests {
         assert!(plans["plan"]["review"].as_str().unwrap().contains("VERDICT: PASS"));
         hub.log("test", "resume me");
         feed.tick(&hub);
-        let mut response = client.get(format!("{base}/api/v1/events")).header("last-event-id", snap["seq"].to_string()).send().await.unwrap();
+        let mut response = client.get(format!("{base}/api/v1/events")).header("last-event-id", frame.seq().to_string()).send().await.unwrap();
         let chunk = tokio::time::timeout(Duration::from_secs(2), response.chunk()).await.unwrap().unwrap().unwrap();
         let chunk = String::from_utf8(chunk.to_vec()).unwrap();
         assert!(chunk.contains("id:") && chunk.contains("resume me"), "{chunk}");
