@@ -1247,7 +1247,7 @@ impl Config {
                 }
             }
         }
-        self.web.address()?;
+        self.web.check()?;
         if let Some(oidc) = &self.web.oidc { oidc.validate()?; }
         if self.remote.listen.parse::<std::net::SocketAddr>().is_err() {
             anyhow::bail!("remote.listen must be an address and port such as 0.0.0.0:7443, got {:?}", self.remote.listen);
@@ -1649,13 +1649,49 @@ pub struct WebCfg {
     pub bind: String,
     pub port: u16,
     pub oidc: Option<OidcCfg>,
+    pub lanes: LaneNames,
 }
 
 impl Default for WebCfg {
-    fn default() -> Self { Self { bind: "127.0.0.1".into(), port: 7420, oidc: None } }
+    fn default() -> Self { Self { bind: "127.0.0.1".into(), port: 7420, oidc: None, lanes: LaneNames::default() } }
+}
+
+/// What the board's six lanes are called. Which jobs go in which lane does not change.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct LaneNames {
+    pub queue: String,
+    pub build: String,
+    pub review: String,
+    pub delivery: String,
+    pub done: String,
+    pub attention: String,
+}
+
+impl Default for LaneNames {
+    fn default() -> Self {
+        Self { queue: "Queue".into(), build: "Build".into(), review: "Review".into(), delivery: "Delivery".into(), done: "Done".into(), attention: "Attention".into() }
+    }
+}
+
+impl LaneNames {
+    /// In board order, the same order as the lanes jobs are placed in.
+    pub fn in_order(&self) -> [&str; 6] {
+        [&self.queue, &self.build, &self.review, &self.delivery, &self.done, &self.attention]
+    }
 }
 
 impl WebCfg {
+    pub fn check(&self) -> anyhow::Result<()> {
+        self.address()?;
+        for (key, name) in ["queue", "build", "review", "delivery", "done", "attention"].iter().zip(self.lanes.in_order()) {
+            if name.trim().is_empty() || name.chars().count() > 40 {
+                anyhow::bail!("web.lanes.{} must be 1 to 40 characters, got {:?}", key, name);
+            }
+        }
+        Ok(())
+    }
+
     pub fn address(&self) -> anyhow::Result<std::net::SocketAddr> {
         let ip: std::net::IpAddr = self.bind.trim().trim_start_matches('[').trim_end_matches(']').parse()
             .map_err(|_| anyhow::anyhow!("web.bind must be an IP address such as 127.0.0.1 or 0.0.0.0, got {:?}", self.bind))?;

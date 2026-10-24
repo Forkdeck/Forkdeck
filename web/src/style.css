@@ -307,9 +307,8 @@ select:focus-visible {
 }
 .lanes {
   display: grid;
-  grid-template-columns: repeat(6, minmax(190px, 1fr));
+  grid-template-columns: repeat(6, minmax(150px, 1fr));
   gap: 12px;
-  min-width: 1180px;
 }
 .lane {
   background: var(--tone-13161c);
@@ -981,6 +980,11 @@ select:focus-visible {
 .lane {
   max-height: calc(100dvh - 210px);
   overflow-y: auto;
+  /* Each lane still scrolls; six bars side by side are noise. */
+  scrollbar-width: none;
+}
+.lane::-webkit-scrollbar {
+  display: none;
 }
 .detail {
   height: 100%;
@@ -1241,3 +1245,88 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .board-scroll { flex: 1 1 0; }
 .lanes { height: 100%; min-height: 0; grid-template-rows: minmax(0, 1fr); box-sizing: border-box; }
 .lane { min-height: 0; max-height: 100%; box-sizing: border-box; }
+/* The job detail floats over the board when a job is selected; the board keeps the full width. */
+.detail-close {
+  display: none;
+}
+@media (min-width: 700px) {
+  .app-body {
+    flex-wrap: nowrap;
+  }
+  .board-main {
+    flex: 1 1 0;
+  }
+  .detail {
+    position: fixed;
+    top: 72px;
+    right: 16px;
+    bottom: 16px;
+    z-index: 20;
+    width: clamp(min(440px, 100vw - 32px), 46vw, 760px);
+    max-width: none;
+    height: auto;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+    overflow: hidden;
+    transform: translateX(calc(100% + 24px));
+    visibility: hidden;
+    transition: transform 0.2s ease, visibility 0.2s;
+  }
+  .detail.open {
+    transform: none;
+    visibility: visible;
+  }
+  .detail-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: auto;
+    width: 32px;
+    height: 32px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+  }
+}
+@media (min-width: 700px) and (prefers-reduced-motion: reduce) {
+  .detail {
+    transition: none;
+  }
+}
+/* Split screen: every lane in view, in rows, instead of scrolling the board sideways. */
+@media (min-width: 700px) and (max-width: 1279px) {
+  .lanes {
+    min-width: 0;
+    height: 100%;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+  }
+  .lane {
+    min-height: 0;
+    max-height: none;
+  }
+  .board-main {
+    padding: 16px;
+  }
+  .sidebar {
+    flex-basis: 168px;
+  }
+}
+@media (min-width: 700px) and (max-width: 899px) {
+  .lanes {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: repeat(3, minmax(0, 1fr));
+  }
+  .workspace-word {
+    display: none;
+  }
+  .app-header {
+    gap: 10px;
+    padding: 12px 16px;
+  }
+}

@@ -101,8 +101,9 @@ async fn ask_jev(cfg: &Config, http: &reqwest::Client, task: &str) -> Result<Val
         .timeout(Duration::from_millis(j.timeout_ms))
         .json(&request_body(cfg, task));
     let key = Some(&j.api_key_env).filter(|n| !n.is_empty()).and_then(|n| std::env::var(n).ok()).filter(|k| !k.is_empty());
-    // With no key set, "auto" on this machine uses the one scripts/local-jev.sh starts its server with.
-    let key = key.or_else(|| (cfg.router.kind == "auto" && crate::orchestrator::is_loopback(&j.base_url)).then(|| LOCAL_DEV_KEY.to_string()));
+    // With no key set, a server on this machine gets the one scripts/local-jev.sh starts it with.
+    // A remote one never does: the key is for the local development server only.
+    let key = key.or_else(|| crate::orchestrator::is_loopback(&j.base_url).then(|| LOCAL_DEV_KEY.to_string()));
     if let Some(key) = key {
         req = req.bearer_auth(key);
     }
@@ -376,6 +377,16 @@ mod tests {
     async fn auto_without_a_server_uses_the_rules_quietly() {
         let r = route(&auto("http://127.0.0.1:1"), &reqwest::Client::new(), "fix the failing test", false).await;
         assert!(!r.asked_jev && r.fell_back.is_none(), "{:?}", r.fell_back);
+    }
+
+    #[tokio::test]
+    async fn jev_without_a_key_set_uses_the_local_development_key() {
+        let (url, seen) = stand_in();
+        let mut cfg = auto(&url);
+        cfg.router.kind = "jev".into();
+        let r = route(&cfg, &reqwest::Client::new(), "rename a field", false).await;
+        assert!(r.asked_jev && r.fell_back.is_none(), "{:?}", r.fell_back);
+        assert!(seen.lock().unwrap().contains("Bearer forkdeck-local-dev"), "the local server's development key: {}", seen.lock().unwrap());
     }
 
     #[tokio::test]

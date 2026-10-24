@@ -8,6 +8,8 @@ import { pill, stageChip, tabClass, type PresentedJob } from "./ui";
 interface Props {
   data: PresentedJob[];
   picked?: number;
+  /** A job was chosen by URL: its detail floats over the board until closed. */
+  open: boolean;
   automation: boolean;
   agents: { claude: boolean; codex: boolean; copilot: boolean };
   live: string;
@@ -15,16 +17,19 @@ interface Props {
   capacity: number;
   workspace: string;
   router: string;
+  lanes: { id: string; label: string }[];
 }
 export function BoardWide({
   data,
   picked,
+  open,
   agents,
   live,
   busy,
   capacity,
   workspace,
   router,
+  lanes: laneNames,
 }: Props) {
   const { route } = useLocation();
   const [activeTab, setTab] = useState("Worker");
@@ -34,22 +39,23 @@ export function BoardWide({
       ?.querySelector(".job-card.selected")
       ?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [picked]);
+  // The detail floats over the board; Escape puts it away.
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && open) route("/");
+    };
+    addEventListener("keydown", key);
+    return () => removeEventListener("keydown", key);
+  }, [open]);
   const jobs = data.map((j) => ({
     ...j,
     pillClass: pill(j.state),
-    cardClass: `job-card${j.id === picked ? " selected" : ""}`,
+    cardClass: `job-card${open && j.id === picked ? " selected" : ""}`,
     pick: () => route(`/jobs/${j.id}`),
   }));
-  const lanes = [
-    "Queue",
-    "Build",
-    "Review",
-    "Delivery",
-    "Done",
-    "Attention",
-  ].map((name) => {
-    const inLane = jobs.filter((j) => j.lane === name);
-    return { name, count: inLane.length, jobs: inLane };
+  const lanes = laneNames.map(({ id, label }) => {
+    const inLane = jobs.filter((j) => j.lane === id);
+    return { name: label, count: inLane.length, jobs: inLane };
   });
   const selected = jobs.find((j) => j.id === picked) ?? jobs[0];
   const sel = { ...selected, stages: selected.stages.map(stageChip) };
@@ -166,12 +172,20 @@ export function BoardWide({
             </div>
           </div>
         </main>
-        <aside aria-label="Job detail" class="detail">
+        <aside aria-label="Job detail" class={`detail${open ? " open" : ""}`}>
           <div class="detail-heading">
             <div class="detail-meta">
               <span>{`#${sel.id}`}</span>
               <span class={sel.pillClass}>{sel.state}</span>
               <span>{sel.elapsed}</span>
+              <button
+                type="button"
+                class="detail-close"
+                aria-label="Close job detail"
+                onClick={() => route("/")}
+              >
+                ×
+              </button>
             </div>
             <h1 class="detail-title">{sel.title}</h1>
             <div class="mono-muted">{sel.route}</div>

@@ -8,22 +8,25 @@ import { tabClass, pill, type PresentedJob } from "./ui";
 export function BoardPhone({
   data,
   live,
+  lanes,
 }: {
   data: PresentedJob[];
   live: string;
+  lanes: { id: string; label: string }[];
 }) {
   const { route } = useLocation();
   const [filter, setFilter] = useState(
     data.some((j) => j.group === "Active") ? "Active" : "All",
   );
-  const filters = ["Active", "Attention", "Done", "All"].map((label) => ({
-    label,
-    pick: () => setFilter(label),
-    className: `filter ${tabClass(label === filter)}`,
+  const named = (id: string) => lanes.find((l) => l.id === id)?.label ?? id;
+  const filters = ["Active", "Attention", "Done", "All"].map((id) => ({
+    label: named(id),
+    pick: () => setFilter(id),
+    className: `filter ${tabClass(id === filter)}`,
   }));
   const jobs = data
     .filter((j) => filter === "All" || j.group === filter)
-    .map((j) => ({ ...j, pillClass: pill(j.state) }));
+    .map((j) => ({ ...j, pillClass: pill(j.state), laneLabel: named(j.lane) }));
   return (
     <div class="phone">
       <header class="phone-header">
@@ -79,7 +82,7 @@ export function BoardPhone({
               <div class="job-heading">
                 <span>{`#${job.id}`}</span>
                 <span class={job.pillClass}>{job.state}</span>
-                <span class="push-right">{job.lane}</span>
+                <span class="push-right">{job.laneLabel}</span>
               </div>
               <div class="phone-title">{job.title}</div>
               <div class="muted-small">{job.meta}</div>

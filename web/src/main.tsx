@@ -54,13 +54,14 @@ function Board({ id }: { id?: string }) {
     );
   const data = snap.jobs.map(present);
   if (narrow && !id) {
-    return <BoardPhone data={data} live={connection.value} />;
+    return <BoardPhone data={data} live={connection.value} lanes={snap.lanes} />;
   }
   return (
     <div class={narrow ? "mobile-detail" : ""}>
       <BoardWide
         data={data}
         picked={picked}
+        open={!!id}
         automation={snap.automation}
         agents={snap.agents}
         busy={snap.busy}
@@ -68,6 +69,7 @@ function Board({ id }: { id?: string }) {
         workspace={snap.workspace}
         router={`${snap.router.kind} · ${snap.router.calls} routes · ${snap.router.last_ms} ms`}
         live={connection.value}
+        lanes={snap.lanes}
       />
     </div>
   );

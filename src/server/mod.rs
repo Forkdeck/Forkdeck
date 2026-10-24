@@ -1,6 +1,7 @@
 pub(crate) mod http;
 mod auth;
 mod view;
+mod wire;
 pub(crate) mod seed;
 mod operations;
 pub(crate) mod write;
