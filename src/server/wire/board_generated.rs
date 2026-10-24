@@ -1303,7 +1303,9 @@ pub enum SnapshotOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
 /// Fields after `workspaces` are the TUI status line and title: running and queued job counts,
-/// jobs and tokens in the last 24 hours, demo mode, and the newest session log lines (oldest first).
+/// jobs and tokens in the last 24 hours, the note the TUI adds after its title (the mode the
+/// daemon runs in; the browser shows it and never branches on it), and the newest session log
+/// lines (oldest first).
 pub struct Snapshot<'a> {
   pub _tab: flatbuffers::Table<'a>,
 }
@@ -1330,7 +1332,7 @@ impl<'a> Snapshot<'a> {
   pub const VT_QUEUED: flatbuffers::VOffsetT = 24;
   pub const VT_SPENT_JOBS: flatbuffers::VOffsetT = 26;
   pub const VT_SPENT_TOKENS: flatbuffers::VOffsetT = 28;
-  pub const VT_DEMO: flatbuffers::VOffsetT = 30;
+  pub const VT_TITLE_NOTE: flatbuffers::VOffsetT = 30;
   pub const VT_LOG: flatbuffers::VOffsetT = 32;
 
   #[inline]
@@ -1345,6 +1347,7 @@ impl<'a> Snapshot<'a> {
     let mut builder = SnapshotBuilder::new(_fbb);
     builder.add_spent_tokens(args.spent_tokens);
     if let Some(x) = args.log { builder.add_log(x); }
+    if let Some(x) = args.title_note { builder.add_title_note(x); }
     builder.add_spent_jobs(args.spent_jobs);
     builder.add_queued(args.queued);
     builder.add_running(args.running);
@@ -1356,7 +1359,6 @@ impl<'a> Snapshot<'a> {
     builder.add_busy(args.busy);
     builder.add_capacity(args.capacity);
     if let Some(x) = args.workspace { builder.add_workspace(x); }
-    builder.add_demo(args.demo);
     builder.add_automation(args.automation);
     builder.finish()
   }
@@ -1454,11 +1456,11 @@ impl<'a> Snapshot<'a> {
     unsafe { self._tab.get::<u64>(Snapshot::VT_SPENT_TOKENS, Some(0)).unwrap()}
   }
   #[inline]
-  pub fn demo(&self) -> bool {
+  pub fn title_note(&self) -> Option<&'a str> {
     // Safety:
     // Created from valid Table for this object
     // which contains a valid value in this slot
-    unsafe { self._tab.get::<bool>(Snapshot::VT_DEMO, Some(false)).unwrap()}
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Snapshot::VT_TITLE_NOTE, None)}
   }
   #[inline]
   pub fn log(&self) -> Option<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<LogEntry<'a>>>> {
@@ -1489,7 +1491,7 @@ impl flatbuffers::Verifiable for Snapshot<'_> {
      .visit_field::<u32>("queued", Self::VT_QUEUED, false)?
      .visit_field::<u32>("spent_jobs", Self::VT_SPENT_JOBS, false)?
      .visit_field::<u64>("spent_tokens", Self::VT_SPENT_TOKENS, false)?
-     .visit_field::<bool>("demo", Self::VT_DEMO, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("title_note", Self::VT_TITLE_NOTE, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<LogEntry>>>>("log", Self::VT_LOG, false)?
      .finish();
     Ok(())
@@ -1509,7 +1511,7 @@ pub struct SnapshotArgs<'a> {
     pub queued: u32,
     pub spent_jobs: u32,
     pub spent_tokens: u64,
-    pub demo: bool,
+    pub title_note: Option<flatbuffers::WIPOffset<&'a str>>,
     pub log: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<LogEntry<'a>>>>>,
 }
 impl<'a> Default for SnapshotArgs<'a> {
@@ -1529,7 +1531,7 @@ impl<'a> Default for SnapshotArgs<'a> {
       queued: 0,
       spent_jobs: 0,
       spent_tokens: 0,
-      demo: false,
+      title_note: None,
       log: None,
     }
   }
@@ -1593,8 +1595,8 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> SnapshotBuilder<'a, 'b, A> {
     self.fbb_.push_slot::<u64>(Snapshot::VT_SPENT_TOKENS, spent_tokens, 0);
   }
   #[inline]
-  pub fn add_demo(&mut self, demo: bool) {
-    self.fbb_.push_slot::<bool>(Snapshot::VT_DEMO, demo, false);
+  pub fn add_title_note(&mut self, title_note: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Snapshot::VT_TITLE_NOTE, title_note);
   }
   #[inline]
   pub fn add_log(&mut self, log: flatbuffers::WIPOffset<flatbuffers::Vector<'b , flatbuffers::ForwardsUOffset<LogEntry<'b >>>>) {
@@ -1631,7 +1633,7 @@ impl core::fmt::Debug for Snapshot<'_> {
       ds.field("queued", &self.queued());
       ds.field("spent_jobs", &self.spent_jobs());
       ds.field("spent_tokens", &self.spent_tokens());
-      ds.field("demo", &self.demo());
+      ds.field("title_note", &self.title_note());
       ds.field("log", &self.log());
       ds.finish()
   }

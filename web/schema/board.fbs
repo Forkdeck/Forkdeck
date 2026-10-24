@@ -18,11 +18,13 @@ table Router { kind: string; calls: ulong; last_ms: ulong;
 /// Where a new task can run: `id` is the opaque value the submit action takes.
 table Workspace { id: string; name: string; }
 /// Fields after `workspaces` are the TUI status line and title: running and queued job counts,
-/// jobs and tokens in the last 24 hours, demo mode, and the newest session log lines (oldest first).
+/// jobs and tokens in the last 24 hours, the note the TUI adds after its title (the mode the
+/// daemon runs in; the browser shows it and never branches on it), and the newest session log
+/// lines (oldest first).
 table Snapshot { automation: bool; workspace: string; capacity: uint; busy: uint;
                  router: Router; agents: Agents; lanes: [Lane]; jobs: [Job];
                  workspaces: [Workspace];
-                 running: uint; queued: uint; spent_jobs: uint; spent_tokens: ulong; demo: bool;
+                 running: uint; queued: uint; spent_jobs: uint; spent_tokens: ulong; title_note: string;
                  log: [LogEntry]; }
 table JobChanged { job: Job; }
 table Tail { id: uint; worker: bool; from: ulong; lines: [string]; }

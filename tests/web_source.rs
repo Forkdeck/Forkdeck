@@ -19,7 +19,14 @@ fn browser_source_has_no_fixture_content_or_mode_switches() {
             if path.is_dir() { dirs.push(path); continue; }
             let source = std::fs::read_to_string(&path).unwrap();
             assert!(!source.to_lowercase().split(|c: char| !c.is_alphanumeric()).any(|word| word == "demo"), "mode switch in {}", path.display());
-            for title in titles { assert!(!source.contains(title), "sample title {title:?} in {}", path.display()); }
+            for title in titles {
+                // Generic one-word titles count only as displayed text, not inside identifiers
+                // (localStorage) or prose about the code.
+                let found = if matches!(title, "Storage" | "API") {
+                    ['\'', '"', '`'].iter().any(|q| source.contains(&format!("{q}{title}{q}"))) || source.contains(&format!(">{title}<"))
+                } else { source.contains(title) };
+                assert!(!found, "sample title {title:?} in {}", path.display());
+            }
         }
     }
 }

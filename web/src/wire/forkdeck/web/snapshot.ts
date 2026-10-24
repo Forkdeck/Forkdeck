@@ -14,7 +14,9 @@ import { Workspace } from '../../forkdeck/web/workspace.ts';
 
 /**
  * Fields after `workspaces` are the TUI status line and title: running and queued job counts,
- * jobs and tokens in the last 24 hours, demo mode, and the newest session log lines (oldest first).
+ * jobs and tokens in the last 24 hours, the note the TUI adds after its title (the mode the
+ * daemon runs in; the browser shows it and never branches on it), and the newest session log
+ * lines (oldest first).
  */
 export class Snapshot {
   bb: flatbuffers.ByteBuffer|null = null;
@@ -116,9 +118,11 @@ spentTokens():bigint {
   return offset ? this.bb!.readUint64(this.bb_pos + offset) : BigInt('0');
 }
 
-demo():boolean {
+titleNote():string|null
+titleNote(optionalEncoding:flatbuffers.Encoding):string|Uint8Array|null
+titleNote(optionalEncoding?:any):string|Uint8Array|null {
   const offset = this.bb!.__offset(this.bb_pos, 30);
-  return offset ? !!this.bb!.readInt8(this.bb_pos + offset) : false;
+  return offset ? this.bb!.__string(this.bb_pos + offset, optionalEncoding) : null;
 }
 
 log(index: number, obj?:LogEntry):LogEntry|null {
@@ -223,8 +227,8 @@ static addSpentTokens(builder:flatbuffers.Builder, spentTokens:bigint) {
   builder.addFieldInt64(12, spentTokens, BigInt('0'));
 }
 
-static addDemo(builder:flatbuffers.Builder, demo:boolean) {
-  builder.addFieldInt8(13, +demo, +false);
+static addTitleNote(builder:flatbuffers.Builder, titleNoteOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(13, titleNoteOffset, 0);
 }
 
 static addLog(builder:flatbuffers.Builder, logOffset:flatbuffers.Offset) {

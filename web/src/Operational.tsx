@@ -11,7 +11,7 @@ const pages = [
   ["/stats", "Stats"],
   ["/configuration", "Configuration"],
 ];
-/** Each page's address; the configuration page reads the doctor API. */
+/** Each page's address; the configuration page reads /api/v1/doctor. */
 const routeOf = (page: string) => (page === "doctor" ? "/configuration" : `/${page}`);
 export function Navigation() {
   return (
