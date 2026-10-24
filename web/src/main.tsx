@@ -1,4 +1,4 @@
-import { Composer, Intake } from "./Actions";
+import { Composer, Intake, Keys } from "./Actions";
 import { Account } from "./Account";
 import { render } from "preact";
 import { useEffect, useState } from "preact/hooks";
@@ -126,6 +126,7 @@ function App() {
   }, []);
   return (
     <LocationProvider>
+      <Keys />
       <Router>
         <Route path="/" component={Board} />
         <Route path="/jobs/:id" component={Board} />
