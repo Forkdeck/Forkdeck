@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 import { test } from 'node:test';
 import { apply, board, connect } from '../web/src/live.ts';
 import { connection } from '../web/src/state.ts';
-import { Frame, Body, Snapshot, Job, JobChanged, Automation, Tail, Resync, Changed } from '../web/src/wire/forkdeck/web.ts';
+import { Frame, Body, Snapshot, Job, JobChanged, Automation, Tail, Resync, Changed, Log, LogEntry } from '../web/src/wire/forkdeck/web.ts';
 const require = createRequire(new URL('../web/package.json', import.meta.url));
 const { Builder, ByteBuffer } = require('flatbuffers');
 
@@ -158,4 +158,23 @@ test('socket retries resume, back off, reload on Resync and stop cleanly', async
     }
     board.value = null;
   }
+});
+
+function logFrame(seq, count) {
+  return frame(Body.Log, seq, b => Log.createLog(b, Log.createLinesVector(b,
+    Array.from({length:count}, (_,i) => LogEntry.createLogEntry(b, b.createString('12:00'), b.createString('issues'), b.createString(`line ${i}`))))));
+}
+test('session log starts with snapshot and appends Log frames capped at 200', () => {
+  const snap = frame(Body.Snapshot, 1, b => {
+    const lines = Snapshot.createLogVector(b, [LogEntry.createLogEntry(b, 0, b.createString('queue'), b.createString('initial'))]);
+    Snapshot.startSnapshot(b); Snapshot.addLog(b,lines); return Snapshot.endSnapshot(b);
+  });
+  const current = apply(null,snap).next;
+  assert.equal(current.log[0].text(),'initial');
+  const next = apply(current,logFrame(2,201)).next;
+  assert.equal(current.log.length,1);
+  assert.equal(next.log.length,200);
+  assert.equal(next.log[0].text(),'line 1');
+  assert.equal(next.log[199].text(),'line 200');
+  assert.equal(apply(next,logFrame(2,1)).next,next);
 });

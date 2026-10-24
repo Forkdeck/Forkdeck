@@ -20,3 +20,7 @@ export function stageChip(state: number, index: number) {
 export function tabClass(selected: boolean): string {
   return `tab${selected ? " selected" : ""}`;
 }
+
+export function jobPath(job: Job): string {
+  return `/${job.kind() === "plan" ? "plans" : "jobs"}/${job.id()}`;
+}

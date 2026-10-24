@@ -19,6 +19,7 @@ import "@fontsource/ibm-plex-mono/latin-500.css";
 import "./style.css";
 
 function Board({ id }: { id?: string }) {
+  const { route } = useLocation();
   const current = board.value;
   const snap = current?.snapshot;
   const [narrow, setNarrow] = useState(matchMedia("(max-width:699px)").matches);
@@ -32,11 +33,14 @@ function Board({ id }: { id?: string }) {
     query.addEventListener("change", change);
     return () => query.removeEventListener("change", change);
   }, []);
+  const selected = current?.jobs.find((j) => j.id() === picked);
+  const planJob = selected?.kind() === "plan";
   useEffect(() => {
-    if (picked) void selectJob(picked);
-  }, [picked]);
+    if (id && planJob) route(`/plans/${picked}`, true);
+    else if (selected) void selectJob(selected.id());
+  }, [picked, planJob, Boolean(selected)]);
   if (!snap || !current) return <Status />;
-  if (!current.jobs.length)
+  if (!current.jobs.length && !id)
     return (
       <div class="empty">
         <header class="app-header">
@@ -63,11 +67,10 @@ function Board({ id }: { id?: string }) {
         picked={picked}
         open={!!id}
         automation={current.automation}
-        agents={snap.agents()}
+        snapshot={snap}
         busy={snap.busy()}
         capacity={snap.capacity()}
         workspace={snap.workspace() ?? ""}
-        router={`${snap.router()?.kind() ?? ""} · ${snap.router()?.calls() ?? 0} routes · ${snap.router()?.lastMs() ?? 0} ms`}
         live={connection.value}
         lanes={lanes}
       />
