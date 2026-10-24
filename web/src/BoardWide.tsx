@@ -179,7 +179,7 @@ export function BoardWide({ data, picked, open, snapshot, live, busy, capacity, 
             <circle cx="18" cy="12" r="2"></circle>
             <path d="M6 7v10M6 12h4a4 4 0 0 0 4-4V7M14 12h2"></path>
           </svg>
-<span class="brand-name">forkdeck{snapshot.demo() ? " (demo)" : ""}</span></div>
+<span class="brand-name">forkdeck{snapshot.titleNote() ? ` ${snapshot.titleNote()}` : ""}</span></div>
       <span class="workspace-label">{workspace}</span>
       <div class="grow" />
       <div class="connection"><span class="live-dot" />{`${live} · ${busy} slots of ${capacity} busy`}</div>

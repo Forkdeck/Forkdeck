@@ -38,8 +38,9 @@ function snapshotFixture(bytes, plans) {
   const workspaces = Snapshot.createWorkspacesVector(b,Array.from({length:old.workspacesLength()},(_,i) => {
     const item = old.workspaces(i); return Workspace.createWorkspace(b,str(item.id()),str(item.name()));
   }));
+  const note = str('(demo)');
   Snapshot.startSnapshot(b); Snapshot.addJobs(b,jobVector); Snapshot.addLanes(b,lanes); Snapshot.addAgents(b,agents); Snapshot.addRouter(b,router); Snapshot.addLog(b,log); Snapshot.addWorkspace(b,workspace); Snapshot.addWorkspaces(b,workspaces); Snapshot.addBusy(b,old.busy()); Snapshot.addCapacity(b,old.capacity()); Snapshot.addAutomation(b,old.automation());
-  Snapshot.addRunning(b,2); Snapshot.addQueued(b,3); Snapshot.addSpentJobs(b,17); Snapshot.addSpentTokens(b,12345n); Snapshot.addDemo(b,true);
+  Snapshot.addRunning(b,2); Snapshot.addQueued(b,3); Snapshot.addSpentJobs(b,17); Snapshot.addSpentTokens(b,12345n); Snapshot.addTitleNote(b,note);
   b.finish(Frame.createFrame(b,9000n,Body.Snapshot,Snapshot.endSnapshot(b)));
   return Buffer.from(b.asUint8Array());
 }

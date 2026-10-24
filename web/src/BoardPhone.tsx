@@ -54,7 +54,7 @@ export function BoardPhone({
           <circle cx="18" cy="12" r="2"></circle>
           <path d="M6 7v10M6 12h4a4 4 0 0 0 4-4V7M14 12h2"></path>
         </svg>
-        <span class="phone-brand">forkdeck{board.value?.snapshot.demo() ? " (demo)" : ""}</span>
+        <span class="phone-brand">forkdeck{board.value?.snapshot.titleNote() ? ` ${board.value.snapshot.titleNote()}` : ""}</span>
         <div class="grow"></div>
         <span class="phone-connection">
           <span class="live-dot"></span>
