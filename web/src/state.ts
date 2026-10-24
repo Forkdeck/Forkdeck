@@ -59,7 +59,7 @@ export const actionBusy = signal(false);
 export const actionError = signal("");
 export const invalidation = signal(0);
 export const writeReason = computed(() => !identityLoaded.value ? "Checking permissions…" : principal.value?.role === "viewer" ? "Operator or admin role required" : "");
-export async function action(command: Record<string, unknown>): Promise<{ id?: number } | undefined> {
+export async function action<T = { id?: number }>(command: Record<string, unknown>): Promise<T | undefined> {
   if (actionBusy.value || writeReason.value) return;
   actionBusy.value = true;
   actionError.value = "";
@@ -73,6 +73,34 @@ export async function action(command: Record<string, unknown>): Promise<{ id?: n
     return result;
   } catch (e) { actionError.value = (e as Error).message; }
   finally { actionBusy.value = false; }
+}
+export interface Forges {
+  providers: { id: "github" | "gitlab"; host: string }[];
+  can_add: boolean;
+}
+export interface RepoPickerData {
+  provider: "github" | "gitlab";
+  host: string;
+  expires_unix: number;
+  repos: {
+    repo: string;
+    private: boolean;
+    default_branch: string;
+    description: string;
+    configured: boolean;
+  }[];
+}
+export interface AddedRepo {
+  repo: string;
+  path: string;
+  restart_required: boolean;
+}
+export async function readForges(): Promise<Forges> {
+  const response = await fetch("/api/v1/forges");
+  if (response.status === 401) location.assign("/auth/login");
+  if (response.status === 404) return { providers: [], can_add: false };
+  if (!response.ok) throw new Error(`Could not load forges (${response.status})`);
+  return response.json();
 }
 export const details = signal<Record<number, JobDetail>>({});
 export const plans = signal<PlanView[]>([]);

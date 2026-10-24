@@ -10,6 +10,7 @@ import { PlansView } from "./PlansView";
 import { plans, connection, error, selectJob, loadIdentity } from "./state";
 import { board, connect } from "./live";
 import { present } from "./ui";
+import { RepoPicker } from "./RepoPicker";
 import "@fontsource/ibm-plex-sans/latin-400.css";
 import "@fontsource/ibm-plex-sans/latin-500.css";
 import "@fontsource/ibm-plex-sans/latin-600.css";
@@ -125,6 +126,7 @@ function App() {
         <Route path="/plans" component={Plans} />
         <Route path="/plans/:id" component={Plans} />
         <Route path="/repos" component={() => <Operational page="repos" />} />
+        <Route path="/repos/add/:id" component={RepoPicker} />
         <Route
           path="/deploys"
           component={() => <Operational page="deploys" />}
