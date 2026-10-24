@@ -8,22 +8,37 @@ pub fn snapshot(hub: &Hub, feed: &Feed) -> Value {
     let mut snap = serde_json::to_value(&native).unwrap();
     let st = hub.state.lock().unwrap();
     let observed = hub.schedule_views.lock().unwrap();
-    snap["jobs"] = Value::Array(st.jobs.iter().filter(|j| j.issue_plan.is_none()).filter_map(|j| {
+    snap["jobs"] = Value::Array(st.jobs.iter().filter_map(|j| {
         let summary = native.jobs.iter().find(|s| s.id == j.id)?;
         let mut v = serde_json::to_value(summary).unwrap();
+        v["kind"] = json!(job_kind(j));
+        v["status"] = json!(j.status.name());
+        v["agent"] = json!(j.decision.as_ref().map(|d| d.agent.name()).unwrap_or(""));
+        v["queued"] = json!(j.inbox.len());
         let projection = projected(j, &st, &observed);
         for (key, value) in serde_json::to_value(projection).unwrap().as_object().unwrap() { v[key] = value.clone(); }
         Some(v)
     }).collect());
-    snap["agents"] = json!({"claude": st.agent_ready(crate::state::AgentKind::Claude), "codex": st.agent_ready(crate::state::AgentKind::Codex), "copilot": st.copilot_usable()});
+    snap["agents"] = json!({"claude": st.agent_ready(crate::state::AgentKind::Claude), "codex": st.agent_ready(crate::state::AgentKind::Codex), "copilot": st.copilot_usable(), "words": crate::state::AgentKind::ALL.iter().map(|k| json!({"agent":k.name(),"word":crate::ui::agent_word(&st, *k)})).collect::<Vec<_>>()});
     snap["workspace"] = json!(std::env::current_dir().ok().and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned())).unwrap_or_default());
     snap["workspaces"] = super::write::workspaces(hub);
     snap["capacity"] = json!(hub.cfg.automation.max_parallel);
     snap["busy"] = json!(st.jobs.iter().filter(|j| j.admitted).count());
-    snap["router"] = json!({"kind":st.router.kind,"calls":st.router.calls,"last_ms":st.router.last_ms});
+    snap["router"] = json!({"kind":st.router.kind,"calls":st.router.calls,"last_ms":st.router.last_ms,"label":crate::ui::router_word(&st),"healthy":match st.router.healthy { None => 0, Some(true) => 1, Some(false) => 2 },"fallbacks":st.router.fallbacks,"remembered":st.router.remembered,"endpoint":if st.router.kind == "rules" { "" } else { &hub.cfg.router.jev.base_url }});
+    snap["running"] = json!(st.jobs.iter().filter(|j| !j.status.finished() && j.status != JobStatus::Queued).count());
+    snap["queued"] = json!(st.jobs.iter().filter(|j| j.status == JobStatus::Queued).count());
+    snap["spent_jobs"] = json!(st.spent.jobs);
+    snap["spent_tokens"] = json!(st.spent.tokens);
+    snap["demo"] = json!(hub.cfg.demo);
+    snap["log"] = json!(st.log.iter().skip(st.log.len().saturating_sub(200)).map(|l| json!({"time":l.time,"who":l.who,"text":l.msg})).collect::<Vec<_>>());
     // Jobs carry the lane's fixed id; what the board calls each lane is configured.
     snap["lanes"] = Value::Array(LANES.iter().zip(hub.cfg.web.lanes.in_order()).map(|(id, label)| json!({"id": id, "label": label})).collect());
     snap
+}
+
+pub(super) fn job_kind(j: &Job) -> &'static str {
+    if j.issue_plan.is_some() { return "plan"; }
+    match j.source { crate::state::Source::Manual => "manual", crate::state::Source::Issue { .. } => "issue", crate::state::Source::Pr { .. } => "pr", crate::state::Source::Deploy { .. } => "deploy" }
 }
 
 pub(super) fn projected(j: &Job, st: &crate::state::State, observed: &std::collections::HashMap<String, crate::schedule::ReadView>) -> forkdeck_remote_proto::BoardProjection {
@@ -45,6 +60,9 @@ pub fn detail(hub: &Hub, feed: &Feed, id: u32) -> Option<Value> {
     let board = snapshot(hub, feed);
     v["board"] = board["jobs"].as_array()?.iter().find(|j| j["id"] == id)?.clone();
     hub.job(id, |j| {
+        v["prompt_title"] = json!(crate::ui::prompt_title(j));
+        let url = match &j.source { crate::state::Source::Issue { url, .. } | crate::state::Source::Pr { url, .. } => url.as_str(), _ => "" };
+        v["source"] = json!({"url":url,"branch":j.branch.as_deref().unwrap_or(""),"workdir":j.workdir.display().to_string()});
         v["revision"] = json!(super::write::revision(j));
         v["choices"] = json!(crate::choices::for_job(j).iter().map(|c| json!({"label":c.label,"detail":c.detail})).collect::<Vec<_>>());
         v["queued"] = json!(j.inbox);
@@ -81,7 +99,7 @@ pub fn plans(hub: &Hub) -> Vec<Value> {
         let publish = unavailable.clone().or_else(|| p.clone().accept(!j.inbox.is_empty()).err());
         let ready = unavailable.clone().or_else(|| p.clone().request_ready(!j.inbox.is_empty()).err());
         let refine = if p.pending.is_some() || p.creating() { Some("Reconcile publication before refining".to_string()) } else if p.graph.is_some() && p.creation.as_ref().is_some_and(|c| c.done) { Some("Changes to a published task graph are not supported yet".to_string()) } else { None };
-        Some(json!({"actions":{"publish":publish,"ready":ready,"refine":refine},"revision":super::write::revision(j),"id": j.id, "title": j.title, "status": plan_state(p), "plan": p, "draft_display": crate::taskgraph::strip(&p.draft), "tasks": tasks, "freshness": observation.map(|v| v.observed_unix), "scheduler": scheduler, "description": plan_description(p), "subtitle": format!("{}{} · r{} · {}", p.repo, p.issue.as_ref().map(|i| format!(" #{}", i.key)).unwrap_or_default(), p.revision, plan_state(p)), "decision": decision}))
+        Some(json!({"actions":{"publish":publish,"ready":ready,"refine":refine},"revision":super::write::revision(j),"id": j.id, "title": j.title, "status": p.status(st.automation), "plan": p, "draft_display": crate::taskgraph::strip(&p.draft), "tasks": tasks, "freshness": observation.map(|v| v.observed_unix), "scheduler": scheduler, "description": plan_description(p, st.automation), "subtitle": p.status(st.automation), "decision": decision}))
     }).collect();
     for v in observed.values() {
         if st.jobs.iter().any(|j| j.issue_plan.as_ref().is_some_and(|p| p.repo == v.repo && p.issue.as_ref() == Some(&v.issue))) { continue; }
@@ -91,11 +109,11 @@ pub fn plans(hub: &Hub) -> Vec<Value> {
     plans
 }
 
-fn plan_description(p: &crate::planning::Plan) -> String {
+fn plan_description(p: &crate::planning::Plan, intake: bool) -> String {
     if let Some(g) = &p.graph {
-        if !p.creation.as_ref().is_some_and(|c| c.done) { return format!("{} tasks in the graph · {}", g.tasks.len(), plan_state(p)); }
+        if !p.creation.as_ref().is_some_and(|c| c.done) { return format!("{} tasks in the graph · {}", g.tasks.len(), p.status(intake)); }
         format!("Accepted and created as {} sub-issues. Tasks start by themselves when what they depend on has merged.", g.tasks.iter().filter(|t| t.kind != crate::taskgraph::Kind::Group).count())
-    } else { plan_state(p) }
+    } else { p.status(intake) }
 }
 
 fn duration(secs: u64) -> String {
@@ -137,7 +155,7 @@ pub(super) fn board(j: &Job, st: &crate::state::State) -> forkdeck_remote_proto:
     }).map(|l| vec![l.time.clone(), l.who.clone(), l.msg.clone()]).collect();
     log.extend(j.worker.tail.iter().enumerate().map(|(i, s)| vec![j.worker.tail_times.get(i).cloned().unwrap_or_default(), "worker".into(), s.clone()]));
     log.extend(j.reviewer.tail.iter().enumerate().map(|(i, s)| vec![j.reviewer.tail_times.get(i).cloned().unwrap_or_default(), "review".into(), s.clone()]));
-    log.extend(j.turns.iter().flat_map(|t| [vec![String::new(), "queue".into(), t.ask.clone()], vec![String::new(), "issues".into(), t.answer.clone()]]));
+    log.extend(j.turns.iter().flat_map(|t| [vec![String::new(), "you".into(), t.ask.clone()], vec![String::new(), "agent".into(), t.answer.clone()]]));
     if !j.outcome.is_empty() { log.push(vec![String::new(), "queue".into(), j.outcome.clone()]); }
     let warn = if unverified {
         let refused = if j.worker.refused.is_empty() { String::new() } else { format!(" Worker was not allowed: {}.", j.worker.refused.join("; ")) };
@@ -151,16 +169,6 @@ pub(super) fn board(j: &Job, st: &crate::state::State) -> forkdeck_remote_proto:
     }
 }
 
-
-fn plan_state(p: &crate::planning::Plan) -> String {
-    if let Some(id) = p.build_job { format!("building #{id}") }
-    else if p.pending.is_some() { "publication pending".into() }
-    else if p.creation.as_ref().is_some_and(|c| c.done) { "scheduling".into() }
-    else if p.ready { "ready for build".into() }
-    else if p.published == Some(p.revision) { "published".into() }
-    else if p.reviewed == Some(p.revision) { "reviewed — accept or refine".into() }
-    else { "planning — needs review".into() }
-}
 
 fn task_views(mut tasks: Vec<Value>, jobs: &[Job], repo: &str) -> Vec<Value> {
     let raw = tasks.clone();
@@ -193,6 +201,65 @@ fn scheduler_summary(v: &crate::schedule::ReadView) -> String {
 mod tests {
     use super::*;
 
+    fn seeded(rt: &tokio::runtime::Runtime) -> Hub {
+        let mut cfg = crate::config::Config { demo: true, ..Default::default() };
+        crate::server::seed::configure(&mut cfg);
+        let hub = Hub::new(cfg, rt.handle().clone());
+        crate::server::seed::seed_demo(&hub).unwrap();
+        hub
+    }
+
+    #[test]
+    fn detail_prompt_titles_match_the_terminal() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let hub = seeded(&rt);
+        let feed = Feed::new();
+        for (status, title) in [
+            (JobStatus::Choosing, "Choose for #70 · a number, or your own approach · F5 options · Ctrl-T new task"),
+            (JobStatus::Interrupted, "Reply to #70 · Enter with nothing typed resumes it · Ctrl-T new task"),
+            (JobStatus::Working, "Message #70 · 1 queued · Enter to queue · Ctrl-S now · Ctrl-T new task"),
+            (JobStatus::Done, "Reply to #70 · 1 queued · Enter to send · Ctrl-T new task"),
+        ] {
+            hub.job(70, |j| { j.status = status; j.inbox.clear(); j.inbox.push_back("follow-up".into()); });
+            assert_eq!(detail(&hub, &feed, 70).unwrap()["prompt_title"], title);
+        }
+    }
+
+    #[test]
+    fn detail_has_source_and_conversation_roles() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let hub = seeded(&rt);
+        let feed = Feed::new();
+        hub.job(72, |j| j.branch = Some("forkdeck/issue-22".into()));
+        let source = &detail(&hub, &feed, 72).unwrap()["source"];
+        assert_eq!(source["url"], "https://github.com/o/semantic-context/issues/22");
+        assert_eq!(source["branch"], "forkdeck/issue-22");
+        assert_eq!(source["workdir"], hub.job(72, |j| j.workdir.display().to_string()).unwrap());
+        hub.job(70, |j| {
+            j.turns = vec![crate::state::Turn { ask: "my request".into(), answer: "my answer".into() }];
+            j.branch = None;
+        });
+        let typed = detail(&hub, &feed, 70).unwrap();
+        assert_eq!((typed["source"]["url"].as_str(), typed["source"]["branch"].as_str()), (Some(""), Some("")));
+        let turns: Vec<_> = typed["board"]["log"].as_array().unwrap().iter().filter(|l| l[2] == "my request" || l[2] == "my answer").cloned().collect();
+        assert_eq!(turns, vec![json!(["", "you", "my request"]), json!(["", "agent", "my answer"])]);
+        assert!(typed["board"]["log"].as_array().unwrap().iter().any(|l| l[1] == "queue" && l[2] == "committed 2803c77"));
+    }
+
+    #[test]
+    fn plan_status_uses_the_native_intake_aware_words() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let hub = seeded(&rt);
+        for intake in [true, false] {
+            hub.state.lock().unwrap().automation = intake;
+            hub.job(101, |j| j.issue_plan.as_mut().unwrap().ready = true);
+            for p in plans(&hub) {
+                let id = p["id"].as_u64().unwrap() as u32;
+                assert_eq!(p["status"], hub.job(id, |j| j.issue_plan.as_ref().unwrap().status(intake)).unwrap());
+            }
+        }
+    }
+
     #[test]
     fn seeded_jobs_use_the_real_projection_without_a_mode_flag() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -210,6 +277,12 @@ mod tests {
         let snap = snapshot(&hub, &feed);
         let jobs = snap["jobs"].as_array().unwrap();
         let job = |id| jobs.iter().find(|j| j["id"] == id).unwrap();
+        let plan = job(100);
+        assert_eq!(plan["kind"], "plan");
+        assert_eq!(plan["lane"], LANES[hub.job(100, |j| crate::ui::job_lane(j)).unwrap()]);
+        assert_eq!(job(72)["status"], "working");
+        assert_eq!(job(72)["agent"], "claude");
+        assert_eq!(job(72)["queued"], 0);
         let working = job(72);
         assert_eq!(working["lane"], "Build");
         assert_eq!(working["state"], "working");

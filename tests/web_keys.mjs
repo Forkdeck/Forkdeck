@@ -33,7 +33,8 @@ async function fixture(page, change = v => v) {
   });
   await page.route('**/api/v1/actions', async route => {
     commands.push(route.request().postDataJSON());
-    await route.fulfill({ json: { id: 100 } });
+    // A typed task of the seeded board: id 100 is a planning job, whose page is /plans/100.
+    await route.fulfill({ json: { id: 70 } });
   });
   return commands;
 }
@@ -45,6 +46,9 @@ async function openTyped(page) {
     const detail = await (await page.request.get(`${base}/api/v1/jobs/${id}`)).json();
     if (detail.actions.reply && !detail.actions.stop) {
       await page.goto(`${base}/jobs/${id}`);
+      // A planning job's card leads to its plan page, which has no reply box.
+      await page.waitForTimeout(200);
+      if (!new URL(page.url()).pathname.startsWith('/jobs/')) continue;
       await page.locator('.reply-input').waitFor();
       return id;
     }
@@ -179,7 +183,9 @@ try {
         return id;
       }, key);
       await page.keyboard.press(key);
-      await expect(page).toHaveURL(new RegExp(`/jobs/${expected}$`));
+      // Planning jobs open their plan, like their board card.
+      await expect(page).toHaveURL(new RegExp(`/(jobs|plans)/${expected}$`));
+      if (new URL(page.url()).pathname.startsWith('/plans/')) await page.goBack();
     }
     await page.keyboard.press('F2');
     await expect(page).toHaveURL(`${base}/`);
@@ -212,7 +218,7 @@ try {
     assert.equal(commands[0].id, id);
     assert.equal(commands[0].issue, '42');
     assert.equal(commands[0].text, 'Plan this existing task');
-    await expect(page).toHaveURL(`${base}/plans/100`);
+    await expect(page).toHaveURL(`${base}/plans/70`);
     await page.goto(`${base}/jobs/${id}`);
     await page.getByRole('button', { name: 'Plan as issue…' }).click();
     await page.route('**/api/v1/actions', route => route.fulfill({ status: 400, json: { error: 'Issue planning is disabled in demo mode.' } }));

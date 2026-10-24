@@ -333,34 +333,49 @@ fn factory(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
     }
 }
 
+/// What follows "forkdeck" in the title; the browser shows the same note.
+pub(crate) fn title_note(demo: bool) -> &'static str {
+    if demo { "(demo)" } else { "" }
+}
+
 fn title_bar(f: &mut Frame, area: Rect, ui: &Ui) {
     let dir = ui.cwd.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let t = format!("~/{} — forkdeck{} — {}x{}", dir, if ui.demo { " (demo)" } else { "" }, area.width, f.area().height);
+    let note = title_note(ui.demo);
+    let t = format!("~/{} — forkdeck{}{} — {}x{}", dir, if note.is_empty() { "" } else { " " }, note, area.width, f.area().height);
     f.render_widget(Paragraph::new(Span::styled(t, fg(DIM))).alignment(Alignment::Center), area);
+}
+
+pub(crate) fn agent_word(st: &State, k: AgentKind) -> &'static str {
+    if k == AgentKind::Copilot && st.copilot_checking {
+        "CHECKING"
+    } else if st.has(k) && !st.agent_ready(k) {
+        "LIMITED"
+    } else if st.has(k) && (k != AgentKind::Copilot || st.copilot_usable()) {
+        "ON CALL"
+    } else if k == AgentKind::Copilot && st.has(k) {
+        "NO ACCESS"
+    } else if k != AgentKind::Copilot && st.stand_in && st.copilot_usable() {
+        "VIA COPILOT"
+    } else {
+        "MISSING"
+    }
+}
+
+pub(crate) fn router_word(st: &State) -> String {
+    match (st.router.kind.as_str(), st.router.healthy) {
+        ("rules", _) => "RULES ROUTER".to_string(),
+        (_, Some(false)) => "JEV DOWN · RULES".to_string(),
+        (k, _) => k.to_uppercase(),
+    }
 }
 
 fn header(f: &mut Frame, area: Rect, st: &State) {
     let chip = |k: AgentKind, own: Color| -> Span {
-        let (word, color) = if k == AgentKind::Copilot && st.copilot_checking {
-            ("CHECKING", DIM)
-        } else if st.has(k) && !st.agent_ready(k) {
-            ("LIMITED", DIM)
-        } else if st.has(k) && (k != AgentKind::Copilot || st.copilot_usable()) {
-            ("ON CALL", own)
-        } else if k == AgentKind::Copilot && st.has(k) {
-            ("NO ACCESS", RED)
-        } else if k != AgentKind::Copilot && st.stand_in && st.copilot_usable() {
-            ("VIA COPILOT", BLUE)
-        } else {
-            ("MISSING", DIM)
-        };
+        let word = agent_word(st, k);
+        let color = match word { "ON CALL" => own, "NO ACCESS" => RED, "VIA COPILOT" => BLUE, _ => DIM };
         Span::styled(format!("{} {}", k.name().to_uppercase(), word), bold(color))
     };
-    let jev = match (st.router.kind.as_str(), st.router.healthy) {
-        ("rules", _) => "RULES ROUTER".to_string(),
-        (_, Some(false)) => "JEV DOWN · RULES".to_string(),
-        (k, _) => k.to_uppercase(),
-    };
+    let jev = router_word(st);
     let top = Line::from(vec![
         Span::styled("  FORKDECK SOFTWARE FACTORY", bold(BRIGHT)),
         Span::styled("   ·   ", fg(DIM)),
@@ -780,12 +795,18 @@ fn log_panel(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+pub(crate) fn prompt_title(j: &Job) -> String {
+    match j.status {
+        JobStatus::Choosing => format!("Choose for #{} · a number, or your own approach · F5 options · Ctrl-T new task", j.id),
+        JobStatus::Interrupted => format!("Reply to #{} · Enter with nothing typed resumes it · Ctrl-T new task", j.id),
+        s if !s.finished() => format!("Message #{} · {} queued · Enter to queue · Ctrl-S now · Ctrl-T new task", j.id, j.inbox.len()),
+        _ => format!("Reply to #{} · {} queued · Enter to send · Ctrl-T new task", j.id, j.inbox.len()),
+    }
+}
+
 fn prompt(f: &mut Frame, area: Rect, ui: &Ui, target: Option<&Job>) {
     let title = match target {
-        Some(j) if j.status == JobStatus::Choosing => format!("Choose for #{} · a number, or your own approach · F5 options · Ctrl-T new task", j.id),
-        Some(j) if j.status == JobStatus::Interrupted => format!("Reply to #{} · Enter with nothing typed resumes it · Ctrl-T new task", j.id),
-        Some(j) if !j.status.finished() => format!("Message #{} · {} queued · Enter to queue · Ctrl-S now · Ctrl-T new task", j.id, j.inbox.len()),
-        Some(j) => format!("Reply to #{} · {} queued · Enter to send · Ctrl-T new task", j.id, j.inbox.len()),
+        Some(j) => prompt_title(j),
         None => format!("{} · {} · Enter to start", if ui.plan_next { "New task, planned first" } else { "Quick task" }, ui.forced.as_ref().map(|a| a.name()).unwrap_or_else(|| "auto".into())),
     };
     let room = area.width.saturating_sub(5) as usize;
