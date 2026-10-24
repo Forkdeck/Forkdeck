@@ -54,6 +54,7 @@ function Board({ id }: { id?: string }) {
       <BoardWide
         data={data}
         picked={picked}
+        open={!!id}
         automation={snap.automation}
         agents={snap.agents}
         busy={snap.busy}

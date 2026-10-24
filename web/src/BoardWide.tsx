@@ -6,6 +6,8 @@ import { pill, stageChip, tabClass, type PresentedJob } from "./ui";
 interface Props {
   data: PresentedJob[];
   picked?: number;
+  /** A job was chosen by URL: its detail floats over the board until closed. */
+  open: boolean;
   automation: boolean;
   agents: { claude: boolean; codex: boolean; copilot: boolean };
   live: string;
@@ -17,6 +19,7 @@ interface Props {
 export function BoardWide({
   data,
   picked,
+  open,
   automation,
   agents,
   live,
@@ -33,10 +36,18 @@ export function BoardWide({
       ?.querySelector(".job-card.selected")
       ?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [picked]);
+  // The detail floats over the board; Escape puts it away.
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && open) route("/");
+    };
+    addEventListener("keydown", key);
+    return () => removeEventListener("keydown", key);
+  }, [open]);
   const jobs = data.map((j) => ({
     ...j,
     pillClass: pill(j.state),
-    cardClass: `job-card${j.id === picked ? " selected" : ""}`,
+    cardClass: `job-card${open && j.id === picked ? " selected" : ""}`,
     pick: () => route(`/jobs/${j.id}`),
   }));
   const lanes = [
@@ -95,7 +106,7 @@ export function BoardWide({
           <span class="brand-name">forkdeck</span>
         </div>
         <label class="workspace-label">
-          Workspace
+          <span class="workspace-word">Workspace</span>
           <select
             class="workspace-select"
             disabled
@@ -239,12 +250,20 @@ export function BoardWide({
             </div>
           </div>
         </main>
-        <aside aria-label="Job detail" class="detail">
+        <aside aria-label="Job detail" class={`detail${open ? " open" : ""}`}>
           <div class="detail-heading">
             <div class="detail-meta">
               <span>{`#${sel.id}`}</span>
               <span class={sel.pillClass}>{sel.state}</span>
               <span>{sel.elapsed}</span>
+              <button
+                type="button"
+                class="detail-close"
+                aria-label="Close job detail"
+                onClick={() => route("/")}
+              >
+                ×
+              </button>
             </div>
             <h1 class="detail-title">{sel.title}</h1>
             <div class="mono-muted">{sel.route}</div>
