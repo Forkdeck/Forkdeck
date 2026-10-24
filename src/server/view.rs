@@ -8,22 +8,37 @@ pub fn snapshot(hub: &Hub, feed: &Feed) -> Value {
     let mut snap = serde_json::to_value(&native).unwrap();
     let st = hub.state.lock().unwrap();
     let observed = hub.schedule_views.lock().unwrap();
-    snap["jobs"] = Value::Array(st.jobs.iter().filter(|j| j.issue_plan.is_none()).filter_map(|j| {
+    snap["jobs"] = Value::Array(st.jobs.iter().filter_map(|j| {
         let summary = native.jobs.iter().find(|s| s.id == j.id)?;
         let mut v = serde_json::to_value(summary).unwrap();
+        v["kind"] = json!(job_kind(j));
+        v["status"] = json!(j.status.name());
+        v["agent"] = json!(j.decision.as_ref().map(|d| d.agent.name()).unwrap_or(""));
+        v["queued"] = json!(j.inbox.len());
         let projection = projected(j, &st, &observed);
         for (key, value) in serde_json::to_value(projection).unwrap().as_object().unwrap() { v[key] = value.clone(); }
         Some(v)
     }).collect());
-    snap["agents"] = json!({"claude": st.agent_ready(crate::state::AgentKind::Claude), "codex": st.agent_ready(crate::state::AgentKind::Codex), "copilot": st.copilot_usable()});
+    snap["agents"] = json!({"claude": st.agent_ready(crate::state::AgentKind::Claude), "codex": st.agent_ready(crate::state::AgentKind::Codex), "copilot": st.copilot_usable(), "words": crate::state::AgentKind::ALL.iter().map(|k| json!({"agent":k.name(),"word":crate::ui::agent_word(&st, *k)})).collect::<Vec<_>>()});
     snap["workspace"] = json!(std::env::current_dir().ok().and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned())).unwrap_or_default());
     snap["workspaces"] = super::write::workspaces(hub);
     snap["capacity"] = json!(hub.cfg.automation.max_parallel);
     snap["busy"] = json!(st.jobs.iter().filter(|j| j.admitted).count());
-    snap["router"] = json!({"kind":st.router.kind,"calls":st.router.calls,"last_ms":st.router.last_ms});
+    snap["router"] = json!({"kind":st.router.kind,"calls":st.router.calls,"last_ms":st.router.last_ms,"label":crate::ui::router_word(&st),"healthy":match st.router.healthy { None => 0, Some(true) => 1, Some(false) => 2 },"fallbacks":st.router.fallbacks,"remembered":st.router.remembered,"endpoint":if st.router.kind == "rules" { "" } else { &hub.cfg.router.jev.base_url }});
+    snap["running"] = json!(st.jobs.iter().filter(|j| !j.status.finished() && j.status != JobStatus::Queued).count());
+    snap["queued"] = json!(st.jobs.iter().filter(|j| j.status == JobStatus::Queued).count());
+    snap["spent_jobs"] = json!(st.spent.jobs);
+    snap["spent_tokens"] = json!(st.spent.tokens);
+    snap["demo"] = json!(hub.cfg.demo);
+    snap["log"] = json!(st.log.iter().skip(st.log.len().saturating_sub(200)).map(|l| json!({"time":l.time,"who":l.who,"text":l.msg})).collect::<Vec<_>>());
     // Jobs carry the lane's fixed id; what the board calls each lane is configured.
     snap["lanes"] = Value::Array(LANES.iter().zip(hub.cfg.web.lanes.in_order()).map(|(id, label)| json!({"id": id, "label": label})).collect());
     snap
+}
+
+pub(super) fn job_kind(j: &Job) -> &'static str {
+    if j.issue_plan.is_some() { return "plan"; }
+    match j.source { crate::state::Source::Manual => "manual", crate::state::Source::Issue { .. } => "issue", crate::state::Source::Pr { .. } => "pr", crate::state::Source::Deploy { .. } => "deploy" }
 }
 
 pub(super) fn projected(j: &Job, st: &crate::state::State, observed: &std::collections::HashMap<String, crate::schedule::ReadView>) -> forkdeck_remote_proto::BoardProjection {
@@ -210,6 +225,12 @@ mod tests {
         let snap = snapshot(&hub, &feed);
         let jobs = snap["jobs"].as_array().unwrap();
         let job = |id| jobs.iter().find(|j| j["id"] == id).unwrap();
+        let plan = job(100);
+        assert_eq!(plan["kind"], "plan");
+        assert_eq!(plan["lane"], LANES[hub.job(100, |j| crate::ui::job_lane(j)).unwrap()]);
+        assert_eq!(job(72)["status"], "working");
+        assert_eq!(job(72)["agent"], "claude");
+        assert_eq!(job(72)["queued"], 0);
         let working = job(72);
         assert_eq!(working["lane"], "Build");
         assert_eq!(working["state"], "working");

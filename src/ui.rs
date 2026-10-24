@@ -339,28 +339,37 @@ fn title_bar(f: &mut Frame, area: Rect, ui: &Ui) {
     f.render_widget(Paragraph::new(Span::styled(t, fg(DIM))).alignment(Alignment::Center), area);
 }
 
-fn header(f: &mut Frame, area: Rect, st: &State) {
-    let chip = |k: AgentKind, own: Color| -> Span {
-        let (word, color) = if k == AgentKind::Copilot && st.copilot_checking {
-            ("CHECKING", DIM)
-        } else if st.has(k) && !st.agent_ready(k) {
-            ("LIMITED", DIM)
-        } else if st.has(k) && (k != AgentKind::Copilot || st.copilot_usable()) {
-            ("ON CALL", own)
-        } else if k == AgentKind::Copilot && st.has(k) {
-            ("NO ACCESS", RED)
-        } else if k != AgentKind::Copilot && st.stand_in && st.copilot_usable() {
-            ("VIA COPILOT", BLUE)
-        } else {
-            ("MISSING", DIM)
-        };
-        Span::styled(format!("{} {}", k.name().to_uppercase(), word), bold(color))
-    };
-    let jev = match (st.router.kind.as_str(), st.router.healthy) {
+pub(crate) fn agent_word(st: &State, k: AgentKind) -> &'static str {
+    if k == AgentKind::Copilot && st.copilot_checking {
+        "CHECKING"
+    } else if st.has(k) && !st.agent_ready(k) {
+        "LIMITED"
+    } else if st.has(k) && (k != AgentKind::Copilot || st.copilot_usable()) {
+        "ON CALL"
+    } else if k == AgentKind::Copilot && st.has(k) {
+        "NO ACCESS"
+    } else if k != AgentKind::Copilot && st.stand_in && st.copilot_usable() {
+        "VIA COPILOT"
+    } else {
+        "MISSING"
+    }
+}
+
+pub(crate) fn router_word(st: &State) -> String {
+    match (st.router.kind.as_str(), st.router.healthy) {
         ("rules", _) => "RULES ROUTER".to_string(),
         (_, Some(false)) => "JEV DOWN · RULES".to_string(),
         (k, _) => k.to_uppercase(),
+    }
+}
+
+fn header(f: &mut Frame, area: Rect, st: &State) {
+    let chip = |k: AgentKind, own: Color| -> Span {
+        let word = agent_word(st, k);
+        let color = match word { "ON CALL" => own, "NO ACCESS" => RED, "VIA COPILOT" => BLUE, _ => DIM };
+        Span::styled(format!("{} {}", k.name().to_uppercase(), word), bold(color))
     };
+    let jev = router_word(st);
     let top = Line::from(vec![
         Span::styled("  FORKDECK SOFTWARE FACTORY", bold(BRIGHT)),
         Span::styled("   ·   ", fg(DIM)),
