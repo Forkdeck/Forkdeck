@@ -47,6 +47,7 @@ hmac = "0.12"
 base64 = "0.22"
 
 [dev-dependencies]
+tokio-tungstenite = "0.29"
 forkdeck-remote-proto = { path = "crates/remote-proto", features = ["client"] }
 
 [profile.release]

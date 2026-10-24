@@ -10,7 +10,8 @@ database and refuses OIDC configuration.
 Serve the browser origin through an HTTPS reverse proxy to Forkdeck's HTTP port.
 Register a **confidential web application**, enable authorization code and PKCE
 S256, use signed ID tokens, and register exactly the public callback URL. Forward
-cookies, query strings, and SSE without buffering. Do not expose an alternative
+cookies and query strings, and pass WebSocket upgrades for `/api/v1/live` (the
+live board) with the `Origin` header intact. Do not expose an alternative
 unauthenticated proxy route. Forkdeck uses its configured callback URL, not forwarded
 headers, to construct authorization requests and validate the logout Origin.
 
@@ -64,8 +65,8 @@ and must restart if the daemon restarts.
 Unauthenticated API requests return 401; pages redirect to `/auth/login`. Responses
 in OIDC mode use `Cache-Control: no-store`. The header shows the signed-in user and
 Sign out submits `POST /auth/logout`, requiring the configured public Origin.
-Sign-out deletes that browser session, clears its cookie, and closes its SSE streams;
-expiry also closes streams, checked at least once per second. The browser returns
+Sign-out deletes that browser session, clears its cookie, and closes its live WebSockets;
+expiry also closes them, checked at least once per second. The browser returns
 to sign-in when the API reports an ended session. The sign-out landing page offers a Sign in link, so provider SSO does not immediately
 create another session. Sign-out is local to Forkdeck;
 it does not terminate the identity provider's SSO session. Forkdeck does not renew
@@ -151,8 +152,8 @@ or userinfo. Map those names in Forkdeck. See the
 authorization, token, and userinfo endpoints. It checks PKCE, cookie attributes,
 state/cookie integrity, signature, issuer, audience, nonce, expiry, missing/malformed
 groups, nested claims, userinfo subject binding, key rotation, role precedence,
-restart persistence, hashed storage, logout Origin, API/page protection, and SSE
-termination. No external identity service is required by the test suite.
+restart persistence, hashed storage, logout Origin, API/page protection, and live
+WebSocket Origin checks and termination. No external identity service is required by the test suite.
 
 ![OIDC sign-in landing page](screenshots/oidc-sign-in-1440x900.png)
 

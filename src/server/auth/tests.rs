@@ -172,7 +172,7 @@ async fn protects_all_pages_and_api_and_sessions_survive_restart() {
         assert_eq!(response.status(),StatusCode::SEE_OTHER);
         assert_eq!(response.headers()[header::LOCATION],"/auth/login");
     }
-    for path in ["/api", "/api/v1/snapshot", "/api/v1/events", "/api/unknown"] {
+    for path in ["/api", "/api/v1/snapshot", "/api/v1/live", "/api/unknown"] {
         assert_eq!(f.client.get(format!("{}{path}",f.base)).send().await.unwrap().status(),StatusCode::UNAUTHORIZED);
     }
     let cookie = f.session().await;
@@ -189,12 +189,22 @@ async fn protects_all_pages_and_api_and_sessions_survive_restart() {
 }
 
 #[tokio::test]
-async fn logout_and_expiry_end_sessions_and_sse() {
+async fn logout_and_expiry_end_sessions_and_the_live_socket() {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     for expire in [false,true] {
         let f = Fixture::new("normal").await;
         let cookie = f.session().await;
-        let mut stream = f.client.get(format!("{}/api/v1/events",f.base)).header(header::COOKIE,&cookie).send().await.unwrap();
-        assert_eq!(stream.status(),StatusCode::OK);
+        let live = |origin: &str| {
+            let mut request = format!("{}/api/v1/live",f.base.replacen("http","ws",1)).into_client_request().unwrap();
+            request.headers_mut().insert(header::COOKIE,cookie.parse().unwrap());
+            request.headers_mut().insert(header::ORIGIN,origin.parse().unwrap());
+            request
+        };
+        // Behind OIDC the browser's Origin is the configured public one, not this server's Host.
+        let refused = tokio_tungstenite::connect_async(live("https://evil.example")).await.unwrap_err();
+        assert!(matches!(refused, tokio_tungstenite::tungstenite::Error::Http(ref r) if r.status() == StatusCode::FORBIDDEN), "{refused:?}");
+        let (mut socket, _) = tokio_tungstenite::connect_async(live("https://forkdeck.example")).await.unwrap();
         if expire {
             rusqlite::Connection::open(f.path.join("history.db")).unwrap().execute("UPDATE web_sessions SET expires = 0",[]).unwrap();
         } else {
@@ -205,7 +215,9 @@ async fn logout_and_expiry_end_sessions_and_sse() {
             assert!(logout.text().await.unwrap().contains("href=\"/auth/login\""));
         }
         assert_eq!(f.client.get(format!("{}/api/v1/me",f.base)).header(header::COOKIE,cookie).send().await.unwrap().status(),StatusCode::UNAUTHORIZED);
-        tokio::time::timeout(Duration::from_secs(3),async { while stream.chunk().await.unwrap().is_some() {} }).await.expect("SSE must close promptly");
+        tokio::time::timeout(Duration::from_secs(3),async {
+            while let Some(Ok(message)) = socket.next().await { if message.is_close() { break; } }
+        }).await.expect("the live socket must close promptly");
     }
 }
 

@@ -32,8 +32,8 @@ To require sign-in and group-based access, configure `[web.oidc]` and an HTTPS
 reverse proxy. See [OIDC setup and provider instructions](web-ui-oidc.md).
 
 The board, job details (`/jobs/:id`), plans (`/plans`, `/plans/:id`), log tabs, and
-phone filters are live. SSE uses the native feed's sequence numbers, bounded replay,
-Last-Event-ID, heartbeats, and resnapshot after gaps/restarts. The intake indicator
+phone filters are live. The live WebSocket uses the native feed's sequence numbers, bounded replay,
+a `since` cursor, pings, and resnapshot after gaps/restarts. The intake indicator
 reflects actual automation state. Scheduler observations retain unknown forge status
 and freshness. Finished work without checks appears as **unverified** in Attention.
 The composer starts a typed task in the daemon workspace or a configured repository.
@@ -75,7 +75,7 @@ planning choice, so those message routes cannot bypass choice protection.
 Doctor shows the latest 200 audit entries, including admissions, outcomes, denied
 requests and replays. Records identify the OIDC subject or `local`, action, target,
 revision, request ID and time, without raw prompt/message bodies. Audit history is
-append-only in SQLite. SSE includes actionable job/plan changes and intake events;
+append-only in SQLite. The live WebSocket carries actionable job/plan changes and intake events;
 the browser refreshes projections from events rather than periodic polling.
 
 See [operational screens and API projections](web-ui-operations.md),

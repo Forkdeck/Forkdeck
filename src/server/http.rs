@@ -1,16 +1,17 @@
-use super::{auth::{self, Auth}, view};
+use super::{auth::{self, Auth}, view, wire};
 use crate::{orchestrator::Hub, remote::feed::{Feed, Numbered}};
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, Query, State},
     http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
-    response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
-use std::{collections::VecDeque, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tokio::sync::broadcast::{self, error::RecvError};
 
 /// Loopback host checks also protect an unauthenticated local server from DNS rebinding.
 #[derive(Clone)]
@@ -63,7 +64,7 @@ async fn no_store(req: Request<Body>, next: Next) -> Response {
     response
 }
 
-async fn snapshot(State(app): State<App>) -> Json<serde_json::Value> { Json(view::snapshot(&app.hub, &app.feed)) }
+async fn snapshot(State(app): State<App>) -> impl IntoResponse { ([(header::CONTENT_TYPE, "application/octet-stream")], wire::board(&app.hub, &app.feed)) }
 async fn detail(State(app): State<App>, Path(id): Path<u32>) -> Response {
     match view::detail(&app.hub, &app.feed, id) { Some(v) => Json(v).into_response(), None => StatusCode::NOT_FOUND.into_response() }
 }
@@ -88,34 +89,70 @@ async fn doctor(State(app): State<App>) -> Response {
 async fn settings(State(app): State<App>) -> Json<serde_json::Value> { Json(super::operations::settings(&app.hub)) }
 
 #[derive(Deserialize)]
-struct Cursor { since: Option<u64> }
+struct Resume { since: Option<u64> }
 
-async fn events(State(app): State<App>, Query(cursor): Query<Cursor>, headers: HeaderMap) -> impl IntoResponse {
-    let since = headers.get("last-event-id").and_then(|s| s.to_str().ok()).and_then(|s| s.parse().ok()).or(cursor.since).unwrap_or(0);
-    let (backlog, rx) = app.feed.subscribe(since);
-    let session = app.auth.as_ref().and_then(|auth| auth.session_key(&headers).map(|key| (auth.clone(), key)));
-    let stream = futures::stream::unfold((VecDeque::from(backlog), rx, session), |(mut queue, mut rx, session)| async move {
-        if let Some((auth, key)) = &session {
-            if !matches!(auth.session_hash(key.clone()).await, Ok(Some(_))) { return None; }
-        }
-        let item: Option<Numbered> = if let Some(e) = queue.pop_front() { Some(e) } else {
-            match tokio::time::timeout(Duration::from_secs(if session.is_some() { 1 } else { 15 }), rx.recv()).await {
-                Ok(Ok(e)) => Some(e),
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => Some((0, forkdeck_remote_proto::Event::Resync)),
-                Err(_) => None,
+async fn live(State(app): State<App>, Query(resume): Query<Resume>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    // Browsers let any page open a WebSocket to any host, so the Origin is checked here. Behind
+    // OIDC the browser sees the configured public origin; locally it sees this server's Host.
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let allowed = match &app.auth {
+            Some(auth) => origin.to_str().ok().is_some_and(|o| o == auth.origin()),
+            None => {
+                let authority = origin.to_str().ok().and_then(|s| s.parse::<axum::http::Uri>().ok()).and_then(|uri| uri.authority().map(|a| a.as_str().to_owned()));
+                authority.as_deref().zip(headers.get(header::HOST).and_then(|h| h.to_str().ok())).is_some_and(|(a, h)| a.eq_ignore_ascii_case(h))
             }
         };
-        if let Some((auth, key)) = &session {
-            if !matches!(auth.session_hash(key.clone()).await, Ok(Some(_))) { return None; }
+        if headers.get_all(header::ORIGIN).iter().count() != 1 || !allowed {
+            return StatusCode::FORBIDDEN.into_response();
         }
-        let event = match item {
-            Some((seq, event)) => Event::default().id(seq.to_string()).json_data(event).unwrap(),
-            None => Event::default().event("freshness").data("{}"),
-        };
-        Some((Ok::<_, Infallible>(event), (queue, rx, session)))
-    });
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10)).text("heartbeat"))
+    }
+    let session = app.auth.as_ref().and_then(|auth| auth.session_key(&headers).map(|key| (auth.clone(), key)));
+    let (backlog, rx) = app.feed.subscribe(resume.since.unwrap_or(0));
+    ws.on_upgrade(move |socket| live_socket(app, socket, backlog, rx, session))
+}
+
+async fn next_live(rx: &mut broadcast::Receiver<Numbered>) -> Option<Numbered> {
+    match rx.recv().await {
+        Ok(event) => Some(event),
+        Err(RecvError::Lagged(_)) => Some((0, forkdeck_remote_proto::Event::Resync)),
+        Err(RecvError::Closed) => None,
+    }
+}
+
+/// A signed-in socket closes within a second of sign-out or expiry, like the session it rode in on.
+async fn live_socket(app: App, mut socket: WebSocket, backlog: Vec<Numbered>, mut rx: broadcast::Receiver<Numbered>, session: Option<(Arc<Auth>, String)>) {
+    let signed_in = || async { match &session { Some((auth, key)) => matches!(auth.session_hash(key.clone()).await, Ok(Some(_))), None => true } };
+    for (seq, event) in backlog {
+        if socket.send(Message::Binary(wire::event(&app.hub, seq, &event).into())).await.is_err() { return; }
+    }
+    let every = Duration::from_secs(10);
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut check = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                _ => {},
+            },
+            _ = ping.tick() => {
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() { return; }
+            }
+            _ = check.tick(), if session.is_some() => {
+                if !signed_in().await {
+                    let _ = socket.send(Message::Close(None)).await;
+                    return;
+                }
+            }
+            event = next_live(&mut rx) => {
+                let Some((seq, event)) = event else {
+                    let _ = socket.send(Message::Close(None)).await;
+                    return;
+                };
+                if socket.send(Message::Binary(wire::event(&app.hub, seq, &event).into())).await.is_err() { return; }
+            }
+        }
+    }
 }
 
 async fn assets(req: Request<Body>) -> Response {
@@ -146,7 +183,7 @@ fn router(app: App) -> Router {
         .route("/v1/jobs/{id}", get(detail))
         .route("/v1/plans", get(plans))
         .route("/v1/plans/{id}", get(plan))
-        .route("/v1/events", get(events))
+        .route("/v1/live", get(live))
         .route("/v1/repos", get(repos))
         .route("/v1/deploys", get(deploys))
         .route("/v1/stats", get(stats))
@@ -211,6 +248,21 @@ pub(super) fn auth_test_router(auth: Arc<Auth>, seeded: bool) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::{connect_async, tungstenite::{client::IntoClientRequest, Message}};
+    use super::super::wire::board_generated::forkdeck::web as fb;
+
+    async fn binary(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Binary(bytes) => return bytes.to_vec(),
+                    Message::Ping(_) | Message::Pong(_) => {},
+                    other => panic!("expected a binary frame, got {other:?}"),
+                }
+            }
+        }).await.unwrap()
+    }
 
     #[test]
     fn only_this_machines_names_count_as_local() {
@@ -219,7 +271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_and_sse_resume_without_a_login() {
+    async fn snapshot_and_live_resume_without_a_login() {
         let mut cfg = crate::config::Config { demo: true, ..Default::default() };
         crate::server::seed::configure(&mut cfg);
         let hub = Hub::new(cfg, tokio::runtime::Handle::current());
@@ -239,16 +291,24 @@ mod tests {
         assert_eq!(asset.headers()[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
         assert!(!asset.headers().contains_key("access-control-allow-origin"));
         // A page from another site that rebinds its own name to 127.0.0.1 is refused.
-        for path in ["", "api/v1/snapshot", "api/v1/events"] {
+        for path in ["", "api/v1/snapshot", "api/v1/live"] {
             assert_eq!(client.get(format!("{base}/{path}")).header(header::HOST, "evil.example").send().await.unwrap().status(), StatusCode::FORBIDDEN);
         }
         let snapshot = client.get(format!("{base}/api/v1/snapshot")).send().await.unwrap();
         assert_eq!(snapshot.headers()[header::CACHE_CONTROL], "no-store");
-        let snap: serde_json::Value = snapshot.json().await.unwrap();
-        assert!(snap["seq"].is_u64());
-        assert!(snap["automation"].is_boolean());
-        assert!(snap["agents"].is_object());
-        assert!(snap["jobs"].as_array().unwrap().iter().any(|j| j["state"] == "unverified" && j["lane"] == "Attention"));
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        assert_eq!(snapshot.headers()[header::CONTENT_TYPE], "application/octet-stream");
+        let bytes = snapshot.bytes().await.unwrap();
+        let frame = super::super::wire::board_generated::forkdeck::web::root_as_frame(&bytes).unwrap();
+        let board = frame.body_as_snapshot().unwrap();
+        let expected = view::snapshot(&hub, &feed);
+        let jobs = board.jobs().unwrap();
+        assert_eq!(jobs.len(), expected["jobs"].as_array().unwrap().len());
+        for (job, expected) in jobs.iter().zip(expected["jobs"].as_array().unwrap()) {
+            assert_eq!(job.id() as u64, expected["id"].as_u64().unwrap());
+            assert_eq!(job.lane(), expected["lane"].as_str());
+            assert_eq!(job.state(), expected["state"].as_str());
+        }
         for (endpoint, field) in [("repos", ""), ("deploys", "repositories"), ("stats", "summary"), ("doctor", "checks"), ("settings", "agents")] {
             let response = client.get(format!("{base}/api/v1/{endpoint}")).send().await.unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
@@ -266,15 +326,81 @@ mod tests {
         assert!(plans["plan"]["draft"].as_str().unwrap().contains("forkdeck-tasks"));
         assert!(!plans["draft_display"].as_str().unwrap().contains("forkdeck-tasks"));
         assert!(plans["plan"]["review"].as_str().unwrap().contains("VERDICT: PASS"));
-        hub.log("test", "resume me");
+        let live = format!("{}/api/v1/live", base.replace("http://", "ws://"));
+        let since = frame.seq();
+        let (mut ws, _) = connect_async(format!("{live}?since={since}")).await.unwrap();
+        ws.send(Message::Text("ignored".into())).await.unwrap();
+        ws.send(Message::Binary(vec![1,2,3].into())).await.unwrap();
+        ws.send(Message::Ping(vec![7].into())).await.unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(2), ws.next()).await.unwrap().unwrap().unwrap();
+        assert_eq!(pong, Message::Pong(vec![7].into()));
+        hub.job(72, |j| j.title = "updated through the hub".into());
         feed.tick(&hub);
-        let mut response = client.get(format!("{base}/api/v1/events")).header("last-event-id", snap["seq"].to_string()).send().await.unwrap();
-        let chunk = tokio::time::timeout(Duration::from_secs(2), response.chunk()).await.unwrap().unwrap().unwrap();
-        let chunk = String::from_utf8(chunk.to_vec()).unwrap();
-        assert!(chunk.contains("id:") && chunk.contains("resume me"), "{chunk}");
-        let mut response = client.get(format!("{base}/api/v1/events")).header("last-event-id", "1").send().await.unwrap();
-        let chunk = response.chunk().await.unwrap().unwrap();
-        assert!(String::from_utf8(chunk.to_vec()).unwrap().contains("Resync"));
+        let bytes = binary(&mut ws).await;
+        let changed = fb::root_as_frame(&bytes).unwrap();
+        assert!(changed.seq() > since);
+        let job = changed.body_as_job_changed().unwrap().job().unwrap();
+        assert_eq!((job.id(), job.title()), (72, Some("updated through the hub")));
+        ws.close(None).await.unwrap();
+
+        for n in 0..3 {
+            hub.job(72, |j| j.title = format!("backlog {n}"));
+            feed.tick(&hub);
+        }
+        let expected = feed.subscribe(since).0;
+        assert!(expected.len() >= 4);
+        let (mut ws, _) = connect_async(format!("{live}?since={since}")).await.unwrap();
+        let mut previous = since;
+        for (seq, _) in expected {
+            let bytes = binary(&mut ws).await;
+            let frame = fb::root_as_frame(&bytes).unwrap();
+            assert_eq!(frame.seq(), seq);
+            assert!(frame.seq() > previous);
+            previous = frame.seq();
+        }
+        ws.close(None).await.unwrap();
+        // Startup timestamps make 1 an expired cursor; a future cursor covers daemon restarts.
+        for since in [1, u64::MAX] {
+            let (mut ws, _) = connect_async(format!("{live}?since={since}")).await.unwrap();
+            let bytes = binary(&mut ws).await;
+            assert_eq!(fb::root_as_frame(&bytes).unwrap().body_type(), fb::Body::Resync);
+            ws.close(None).await.unwrap();
+        }
+        for origin in ["http://evil.test", "null", "http://127.0.0.1:1", "invalid"] {
+            let mut request = live.clone().into_client_request().unwrap();
+            request.headers_mut().insert(header::ORIGIN, origin.parse().unwrap());
+            let err = connect_async(request).await.unwrap_err();
+            match err {
+                tokio_tungstenite::tungstenite::Error::Http(response) => assert_eq!(response.status(), StatusCode::FORBIDDEN),
+                other => panic!("expected a forbidden handshake, got {other}"),
+            }
+        }
+        let mut request = live.clone().into_client_request().unwrap();
+        request.headers_mut().insert(header::ORIGIN, base.parse().unwrap());
+        let (mut ws, _) = connect_async(request).await.unwrap();
+        let ping = tokio::time::timeout(Duration::from_secs(12), ws.next()).await.unwrap().unwrap().unwrap();
+        assert!(matches!(ping, Message::Ping(_)));
+        ws.close(None).await.unwrap();
+        assert_eq!(client.get(format!("{base}/api/v1/events")).send().await.unwrap().status(), StatusCode::NOT_FOUND);
         server.abort();
     }
+
+    #[tokio::test]
+    async fn a_lagged_receiver_sends_resync_and_keeps_receiving() {
+        let hub = Hub::new(crate::config::Config::default(), tokio::runtime::Handle::current());
+        let feed = Feed::new();
+        let (_, mut rx) = feed.subscribe(0);
+        for n in 0..1100 {
+            hub.state.lock().unwrap().automation = n % 2 == 0;
+            feed.tick(&hub);
+        }
+        let (seq, event) = next_live(&mut rx).await.unwrap();
+        let bytes = wire::event(&hub, seq, &event);
+        assert_eq!(fb::root_as_frame(&bytes).unwrap().body_type(), fb::Body::Resync);
+        assert!(matches!(next_live(&mut rx).await, Some((_, forkdeck_remote_proto::Event::Automation { .. }))));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        drop(tx);
+        assert!(next_live(&mut rx).await.is_none());
+    }
+
 }

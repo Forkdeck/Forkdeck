@@ -844,6 +844,7 @@ dependencies = [
  "tarpc",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "tokio-util",
  "toml",
 ]

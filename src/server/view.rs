@@ -1,7 +1,7 @@
 use crate::{orchestrator::Hub, remote::feed::Feed, state::{Job, JobStatus, StageState}};
 use serde_json::{json, Value};
 
-const LANES: [&str; 6] = ["Queue", "Build", "Review", "Delivery", "Done", "Attention"];
+pub(super) const LANES: [&str; 6] = ["Queue", "Build", "Review", "Delivery", "Done", "Attention"];
 
 pub fn snapshot(hub: &Hub, feed: &Feed) -> Value {
     let native = feed.snapshot(hub);
@@ -11,15 +11,7 @@ pub fn snapshot(hub: &Hub, feed: &Feed) -> Value {
     snap["jobs"] = Value::Array(st.jobs.iter().filter(|j| j.issue_plan.is_none()).filter_map(|j| {
         let summary = native.jobs.iter().find(|s| s.id == j.id)?;
         let mut v = serde_json::to_value(summary).unwrap();
-        let mut projection = board(j, &st);
-        if j.status == JobStatus::Queued {
-            if let crate::state::Source::Issue { repo, number, .. } = &j.source {
-                if let Some(status) = observed.values().filter(|v| &v.repo == repo).flat_map(|v| &v.tasks).find(|t| t["task"]["number"] == *number).and_then(|t| t["status"].as_str()).filter(|s| s.starts_with("waiting for ")) {
-                    projection.state = "waiting".into();
-                    projection.meta = format!("blocked by {} · not merged", status.trim_start_matches("waiting for "));
-                }
-            }
-        }
+        let projection = projected(j, &st, &observed);
         for (key, value) in serde_json::to_value(projection).unwrap().as_object().unwrap() { v[key] = value.clone(); }
         Some(v)
     }).collect());
@@ -32,6 +24,19 @@ pub fn snapshot(hub: &Hub, feed: &Feed) -> Value {
     // Jobs carry the lane's fixed id; what the board calls each lane is configured.
     snap["lanes"] = Value::Array(LANES.iter().zip(hub.cfg.web.lanes.in_order()).map(|(id, label)| json!({"id": id, "label": label})).collect());
     snap
+}
+
+pub(super) fn projected(j: &Job, st: &crate::state::State, observed: &std::collections::HashMap<String, crate::schedule::ReadView>) -> forkdeck_remote_proto::BoardProjection {
+    let mut projection = board(j, st);
+    if j.status == JobStatus::Queued {
+        if let crate::state::Source::Issue { repo, number, .. } = &j.source {
+            if let Some(status) = observed.values().filter(|v| &v.repo == repo).flat_map(|v| &v.tasks).find(|t| t["task"]["number"] == *number).and_then(|t| t["status"].as_str()).filter(|s| s.starts_with("waiting for ")) {
+                projection.state = "waiting".into();
+                projection.meta = format!("blocked by {} · not merged", status.trim_start_matches("waiting for "));
+            }
+        }
+    }
+    projection
 }
 
 pub fn detail(hub: &Hub, feed: &Feed, id: u32) -> Option<Value> {
@@ -97,7 +102,7 @@ fn stage(state: StageState) -> u8 {
     match state { StageState::Idle => 0, StageState::Running => 1, StageState::Ok => 2, StageState::Skipped => 3, StageState::Failed => 4 }
 }
 
-fn board(j: &Job, st: &crate::state::State) -> forkdeck_remote_proto::BoardProjection {
+pub(super) fn board(j: &Job, st: &crate::state::State) -> forkdeck_remote_proto::BoardProjection {
     let lane = crate::ui::job_lane(j);
     let unverified = j.status == JobStatus::Done && j.checks.is_none() && j.issue_plan.is_none();
     let end = if j.status.finished() { j.finished.unwrap_or_else(std::time::Instant::now) } else { std::time::Instant::now() };
