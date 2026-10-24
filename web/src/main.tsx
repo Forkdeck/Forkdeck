@@ -7,6 +7,7 @@ import { BoardWide } from "./BoardWide";
 import { BoardPhone } from "./BoardPhone";
 import { Operational, Navigation } from "./Operational";
 import { PlansView } from "./PlansView";
+import { RepoPicker } from "./RepoPicker";
 import {
   snapshot,
   plans,
@@ -121,6 +122,7 @@ function App() {
         <Route path="/plans" component={Plans} />
         <Route path="/plans/:id" component={Plans} />
         <Route path="/repos" component={() => <Operational page="repos" />} />
+        <Route path="/repos/add/:id" component={RepoPicker} />
         <Route
           path="/deploys"
           component={() => <Operational page="deploys" />}

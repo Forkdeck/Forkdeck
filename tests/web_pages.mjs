@@ -1,5 +1,6 @@
 // Run against a seeded server: FORKDECK_WEB_URL=http://127.0.0.1:17420 node tests/web_pages.mjs
 import assert from 'node:assert/strict';
+import { checkRepoPicker } from './web_repo_picker.mjs';
 import { createRequire } from 'node:module';
 const require = createRequire(new URL('../web/package.json', import.meta.url));
 const { chromium } = require('@playwright/test');
@@ -8,6 +9,7 @@ const browser = await chromium.launch({headless:true,executablePath:process.env.
 try {
   for (const width of [1440,390]) {
     const page = await browser.newPage({viewport:{width,height:900}});
+    assert.equal((await page.request.get(`${base}/api/v1/forges`)).status(),404);
     const errors=[];
     page.on('pageerror',error=>errors.push(String(error)));
     for (const path of ['repos','deploys','stats','doctor']) {
@@ -16,6 +18,7 @@ try {
       await page.waitForFunction(()=>!document.querySelector('[role=status]'));
       await page.locator('.operation-panel').first().waitFor();
       assert.ok(await page.locator('main h1').innerText());
+      if (path === 'repos') assert.equal(await page.locator('[href^="/forges/"]').count(),0);
       assert.equal(await page.locator('[role=alert]').count(),0);
       assert.ok(await page.locator('nav a[href="/plans"]').count());
       const overflow=await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth);
@@ -40,5 +43,6 @@ try {
     assert.deepEqual(errors,[]);
     await page.close();
     console.log(`Operational pages and plans at ${width}px: passed`);
+    await checkRepoPicker(browser, base, width);
   }
 } finally {await browser.close();}

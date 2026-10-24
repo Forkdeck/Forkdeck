@@ -1,5 +1,6 @@
 import { invalidation } from "./state";
 import { Account } from "./Account";
+import { AddRepositoryLinks } from "./RepoPicker";
 import { useEffect, useState } from "preact/hooks";
 import type { ComponentChildren } from "preact";
 const pages = [
@@ -203,6 +204,7 @@ export function Operational({
         </aside>
         <main class="operations-main">
           <h1>{title}</h1>
+          {page === "repos" && <AddRepositoryLinks />}
           {error && <p role="alert">{error}</p>}
           {data == null ? (
             <p role="status">Loading…</p>
