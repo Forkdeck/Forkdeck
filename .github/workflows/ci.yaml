@@ -60,3 +60,29 @@ jobs:
           cargo build --locked
           python3 -I tests/tui_exit.py target/debug/forkdeck
           python3 -I tests/tui_issue_plans.py target/debug/forkdeck
+
+  docs:
+    name: Documentation links
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Markdown parser
+        run: npm ci --prefix web
+
+      - name: Test documentation checker
+        run: node --test tests/doc_links.mjs
+
+      - name: Check documentation links and anchors
+        run: node scripts/check-doc-links.mjs

@@ -1,7 +1,7 @@
 # Web UI captures
 
-All captures use Chromium, the embedded production bundle, the one-use browser
-login, and the real `/api/v1` endpoints. There are no browser fixtures or response
+All captures use Chromium, the embedded production bundle, default local access
+without a browser login, and the real `/api/v1` endpoints. There are no browser fixtures or response
 interceptors. Reproduce with `npm run build --prefix web`, `cargo build`, then
 `node web/scripts/screenshots.mjs` (`CHROMIUM_PATH` and `FORKDECK_BIN` override the
 executables). After capture, `python3 web/scripts/compare-screenshots.py`
