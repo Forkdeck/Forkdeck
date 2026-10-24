@@ -172,9 +172,14 @@ pub async fn serve(hub: Hub, feed: Arc<Feed>) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-pub(super) fn auth_test_router(auth: Arc<Auth>) -> Router {
-    let hub = Hub::new(crate::config::Config::default(), tokio::runtime::Handle::current());
-    router(App { hub, feed: Arc::new(Feed::new()), loopback: true, auth: Some(auth) })
+pub(super) fn auth_test_router(auth: Arc<Auth>, seeded: bool) -> Router {
+    let mut cfg = crate::config::Config { demo: true, ..Default::default() };
+    if seeded { super::seed::configure(&mut cfg); }
+    let hub = Hub::new(cfg, tokio::runtime::Handle::current());
+    if seeded { super::seed::seed_demo(&hub).unwrap(); }
+    let feed = Arc::new(Feed::new());
+    tokio::spawn(feed.clone().run(hub.clone(), Duration::from_millis(200)));
+    router(App { hub, feed, loopback: true, auth: Some(auth) })
 }
 
 #[cfg(test)]

@@ -48,13 +48,25 @@ seeded jobs with `forkdeck serve --demo`, then regular `forkdeck serve` against 
 private copy of `~/.local/state/forkdeck/forkdeck.db` and its WAL in a temporary
 `XDG_STATE_HOME`. The real-history capture disables agent executables and issue
 intake; original database hashes must remain unchanged. Both paths use the same API
-views. Screenshots at 1440×900 and 390×844, including unverified job detail, are saved
-under `docs/web-ui-mockup/screenshots/`. The script also checks that reply controls
-stay inside the viewport. Set `CHROMIUM_PATH` if Chromium is installed elsewhere.
+views. Captures include board/selected job, unverified detail, every plan tab,
+repositories, deployments, stats and doctor at 1440×900; board, detail and all plan
+tabs also run at 390×844. Screenshots are saved under `docs/screenshots/`.
+The OIDC captures use the existing Rust test fake provider, an isolated session
+database and a temporary loopback HTTPS proxy: sign-in landing page, then an actual
+provider sign-in and the signed-in header on desktop and phone. Default local mode
+still has no login. The fixture is an ignored Rust test started by the script.
+
+The script checks document overflow, reply control visibility, browser errors and
+original file hashes. Real history has no configured repositories in this isolated
+capture config; its repository/deployment empty states are captured as observed.
+Missing plans remain empty rather than receiving demo content. Journal, deployment
+state and metrics attempts are also copied when present so real stats use real records.
+Set `CHROMIUM_PATH` or `FORKDECK_BIN` to override executables. The script needs Cargo
+and OpenSSL for the OIDC fixture and temporary certificate.
+
 It renders the approved mockups with the same local fonts into `/tmp`; run
 `python3 web/scripts/compare-screenshots.py` (Pillow required) to refresh the measured
-comparison. See [capture notes](web-ui-mockup/screenshots/README.md) for the
-remaining content differences from the references.
+comparison. See the [complete capture gallery](screenshots/README.md).
 
 See [operational screen verification](web-ui-operations.md) for Markdown and
 browser checks, and [development status](development.md#status) for live-integration gaps.

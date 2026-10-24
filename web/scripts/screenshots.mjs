@@ -5,18 +5,22 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import https from "node:https";
+import http from "node:http";
+import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
 const root = path.resolve(import.meta.dirname, "../..");
-const outputDir = path.join(root, "docs/web-ui-mockup/screenshots");
+const outputDir = path.join(root, "docs/screenshots");
 const binary =
   process.env.FORKDECK_BIN || path.join(root, "target/debug/forkdeck");
+fs.mkdirSync(outputDir, { recursive: true });
 const browser = await chromium.launch({
   executablePath:
     process.env.CHROMIUM_PATH ||
     "/home/justin/.cache/ms-playwright/chromium-1187/chrome-linux/chrome",
   headless: true,
 });
+const captured = new Set();
 const hash = (file) =>
   createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 
@@ -119,6 +123,7 @@ async function capture(real) {
   const originals = [];
   if (real) {
     const source = path.join(os.homedir(), ".local/state/forkdeck/forkdeck.db");
+    if (!fs.existsSync(source)) throw new Error(`Real history not found: ${source}`);
     // Copy the WAL too: SQLite may hold the newest committed history there.
     for (const suffix of ["", "-wal"]) {
       const file = source + suffix;
@@ -129,6 +134,16 @@ async function capture(real) {
           path.join(state, "forkdeck/forkdeck.db" + suffix),
         );
       }
+    }
+  }
+  if (real) {
+    for (const name of ["journal.jsonl", "attempts-v1", "deploy.json"]) {
+      const source = path.join(os.homedir(), ".local/state/forkdeck", name);
+      if (!fs.existsSync(source)) continue;
+      const files = fs.statSync(source).isDirectory()
+        ? fs.readdirSync(source).map((name) => path.join(source, name)) : [source];
+      for (const file of files) originals.push([file, hash(file)]);
+      fs.cpSync(source, path.join(state, "forkdeck", name), { recursive: true });
     }
   }
   const config = path.join(temp, "capture.toml");
@@ -166,7 +181,7 @@ cmd = "/unavailable-for-history-capture"
   server.stderr.on("data", (data) => process.stderr.write(data));
   let text = "";
   try {
-    const login = await new Promise((resolve, reject) => {
+    const address = await new Promise((resolve, reject) => {
       const timeout = setTimeout(
         () => reject(new Error("No server address")),
         30000,
@@ -186,7 +201,7 @@ cmd = "/unavailable-for-history-capture"
         }
       });
     });
-    const base = new URL(login).origin;
+    const base = new URL(address).origin;
     const page = await browser.newPage({
       viewport: { width: 1440, height: 900 },
     });
@@ -203,87 +218,46 @@ cmd = "/unavailable-for-history-capture"
           .sort((a, b) => b.id - a.id)[0]
       : snapshot.jobs.find((j) => j.state === "working");
     if (!selected) throw new Error("No job for detail capture");
-    const captures = real
-      ? [
-          ["real-board-1440x900.png", `/jobs/${selected.id}`, 1440, 900],
-          ["real-board-390x844.png", "/", 390, 844],
-          ["real-detail-390x844.png", `/jobs/${selected.id}`, 390, 844],
-        ]
-      : [
-          ["board-1440x900.png", `/jobs/${selected.id}`, 1440, 900, "Main"],
-          ["plans-1440x900.png", "/plans", 1440, 900, "Plan"],
-          ["board-390x844.png", "/", 390, 844, "Phone"],
-          [
-            "unverified-1440x900.png",
-            `/jobs/${snapshot.jobs.find((j) => j.state === "unverified").id}`,
-            1440,
-            900,
-          ],
-        ];
-    for (const [file, url, width, height, name] of captures) {
+    const prefix = real ? "real-" : "";
+    const detail = snapshot.jobs.find((j) => j.state === "unverified") || selected;
+    const planList = await (await page.request.get(base + "/api/v1/plans")).json();
+    const plan = planList.find((p) => p.plan.graph) || planList[0];
+    const planUrl = plan ? `/plans/${plan.id}` : "/plans";
+    const captures = [];
+    for (const [width, height] of [[1440, 900], [390, 844]]) {
+      captures.push(["board", width < 700 ? "/" : `/jobs/${selected.id}`, width, height]);
+      captures.push(["detail", `/jobs/${detail.id}`, width, height]);
+      for (const tab of ["Tasks", "Plan", "Review"])
+        captures.push([`plans-${tab.toLowerCase()}`, planUrl, width, height, plan ? tab : null]);
+    }
+    for (const name of ["repos", "deploys", "stats", "doctor"])
+      captures.push([name, `/${name}`, 1440, 900]);
+    for (const [name, url, width, height, tab] of captures) {
+      const file = `${prefix}${name}-${width}x${height}.png`;
       await page.setViewportSize({ width, height });
       await page.goto(base + url);
-      await page.waitForSelector(
-        url.startsWith("/plans")
-          ? ".task-row"
-          : url.startsWith("/jobs")
-            ? ".detail-title"
-            : ".phone-card",
-      );
-      if (
-        !url.startsWith("/plans") &&
-        !(width < 700 && url.startsWith("/jobs"))
-      )
-        await page
-          .getByText("Live", { exact: width < 700 })
-          .first()
-          .waitFor();
-      await page.evaluate(() => document.fonts.ready);
-      if (real && url === "/")
-        await page.getByRole("tab", { name: "All", exact: true }).click();
-      if (url.startsWith("/jobs") && (real || file.startsWith("unverified")))
-        await page.locator(".warning").waitFor();
-      if (url.startsWith("/jobs")) {
-        const reply = await page.locator(".reply-form").boundingBox();
-        const controls = await page
-          .locator(".reply-form input, .reply-form button")
-          .evaluateAll((nodes) =>
-            nodes.map((node) => {
-              const r = node.getBoundingClientRect();
-              return {
-                label: node.textContent || "input",
-                x: r.x,
-                y: r.y,
-                width: r.width,
-                height: r.height,
-              };
-            }),
-          );
-        for (const control of controls) {
-          if (
-            control.x < 0 ||
-            control.y < 0 ||
-            control.x + control.width > width + 1 ||
-            control.y + control.height > height + 1
-          ) {
-            throw new Error(
-              `Reply control outside viewport in ${file}: ${control.label}`,
-            );
-          }
+      if (["repos", "deploys", "stats", "doctor"].includes(name)) {
+        await page.waitForFunction(() => !document.querySelector('[role="status"]'));
+        await page.locator("main h1").waitFor();
+      } else if (name.startsWith("plans")) {
+        await page.getByRole("heading", { name: plan ? plan.title : "Issue plans", exact: true }).waitFor();
+        if (tab) {
+          await page.getByRole("tab", { name: tab, exact: true }).click();
+          await page.locator(tab === "Tasks" ? ".task-list" : ".plan-prose").waitFor();
         }
-        if (!reply || reply.y + reply.height > height + 1)
-          throw new Error(`Reply bar outside viewport in ${file}`);
+      } else {
+        await page.locator(width < 700 && url === "/" ? ".phone-card" : ".detail-title").first().waitFor();
+        if (real && url === "/")
+          await page.getByRole("tab", { name: "All", exact: true }).click();
+        if (url.startsWith("/jobs")) {
+          await page.waitForFunction((id) => document.querySelector(".detail-meta")?.textContent.startsWith(`#${id}`), Number(url.split("/").pop()));
+          await page.locator(".job-card.selected").evaluate((node) => node.scrollIntoView({ block: "nearest", inline: "nearest" }));
+        }
       }
-      await page.screenshot({ path: path.join(outputDir, file) });
-      console.log(file);
-      if (name) await reference(page, name);
-    }
-    if (!real) {
-      await page.goto(base + "/plans");
-      for (const tab of ["Plan", "Review"]) {
-        await page.getByRole("tab", { name: tab, exact: true }).click();
-        if (!(await page.locator(".plan-prose").innerText()).trim())
-          throw new Error(`Empty ${tab}`);
+      await save(page, file);
+      if (!real) {
+        const ref = name === "board" ? (width < 700 ? "Phone" : "Main") : name === "plans-tasks" && width === 1440 ? "Plan" : null;
+        if (ref) await reference(page, ref);
       }
     }
     if (errors.length) throw new Error(errors.join("\n"));
@@ -302,9 +276,93 @@ cmd = "/unavailable-for-history-capture"
     fs.rmSync(temp, { recursive: true, force: true });
   }
 }
+async function save(page, file) {
+  await page.evaluate(() => document.fonts.ready);
+  await page.evaluate(() => new Promise(requestAnimationFrame));
+  const problems = await page.evaluate(() => {
+    const issues = [];
+    if (document.documentElement.scrollWidth > innerWidth) issues.push("document overflow");
+    for (const node of document.querySelectorAll(".reply-form input, .reply-form button")) {
+      const r = node.getBoundingClientRect();
+      if (r.x < 0 || r.y < 0 || r.right > innerWidth + 1 || r.bottom > innerHeight + 1)
+        issues.push(`reply control outside viewport: ${node.textContent || "input"}`);
+    }
+    return issues;
+  });
+  if (problems.length) throw new Error(`${file}: ${problems.join(", ")}`);
+  if (await page.locator(".connection, .phone-connection").count())
+    await page.waitForFunction(() => [...document.querySelectorAll(".connection, .phone-connection")].some((node) => node.textContent.includes("Live")));
+  await page.screenshot({ path: path.join(outputDir, file) });
+  captured.add(file);
+  console.log(file);
+}
+
+async function captureOidc() {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "forkdeck-oidc-capture-"));
+  let fixture;
+  let proxy;
+  try {
+    execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", path.join(temp, "key.pem"), "-out", path.join(temp, "cert.pem"), "-days", "1", "-subj", "/CN=localhost"], { stdio: "ignore" });
+    let upstream;
+    proxy = https.createServer({ key: fs.readFileSync(path.join(temp, "key.pem")), cert: fs.readFileSync(path.join(temp, "cert.pem")) }, (req, res) => {
+      const forwarded = http.request(upstream + req.url, { method: req.method, headers: req.headers }, (response) => {
+        res.writeHead(response.statusCode, response.headers);
+        response.pipe(res);
+      });
+      forwarded.on("error", (error) => res.destroy(error));
+      req.pipe(forwarded);
+    });
+    proxy.listen(0, "127.0.0.1");
+    await once(proxy, "listening");
+    const origin = `https://localhost:${proxy.address().port}`;
+    fixture = spawn("cargo", ["test", "--bin", "forkdeck", "screenshot_provider", "--", "--ignored", "--nocapture"], {
+      cwd: root, env: { ...process.env, FORKDECK_CAPTURE_ORIGIN: origin }, stdio: ["pipe", "pipe", "inherit"],
+    });
+    upstream = await new Promise((resolve, reject) => {
+      let output = "";
+      const timeout = setTimeout(() => reject(new Error("OIDC fixture did not start")), 120000);
+      fixture.once("exit", (code) => { clearTimeout(timeout); reject(new Error(`OIDC fixture exited ${code}`)); });
+      fixture.stdout.on("data", (chunk) => {
+        output += chunk;
+        const match = output.match(/Forkdeck capture fixture: (http:\/\/127\.0\.0\.1:\d+)/);
+        if (match) { clearTimeout(timeout); resolve(match[1]); }
+      });
+    });
+    const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
+    try {
+      const page = await context.newPage();
+      // Forkdeck's existing signed-out landing page; default local mode still has no login.
+      await page.goto(origin + "/auth/logout");
+      await page.getByRole("link", { name: "Sign in", exact: true }).waitFor();
+      await save(page, "oidc-sign-in-1440x900.png");
+      await page.getByRole("link", { name: "Sign in", exact: true }).click();
+      await page.locator(".signed-in").getByText("Test member", { exact: true }).waitFor();
+      await page.locator(".job-card.selected").waitFor();
+      await save(page, "oidc-board-1440x900.png");
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.reload();
+      await page.locator(".phone-card").first().waitFor();
+      await save(page, "oidc-board-390x844.png");
+    } finally { await context.close(); }
+  } finally {
+    if (fixture && fixture.exitCode === null) {
+      const ended = once(fixture, "exit");
+      fixture.stdin.end("\n");
+      await ended;
+    }
+    if (proxy) await new Promise((resolve) => proxy.close(resolve));
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+}
+
 try {
   await capture(false);
   await capture(true);
+  await captureOidc();
+  for (const file of fs.readdirSync(outputDir)) {
+    if (file.endsWith(".png") && !["terminal.png", "team.png"].includes(file) && !captured.has(file))
+      fs.unlinkSync(path.join(outputDir, file));
+  }
 } finally {
   await browser.close();
 }

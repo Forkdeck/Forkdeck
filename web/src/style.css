@@ -1153,3 +1153,57 @@ select:focus-visible {
 .signed-in > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
 .signed-in form { margin: 0; }
 @media (max-width: 699px) { .signed-in > span { max-width: 100px; } }
+
+/* Keep long operational records reachable inside the fixed-height application. */
+.operations-main {
+  overflow-y: auto;
+  min-height: 0;
+  box-sizing: border-box;
+}
+.mobile-plan-picker { display: none; }
+@media (max-width: 699px) {
+  .app-body:has(.plans-sidebar) {
+    flex-direction: column;
+    flex-wrap: nowrap;
+  }
+  .plans-sidebar {
+    flex: 0 0 auto;
+    padding: 8px 12px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .plans-sidebar .plans-label,
+  .plans-sidebar .plan-link { display: none; }
+  .mobile-plan-picker {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .mobile-plan-picker select {
+    flex: 1;
+    min-width: 0;
+    min-height: 44px;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--selected);
+    color: var(--text);
+    font: inherit;
+  }
+  .plans-main {
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: 16px 12px;
+  }
+  .plan-prose { padding: 16px; }
+  .phone-header { flex-wrap: wrap; }
+  .signed-in { flex-shrink: 0; }
+}
+
+.phone > .operations-nav { flex-shrink: 0; }
+.job-title, .phone-title, .muted-small, .detail-title { overflow-wrap: anywhere; }
+.task-empty { padding: 8px 12px; color: var(--muted); }
+
+.signed-in button { white-space: nowrap; }

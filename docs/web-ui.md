@@ -41,3 +41,7 @@ disabled controls have the title “Coming in the next milestone”.
 
 See [operational screens and API projections](web-ui-operations.md),
 [development](development.md#web-development), and [testing and captures](testing.md#web-captures).
+
+![Web board with a selected job](screenshots/board-1440x900.png)
+
+See the [desktop, phone and real-history captures](screenshots/README.md).

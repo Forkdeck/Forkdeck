@@ -27,3 +27,7 @@ FORKDECK_WEB_URL=http://127.0.0.1:17420 node tests/web_pages.mjs
 ```
 
 The browser check needs a demo server and a Playwright Chromium installation. `FORKDECK_CHROMIUM` can select an existing Chromium executable. It checks every operational page and Markdown tabs at 1440 px and 390 px, including navigation, overflow, and browser errors; screenshots go to `/tmp`.
+
+![Deployment status](screenshots/deploys-1440x900.png)
+
+See the [desktop, phone and real-history captures](screenshots/README.md).

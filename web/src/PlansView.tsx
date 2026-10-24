@@ -90,6 +90,12 @@ export function PlansView({
       <div class="app-body">
         <nav aria-label="Plans" class="plans-sidebar">
           <Navigation />
+          <label class="mobile-plan-picker">
+            Issue plan
+            <select value={String(plan.id)} onChange={(event) => location.assign(`/plans/${event.currentTarget.value}`)}>
+              {allPlans.map((p) => <option value={String(p.id)}>{p.title}</option>)}
+            </select>
+          </label>
           <h2 class="plans-label">Issue plans</h2>
           {allPlans.map((p) => (
             <a
@@ -121,11 +127,11 @@ export function PlansView({
               >
                 Re-plan…
               </button>
-              <a
-                href={plan.plan.issue?.url || undefined}
+              {plan.plan.issue?.url && <a
+                href={plan.plan.issue.url}
                 aria-disabled={!plan.plan.issue?.url}
                 class="issue-link"
-              >{`Open #${plan.plan.issue?.key ?? ""} on ${plan.plan.provider === "gitlab" ? "GitLab" : "GitHub"}`}</a>
+              >{`Open #${plan.plan.issue?.key ?? ""} on ${plan.plan.provider === "gitlab" ? "GitLab" : "GitHub"}`}</a>}
             </div>
           </div>
           <div class="revision-flags" aria-label="Revision status">
@@ -160,6 +166,7 @@ export function PlansView({
             <>
               <div class="task-layout">
                 <section aria-label="Task list" class="task-list">
+                  {!tasks.length && <p class="task-empty">No tasks observed for this plan.</p>}
                   {tasks.map((t) => (
                     <Fragment key={t.n}>
                       <div class={`task-row${t.nested ? " nested" : ""}`}>

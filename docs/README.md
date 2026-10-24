@@ -37,7 +37,7 @@
 - [Web UI mockup](web-ui-mockup/README.md) — approved visual language;
   [board](web-ui-mockup/Main.dc.html), [plans](web-ui-mockup/Plan.dc.html) and
   [phone](web-ui-mockup/Phone.dc.html) references.
-- [Web UI captures](web-ui-mockup/screenshots/README.md) — seeded/real-history captures and reference differences.
+- [Web UI captures](screenshots/README.md) — seeded/real-history captures and reference differences.
 
 ## Design and implementation plans
 

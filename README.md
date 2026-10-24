@@ -6,7 +6,12 @@ You give it a task, or label an issue, and it decides which CLI should do the
 work and at what effort, runs it, has the *other* CLI review the result, and
 shows the whole thing as a live tree.
 
-![forkdeck running in demo mode](docs/screenshot.png)
+![forkdeck running in demo mode](docs/screenshots/terminal.png)
+
+![Forkdeck web board with a selected job](docs/screenshots/board-1440x900.png)
+
+[Web UI screenshot gallery](docs/screenshots/README.md) · [Web UI setup](docs/web-ui.md)
+
 
 It drives the official CLIs as subprocesses, so it uses whatever login they
 already have, subscription or API key. It never talks to a model API itself.

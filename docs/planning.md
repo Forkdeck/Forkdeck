@@ -95,3 +95,7 @@ planning commands are not part of this first version.
 
 For plans split across several issues, see [sub-issues](sub-issues.md).
 Offline acceptance commands are in [testing](testing.md#issue-planning).
+
+![Issue plan tasks and scheduler](screenshots/plans-tasks-1440x900.png)
+
+See the [desktop, phone and real-history captures](screenshots/README.md).

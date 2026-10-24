@@ -152,3 +152,9 @@ state/cookie integrity, signature, issuer, audience, nonce, expiry, missing/malf
 groups, nested claims, userinfo subject binding, key rotation, role precedence,
 restart persistence, hashed storage, logout Origin, API/page protection, and SSE
 termination. No external identity service is required by the test suite.
+
+![OIDC sign-in landing page](screenshots/oidc-sign-in-1440x900.png)
+
+![Signed-in OIDC header](screenshots/oidc-board-1440x900.png)
+
+See the [desktop, phone and real-history captures](screenshots/README.md).

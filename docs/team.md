@@ -37,7 +37,7 @@ is not derived from anything about the machine.
 **Seeing it.** `F4` swaps the agent tree for the team pane, and
 `forkdeck team` prints the same thing:
 
-![the team pane in demo mode](team.png)
+![the team pane in demo mode](screenshots/team.png)
 
 ```
 alice on mbp-alice (you)

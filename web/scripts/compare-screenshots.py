@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PIL import Image, ImageChops
 
-root = Path(__file__).resolve().parents[2] / "docs/web-ui-mockup/screenshots"
+root = Path(__file__).resolve().parents[2] / "docs/screenshots"
 report = {
     "note": "Content is derived from native Hub state. Differences include honest live metadata and filters; see README.md.",
     "reference_comparisons": [],
@@ -13,7 +13,7 @@ report = {
 }
 for name, file in [
     ("Main", "board-1440x900.png"),
-    ("Plan", "plans-1440x900.png"),
+    ("Plan", "plans-tasks-1440x900.png"),
     ("Phone", "board-390x844.png"),
 ]:
     app = Image.open(root / file).convert("RGB")
