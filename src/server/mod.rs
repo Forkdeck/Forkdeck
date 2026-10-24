@@ -1,5 +1,6 @@
 mod http;
 mod view;
+mod wire;
 pub(crate) mod seed;
 mod operations;
 

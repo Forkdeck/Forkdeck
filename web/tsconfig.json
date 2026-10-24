@@ -1,1 +1,1 @@
-{"compilerOptions":{"target":"ES2022","module":"ESNext","moduleResolution":"Bundler","jsx":"react-jsx","jsxImportSource":"preact","strict":true,"skipLibCheck":true,"noEmit":true,"lib":["ES2022","DOM"]},"include":["src","vite.config.ts"]}
+{"compilerOptions":{"target":"ES2022","module":"ESNext","moduleResolution":"Bundler","jsx":"react-jsx","jsxImportSource":"preact","allowImportingTsExtensions":true,"strict":true,"skipLibCheck":true,"noEmit":true,"lib":["ES2022","DOM"]},"include":["src","vite.config.ts"]}

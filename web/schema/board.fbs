@@ -1,0 +1,18 @@
+namespace forkdeck.web;
+
+table LogEntry { time: string; who: string; text: string; }
+table Job { id: uint; title: string; lane: string; state: string; meta: string;
+            elapsed: string; route: string; stages: [ubyte]; log: [LogEntry]; warn: string; }
+table Lane { id: string; label: string; }
+table Agents { claude: bool; codex: bool; copilot: bool; }
+table Router { kind: string; calls: ulong; last_ms: ulong; }
+table Snapshot { automation: bool; workspace: string; capacity: uint; busy: uint;
+                 router: Router; agents: Agents; lanes: [Lane]; jobs: [Job]; }
+table JobChanged { job: Job; }
+table Tail { id: uint; worker: bool; from: ulong; lines: [string]; }
+table Automation { on: bool; }
+table Resync {}
+table Changed {}
+union Body { Snapshot, JobChanged, Tail, Automation, Resync, Changed }
+table Frame { seq: ulong; body: Body; }
+root_type Frame;
