@@ -180,7 +180,7 @@ pub(super) async fn action(State(app): State<App>, req: Request<Body>) -> Respon
     let headers = req.headers();
     let origin = app.auth.as_ref().map(|auth| auth.origin())
         .or_else(|| headers.get(header::HOST).and_then(|h| h.to_str().ok()).map(|host| format!("http://{host}")));
-    let denied = if req.extensions().get::<Principal>().is_some_and(|p| !matches!(p.role.as_str(), "operator" | "admin")) {
+    let denied = if !super::auth::can_write(req.extensions().get::<Principal>()) {
         Some((403, "Operator or admin role required"))
     } else if headers.get("sec-fetch-site").is_some_and(|h| h == "cross-site") || headers.get(header::ORIGIN).is_some_and(|h| h.to_str().ok() != origin.as_deref()) {
         Some((403, "Cross-origin actions are forbidden"))
