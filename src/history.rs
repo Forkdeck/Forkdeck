@@ -88,6 +88,14 @@ const MIGRATIONS: &[&str] = &["
         finished INTEGER NOT NULL
     );
     CREATE INDEX routes_scope ON routes (scope, kind, finished);
+", "
+    CREATE TABLE web_sessions (
+        token_hash TEXT PRIMARY KEY,
+        scope TEXT NOT NULL,
+        principal TEXT NOT NULL,
+        expires INTEGER NOT NULL
+    );
+    CREATE INDEX web_sessions_expiry ON web_sessions (expires);
 "];
 
 /// Routes kept per repository and kind of job; older ones are dropped as new ones come.
@@ -428,6 +436,22 @@ impl History {
         }
         db.execute_batch("COMMIT").map_err(e)?;
         Ok(History { db: Mutex::new(db) })
+    }
+
+    pub fn web_session_save(&self, hash: &str, scope: &str, principal: &str, expires: i64) -> Result<(), String> {
+        let db = self.db.lock().unwrap();
+        db.execute("DELETE FROM web_sessions WHERE expires <= ?1", params![now_secs() as i64]).map_err(|e| e.to_string())?;
+        db.execute("INSERT INTO web_sessions VALUES (?1, ?2, ?3, ?4)", params![hash, scope, principal, expires]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn web_session(&self, hash: &str, scope: &str) -> Result<Option<String>, String> {
+        self.db.lock().unwrap().query_row("SELECT principal FROM web_sessions WHERE token_hash = ?1 AND scope = ?2 AND expires > ?3", params![hash, scope, now_secs() as i64], |r| r.get(0)).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn web_session_delete(&self, hash: &str) -> Result<(), String> {
+        self.db.lock().unwrap().execute("DELETE FROM web_sessions WHERE token_hash = ?1", params![hash]).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// A new job id, reserved with an empty row so another forkdeck cannot take it.

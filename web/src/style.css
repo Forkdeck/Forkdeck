@@ -1148,3 +1148,8 @@ select:focus-visible {
     gap: 0;
   }
 }
+
+.signed-in { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); min-width: 0; }
+.signed-in > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
+.signed-in form { margin: 0; }
+@media (max-width: 699px) { .signed-in > span { max-width: 100px; } }

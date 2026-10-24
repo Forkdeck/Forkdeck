@@ -352,9 +352,24 @@ mode = "off"
 # invocation_max_usd = 1.0       # installed Claude flag when supported; not a token cap
 # cohorts = [{ definition = "prompt-proxy-v1", category = "fix", complexity = "standard", context = "prompt-small" }]
 
-# Browser UI served by forkdeck serve. It has no login: on 127.0.0.1 only this machine can
-# open it. On a server, bind 0.0.0.0 and keep it behind a firewall, VPN or an authenticating
-# reverse proxy; anyone who reaches the port sees every job, log and plan.
+# Browser UI served by forkdeck serve. No login unless web.oidc is configured.
+# Without OIDC, anyone who reaches the port sees every job, log and plan.
 [web]
 bind = "127.0.0.1"
 port = 7420
+
+
+# Optional group-based OIDC access; needs a public HTTPS reverse proxy.
+# See docs/web-ui-oidc.md for provider setup. Store the secret only in the environment.
+# [web.oidc]
+# issuer = "https://identity.example/realms/work"
+# client_id = "forkdeck"
+# client_secret_env = "FORKDECK_OIDC_SECRET"
+# redirect_url = "https://forkdeck.example/auth/callback"
+# scopes = ["openid", "email", "profile", "groups"]
+# groups_claim = "groups" # dotted paths supported, e.g. realm_access.roles
+# session_lifetime_secs = 43200
+# [web.oidc.roles]
+# viewer = ["forkdeck-readers"]
+# operator = ["forkdeck-operators"]
+# admin = ["forkdeck-admins"]

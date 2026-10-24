@@ -1,3 +1,4 @@
+import { Account } from "./Account";
 import { render } from "preact";
 import { useEffect, useState } from "preact/hooks";
 import { LocationProvider, Router, Route } from "preact-iso";
@@ -40,7 +41,11 @@ function Board({ id }: { id?: string }) {
   if (!snap.jobs.length)
     return (
       <div class="empty">
-        <Navigation />
+        <header class="app-header">
+          <Navigation />
+          <span class="grow" />
+          <Account />
+        </header>
         <h1>No jobs yet</h1>
         <p>Jobs started from Forkdeck appear here live.</p>
       </div>
@@ -71,7 +76,11 @@ function Plans({ id }: { id?: string }) {
   if (!all.length)
     return (
       <div class="empty">
-        <Navigation />
+        <header class="app-header">
+          <Navigation />
+          <span class="grow" />
+          <Account />
+        </header>
         <h1>Issue plans</h1>
         <p>No issue plans yet.</p>
       </div>
@@ -80,7 +89,11 @@ function Plans({ id }: { id?: string }) {
   if (!plan)
     return (
       <div class="empty">
-        <Navigation />
+        <header class="app-header">
+          <Navigation />
+          <span class="grow" />
+          <Account />
+        </header>
         <h1>Plan not found</h1>
       </div>
     );
@@ -89,6 +102,7 @@ function Plans({ id }: { id?: string }) {
 function Status() {
   return (
     <div class="empty" role="status">
+      <Account />
       <h1>forkdeck</h1>
       <p>{error.value || "Connecting…"}</p>
     </div>

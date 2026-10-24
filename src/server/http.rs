@@ -1,4 +1,4 @@
-use super::view;
+use super::{auth::{self, Auth}, view};
 use crate::{orchestrator::Hub, remote::feed::{Feed, Numbered}};
 use axum::{
     body::Body,
@@ -12,10 +12,9 @@ use axum::{
 use serde::Deserialize;
 use std::{collections::VecDeque, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
-/// There is no login: whoever reaches the address sees everything. `loopback` says the server
-/// listens on this machine only, where the one remaining risk is another site's page reaching it.
+/// Loopback host checks also protect an unauthenticated local server from DNS rebinding.
 #[derive(Clone)]
-struct App { hub: Hub, feed: Arc<Feed>, loopback: bool }
+struct App { hub: Hub, feed: Arc<Feed>, loopback: bool, auth: Option<Arc<Auth>> }
 
 #[derive(rust_embed::RustEmbed)]
 #[folder = "web/dist/"]
@@ -34,8 +33,26 @@ fn local_host(host: &str) -> bool {
 }
 
 async fn same_machine(State(app): State<App>, req: Request<Body>, next: Next) -> Response {
-    if app.loopback && !req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).is_some_and(local_host) {
+    if app.loopback && app.auth.is_none() && !req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).is_some_and(local_host) {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    let protected = app.auth.is_some();
+    let mut response = next.run(req).await;
+    if protected { response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap()); }
+    response
+}
+
+async fn authenticated(State(app): State<App>, mut req: Request<Body>, next: Next) -> Response {
+    if let Some(auth) = &app.auth {
+        match auth.session(req.headers()).await {
+            Ok(Some(principal)) => { req.extensions_mut().insert(principal); }
+            Ok(None) => {
+                return if req.uri().path() == "/api" || req.uri().path().starts_with("/api/") {
+                    StatusCode::UNAUTHORIZED.into_response()
+                } else { axum::response::Redirect::to("/auth/login").into_response() };
+            }
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
     }
     next.run(req).await
 }
@@ -69,20 +86,27 @@ struct Cursor { since: Option<u64> }
 async fn events(State(app): State<App>, Query(cursor): Query<Cursor>, headers: HeaderMap) -> impl IntoResponse {
     let since = headers.get("last-event-id").and_then(|s| s.to_str().ok()).and_then(|s| s.parse().ok()).or(cursor.since).unwrap_or(0);
     let (backlog, rx) = app.feed.subscribe(since);
-    let stream = futures::stream::unfold((VecDeque::from(backlog), rx), |(mut queue, mut rx)| async move {
+    let session = app.auth.as_ref().and_then(|auth| auth.session_key(&headers).map(|key| (auth.clone(), key)));
+    let stream = futures::stream::unfold((VecDeque::from(backlog), rx, session), |(mut queue, mut rx, session)| async move {
+        if let Some((auth, key)) = &session {
+            if !matches!(auth.session_hash(key.clone()).await, Ok(Some(_))) { return None; }
+        }
         let item: Option<Numbered> = if let Some(e) = queue.pop_front() { Some(e) } else {
-            match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
+            match tokio::time::timeout(Duration::from_secs(if session.is_some() { 1 } else { 15 }), rx.recv()).await {
                 Ok(Ok(e)) => Some(e),
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => Some((0, forkdeck_remote_proto::Event::Resync)),
                 Err(_) => None,
             }
         };
+        if let Some((auth, key)) = &session {
+            if !matches!(auth.session_hash(key.clone()).await, Ok(Some(_))) { return None; }
+        }
         let event = match item {
             Some((seq, event)) => Event::default().id(seq.to_string()).json_data(event).unwrap(),
             None => Event::default().event("freshness").data("{}"),
         };
-        Some((Ok::<_, Infallible>(event), (queue, rx)))
+        Some((Ok::<_, Infallible>(event), (queue, rx, session)))
     });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10)).text("heartbeat"))
 }
@@ -109,6 +133,7 @@ async fn security(req: Request<Body>, next: Next) -> Response {
 
 fn router(app: App) -> Router {
     let api = Router::new()
+        .route("/v1/me", get(auth::whoami))
         .route("/v1/snapshot", get(snapshot))
         .route("/v1/jobs/{id}", get(detail))
         .route("/v1/plans", get(plans))
@@ -121,23 +146,35 @@ fn router(app: App) -> Router {
         .route("/v1/settings", get(settings))
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(middleware::from_fn(no_store));
-    Router::new().nest("/api", api)
-        .fallback(assets)
+    let protected = Router::new().nest("/api", api).fallback(assets)
+        .layer(middleware::from_fn_with_state(app.clone(), authenticated));
+    let routes = match &app.auth { Some(auth) => protected.merge(auth::routes(auth.clone())), None => protected };
+    routes
         .layer(middleware::from_fn_with_state(app.clone(), same_machine))
         .with_state(app).layer(middleware::from_fn(security))
 }
 
 pub async fn serve(hub: Hub, feed: Arc<Feed>) -> anyhow::Result<()> {
     let at: SocketAddr = hub.cfg.web.address()?;
+    let auth = match &hub.cfg.web.oidc {
+        Some(cfg) => Some(Auth::new(cfg.clone(), hub.history.clone().ok_or_else(|| anyhow::anyhow!("OIDC requires durable history storage"))?).await?),
+        None => None,
+    };
     let listener = tokio::net::TcpListener::bind(at).await?;
     let local = listener.local_addr()?;
     let loopback = local.ip().is_loopback();
     println!("Forkdeck web UI: http://{local}/");
-    if !loopback {
+    if !loopback && auth.is_none() {
         eprintln!("warning: the web UI has no login and listens on {local}: anyone who can reach that address sees every job, log and plan. Keep it behind a firewall, VPN or an authenticating reverse proxy.");
     }
-    axum::serve(listener, router(App { hub, feed, loopback })).await?;
+    axum::serve(listener, router(App { hub, feed, loopback, auth })).await?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn auth_test_router(auth: Arc<Auth>) -> Router {
+    let hub = Hub::new(crate::config::Config::default(), tokio::runtime::Handle::current());
+    router(App { hub, feed: Arc::new(Feed::new()), loopback: true, auth: Some(auth) })
 }
 
 #[cfg(test)]
@@ -159,7 +196,7 @@ mod tests {
         let feed = Arc::new(Feed::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let app = router(App { hub: hub.clone(), feed: feed.clone(), loopback: true });
+        let app = router(App { hub: hub.clone(), feed: feed.clone(), loopback: true, auth: None });
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
         let index = client.get(format!("{base}/")).send().await.unwrap();

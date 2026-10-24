@@ -1,3 +1,4 @@
+import { Account } from "./Account";
 import { useEffect, useState } from "preact/hooks";
 import type { ComponentChildren } from "preact";
 const pages = [
@@ -192,6 +193,7 @@ export function Operational({
         <span class="mono-muted">
           {updated ? `Observed ${updated.toLocaleTimeString()}` : "Connecting…"}
         </span>
+        <Account />
       </header>
       <div class="app-body">
         <aside class="operations-sidebar">

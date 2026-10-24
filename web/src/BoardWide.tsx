@@ -1,3 +1,4 @@
+import { Account } from "./Account";
 import { Fragment } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { useLocation } from "preact-iso";
@@ -119,16 +120,7 @@ export function BoardWide({
           <span class={autoDot}></span>
           {`Issue intake ${autoLabel}`}
         </button>
-        <button
-          type="button"
-          aria-label="Account"
-          class="account"
-          disabled
-          aria-disabled="true"
-          title="Coming in the next milestone"
-        >
-          {workspace.slice(0, 1).toUpperCase()}
-        </button>
+        <Account />
       </header>
       <div class="app-body">
         <nav aria-label="Main" class="sidebar">

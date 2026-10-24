@@ -53,6 +53,12 @@ interface Snapshot extends Omit<NativeSnapshot, "jobs"> {
   router: { kind: string; calls: number; last_ms: number };
   agents: { claude: boolean; codex: boolean; copilot: boolean };
 }
+export const principal = signal<{
+  subject: string;
+  name: string;
+  groups: string[];
+  role: string;
+} | null>(null);
 export const snapshot = signal<Snapshot | null>(null);
 export const details = signal<Record<number, JobDetail>>({});
 export const plans = signal<PlanView[]>([]);
@@ -64,6 +70,7 @@ let selected: number | undefined;
 
 async function read<T>(path: string): Promise<T> {
   const response = await fetch("/api/v1/" + path);
+  if (response.status === 401) location.assign("/auth/login");
   if (!response.ok)
     throw new Error(`Could not load ${path} (${response.status})`);
   return response.json();
@@ -157,6 +164,7 @@ function connect(seq: number) {
   };
   source.onerror = () => {
     connection.value = "Reconnecting";
+    void read<typeof principal.value>("me").catch(fail);
   };
   source.onmessage = (e) => {
     reduce(JSON.parse(e.data));
@@ -168,6 +176,7 @@ function reconnect() {
   void refresh().then(connect).catch(fail);
 }
 export function start() {
+  void read<typeof principal.value>("me").then((user) => { principal.value = user; }).catch(fail);
   reconnect();
   return () => {
     source?.close();

@@ -1138,7 +1138,7 @@ forkdeck serve --demo
 # Forkdeck web UI: http://127.0.0.1:7420/
 ```
 
-There is no login. By default the UI listens on 127.0.0.1, so only this machine can open
+Login is optional. Without `[web.oidc]`, the UI listens on 127.0.0.1, so only this machine can open
 it, and requests naming any other host are refused, which stops another site's page from
 reaching it through DNS rebinding. On a server, set the address to listen on:
 
@@ -1148,9 +1148,12 @@ bind = "0.0.0.0"   # default 127.0.0.1
 port = 7420
 ```
 
-Anyone who can reach that address sees every job, log and plan, and `forkdeck serve`
+Without OIDC, anyone who can reach that address sees every job, log and plan, and `forkdeck serve`
 prints a warning saying so. Keep it behind a firewall, a VPN, or a reverse proxy that
 does the authentication. No CORS is enabled.
+
+To require sign-in and group-based access, configure `[web.oidc]` and an HTTPS
+reverse proxy. See [OIDC setup and provider instructions](docs/web-ui-oidc.md).
 
 The board, job details (`/jobs/:id`), plans (`/plans`, `/plans/:id`), log tabs, and
 phone filters are live. SSE uses the native feed's sequence numbers, bounded replay,

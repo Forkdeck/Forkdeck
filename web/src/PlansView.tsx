@@ -1,3 +1,4 @@
+import { Account } from "./Account";
 import { Markdown } from "./Markdown";
 import { Navigation } from "./Operational";
 import { Fragment } from "preact";
@@ -84,6 +85,7 @@ export function PlansView({
         >
           New plan
         </button>
+        <Account />
       </header>
       <div class="app-body">
         <nav aria-label="Plans" class="plans-sidebar">

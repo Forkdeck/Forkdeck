@@ -1,7 +1,8 @@
 # Read-only operational screens
 
 The browser menu exposes plans, repositories, deployments, stats, and doctor/settings.
-All API reads use `Cache-Control: no-store`; mutations and login are outside this milestone.
+All API reads use `Cache-Control: no-store`; application mutations remain outside this milestone.
+Optional [OIDC login and group access](web-ui-oidc.md) protects all browser routes when configured.
 
 - `GET /api/v1/plans` and `/plans/{id}` retain the native Plan and add `draft_display`, with the task graph fence removed. Markdown disables HTML and images and accepts only HTTP/HTTPS links. Revision markers describe the selected current revision; the Plan structure does not retain older revision bodies.
 - `GET /api/v1/repos` projects configured intake labels, automation, poll observations, recorded holds, limits, teammate claims, and plan scheduler observations. A hold describes the last poll, not a fresh admission decision.

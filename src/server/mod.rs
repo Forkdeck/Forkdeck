@@ -1,4 +1,5 @@
 mod http;
+mod auth;
 mod view;
 pub(crate) mod seed;
 mod operations;

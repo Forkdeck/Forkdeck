@@ -1,3 +1,4 @@
+import { Account } from "./Account";
 import { Navigation } from "./Operational";
 import { Fragment } from "preact";
 import { useState } from "preact/hooks";
@@ -47,6 +48,7 @@ export function BoardPhone({
           <span class="live-dot"></span>
           {live}
         </span>
+        <Account />
       </header>
       <Navigation />
       <div role="tablist" class="phone-tabs">

@@ -1248,6 +1248,7 @@ impl Config {
             }
         }
         self.web.address()?;
+        if let Some(oidc) = &self.web.oidc { oidc.validate()?; }
         if self.remote.listen.parse::<std::net::SocketAddr>().is_err() {
             anyhow::bail!("remote.listen must be an address and port such as 0.0.0.0:7443, got {:?}", self.remote.listen);
         }
@@ -1640,18 +1641,18 @@ tool = "rollback"
     }
 }
 
-/// The browser UI. It has no login of its own: on loopback (the default) only this machine reaches
-/// it; on any other address it is open to whoever can reach that address.
+/// Browser UI, with optional group-based OpenID Connect access.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebCfg {
     /// Address to listen on: 127.0.0.1 (this machine only), or e.g. 0.0.0.0 on a server.
     pub bind: String,
     pub port: u16,
+    pub oidc: Option<OidcCfg>,
 }
 
 impl Default for WebCfg {
-    fn default() -> Self { Self { bind: "127.0.0.1".into(), port: 7420 } }
+    fn default() -> Self { Self { bind: "127.0.0.1".into(), port: 7420, oidc: None } }
 }
 
 impl WebCfg {
@@ -1659,5 +1660,53 @@ impl WebCfg {
         let ip: std::net::IpAddr = self.bind.trim().trim_start_matches('[').trim_end_matches(']').parse()
             .map_err(|_| anyhow::anyhow!("web.bind must be an IP address such as 127.0.0.1 or 0.0.0.0, got {:?}", self.bind))?;
         Ok(std::net::SocketAddr::new(ip, self.port))
+    }
+}
+
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct OidcCfg {
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret_env: String,
+    pub redirect_url: String,
+    #[serde(default = "oidc_scopes")]
+    pub scopes: Vec<String>,
+    #[serde(default = "oidc_groups")]
+    pub groups_claim: String,
+    pub roles: OidcRoles,
+    #[serde(default = "oidc_lifetime")]
+    pub session_lifetime_secs: u64,
+}
+
+fn oidc_scopes() -> Vec<String> { ["openid", "email", "profile", "groups"].map(String::from).to_vec() }
+fn oidc_groups() -> String { "groups".into() }
+fn oidc_lifetime() -> u64 { 12 * 60 * 60 }
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct OidcRoles {
+    pub viewer: Vec<String>,
+    pub operator: Vec<String>,
+    pub admin: Vec<String>,
+}
+
+impl OidcCfg {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let issuer = reqwest::Url::parse(&self.issuer)?;
+        let redirect = reqwest::Url::parse(&self.redirect_url)?;
+        let clean = |u: &reqwest::Url| u.host_str().is_some() && u.username().is_empty() && u.password().is_none() && u.query().is_none() && u.fragment().is_none();
+        let local = issuer.host_str().is_some_and(|h| h == "localhost" || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+        anyhow::ensure!(clean(&issuer) && (issuer.scheme() == "https" || (issuer.scheme() == "http" && local)), "web.oidc.issuer must be HTTPS (HTTP allowed for a loopback provider)");
+        anyhow::ensure!(clean(&redirect) && redirect.scheme() == "https" && redirect.path() == "/auth/callback", "web.oidc.redirect_url must be the public HTTPS /auth/callback URL");
+        anyhow::ensure!(!self.client_id.trim().is_empty(), "web.oidc.client_id is required");
+        anyhow::ensure!(!self.client_secret_env.is_empty() && self.client_secret_env.bytes().enumerate().all(|(i,b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())), "web.oidc.client_secret_env must name an environment variable");
+        anyhow::ensure!(!self.groups_claim.split('.').any(str::is_empty), "web.oidc.groups_claim must be a dotted claim path");
+        anyhow::ensure!(self.scopes.iter().any(|s| s == "openid") && self.scopes.iter().all(|s| !s.is_empty() && !s.chars().any(char::is_whitespace)), "web.oidc.scopes must contain openid and valid scope names");
+        let groups: Vec<_> = self.roles.viewer.iter().chain(&self.roles.operator).chain(&self.roles.admin).collect();
+        anyhow::ensure!(!groups.is_empty() && groups.iter().all(|g| !g.trim().is_empty()), "web.oidc.roles must allow at least one nonempty group");
+        anyhow::ensure!(self.session_lifetime_secs > 0 && self.session_lifetime_secs <= 365 * 86400, "web.oidc.session_lifetime_secs must be 1..31536000");
+        Ok(())
     }
 }
