@@ -1207,3 +1207,37 @@ select:focus-visible {
 .task-empty { padding: 8px 12px; color: var(--muted); }
 
 .signed-in button { white-space: nowrap; }
+
+.writable-composer { flex-wrap: wrap; gap: 8px; }
+.writable-composer label { font-size: 12px; color: var(--muted); }
+.writable-composer select { max-width: 180px; }
+.action-notice { color: var(--accent); font-size: 12px; padding: 4px 12px; margin: 0; }
+.job-actions { flex-shrink: 0; max-height: 45%; overflow: auto; background: var(--background); }
+.choices, .queued-messages { padding: 8px 12px; font-size: 12px; }
+.choices h2 { font-size: 13px; }
+.choices button { display: block; width: 100%; text-align: left; padding: 8px; margin: 4px 0; }
+.choices button span { display: block; }
+.plan-write-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0; }
+.plan-write-actions label { display: flex; align-items: center; gap: 8px; }
+.plan-write-actions textarea { min-width: 180px; max-width: 100%; background: var(--background); color: inherit; }
+.plan-write-actions button { padding: 8px; }
+.reply-form { flex-wrap: wrap; }
+.reply-form input { min-width: 120px; }
+@media (max-width: 699px) {
+  .writable-composer { padding: 8px; }
+  .writable-composer .task-input { flex-basis: 100%; width: 100%; }
+  .phone-header .intake { font-size: 10px; padding: 4px; }
+  .plan-write-actions label { flex-wrap: wrap; }
+}
+button:disabled { opacity: .5; cursor: not-allowed; }
+.writable-composer { color-scheme: dark; }
+.writable-composer .agent-select { max-width: 165px; }
+.choices button { background: var(--selected); color: var(--text); border: 1px solid var(--border); border-radius: 6px; font: inherit; cursor: pointer; }
+.plan-write-actions textarea { border: 1px solid var(--border); border-radius: 6px; padding: 8px; font: inherit; }
+.phone > div:last-child { flex-shrink: 0; }
+/* Composer wrapping changes available board height; keep each lane inside that space. */
+.board-main { min-height: 0; overflow: hidden; }
+.board-main > div:first-child { flex-shrink: 0; }
+.board-scroll { flex: 1 1 0; }
+.lanes { height: 100%; min-height: 0; grid-template-rows: minmax(0, 1fr); box-sizing: border-box; }
+.lane { min-height: 0; max-height: 100%; box-sizing: border-box; }

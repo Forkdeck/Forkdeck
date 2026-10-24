@@ -533,6 +533,16 @@ pub struct Job {
 }
 
 impl Job {
+    /// Optimistic concurrency token for user decisions; output and elapsed clocks do not change it.
+    pub fn action_revision(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let value = serde_json::json!([self.status, self.turns, self.plan, self.issue_plan, self.inbox]);
+        format!("{:x}", Sha256::digest(serde_json::to_vec(&value).unwrap()))
+    }
+    pub fn check_revision(&self, expected: Option<&str>) -> Result<(), String> {
+        if expected.is_some_and(|r| r != self.action_revision()) { Err("stale revision".into()) } else { Ok(()) }
+    }
+
     pub fn stage(&mut self, slot: crate::agents::Slot) -> &mut Stage {
         use crate::agents::Slot;
         match slot {

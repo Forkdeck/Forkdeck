@@ -222,6 +222,7 @@ path = "."
         st.jobs.push(j);
     }
     // The journal and attempt reports consume native records, just as normal operation does.
+    st.next_id = st.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let records = st.jobs.iter().filter(|j| j.status.finished() && j.issue_plan.is_none()).map(|j| crate::journal::entry(j,j.status,&j.outcome,0)).collect::<Vec<_>>();
     read_records.entries = records;
     let now = crate::journal::now();

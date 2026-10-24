@@ -23,8 +23,11 @@ JavaScript errors, live connections and unchanged source-file hashes.
 
 `forkdeck serve --demo` seeds native Hub jobs, plans, task graphs, repository facts,
 deployments and metrics in `src/server/seed.rs`. These are projected by the same
-API code as normal service data. The board selects a working job; detail selects
-an unverified job. Plan captures select a graph when available, then click each tab.
+API code as normal service data. The board selects an active typed job, with unsent drafts from its native prompt to
+show the available write controls; detail selects
+an unverified job. Plan captures select a graph when available, then click each tab. The demo capture
+toggles intake through HTTP and restores it before capturing, so Doctor shows actual
+audit entries. Publication and decision controls retain their native eligibility reasons.
 
 | Screen | Desktop · 1440×900 | Phone · 390×844 |
 | --- | --- | --- |

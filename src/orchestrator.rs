@@ -482,6 +482,13 @@ impl Hub {
             st.log("queue", format!("#{} {}", id, clip(&title, 90)));
             id
         };
+        // Admission must be saved before any agent is launched.
+        if self.history.is_some() {
+            if let Err(error) = self.persist(id) {
+                self.state.lock().unwrap().jobs.retain(|j| j.id != id);
+                return Err(error);
+            }
+        }
         self.persist_queue(id);
         let hub = self.clone();
         self.rt.spawn(async move { run_job(hub, id).await });
@@ -492,12 +499,18 @@ impl Hub {
     /// Send a follow-up message to a finished typed task. The agent picks up in the same working
     /// tree and is given the conversation so far. Err says why it was not taken.
     pub async fn reply(&self, id: u32, text: String) -> Result<(), String> {
+        self.reply_at(id, text, None).await
+    }
+
+    /// Same reply admission, with an optional decision revision from a remote client.
+    pub async fn reply_at(&self, id: u32, text: String, expected: Option<&str>) -> Result<(), String> {
         let _admission = self.admission.lock().await;
-        self.reply_admitted(id, text).await
+        self.job(id, |j| j.check_revision(expected)).ok_or("no such job")??;
+        self.reply_admitted(id, text, expected).await
     }
 
     /// `reply`, for a caller that already holds the admission lock.
-    async fn reply_admitted(&self, id: u32, text: String) -> Result<(), String> {
+    async fn reply_admitted(&self, id: u32, text: String, expected: Option<&str>) -> Result<(), String> {
         // A finished task starts working again: take it over first, as `resume` does, so a second
         // forkdeck that restored the same task cannot run it at the same time.
         let finished_typed = self.job(id, |j| j.source.is_manual() && j.status.finished() && j.in_history).unwrap_or(false);
@@ -508,6 +521,7 @@ impl Hub {
                 return Err("shutting down".into());
             }
             let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return Err("no such job".into()) };
+            j.check_revision(expected)?;
             if !j.source.is_manual() {
                 return Err("only typed tasks take replies".into());
             }
@@ -527,7 +541,7 @@ impl Hub {
                 let n = j.plan.as_ref().map(|p| p.options.len()).unwrap_or(0);
                 let c = Choice::parse(&text, n);
                 drop(st);
-                return self.choose(id, c);
+                return self.choose_at(id, c, expected);
             }
             if !j.status.finished() {
                 // It is working: the agent gets this when its current step ends.
@@ -575,8 +589,13 @@ impl Hub {
 
     /// Publish a reviewed issue plan, or mark the published one ready for build (F6).
     pub async fn plan_action(&self, id: u32, action: crate::planning::Action) -> Result<(), String> {
+        self.plan_action_at(id, action, None).await
+    }
+
+    pub async fn plan_action_at(&self, id: u32, action: crate::planning::Action, expected: Option<&str>) -> Result<(), String> {
         if self.cfg.demo { return Err("issue publication is disabled in demo mode".into()); }
         let _admission = self.admission.lock().await;
+        self.job(id, |j| j.check_revision(expected)).ok_or("no such job")??;
         // Checked before the takeover: taking over reloads the saved job, and a job running here
         // would come back looking interrupted, so the check after it would let a second run start.
         let eligible = self.job(id, |j| j.status.finished() && j.issue_plan.is_some()).unwrap_or(false);
@@ -586,6 +605,7 @@ impl Hub {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if st.stopping { return Err("shutting down".into()); }
             let j = st.jobs.iter_mut().find(|j| j.id == id).ok_or("select an issue plan")?;
+            j.check_revision(expected)?;
             if !j.status.finished() { return Err("wait for the current turn to finish".into()); }
             let queued = !j.inbox.is_empty();
             let p = j.issue_plan.as_mut().ok_or("select an issue plan")?;
@@ -642,14 +662,19 @@ impl Hub {
             }).ok_or("task missing")??;
         }
         if self.history.is_some() { self.persist(id)?; }
-        self.reply_admitted(id, format!("{request}\n\nRefine this into a complete issue implementation plan and submit it for plan review.")).await
+        self.reply_admitted(id, format!("{request}\n\nRefine this into a complete issue implementation plan and submit it for plan review."), None).await
     }
 
     /// Pick how a planned task goes ahead.
     pub fn choose(&self, id: u32, c: Choice) -> Result<(), String> {
+        self.choose_at(id, c, None)
+    }
+
+    pub fn choose_at(&self, id: u32, c: Choice, expected: Option<&str>) -> Result<(), String> {
         let chose = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return Err("no such job".into()) };
+            j.check_revision(expected)?;
             if j.status != JobStatus::Choosing {
                 return Err("it is not waiting for a choice".into());
             }
@@ -675,9 +700,14 @@ impl Hub {
     /// Send a message and have the running agent take it now: it is stopped and continues its
     /// conversation with the message. A finished task takes it as a reply.
     pub async fn steer_now(&self, id: u32, text: String) -> Result<(), String> {
+        self.steer_now_at(id, text, None).await
+    }
+
+    pub async fn steer_now_at(&self, id: u32, text: String, expected: Option<&str>) -> Result<(), String> {
         let steer = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) else { return Err("no such job".into()) };
+            j.check_revision(expected)?;
             if !j.source.is_manual() {
                 return Err("only typed tasks take messages".into());
             }
@@ -697,7 +727,7 @@ impl Hub {
                 self.save(id);
                 Ok(())
             }
-            None => self.reply(id, text).await,
+            None => self.reply_at(id, text, expected).await,
         }
     }
 
@@ -712,6 +742,13 @@ impl Hub {
             c.fire();
             self.log("queue", format!("#{} cancel requested", id));
         }
+    }
+
+    /// Shared intake control for terminal, phone and browser clients.
+    pub fn automation(&self, on: bool) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.automation = on;
+        st.log("issues", if on { "issue intake on" } else { "issue intake paused" });
     }
 
     /// Stop polling, cancel everything and wait for jobs to finish reporting, so no issue is left looking claimed.

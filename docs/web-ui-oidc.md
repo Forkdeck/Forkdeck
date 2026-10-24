@@ -48,8 +48,9 @@ Groups must be a JSON array of strings. Values match exactly, including case and
 any leading slash. Forkdeck first reads the configured dotted claim path from the
 verified ID token. Only an absent claim triggers userinfo; that response must have
 the same subject. Missing, malformed, or unrecognized groups deny access. The
-highest matching role wins: admin, operator, viewer. All three currently read the
-same workspace; the role is retained for future write authorization.
+highest matching role wins: admin, operator, viewer. All three read the
+same workspace. Operator and admin can use browser actions; viewer receives 403 and
+sees the controls disabled with the required-role explanation.
 
 Sessions use a random 256-bit cookie with HttpOnly, Secure, SameSite=Lax, and a fixed
 expiry. SQLite history stores only its SHA-256 hash, user identity, groups, role,

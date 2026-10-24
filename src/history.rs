@@ -96,6 +96,9 @@ const MIGRATIONS: &[&str] = &["
         expires INTEGER NOT NULL
     );
     CREATE INDEX web_sessions_expiry ON web_sessions (expires);
+", "
+    CREATE TABLE web_operations (key TEXT PRIMARY KEY, record TEXT NOT NULL, created INTEGER NOT NULL);
+    CREATE TABLE web_audit (id INTEGER PRIMARY KEY, record TEXT NOT NULL);
 "];
 
 /// Routes kept per repository and kind of job; older ones are dropped as new ones come.
@@ -436,6 +439,32 @@ impl History {
         }
         db.execute_batch("COMMIT").map_err(e)?;
         Ok(History { db: Mutex::new(db) })
+    }
+
+    /// Write admission is durable before a Hub action can start. Pending admissions survive a crash
+    /// and are never executed again automatically: the outcome may already exist on the forge.
+    pub fn web_operation(&self, key: &str) -> Result<Option<String>, String> {
+        self.db.lock().unwrap().query_row("SELECT record FROM web_operations WHERE key = ?1", [key], |r| r.get(0)).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn web_record(&self, key: Option<&str>, operation: &str, audit: &str) -> Result<(), String> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        if let Some(key) = key {
+            tx.execute("INSERT INTO web_operations VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET record = excluded.record", params![key, operation, now_secs() as i64]).map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM web_operations WHERE created < ?1", [now_secs() as i64 - 7 * 86400]).map_err(|e| e.to_string())?;
+        }
+        tx.execute("INSERT INTO web_audit(record) VALUES (?1)", [audit]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn web_audit(&self) -> Result<Vec<serde_json::Value>, String> {
+        let db = self.db.lock().unwrap();
+        let mut query = db.prepare("SELECT record FROM web_audit ORDER BY id DESC LIMIT 200").map_err(|e| e.to_string())?;
+        let rows = query.query_map([], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?.map(|r| {
+            serde_json::from_str(&r.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        }).collect();
+        rows
     }
 
     pub fn web_session_save(&self, hash: &str, scope: &str, principal: &str, expires: i64) -> Result<(), String> {
@@ -1049,4 +1078,15 @@ mod tests {
         assert!(History::open(&p).err().unwrap().contains("newer forkdeck"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[tokio::test]
+    async fn failed_submission_persistence_never_launches_a_job() {
+        let mut hub = crate::orchestrator::Hub::new(crate::config::Config { demo:true,..Default::default() },tokio::runtime::Handle::current());
+        let history = std::sync::Arc::new(History::in_memory());
+        history.db.lock().unwrap().execute_batch("DROP TABLE turns").unwrap();
+        hub.history = Some(history);
+        let (status, _) = crate::server::http::test_post(hub.clone(),serde_json::json!({"action":"submit","text":"must not execute","workspace":"workspace","plan_first":false}),"broken-storage").await;
+        assert_eq!(status,axum::http::StatusCode::BAD_REQUEST);
+        assert!(hub.state.lock().unwrap().jobs.is_empty());
+    }
+
 }

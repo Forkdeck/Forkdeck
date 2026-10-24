@@ -1,8 +1,10 @@
+import { action, actionBusy, writeReason } from "./state";
+import { ActionStatus, Composer, Intake } from "./Actions";
 import { Account } from "./Account";
 import { Markdown } from "./Markdown";
 import { Navigation } from "./Operational";
 import { Fragment } from "preact";
-import { useState } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
 import { tabClass } from "./ui";
 import type { PlanView } from "./state";
 export function PlansView({
@@ -13,6 +15,13 @@ export function PlansView({
   allPlans: PlanView[];
 }) {
   const [tab, setTab] = useState("Tasks");
+  const [feedback, setFeedback] = useState("");
+  const [newPlan, setNewPlan] = useState(false);
+  useEffect(() => setFeedback(""), [plan.id]);
+  const disabled = Boolean(writeReason.value) || actionBusy.value || !plan.revision;
+  const apply = async (operation: string) => {
+    if (await action({ action: "plan", id: plan.id, operation, text: feedback, expected_revision: plan.revision })) setFeedback("");
+  };
 
   const tabs = ["Tasks", "Plan", "Review"];
   const tasks = plan.tasks.map(({ task, status, after }) => ({
@@ -76,15 +85,8 @@ export function PlansView({
         </a>
         <span class="muted-label">Plans</span>
         <div class="grow"></div>
-        <button
-          type="button"
-          class="new-plan"
-          disabled
-          aria-disabled="true"
-          title="Coming in the next milestone"
-        >
-          New plan
-        </button>
+        <Intake />
+        <button type="button" class="new-plan" disabled={Boolean(writeReason.value)} title={writeReason.value} onClick={() => setNewPlan(!newPlan)}>New plan</button>
         <Account />
       </header>
       <div class="app-body">
@@ -111,6 +113,8 @@ export function PlansView({
           ))}
         </nav>
         <main class="plans-main">
+          {newPlan && <Composer issuePlan />}
+          <ActionStatus />
           <div class="plan-heading">
             <div class="plan-heading-copy">
               <div class="mono-muted">{`${plan.plan.repo}${plan.plan.issue ? "#" + plan.plan.issue.key : ""} · revision ${plan.plan.revision} · ${plan.status}`}</div>
@@ -118,21 +122,19 @@ export function PlansView({
               <div class="plan-subtitle">{plan.description}</div>
             </div>
             <div class="plan-actions">
-              <button
-                type="button"
-                class="replan-button"
-                disabled
-                aria-disabled="true"
-                title="Coming in the next milestone"
-              >
-                Re-plan…
-              </button>
+              <button type="button" class="replan-button" disabled={disabled || Boolean(plan.actions?.refine) || !feedback.trim()} title={writeReason.value || plan.actions?.refine || "Enter feedback below to re-plan"} onClick={() => void apply("replan")}>Re-plan…</button>
               {plan.plan.issue?.url && <a
                 href={plan.plan.issue.url}
                 aria-disabled={!plan.plan.issue?.url}
                 class="issue-link"
               >{`Open #${plan.plan.issue?.key ?? ""} on ${plan.plan.provider === "gitlab" ? "GitLab" : "GitHub"}`}</a>}
             </div>
+          </div>
+          <div class="plan-write-actions">
+            <label>Feedback <textarea value={feedback} onInput={e => setFeedback(e.currentTarget.value)} disabled={Boolean(writeReason.value)} placeholder="Feedback to refine or re-plan…" /></label>
+            <button type="button" class="secondary-button" disabled={disabled || Boolean(plan.actions?.publish)} title={writeReason.value || plan.actions?.publish || ""} onClick={() => void apply("accept")}>Accept and publish</button>
+            <button type="button" class="secondary-button" disabled={disabled || Boolean(plan.actions?.refine) || !feedback.trim()} title={writeReason.value || plan.actions?.refine || ""} onClick={() => void apply("refine")}>Refine</button>
+            <button type="button" class="secondary-button" disabled={disabled || Boolean(plan.actions?.ready)} title={writeReason.value || plan.actions?.ready || ""} onClick={() => void apply("ready")}>Ready for build</button>
           </div>
           <div class="revision-flags" aria-label="Revision status">
             {["reviewed", "accepted", "published"].map((flag) => (
@@ -197,8 +199,7 @@ export function PlansView({
                     <div class="decision">
                       <h2 class="decision-heading">{`#${plan.decision?.number ?? ""} needs you: ${plan.decision?.title ?? ""}`}</h2>
                       <div class="decision-copy">
-                        Your answer goes into the instructions of every task
-                        that depends on it.
+                        Answer this decision on the issue. Browser answers are not supported yet.
                       </div>
                       <label htmlFor="answer" class="decision-label">
                         Your decision
@@ -209,14 +210,14 @@ export function PlansView({
                         class="decision-input"
                         disabled
                         aria-disabled="true"
-                        title="Coming in the next milestone"
+                        title={writeReason.value || "Answer this decision on the issue; browser answers are not supported yet"}
                       />
                       <button
                         type="button"
                         class="decision-button"
                         disabled
                         aria-disabled="true"
-                        title="Coming in the next milestone"
+                        title={writeReason.value || "Answer this decision on the issue; browser answers are not supported yet"}
                       >{`Answer and close #${plan.decision?.number ?? ""}`}</button>
                     </div>
                   )}

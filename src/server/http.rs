@@ -6,7 +6,7 @@ use axum::{
     http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -14,7 +14,7 @@ use std::{collections::VecDeque, convert::Infallible, net::SocketAddr, sync::Arc
 
 /// Loopback host checks also protect an unauthenticated local server from DNS rebinding.
 #[derive(Clone)]
-struct App { hub: Hub, feed: Arc<Feed>, loopback: bool, auth: Option<Arc<Auth>> }
+pub(super) struct App { pub hub: Hub, pub feed: Arc<Feed>, loopback: bool, pub auth: Option<Arc<Auth>>, pub writes: Arc<tokio::sync::Mutex<super::write::Writes>> }
 
 #[derive(rust_embed::RustEmbed)]
 #[folder = "web/dist/"]
@@ -77,7 +77,14 @@ async fn deploys(State(app): State<App>) -> Json<serde_json::Value> { Json(super
 #[derive(Deserialize)]
 struct StatsWindow { days: Option<u32> }
 async fn stats(State(app): State<App>, Query(window): Query<StatsWindow>) -> Json<serde_json::Value> { Json(super::operations::stats(&app.hub, window.days.unwrap_or(7).clamp(1,3650))) }
-async fn doctor(State(app): State<App>) -> Json<serde_json::Value> { Json(super::operations::doctor(&app.hub).await) }
+async fn doctor(State(app): State<App>) -> Response {
+    let mut value = super::operations::doctor(&app.hub).await;
+    match app.audit().await {
+        Ok(audit) => value["audit"] = serde_json::json!(audit),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    Json(value).into_response()
+}
 async fn settings(State(app): State<App>) -> Json<serde_json::Value> { Json(super::operations::settings(&app.hub)) }
 
 #[derive(Deserialize)]
@@ -134,6 +141,7 @@ async fn security(req: Request<Body>, next: Next) -> Response {
 fn router(app: App) -> Router {
     let api = Router::new()
         .route("/v1/me", get(auth::whoami))
+        .route("/v1/actions", post(super::write::action))
         .route("/v1/snapshot", get(snapshot))
         .route("/v1/jobs/{id}", get(detail))
         .route("/v1/plans", get(plans))
@@ -165,10 +173,28 @@ pub async fn serve(hub: Hub, feed: Arc<Feed>) -> anyhow::Result<()> {
     let loopback = local.ip().is_loopback();
     println!("Forkdeck web UI: http://{local}/");
     if !loopback && auth.is_none() {
-        eprintln!("warning: the web UI has no login and listens on {local}: anyone who can reach that address sees every job, log and plan. Keep it behind a firewall, VPN or an authenticating reverse proxy.");
+        eprintln!("warning: the web UI has no login and listens on {local}: anyone who can reach that address can read and operate this workspace. Keep it behind a firewall, VPN or an authenticating reverse proxy.");
     }
-    axum::serve(listener, router(App { hub, feed, loopback, auth })).await?;
+    axum::serve(listener, router(App { hub, feed, loopback, auth, writes: Default::default() })).await?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn test_router(hub: Hub, feed: Arc<Feed>) -> Router {
+    router(App { hub, feed, loopback: true, auth: None, writes: Default::default() })
+}
+
+#[cfg(test)]
+pub(crate) async fn test_post(hub: Hub, body: serde_json::Value, key: &str) -> (StatusCode, serde_json::Value) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = router(App { hub, feed: Arc::new(Feed::new()), loopback: true, auth: None, writes: Default::default() });
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    let result = reqwest::Client::new().post(format!("{base}/api/v1/actions")).header("idempotency-key",key).json(&body).send().await.unwrap();
+    let status = result.status();
+    let body = result.json().await.unwrap();
+    task.abort();
+    (status, body)
 }
 
 #[cfg(test)]
@@ -179,7 +205,7 @@ pub(super) fn auth_test_router(auth: Arc<Auth>, seeded: bool) -> Router {
     if seeded { super::seed::seed_demo(&hub).unwrap(); }
     let feed = Arc::new(Feed::new());
     tokio::spawn(feed.clone().run(hub.clone(), Duration::from_millis(200)));
-    router(App { hub, feed, loopback: true, auth: Some(auth) })
+    router(App { hub, feed, loopback: true, auth: Some(auth), writes: Default::default() })
 }
 
 #[cfg(test)]
@@ -201,7 +227,7 @@ mod tests {
         let feed = Arc::new(Feed::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let app = router(App { hub: hub.clone(), feed: feed.clone(), loopback: true, auth: None });
+        let app = router(App { hub: hub.clone(), feed: feed.clone(), loopback: true, auth: None, writes: Default::default() });
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
         let index = client.get(format!("{base}/")).send().await.unwrap();

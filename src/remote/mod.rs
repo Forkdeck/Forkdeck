@@ -299,12 +299,13 @@ async fn call(ctx: &Ctx, device: &str, c: Call) -> Reply {
             Reply::Ok
         }
         Call::SetAutomation { on } => {
-            let mut st = hub.state.lock().unwrap();
+            let st = hub.state.lock().unwrap();
             if on && st.stopping {
                 return Reply::Err { msg: "shutting down".into() };
             }
-            st.automation = on;
-            st.log("remote", format!("{}: polling {}", device, if on { "on" } else { "paused" }));
+            drop(st);
+            hub.automation(on);
+            hub.log("remote", format!("{}: polling {}", device, if on { "on" } else { "paused" }));
             Reply::Ok
         }
         Call::PollNow => {

@@ -1,3 +1,4 @@
+import { invalidation } from "./state";
 import { Account } from "./Account";
 import { useEffect, useState } from "preact/hooks";
 import type { ComponentChildren } from "preact";
@@ -149,6 +150,7 @@ interface Stats {
 interface Doctor {
   checks: { name: string; status: string; detail: unknown }[];
   settings: unknown;
+  audit: unknown;
 }
 export function Operational({
   page,
@@ -175,10 +177,10 @@ export function Operational({
       }
     };
     void load();
-    const timer = setInterval(load, 30000);
+    const unsubscribe = invalidation.subscribe(() => { void load(); });
     return () => {
       alive = false;
-      clearInterval(timer);
+      unsubscribe();
     };
   }, [page]);
   const title = pages.find(([url]) => url === `/${page}`)![1];
@@ -330,6 +332,7 @@ export function Operational({
                       <RecordView data={c.detail} />
                     </Panel>
                   ))}
+                  <Panel title="Action audit log"><RecordView data={(data as Doctor).audit} /></Panel>
                   <Panel title="Effective configuration · secrets redacted">
                     <RecordView data={(data as Doctor).settings} />
                   </Panel>

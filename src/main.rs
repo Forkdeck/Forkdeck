@@ -1422,11 +1422,10 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                     match k.code {
                         KeyCode::Char('a') if ctrl => {
+                            let on = !hub.state.lock().unwrap_or_else(|e| e.into_inner()).automation;
+                            hub.automation(on);
                             let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
-                            st.automation = !st.automation;
-                            let on = st.automation;
                             let none = st.repos.is_empty();
-                            st.log("issues", if on { "polling on" } else { "polling paused" });
                             if on && none {
                                 st.log("issues", "no [[repos]] configured, nothing to poll");
                             }

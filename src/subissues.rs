@@ -285,8 +285,23 @@ path = {dir:?}
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             rt.block_on(async {
                 let (hub, id) = reviewed(root).await;
-                hub.plan_action(id, Action::Publish).await.unwrap();
+                let old_revision = hub.job(id, |j| crate::server::write::revision(j)).unwrap();
+                for operation in ["refine", "replan"] {
+                    let revision = hub.job(id, |j| crate::server::write::revision(j)).unwrap();
+                    let (status, result) = crate::server::http::test_post(hub.clone(), serde_json::json!({"action":"plan","id":id,"operation":operation,"text":"Keep the independently reviewable tasks","expected_revision":revision}),operation).await;
+                    assert_eq!(status, axum::http::StatusCode::OK,"{result}");
+                    until(&hub,id).await;
+                }
+                let (status, _) = crate::server::http::test_post(hub.clone(), serde_json::json!({"action":"plan","id":id,"operation":"accept","expected_revision":old_revision}),"stale-plan").await;
+                assert_eq!(status, axum::http::StatusCode::CONFLICT);
+                let revision = hub.job(id, |j| crate::server::write::revision(j)).unwrap();
+                let command = serde_json::json!({"action":"plan","id":id,"operation":"accept","expected_revision":revision});
+                let (status, result) = crate::server::http::test_post(hub.clone(), command.clone(), "publish-plan").await;
+                assert_eq!(status, axum::http::StatusCode::OK, "{result}");
                 until(&hub, id).await;
+                let (status, replay) = crate::server::http::test_post(hub.clone(), command, "publish-plan").await;
+                assert_eq!(status, axum::http::StatusCode::OK);
+                assert_eq!(replay, result, "a retry after publication returns the first result");
                 let outcome = hub.job(id, |j| j.outcome.clone()).unwrap();
                 assert_eq!(outcome, "Created 6 sub-issues under #1; 1 ready to start.");
                 let s = forge(root);
@@ -312,6 +327,32 @@ path = {dir:?}
                 assert!(task.contains("Part of #1") && task.contains(&format!("Depends on #{}", n("Endpoint"))), "{task}");
                 let p = hub.job(id, |j| j.issue_plan.clone().unwrap()).unwrap();
                 assert!(p.resolved() && p.graph.unwrap().tasks.iter().all(|t| t.number.is_some()));
+            });
+        });
+    }
+
+    #[test]
+    fn browser_marks_a_published_single_issue_ready() {
+        isolated("subissues::tests::browser_marks_a_published_single_issue_ready", |root| {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                let (hub,id) = reviewed(root).await;
+                // Seed a native single-issue plan using the same fake forge and reviewed Hub.
+                hub.job(id, |j| {
+                    let p = j.issue_plan.as_mut().unwrap();
+                    p.draft = taskgraph::strip(&p.draft);
+                    p.graph = None;
+                });
+                hub.persist(id).unwrap();
+                for (operation,key) in [("accept","single-publish"),("ready","single-ready")] {
+                    let revision = hub.job(id, |j| crate::server::write::revision(j)).unwrap();
+                    let (status,result) = crate::server::http::test_post(hub.clone(),serde_json::json!({"action":"plan","id":id,"operation":operation,"expected_revision":revision}),key).await;
+                    assert_eq!(status,axum::http::StatusCode::OK,"{result}");
+                    until(&hub,id).await;
+                }
+                assert!(hub.job(id, |j| j.issue_plan.as_ref().unwrap().ready_for_intake()).unwrap());
+                let state = forge(root);
+                assert!(state["issues"]["1"]["labels"].as_array().unwrap().iter().any(|label| label == "agent:ready"));
             });
         });
     }

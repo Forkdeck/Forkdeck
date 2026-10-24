@@ -1,3 +1,4 @@
+import { Composer, Intake } from "./Actions";
 import { Account } from "./Account";
 import { render } from "preact";
 import { useEffect, useState } from "preact/hooks";
@@ -48,6 +49,7 @@ function Board({ id }: { id?: string }) {
         </header>
         <h1>No jobs yet</h1>
         <p>Jobs started from Forkdeck appear here live.</p>
+        <Intake /><Composer />
       </div>
     );
   const data = snap.jobs.map(present);
@@ -83,6 +85,7 @@ function Plans({ id }: { id?: string }) {
         </header>
         <h1>Issue plans</h1>
         <p>No issue plans yet.</p>
+        <Composer issuePlan />
       </div>
     );
   const plan = id ? all.find((p) => String(p.id) === id) : all[0];

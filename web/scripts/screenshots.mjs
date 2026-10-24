@@ -216,8 +216,18 @@ cmd = "/unavailable-for-history-capture"
       ? snapshot.jobs
           .filter((j) => j.state === "unverified")
           .sort((a, b) => b.id - a.id)[0]
-      : snapshot.jobs.find((j) => j.state === "working");
+      : snapshot.jobs.find((j) => j.kind === "manual" && ["working", "planning", "reviewing"].includes(j.state));
     if (!selected) throw new Error("No job for detail capture");
+    if (!real) {
+      // Exercise a native write before the Doctor capture; the audit is actual service data.
+      for (const on of [!snapshot.automation, snapshot.automation]) {
+        const response = await page.request.post(base + "/api/v1/actions", {
+          headers: { "Idempotency-Key": `capture-intake-${on}` },
+          data: { action: "automation", on },
+        });
+        if (!response.ok()) throw new Error(`Intake action: ${response.status()}`);
+      }
+    }
     const prefix = real ? "real-" : "";
     const detail = snapshot.jobs.find((j) => j.state === "unverified") || selected;
     const planList = await (await page.request.get(base + "/api/v1/plans")).json();
@@ -254,6 +264,12 @@ cmd = "/unavailable-for-history-capture"
           await page.locator(".job-card.selected").evaluate((node) => node.scrollIntoView({ block: "nearest", inline: "nearest" }));
         }
       }
+      if (!real && name === "board" && width >= 700) {
+        // Unsent drafts come from the selected native task; no response fixtures are introduced.
+        await page.getByRole("textbox", { name: "New task", exact: true }).fill(selected.title);
+        await page.getByRole("textbox", { name: "Reply to this task", exact: true }).fill(selected.title);
+        if (!(await page.getByRole("button", { name: "Send now", exact: true }).isEnabled())) throw new Error("Writable controls disabled");
+      }
       await save(page, file);
       if (!real) {
         const ref = name === "board" ? (width < 700 ? "Phone" : "Main") : name === "plans-tasks" && width === 1440 ? "Plan" : null;
@@ -282,6 +298,9 @@ async function save(page, file) {
   const problems = await page.evaluate(() => {
     const issues = [];
     if (document.documentElement.scrollWidth > innerWidth) issues.push("document overflow");
+    const detail = document.querySelector(".detail-meta");
+    const header = document.querySelector(".app-header");
+    if (detail && detail.getBoundingClientRect().top < (header?.getBoundingClientRect().bottom ?? 0)) issues.push("detail heading clipped by header");
     for (const node of document.querySelectorAll(".reply-form input, .reply-form button")) {
       const r = node.getBoundingClientRect();
       if (r.x < 0 || r.y < 0 || r.right > innerWidth + 1 || r.bottom > innerHeight + 1)

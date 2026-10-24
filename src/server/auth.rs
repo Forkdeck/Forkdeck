@@ -63,6 +63,10 @@ fn with_cookie(mut response: Response, value: String) -> Response {
 }
 
 impl Auth {
+    pub(super) fn origin(&self) -> String {
+        reqwest::Url::parse(&self.cfg.redirect_url).unwrap().origin().ascii_serialization()
+    }
+
     pub async fn new(cfg: OidcCfg, history: Arc<History>) -> anyhow::Result<Arc<Self>> {
         cfg.validate()?;
         let secret = std::env::var(&cfg.client_secret_env).ok().filter(|s| !s.trim().is_empty()).ok_or_else(|| anyhow::anyhow!("web.oidc.client_secret_env must refer to a nonempty environment variable"))?;

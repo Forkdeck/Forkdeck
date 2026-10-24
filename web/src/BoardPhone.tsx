@@ -1,3 +1,4 @@
+import { Composer, Intake } from "./Actions";
 import { Account } from "./Account";
 import { Navigation } from "./Operational";
 import { Fragment } from "preact";
@@ -48,6 +49,7 @@ export function BoardPhone({
           <span class="live-dot"></span>
           {live}
         </span>
+        <Intake />
         <Account />
       </header>
       <Navigation />
@@ -85,28 +87,7 @@ export function BoardPhone({
           </Fragment>
         ))}
       </div>
-      <form class="phone-composer" onSubmit={(e) => e.preventDefault()}>
-        <label htmlFor="ptask" class="sr-only">
-          New task
-        </label>
-        <input
-          id="ptask"
-          placeholder="New task…"
-          class="phone-input"
-          disabled
-          aria-disabled="true"
-          title="Coming in the next milestone"
-        />
-        <button
-          type="button"
-          class="phone-start"
-          disabled
-          aria-disabled="true"
-          title="Coming in the next milestone"
-        >
-          Start
-        </button>
-      </form>
+      <Composer />
     </div>
   );
 }

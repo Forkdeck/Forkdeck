@@ -1,8 +1,9 @@
-mod http;
+pub(crate) mod http;
 mod auth;
 mod view;
 pub(crate) mod seed;
 mod operations;
+pub(crate) mod write;
 
 use crate::{orchestrator::Hub, remote::feed::Feed};
 use std::{sync::Arc, time::Duration};

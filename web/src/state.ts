@@ -1,4 +1,4 @@
-import { signal, batch } from "@preact/signals";
+import { signal, batch, computed } from "@preact/signals";
 import type { PresentedJob } from "./ui";
 import type {
   BoardProjection,
@@ -11,9 +11,15 @@ import type {
 export interface BoardJob extends JobSummary, BoardProjection {}
 export interface JobDetail extends NativeJobDetail {
   board: BoardJob;
+  revision: string;
+  choices: { label: string; detail: string }[];
+  queued: string[];
+  actions: { reply: boolean; stop: boolean; retry: boolean; resume: boolean };
 }
 export interface PlanView {
   id: number | string;
+  revision?: string;
+  actions?: { publish: string | null; ready: string | null; refine: string | null };
   title: string;
   subtitle?: string;
   status: string;
@@ -48,6 +54,7 @@ export interface PlanView {
 interface Snapshot extends Omit<NativeSnapshot, "jobs"> {
   jobs: BoardJob[];
   workspace: string;
+  workspaces: { id: string; name: string }[];
   capacity: number;
   busy: number;
   router: { kind: string; calls: number; last_ms: number };
@@ -59,6 +66,26 @@ export const principal = signal<{
   groups: string[];
   role: string;
 } | null>(null);
+const identityLoaded = signal(false);
+export const actionBusy = signal(false);
+export const actionError = signal("");
+export const invalidation = signal(0);
+export const writeReason = computed(() => !identityLoaded.value ? "Checking permissions…" : principal.value?.role === "viewer" ? "Operator or admin role required" : "");
+export async function action(command: Record<string, unknown>): Promise<{ id?: number } | undefined> {
+  if (actionBusy.value || writeReason.value) return;
+  actionBusy.value = true;
+  actionError.value = "";
+  const key = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join("");
+  const options = { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": key }, body: JSON.stringify(command) };
+  try {
+    const response = await fetch("/api/v1/actions", options).catch(() => fetch("/api/v1/actions", options));
+    if (response.status === 401) location.assign("/auth/login");
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error ?? `Action failed (${response.status})`);
+    return result;
+  } catch (e) { actionError.value = (e as Error).message; }
+  finally { actionBusy.value = false; }
+}
 export const snapshot = signal<Snapshot | null>(null);
 export const details = signal<Record<number, JobDetail>>({});
 export const plans = signal<PlanView[]>([]);
@@ -67,6 +94,7 @@ export const error = signal("");
 let source: EventSource | undefined;
 let pending: ReturnType<typeof setTimeout> | undefined;
 let selected: number | undefined;
+let operationsDirty = false;
 
 async function read<T>(path: string): Promise<T> {
   const response = await fetch("/api/v1/" + path);
@@ -99,6 +127,7 @@ function scheduleRefresh() {
   if (!pending)
     pending = setTimeout(() => {
       pending = undefined;
+      if (operationsDirty) { operationsDirty = false; invalidation.value++; }
       void refresh().catch(fail);
     }, 100);
 }
@@ -152,6 +181,9 @@ export function reduce(event: FeedEvent) {
       };
     }
   }
+  // Streaming tail lines refresh job projections, without rerunning Doctor probes per line.
+  operationsDirty ||= "Job" in event || "Automation" in event ||
+    ("Log" in event && event.Log.lines.some(line => line.who === "web"));
   scheduleRefresh();
 }
 function connect(seq: number) {
@@ -169,14 +201,14 @@ function connect(seq: number) {
   source.onmessage = (e) => {
     reduce(JSON.parse(e.data));
   };
-  source.addEventListener("freshness", scheduleRefresh);
+
 }
 function reconnect() {
   source?.close();
   void refresh().then(connect).catch(fail);
 }
 export function start() {
-  void read<typeof principal.value>("me").then((user) => { principal.value = user; }).catch(fail);
+  void read<typeof principal.value>("me").then((user) => { principal.value = user; identityLoaded.value = true; }).catch(fail);
   reconnect();
   return () => {
     source?.close();

@@ -25,6 +25,7 @@ pub fn snapshot(hub: &Hub, feed: &Feed) -> Value {
     }).collect());
     snap["agents"] = json!({"claude": st.agent_ready(crate::state::AgentKind::Claude), "codex": st.agent_ready(crate::state::AgentKind::Codex), "copilot": st.copilot_usable()});
     snap["workspace"] = json!(std::env::current_dir().ok().and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned())).unwrap_or_default());
+    snap["workspaces"] = super::write::workspaces(hub);
     snap["capacity"] = json!(hub.cfg.automation.max_parallel);
     snap["busy"] = json!(st.jobs.iter().filter(|j| j.admitted).count());
     snap["router"] = json!({"kind":st.router.kind,"calls":st.router.calls,"last_ms":st.router.last_ms});
@@ -36,6 +37,12 @@ pub fn detail(hub: &Hub, feed: &Feed, id: u32) -> Option<Value> {
     let mut v = serde_json::to_value(&detail).ok()?;
     let board = snapshot(hub, feed);
     v["board"] = board["jobs"].as_array()?.iter().find(|j| j["id"] == id)?.clone();
+    hub.job(id, |j| {
+        v["revision"] = json!(super::write::revision(j));
+        v["choices"] = json!(crate::choices::for_job(j).iter().map(|c| json!({"label":c.label,"detail":c.detail})).collect::<Vec<_>>());
+        v["queued"] = json!(j.inbox);
+        v["actions"] = json!({"reply":j.source.is_manual(),"stop":!j.status.finished(),"resume":j.source.is_manual() && j.status == JobStatus::Interrupted,"retry":j.source.is_manual() && j.status.finished() && j.status != JobStatus::Interrupted});
+    });
     Some(v)
 }
 
@@ -57,7 +64,11 @@ pub fn plans(hub: &Hub) -> Vec<Value> {
             None => scheduler_summary(v),
         }).unwrap_or_else(|| "No scheduler pass observed yet; forge status unknown".into());
         let decision = tasks.iter().find(|t| t["task"]["kind"] == "decision" && t["status"] == "needs you").map(|t| t["task"].clone());
-        Some(json!({"id": j.id, "title": j.title, "status": plan_state(p), "plan": p, "draft_display": crate::taskgraph::strip(&p.draft), "tasks": tasks, "freshness": observation.map(|v| v.observed_unix), "scheduler": scheduler, "description": plan_description(p), "subtitle": format!("{}{} · r{} · {}", p.repo, p.issue.as_ref().map(|i| format!(" #{}", i.key)).unwrap_or_default(), p.revision, plan_state(p)), "decision": decision}))
+        let unavailable = if hub.cfg.demo { Some("Issue publication is disabled in demo mode".to_string()) } else if !j.status.finished() { Some("Wait for the current turn to finish".to_string()) } else { None };
+        let publish = unavailable.clone().or_else(|| p.clone().accept(!j.inbox.is_empty()).err());
+        let ready = unavailable.clone().or_else(|| p.clone().request_ready(!j.inbox.is_empty()).err());
+        let refine = if p.pending.is_some() || p.creating() { Some("Reconcile publication before refining".to_string()) } else if p.graph.is_some() && p.creation.as_ref().is_some_and(|c| c.done) { Some("Changes to a published task graph are not supported yet".to_string()) } else { None };
+        Some(json!({"actions":{"publish":publish,"ready":ready,"refine":refine},"revision":super::write::revision(j),"id": j.id, "title": j.title, "status": plan_state(p), "plan": p, "draft_display": crate::taskgraph::strip(&p.draft), "tasks": tasks, "freshness": observation.map(|v| v.observed_unix), "scheduler": scheduler, "description": plan_description(p), "subtitle": format!("{}{} · r{} · {}", p.repo, p.issue.as_ref().map(|i| format!(" #{}", i.key)).unwrap_or_default(), p.revision, plan_state(p)), "decision": decision}))
     }).collect();
     for v in observed.values() {
         if st.jobs.iter().any(|j| j.issue_plan.as_ref().is_some_and(|p| p.repo == v.repo && p.issue.as_ref() == Some(&v.issue))) { continue; }
@@ -178,6 +189,10 @@ mod tests {
         crate::server::seed::seed_demo(&hub).unwrap();
         // Opening history is avoided in this unit test; projection cannot depend on this flag.
         std::sync::Arc::make_mut(&mut hub.cfg).demo = false;
+        {
+            let st = hub.state.lock().unwrap();
+            assert!(st.jobs.iter().all(|j| j.id < st.next_id), "new demo tasks must not reuse seeded IDs");
+        }
         let feed = Feed::new();
         let snap = snapshot(&hub, &feed);
         let jobs = snap["jobs"].as_array().unwrap();

@@ -20,6 +20,7 @@ const SNAPSHOT_LOG: usize = 200;
 
 struct Prev {
     summary: JobSummary,
+    actionable: String,
     worker: StageView,
     reviewer: StageView,
 }
@@ -114,12 +115,13 @@ impl Feed {
         for j in &st.jobs {
             let created = inner.created(j);
             let cur = Prev {
+                actionable: crate::server::write::revision(j),
                 summary: view::summary(j, st.stopping, created),
                 worker: view::stage(&j.worker),
                 reviewer: view::stage(&j.reviewer),
             };
             let prev = inner.jobs.get(&j.id);
-            if prev.map(|p| p.summary != cur.summary).unwrap_or(true) {
+            if prev.map(|p| p.summary != cur.summary || p.actionable != cur.actionable).unwrap_or(true) {
                 out.push(Event::Job { job: cur.summary.clone() });
             }
             for (which, stage, now, before) in [

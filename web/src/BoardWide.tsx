@@ -1,3 +1,4 @@
+import { Composer, JobActions, Intake } from "./Actions";
 import { Account } from "./Account";
 import { Fragment } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
@@ -18,7 +19,6 @@ interface Props {
 export function BoardWide({
   data,
   picked,
-  automation,
   agents,
   live,
   busy,
@@ -71,8 +71,6 @@ export function BoardWide({
     text: (l[1] === "worker" ? "" : l[1] + "  ") + l[2],
     className: `log-text log-${l[1]}`,
   }));
-  const autoLabel = automation ? "on" : "paused";
-  const autoDot = `live-dot${automation ? "" : " paused"}`;
   return (
     <div class="app-shell">
       <header class="app-header">
@@ -95,31 +93,13 @@ export function BoardWide({
           </svg>
           <span class="brand-name">forkdeck</span>
         </div>
-        <label class="workspace-label">
-          Workspace
-          <select
-            class="workspace-select"
-            disabled
-            aria-disabled="true"
-            title="Coming in the next milestone"
-          >
-            <option>{workspace}</option>
-          </select>
-        </label>
+        <span class="workspace-label">{workspace}</span>
         <div class="grow"></div>
         <div class="connection">
           <span class="live-dot"></span>
           {`${live} · ${busy} slots of ${capacity} busy`}
         </div>
-        <button
-          type="button"
-          aria-disabled="true"
-          title={automation ? "Issue intake is on" : "Issue intake is paused"}
-          class="intake"
-        >
-          <span class={autoDot}></span>
-          {`Issue intake ${autoLabel}`}
-        </button>
+        <Intake />
         <Account />
       </header>
       <div class="app-body">
@@ -154,53 +134,7 @@ export function BoardWide({
           </div>
         </nav>
         <main class="board-main">
-          <form class="composer" onSubmit={(e) => e.preventDefault()}>
-            <label htmlFor="task" class="sr-only">
-              New task
-            </label>
-            <input
-              id="task"
-              placeholder="New task… (Enter to queue, Ctrl-Enter to send now)"
-              class="task-input"
-              disabled
-              aria-disabled="true"
-              title="Coming in the next milestone"
-            />
-            <label class="agent-label">
-              Agent
-              <select
-                class="agent-select"
-                disabled
-                aria-disabled="true"
-                title="Coming in the next milestone"
-              >
-                <option>Auto (fork layer)</option>
-                <option>claude</option>
-                <option>codex</option>
-              </select>
-            </label>
-            <label class="plan-toggle">
-              <input
-                type="checkbox"
-                checked
-                onClick={(e) => e.preventDefault()}
-                tabIndex={-1}
-                class="plan-checkbox"
-                aria-disabled="true"
-                title="Coming in the next milestone"
-              />
-              Plan first
-            </label>
-            <button
-              type="button"
-              class="start-button"
-              disabled
-              aria-disabled="true"
-              title="Coming in the next milestone"
-            >
-              Start
-            </button>
-          </form>
+          <Composer />
           <div class="board-scroll" ref={board}>
             <div class="lanes">
               {lanes.map((lane) => (
@@ -279,46 +213,7 @@ export function BoardWide({
               </Fragment>
             ))}
           </div>
-          <form class="reply-form" onSubmit={(e) => e.preventDefault()}>
-            <label htmlFor="reply" class="sr-only">
-              Reply to this task
-            </label>
-            <input
-              id="reply"
-              placeholder="Reply… (queued until the agent finishes)"
-              class="reply-input"
-              disabled
-              aria-disabled="true"
-              title="Coming in the next milestone"
-            />
-            <button
-              type="button"
-              class="secondary-button"
-              disabled
-              aria-disabled="true"
-              title="Coming in the next milestone"
-            >
-              Queue
-            </button>
-            <button
-              type="button"
-              class="primary-button"
-              disabled
-              aria-disabled="true"
-              title="Coming in the next milestone"
-            >
-              Send now
-            </button>
-            <button
-              type="button"
-              class="stop-button"
-              disabled
-              aria-disabled="true"
-              title="Coming in the next milestone"
-            >
-              Stop
-            </button>
-          </form>
+          <JobActions key={sel.id} id={sel.id} />
         </aside>
       </div>
     </div>

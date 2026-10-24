@@ -244,3 +244,15 @@ async fn screenshot_provider() {
         std::io::stdin().read_line(&mut line).unwrap();
     }).await.unwrap();
 }
+
+#[tokio::test]
+async fn viewer_cannot_write_but_operator_and_admin_can() {
+    for (mode, status) in [("userinfo",StatusCode::FORBIDDEN),("nested",StatusCode::OK),("rotation",StatusCode::OK)] {
+        let fixture = Fixture::new(mode).await;
+        let cookie = fixture.session().await;
+        let response = fixture.client.post(format!("{}/api/v1/actions",fixture.base))
+            .header(header::COOKIE,cookie).header(header::ORIGIN,"https://forkdeck.example")
+            .header("idempotency-key","intake").json(&json!({"action":"automation","on":true})).send().await.unwrap();
+        assert_eq!(response.status(),status,"{mode}");
+    }
+}
