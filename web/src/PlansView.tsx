@@ -7,6 +7,10 @@ import { Fragment } from "preact";
 import { useEffect, useState } from "preact/hooks";
 import { tabClass } from "./ui";
 import type { PlanView } from "./state";
+/** A decision is a sibling issue of the plan's: same repository, its own number (GitHub and GitLab URLs). */
+function decisionUrl(planIssue: string | undefined, number: number): string | undefined {
+  return planIssue && /\/issues\/\d+$/.test(planIssue) ? planIssue.replace(/\d+$/, String(number)) : undefined;
+}
 export function PlansView({
   plan,
   allPlans,
@@ -199,26 +203,14 @@ export function PlansView({
                     <div class="decision">
                       <h2 class="decision-heading">{`#${plan.decision?.number ?? ""} needs you: ${plan.decision?.title ?? ""}`}</h2>
                       <div class="decision-copy">
-                        Answer this decision on the issue. Browser answers are not supported yet.
+                        Answer it on the issue: your answer goes into the instructions of every task that depends on it.
                       </div>
-                      <label htmlFor="answer" class="decision-label">
-                        Your decision
-                      </label>
-                      <input
-                        id="answer"
-                        placeholder="Your answer…"
-                        class="decision-input"
-                        disabled
-                        aria-disabled="true"
-                        title={writeReason.value || "Answer this decision on the issue; browser answers are not supported yet"}
-                      />
-                      <button
-                        type="button"
-                        class="decision-button"
-                        disabled
-                        aria-disabled="true"
-                        title={writeReason.value || "Answer this decision on the issue; browser answers are not supported yet"}
-                      >{`Answer and close #${plan.decision?.number ?? ""}`}</button>
+                      {/* Browser answers are not supported yet; offer the place where answering works. */}
+                      {decisionUrl(plan.plan.issue?.url, plan.decision.number) && (
+                        <a class="decision-button" href={decisionUrl(plan.plan.issue?.url, plan.decision.number)}>
+                          {`Answer #${plan.decision.number} on ${plan.plan.provider === "gitlab" ? "GitLab" : "GitHub"}`}
+                        </a>
+                      )}
                     </div>
                   )}
                 </section>

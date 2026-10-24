@@ -50,14 +50,18 @@ export function JobActions({ id }: { id: number }) {
   return <div class="job-actions"><ActionStatus />
     {!!detail.choices.length && <section class="choices" aria-label="Choices"><h2>Choose an approach</h2>{detail.choices.map((choice, option) => <button type="button" disabled={disabled} title={reason} onClick={() => void send("choose", { option, expected_revision: detail.revision })}><strong>{choice.label}</strong><span>{choice.detail}</span></button>)}</section>}
     {!!detail.queued.length && <div class="queued-messages"><strong>Queued</strong>{detail.queued.map(message => <p>{message}</p>)}</div>}
+    {/* A reply box that cannot take text reads as broken; say why instead. */}
+    {!detail.actions.reply && <p class="action-notice">Only typed tasks take replies; this one came from {detail.summary.origin || "an issue or pull request"}.</p>}
     <form class="reply-form" onSubmit={e => { e.preventDefault(); void send("reply", { text, expected_revision: detail.revision }); }}>
+      {detail.actions.reply && <>
       <input aria-label="Reply to this task" class="reply-input" placeholder="Reply… (queued until the agent finishes)" value={text} onInput={e => setText(e.currentTarget.value)} onKeyDown={e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); if (text.trim() && !disabled && detail.actions.reply) void send("steer", { text, expected_revision: detail.revision }); } }} disabled={disabled || !detail.actions.reply} title={reason || (!detail.actions.reply ? "Only typed tasks take replies" : "")} />
       <button type="submit" class="secondary-button" disabled={disabled || !text.trim() || !detail.actions.reply} title={reason}>Queue</button>
       <button type="button" class="primary-button" disabled={disabled || !text.trim() || !detail.actions.reply} title={reason} onClick={() => void send("steer", { text, expected_revision: detail.revision })}>Send now</button>
+      </>}
       {detail.actions.stop && <button type="button" class="stop-button" disabled={disabled} title={reason} onClick={() => void send("cancel")}>Stop</button>}
       {detail.actions.resume && <button type="button" class="secondary-button" disabled={disabled} title={reason} onClick={() => void send("resume")}>Resume</button>}
       {detail.actions.retry && <button type="button" class="secondary-button" disabled={disabled} title={reason} onClick={() => void send("retry")}>Retry</button>}
-      {!!detail.choices.length && <button type="button" class="secondary-button" disabled={disabled || !text.trim()} title={reason} onClick={() => void send("choose", { text, expected_revision: detail.revision })}>Use my response</button>}
+      {!!detail.choices.length && detail.actions.reply && <button type="button" class="secondary-button" disabled={disabled || !text.trim()} title={reason} onClick={() => void send("choose", { text, expected_revision: detail.revision })}>Use my response</button>}
     </form>
   </div>;
 }
