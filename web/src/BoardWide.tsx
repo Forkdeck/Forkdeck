@@ -1,3 +1,5 @@
+import type { Agents, Lane } from "./wire/forkdeck/web.ts";
+import { details } from "./state";
 import { Fragment } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { useLocation } from "preact-iso";
@@ -9,13 +11,13 @@ interface Props {
   /** A job was chosen by URL: its detail floats over the board until closed. */
   open: boolean;
   automation: boolean;
-  agents: { claude: boolean; codex: boolean; copilot: boolean };
+  agents: Agents | null;
   live: string;
   busy: number;
   capacity: number;
   workspace: string;
   router: string;
-  lanes: { id: string; label: string }[];
+  lanes: Lane[];
 }
 export function BoardWide({
   data,
@@ -48,34 +50,35 @@ export function BoardWide({
   }, [open]);
   const jobs = data.map((j) => ({
     ...j,
-    pillClass: pill(j.state),
-    cardClass: `job-card${open && j.id === picked ? " selected" : ""}`,
-    pick: () => route(`/jobs/${j.id}`),
+    pillClass: pill(j.job.state()),
+    cardClass: `job-card${open && j.job.id() === picked ? " selected" : ""}`,
+    pick: () => route(`/jobs/${j.job.id()}`),
   }));
-  const lanes = laneNames.map(({ id, label }) => {
-    const inLane = jobs.filter((j) => j.lane === id);
-    return { name: label, count: inLane.length, jobs: inLane };
+  const lanes = laneNames.map((lane) => {
+    const inLane = jobs.filter((j) => j.job.lane() === lane.id());
+    return { name: lane.label() ?? "", count: inLane.length, jobs: inLane };
   });
-  const selected = jobs.find((j) => j.id === picked) ?? jobs[0];
-  const sel = { ...selected, stages: selected.stages.map(stageChip) };
+  const selected = jobs.find((j) => j.job.id() === picked) ?? jobs[0];
+  const job = selected.job;
+  const detail = details.value[job.id()]?.board;
+  const stages = Array.from(
+    detail ? detail.stages : job.stagesArray() ?? [],
+    stageChip,
+  );
   const tabs = ["Worker", "Reviewer", "Conversation"].map((label) => ({
     label,
     pick: () => setTab(label),
     className: tabClass(label === activeTab),
   }));
-  const lines = selected.log.filter((l) =>
-    activeTab === "Reviewer"
-      ? l[1] === "review"
-      : activeTab === "Conversation"
-        ? ["queue", "issues"].includes(l[1])
-        : l[1] !== "review",
+  const lines = detail ? detail.log : Array.from(
+    { length: job.logLength() }, (_, i) => job.log(i)!,
   );
-  if (!lines.length) lines.push(["", "queue", "Nothing here yet."]);
-  const log = lines.map((l) => ({
-    t: l[0],
-    text: (l[1] === "worker" ? "" : l[1] + "  ") + l[2],
-    className: `log-text log-${l[1]}`,
-  }));
+  const log = lines.filter((line) => {
+    const who = Array.isArray(line) ? line[1] : line.who();
+    return activeTab === "Reviewer" ? who === "review"
+      : activeTab === "Conversation" ? ["queue", "issues"].includes(who ?? "")
+      : who !== "review";
+  });
   const autoLabel = automation ? "on" : "paused";
   const autoDot = `live-dot${automation ? "" : " paused"}`;
   return (
@@ -158,11 +161,11 @@ export function BoardWide({
           </a>
           <div class="agent-status">
             <div class="agent-heading">Agents</div>
-            {`claude · ${agents.claude ? "ready" : "unavailable"}`}
+            {`claude · ${agents?.claude() ? "ready" : "unavailable"}`}
             <br />
-            {`codex · ${agents.codex ? "ready" : "unavailable"}`}
+            {`codex · ${agents?.codex() ? "ready" : "unavailable"}`}
             <br />
-            {`copilot · ${agents.copilot ? "ready" : "no seat"}`}
+            {`copilot · ${agents?.copilot() ? "ready" : "no seat"}`}
             <br />
             {router}
           </div>
@@ -224,18 +227,18 @@ export function BoardWide({
                       <span class="mono-muted">{lane.count}</span>
                     </div>
                     {lane.jobs.map((job) => (
-                      <Fragment key={job.id}>
+                      <Fragment key={job.job.id()}>
                         <button
                           type="button"
                           onClick={job.pick}
                           class={job.cardClass}
                         >
                           <div class="job-heading">
-                            <span>{`#${job.id}`}</span>
-                            <span class={job.pillClass}>{job.state}</span>
+                            <span>{`#${job.job.id()}`}</span>
+                            <span class={job.pillClass}>{job.job.state()}</span>
                           </div>
-                          <div class="job-title">{job.title}</div>
-                          <div class="muted-small">{job.meta}</div>
+                          <div class="job-title">{job.job.title()}</div>
+                          <div class="muted-small">{job.job.meta()}</div>
                         </button>
                       </Fragment>
                     ))}
@@ -248,9 +251,9 @@ export function BoardWide({
         <aside aria-label="Job detail" class={`detail${open ? " open" : ""}`}>
           <div class="detail-heading">
             <div class="detail-meta">
-              <span>{`#${sel.id}`}</span>
-              <span class={sel.pillClass}>{sel.state}</span>
-              <span>{sel.elapsed}</span>
+              <span>{`#${job.id()}`}</span>
+              <span class={pill(detail ? detail.state : job.state())}>{detail ? detail.state : job.state()}</span>
+              <span>{detail ? detail.elapsed : job.elapsed()}</span>
               <button
                 type="button"
                 class="detail-close"
@@ -260,18 +263,18 @@ export function BoardWide({
                 ×
               </button>
             </div>
-            <h1 class="detail-title">{sel.title}</h1>
-            <div class="mono-muted">{sel.route}</div>
+            <h1 class="detail-title">{detail ? detail.title : job.title()}</h1>
+            <div class="mono-muted">{detail ? detail.route : job.route()}</div>
             <div class="stage-list">
-              {sel.stages.map((st) => (
+              {stages.map((st) => (
                 <Fragment key={st.label}>
                   <span class={st.className}>{st.label}</span>
                 </Fragment>
               ))}
             </div>
-            {sel.warn && (
+            {(detail ? detail.warn : job.warn()) && (
               <>
-                <div class="warning">{sel.warn}</div>
+                <div class="warning">{detail ? detail.warn : job.warn()}</div>
               </>
             )}
           </div>
@@ -291,14 +294,22 @@ export function BoardWide({
             ))}
           </div>
           <div class="log">
-            {log.map((line) => (
-              <Fragment key={line.t + line.text}>
-                <div class="log-row">
-                  <span class="log-time">{line.t}</span>
-                  <span class={line.className}>{line.text}</span>
-                </div>
-              </Fragment>
-            ))}
+            {!log.length && <div class="log-row">Nothing here yet.</div>}
+            {log.map((line, i) => {
+              const time = Array.isArray(line) ? line[0] : line.time();
+              const who = Array.isArray(line) ? line[1] : line.who();
+              const text = Array.isArray(line) ? line[2] : line.text();
+              return (
+                <Fragment key={i}>
+                  <div class="log-row">
+                    <span class="log-time">{time}</span>
+                    <span class={`log-text log-${who}`}>
+                      {(who === "worker" ? "" : who + "  ") + text}
+                    </span>
+                  </div>
+                </Fragment>
+              );
+            })}
           </div>
           <form class="reply-form" onSubmit={(e) => e.preventDefault()}>
             <label htmlFor="reply" class="sr-only">

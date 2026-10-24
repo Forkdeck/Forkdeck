@@ -1,3 +1,4 @@
+import type { Lane } from "./wire/forkdeck/web.ts";
 import { Navigation } from "./Operational";
 import { Fragment } from "preact";
 import { useState } from "preact/hooks";
@@ -10,13 +11,13 @@ export function BoardPhone({
 }: {
   data: PresentedJob[];
   live: string;
-  lanes: { id: string; label: string }[];
+  lanes: Lane[];
 }) {
   const { route } = useLocation();
   const [filter, setFilter] = useState(
     data.some((j) => j.group === "Active") ? "Active" : "All",
   );
-  const named = (id: string) => lanes.find((l) => l.id === id)?.label ?? id;
+  const named = (id: string) => lanes.find((l) => l.id() === id)?.label() ?? id;
   const filters = ["Active", "Attention", "Done", "All"].map((id) => ({
     label: named(id),
     pick: () => setFilter(id),
@@ -24,7 +25,11 @@ export function BoardPhone({
   }));
   const jobs = data
     .filter((j) => filter === "All" || j.group === filter)
-    .map((j) => ({ ...j, pillClass: pill(j.state), laneLabel: named(j.lane) }));
+    .map((j) => ({
+      ...j,
+      pillClass: pill(j.job.state()),
+      laneLabel: named(j.job.lane() ?? ""),
+    }));
   return (
     <div class="phone">
       <header class="phone-header">
@@ -69,19 +74,19 @@ export function BoardPhone({
       </div>
       <div class="phone-list">
         {jobs.map((job) => (
-          <Fragment key={job.id}>
+          <Fragment key={job.job.id()}>
             <button
               type="button"
-              onClick={() => route(`/jobs/${job.id}`)}
+              onClick={() => route(`/jobs/${job.job.id()}`)}
               class="phone-card"
             >
               <div class="job-heading">
-                <span>{`#${job.id}`}</span>
-                <span class={job.pillClass}>{job.state}</span>
+                <span>{`#${job.job.id()}`}</span>
+                <span class={job.pillClass}>{job.job.state()}</span>
                 <span class="push-right">{job.laneLabel}</span>
               </div>
-              <div class="phone-title">{job.title}</div>
-              <div class="muted-small">{job.meta}</div>
+              <div class="phone-title">{job.job.title()}</div>
+              <div class="muted-small">{job.job.meta()}</div>
             </button>
           </Fragment>
         ))}

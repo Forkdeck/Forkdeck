@@ -1,11 +1,8 @@
 import { signal, batch } from "@preact/signals";
-import type { PresentedJob } from "./ui";
 import type {
   BoardProjection,
   JobSummary,
   JobDetail as NativeJobDetail,
-  Snapshot as NativeSnapshot,
-  Event as FeedEvent,
 } from "./contracts";
 
 export interface BoardJob extends JobSummary, BoardProjection {}
@@ -45,22 +42,10 @@ export interface PlanView {
     status: string;
   }[];
 }
-interface Snapshot extends Omit<NativeSnapshot, "jobs"> {
-  jobs: BoardJob[];
-  workspace: string;
-  capacity: number;
-  busy: number;
-  router: { kind: string; calls: number; last_ms: number };
-  agents: { claude: boolean; codex: boolean; copilot: boolean };
-  /** Board order; a job's `lane` is the id, the label is what the configuration calls it. */
-  lanes: { id: string; label: string }[];
-}
-export const snapshot = signal<Snapshot | null>(null);
 export const details = signal<Record<number, JobDetail>>({});
 export const plans = signal<PlanView[]>([]);
 export const connection = signal("Connecting");
 export const error = signal("");
-let source: EventSource | undefined;
 let pending: ReturnType<typeof setTimeout> | undefined;
 let selected: number | undefined;
 
@@ -79,109 +64,38 @@ export async function selectJob(id: number) {
     error.value = String((e as Error).message);
   }
 }
-async function refresh() {
-  const snap = await read<Snapshot>("snapshot");
+export async function refresh() {
   const nextPlans = await read<PlanView[]>("plans");
   batch(() => {
-    snapshot.value = snap;
     plans.value = nextPlans;
     error.value = "";
   });
   if (selected) await selectJob(selected);
-  return snap.seq;
 }
-function scheduleRefresh() {
+export function scheduleRefresh() {
   if (!pending)
     pending = setTimeout(() => {
       pending = undefined;
-      void refresh().catch(fail);
+      void refresh().catch((e: Error) => { error.value = e.message; });
     }, 100);
 }
-function fail(e: unknown) {
-  error.value = (e as Error).message;
-  connection.value = "Disconnected";
+export function stopRefresh() {
+  clearTimeout(pending);
+  pending = undefined;
 }
-
-/** Fold native feed events into signals; enriched projections are refreshed in one bounded batch. */
-export function reduce(event: FeedEvent) {
-  const snap = snapshot.value;
-  if (!snap) return;
-  if (event === "Resync") {
-    reconnect();
-    return;
-  }
-  if (typeof event !== "object") return;
-  if ("Automation" in event)
-    snapshot.value = {
-      ...snap,
-      automation: (event.Automation as { on: boolean }).on,
-    };
-  if ("Job" in event) {
-    const job = (event.Job as { job: Partial<BoardJob> }).job;
-    snapshot.value = {
-      ...snap,
-      jobs: snap.jobs.map((j) => (j.id === job.id ? { ...j, ...job } : j)),
-    };
-  }
-  if ("Tail" in event) {
-    const tail = event.Tail as {
-      id: number;
-      which: "Worker" | "Reviewer";
-      from: number;
-      lines: string[];
-    };
-    const detail = details.value[tail.id];
-    if (detail) {
-      const key = tail.which === "Worker" ? "worker" : "reviewer";
-      const lines =
-        detail[key].pushed === tail.from
-          ? [...detail[`${key}_tail`], ...tail.lines]
-          : tail.lines;
-      details.value = {
-        ...details.value,
-        [tail.id]: {
-          ...detail,
-          [key]: { ...detail[key], pushed: tail.from + tail.lines.length },
-          [`${key}_tail`]: lines.slice(-500),
-        },
-      };
-    }
-  }
-  scheduleRefresh();
-}
-function connect(seq: number) {
-  source?.close();
-  // EventSource cannot set Last-Event-ID on its first request. Establish snapshot -> subscription
-  // with a query cursor; native reconnections send the standard Last-Event-ID header.
-  source = new EventSource(`/api/v1/events?since=${seq}`);
-  source.onopen = () => {
-    connection.value = "Live";
-  };
-  source.onerror = () => {
-    connection.value = "Reconnecting";
-  };
-  source.onmessage = (e) => {
-    reduce(JSON.parse(e.data));
-  };
-  source.addEventListener("freshness", scheduleRefresh);
-}
-function reconnect() {
-  source?.close();
-  void refresh().then(connect).catch(fail);
-}
-export function start() {
-  reconnect();
-  return () => {
-    source?.close();
-    clearTimeout(pending);
-  };
-}
-
-export function present(job: BoardJob): PresentedJob {
-  return {
-    ...job,
-    group: ["Build", "Review", "Delivery", "Queue"].includes(job.lane)
-      ? "Active"
-      : job.lane,
+export function mergeTail(tail: { id: number; worker: boolean; from: number; lines: string[] }) {
+  const detail = details.value[tail.id];
+  if (!detail) return;
+  const key = tail.worker ? "worker" : "reviewer";
+  const lines = detail[key].pushed === tail.from
+    ? [...detail[`${key}_tail`], ...tail.lines]
+    : tail.lines;
+  details.value = {
+    ...details.value,
+    [tail.id]: {
+      ...detail,
+      [key]: { ...detail[key], pushed: tail.from + tail.lines.length },
+      [`${key}_tail`]: lines.slice(-500),
+    },
   };
 }
