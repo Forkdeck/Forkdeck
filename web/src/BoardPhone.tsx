@@ -1,11 +1,13 @@
 import { Composer, Intake } from "./Actions";
+import { AgentChips, BoardStatus, SessionLog, RouterStatus } from "./BoardWide";
+import { board } from "./live";
 import { Account } from "./Account";
 import type { Lane } from "./wire/forkdeck/web.ts";
 import { Navigation } from "./Operational";
 import { Fragment } from "preact";
 import { useState } from "preact/hooks";
 import { useLocation } from "preact-iso";
-import { tabClass, pill, type PresentedJob } from "./ui";
+import { tabClass, pill, jobPath, type PresentedJob } from "./ui";
 export function BoardPhone({
   data,
   live,
@@ -21,6 +23,7 @@ export function BoardPhone({
   );
   const named = (id: string) => lanes.find((l) => l.id() === id)?.label() ?? id;
   const filters = ["Active", "Attention", "Done", "All"].map((id) => ({
+    id,
     label: named(id),
     pick: () => setFilter(id),
     className: `filter ${tabClass(id === filter)}`,
@@ -51,7 +54,7 @@ export function BoardPhone({
           <circle cx="18" cy="12" r="2"></circle>
           <path d="M6 7v10M6 12h4a4 4 0 0 0 4-4V7M14 12h2"></path>
         </svg>
-        <span class="phone-brand">forkdeck</span>
+        <span class="phone-brand">forkdeck{board.value?.snapshot.demo() ? " (demo)" : ""}</span>
         <div class="grow"></div>
         <span class="phone-connection">
           <span class="live-dot"></span>
@@ -60,6 +63,12 @@ export function BoardPhone({
         <Intake />
         <Account />
       </header>
+      <AgentChips agents={board.value?.snapshot.agents() ?? null} />
+      <details class="phone-router">
+        <summary>{board.value?.snapshot.router()?.label() || board.value?.snapshot.router()?.kind()}</summary>
+        <RouterStatus router={board.value?.snapshot.router() ?? null} />
+      </details>
+      <BoardStatus />
       <Navigation />
       <div role="tablist" class="phone-tabs">
         {filters.map((f) => (
@@ -67,7 +76,7 @@ export function BoardPhone({
             <button
               type="button"
               role="tab"
-              aria-selected={f.label === filter}
+              aria-selected={f.id === filter}
               onClick={f.pick}
               class={f.className}
             >
@@ -81,11 +90,11 @@ export function BoardPhone({
           <Fragment key={job.job.id()}>
             <button
               type="button"
-              onClick={() => route(`/jobs/${job.job.id()}`)}
+              onClick={() => route(jobPath(job.job))}
               class="phone-card"
             >
               <div class="job-heading">
-                <span>{`#${job.job.id()}`}</span>
+                <span>{`#${job.job.id()}${job.job.queued() ? ` ✉${job.job.queued()}` : ""}`}</span>
                 <span class={job.pillClass}>{job.job.state()}</span>
                 <span class="push-right">{job.laneLabel}</span>
               </div>
@@ -95,6 +104,7 @@ export function BoardPhone({
           </Fragment>
         ))}
       </div>
+      <SessionLog />
       <Composer />
     </div>
   );

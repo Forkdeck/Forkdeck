@@ -1343,3 +1343,55 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   .repo-picker-row { align-items: stretch; flex-direction: column; gap: 14px; }
   .repo-picker-row > .task-pill { align-self: flex-start; }
 }
+
+/* Board facts use the daemon's TUI labels and counts. */
+.agent-chips { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.agent-chip { font: 500 11px "IBM Plex Mono", monospace; }
+.agent-claude { color: var(--accent); }
+.agent-codex { color: var(--green); }
+.agent-copilot, .agent-blue { color: var(--blue); }
+.agent-red { color: var(--red); }
+.agent-dim { color: var(--muted); }
+.router-label { color: var(--purple); font-size: 12px; }
+.board-status { flex-shrink: 0; padding: 6px 24px; border-bottom: 1px solid var(--border); color: var(--muted); font: 11px "IBM Plex Mono", monospace; overflow-wrap: anywhere; }
+.router-status { overflow-wrap: anywhere; line-height: 1.7; }
+.app-header > .agent-chips { margin-left: auto; }
+.session-log { flex-shrink: 0; border: 1px solid var(--border); border-radius: 6px; margin-top: 8px; min-height: 30px; }
+.session-log summary { cursor: pointer; padding: 6px 10px; color: var(--muted); }
+.session-log .log { height: 140px; min-height: 0; margin: 0 8px 8px; flex: none; }
+.session-log .log-jump { margin: 0 8px 4px; }
+.detail-overview { flex: 0 1 auto; max-height: 48%; overflow-y: auto; min-height: 0; }
+.detail-source { color: var(--muted); font: 11px "IBM Plex Mono", monospace; overflow-wrap: anywhere; }
+.detail-source a { margin-right: 12px; }
+.detail-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 12px 20px; }
+.detail-facts h3 { margin: 0 0 6px; font-size: 12px; }
+.stage-details, .outcome { border: 1px solid var(--border); border-radius: 6px; padding: 8px; font-size: 12px; overflow-wrap: anywhere; }
+.stage-details .mono-muted { font-size: 11px; }
+.outcome { grid-column: 1 / -1; }
+.routing-gates { display: flex; flex-direction: column; gap: 4px; }
+.routing-gate { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font: 11px "IBM Plex Mono", monospace; }
+.routing-gate meter { width: 80px; }
+.detail .log { min-height: 90px; flex: 1 1 120px; }
+.log-row { white-space: pre-wrap; overflow-wrap: anywhere; }
+.log-jump { flex-shrink: 0; border: 1px solid var(--border); border-radius: 6px; background: var(--selected); color: var(--accent); padding: 6px 10px; margin: 8px 20px 0; cursor: pointer; font: inherit; }
+.phone-board-back { display: none; }
+.log-you { color: var(--green); }
+.log-agent { color: var(--text); }
+.issue-plan-list { flex-shrink: 0; min-width: 0; }
+.issue-plan-list .plans-label { margin-left: 0; }
+.issue-plan-options { display: flex; flex-wrap: wrap; gap: 8px; max-height: 160px; overflow-y: auto; }
+.issue-plan-options .plan-link { flex: 1 1 210px; min-width: 0; margin: 0; border: 1px solid var(--border); overflow-wrap: anywhere; }
+@media (max-width: 699px) {
+  .phone > .agent-chips { padding: 6px 12px; }
+  .board-status { padding: 6px 12px; line-height: 1.6; }
+  .phone > .session-log { margin: 8px 12px; }
+  .phone-board-back { display: block; flex-shrink: 0; padding: 12px 20px; border-bottom: 1px solid var(--border); }
+  .mobile-detail .board-status { display: none; }
+  .mobile-detail .detail { min-height: 0; height: 100dvh; border: 0; }
+  .detail-overview { max-height: 42%; }
+  .detail-facts { grid-template-columns: minmax(0, 1fr); }
+  .issue-plan-options { max-height: 135px; }
+}
+
+.phone-router { padding: 4px 12px; color: var(--purple); font-size: 12px; }
+.phone-router .router-status { padding: 4px; margin: 0; }

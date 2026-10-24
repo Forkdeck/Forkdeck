@@ -96,27 +96,17 @@ export function PlansView({
       <div class="app-body">
         <nav aria-label="Plans" class="plans-sidebar">
           <Navigation />
-          <label class="mobile-plan-picker">
-            Issue plan
-            <select value={String(plan.id)} onChange={(event) => location.assign(`/plans/${event.currentTarget.value}`)}>
-              {allPlans.map((p) => <option value={String(p.id)}>{p.title}</option>)}
-            </select>
-          </label>
-          <h2 class="plans-label">Issue plans</h2>
-          {allPlans.map((p) => (
-            <a
-              href={`/plans/${p.id}`}
-              class={`plan-link${p.id === plan.id ? " selected" : ""}`}
-            >
-              <span class="medium">{p.title}</span>
-              <span class="plan-caption">
-                {p.subtitle ??
-                  `${p.plan.repo} · r${p.plan.revision} · ${p.status}`}
-              </span>
-            </a>
-          ))}
         </nav>
         <main class="plans-main">
+          <section class="issue-plan-list" aria-label="Issue plans">
+            <h2 class="plans-label">Issue plans</h2>
+            <div class="issue-plan-options">
+              {allPlans.map((p) => <a href={`/plans/${p.id}`} aria-current={p.id === plan.id ? "page" : undefined} class={`plan-link${p.id === plan.id ? " selected" : ""}`}>
+                <span class="medium">{`#${p.id} · ${p.title}`}</span>
+                <span class="plan-caption">{p.status}</span>
+              </a>)}
+            </div>
+          </section>
           {newPlan && <Composer issuePlan />}
           <ActionStatus source="plan" page />
           <div class="plan-heading">

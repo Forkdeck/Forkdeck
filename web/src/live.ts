@@ -1,6 +1,6 @@
 import { signal } from "@preact/signals";
 import { ByteBuffer } from "flatbuffers";
-import { Frame, Body, Snapshot, Job, JobChanged, Automation, Tail } from "./wire/forkdeck/web.ts";
+import { Frame, Body, Snapshot, Job, JobChanged, Automation, Tail, Log, LogEntry } from "./wire/forkdeck/web.ts";
 import { connection, error, refresh, scheduleRefresh, stopRefresh, mergeTail, markOperationsDirty } from "./state.ts";
 
 export interface Board {
@@ -8,6 +8,7 @@ export interface Board {
   snapshot: Snapshot;
   jobs: Job[];
   automation: boolean;
+  log: LogEntry[];
 }
 export const board = signal<Board | null>(null);
 
@@ -21,7 +22,8 @@ export function apply(current: Board | null, frame: Frame): {
   if (frame.bodyType() === Body.Snapshot) {
     const snapshot: Snapshot = frame.body(new Snapshot());
     const jobs = Array.from({ length: snapshot.jobsLength() }, (_, i) => snapshot.jobs(i)!);
-    return { next: { seq, snapshot, jobs, automation: snapshot.automation() }, resync: false };
+    return { next: { seq, snapshot, jobs, automation: snapshot.automation(),
+      log: Array.from({ length: snapshot.logLength() }, (_, i) => snapshot.log(i)!).slice(-200) }, resync: false };
   }
   if (!current) return { next: current, resync: false };
   // A snapshot reloaded mid-stream already holds everything up to its seq.
@@ -40,6 +42,11 @@ export function apply(current: Board | null, frame: Frame): {
     case Body.Automation: {
       const automation: Automation = frame.body(new Automation());
       next.automation = automation.on();
+      break;
+    }
+    case Body.Log: {
+      const log: Log = frame.body(new Log());
+      next.log = [...current.log, ...Array.from({ length: log.linesLength() }, (_, i) => log.lines(i)!)].slice(-200);
       break;
     }
     case Body.Tail: {
