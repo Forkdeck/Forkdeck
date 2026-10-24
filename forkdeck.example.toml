@@ -373,3 +373,18 @@ port = 7420
 # viewer = ["forkdeck-readers"]
 # operator = ["forkdeck-operators"]
 # admin = ["forkdeck-admins"]
+
+# Optional repository picker (independent of OIDC sign-in). Restart after adding a repo.
+# [web.forges.github]
+# host = "github.com"                         # or GitHub Enterprise
+# client_id = "your-oauth-app-client-id"
+# client_secret_env = "FORKDECK_GITHUB_SECRET"
+# redirect_url = "https://forkdeck.example/forges/github/callback"
+# private = false                             # true requests GitHub's repo scope
+# clone_dir = "~/.local/share/forkdeck/repos"
+# [web.forges.gitlab]
+# host = "gitlab.com"                         # or a self-managed host
+# client_id = "your-oauth-app-client-id"
+# client_secret_env = "FORKDECK_GITLAB_SECRET"
+# redirect_url = "https://forkdeck.example/forges/gitlab/callback"
+# clone_dir = "~/.local/share/forkdeck/repos"
