@@ -128,8 +128,8 @@ export function BoardWide({
           <a href="/stats" class="nav-link">
             Stats
           </a>
-          <a href="/doctor" class="nav-link">
-            Doctor & settings
+          <a href="/configuration" class="nav-link">
+            Configuration
           </a>
           <div class="agent-status">
             <div class="agent-heading">Agents</div>

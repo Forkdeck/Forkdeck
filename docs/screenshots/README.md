@@ -26,7 +26,7 @@ deployments and metrics in `src/server/seed.rs`. These are projected by the same
 API code as normal service data. The board selects an active typed job, with unsent drafts from its native prompt to
 show the available write controls; detail selects
 an unverified job. Plan captures select a graph when available, then click each tab. The demo capture
-toggles intake through HTTP and restores it before capturing, so Doctor shows actual
+toggles intake through HTTP and restores it before capturing, so Configuration shows actual
 audit entries. Publication and decision controls retain their native eligibility reasons.
 
 | Screen | Desktop · 1440×900 | Phone · 390×844 |
@@ -39,7 +39,7 @@ audit entries. Publication and decision controls retain their native eligibility
 | Repos | [View](repos-1440x900.png) | — |
 | Deploys | [View](deploys-1440x900.png) | — |
 | Stats | [View](stats-1440x900.png) | — |
-| Doctor | [View](doctor-1440x900.png) | — |
+| Configuration | [View](doctor-1440x900.png) | — |
 
 ![Selected working job](board-1440x900.png)
 
@@ -68,7 +68,7 @@ Stats use the copied native journal and attempt records. No demo content is adde
 | Repos | [View](real-repos-1440x900.png) | — |
 | Deploys | [View](real-deploys-1440x900.png) | — |
 | Stats | [View](real-stats-1440x900.png) | — |
-| Doctor | [View](real-doctor-1440x900.png) | — |
+| Configuration | [View](real-doctor-1440x900.png) | — |
 
 ## Optional OIDC
 

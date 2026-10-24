@@ -1,6 +1,6 @@
 # Operational screens
 
-The browser menu exposes plans, repositories, deployments, stats, and doctor/settings.
+The browser menu exposes plans, repositories, deployments, stats, and configuration (`/configuration`; the old `/doctor` address redirects there).
 All API reads use `Cache-Control: no-store`; [browser writes](web-ui.md) share the native Hub actions.
 Optional [OIDC login and group access](web-ui-oidc.md) protects all browser routes when configured.
 

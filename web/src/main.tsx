@@ -2,7 +2,7 @@ import { Composer, Intake } from "./Actions";
 import { Account } from "./Account";
 import { render } from "preact";
 import { useEffect, useState } from "preact/hooks";
-import { LocationProvider, Router, Route } from "preact-iso";
+import { LocationProvider, Router, Route, useLocation } from "preact-iso";
 import { BoardWide } from "./BoardWide";
 import { BoardPhone } from "./BoardPhone";
 import { Operational, Navigation } from "./Operational";
@@ -104,6 +104,12 @@ function Plans({ id }: { id?: string }) {
     );
   return <PlansView plan={plan} allPlans={all} />;
 }
+/** The page was called Doctor & settings; old links land on its new address. */
+function MovedToConfiguration() {
+  const { route } = useLocation();
+  useEffect(() => route("/configuration", true), []);
+  return null;
+}
 function Status() {
   return (
     <div class="empty" role="status">
@@ -132,7 +138,8 @@ function App() {
           component={() => <Operational page="deploys" />}
         />
         <Route path="/stats" component={() => <Operational page="stats" />} />
-        <Route path="/doctor" component={() => <Operational page="doctor" />} />
+        <Route path="/configuration" component={() => <Operational page="doctor" />} />
+        <Route path="/doctor" component={MovedToConfiguration} />
         <Route default component={Status} />
       </Router>
     </LocationProvider>

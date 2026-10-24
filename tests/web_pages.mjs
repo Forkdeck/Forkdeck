@@ -12,7 +12,11 @@ try {
     assert.equal((await page.request.get(`${base}/api/v1/forges`)).status(),404);
     const errors=[];
     page.on('pageerror',error=>errors.push(String(error)));
-    for (const path of ['repos','deploys','stats','doctor']) {
+    // The old Doctor & settings address still works and lands on Configuration.
+    await page.goto(`${base}/doctor`);
+    await page.waitForURL(`${base}/configuration`);
+    assert.equal(await page.locator('nav a[aria-current="page"]').innerText(),'Configuration');
+    for (const path of ['repos','deploys','stats','configuration']) {
       const r=await page.goto(`${base}/${path}`);
       assert.equal(r.status(),200);
       await page.waitForFunction(()=>!document.querySelector('[role=status]'));

@@ -9,8 +9,10 @@ const pages = [
   ["/repos", "Repositories"],
   ["/deploys", "Deployments"],
   ["/stats", "Stats"],
-  ["/doctor", "Doctor & settings"],
+  ["/configuration", "Configuration"],
 ];
+/** Each page's address; the configuration page reads the doctor API. */
+const routeOf = (page: string) => (page === "doctor" ? "/configuration" : `/${page}`);
 export function Navigation() {
   return (
     <nav class="operations-nav" aria-label="Main">
@@ -184,7 +186,7 @@ export function Operational({
       unsubscribe();
     };
   }, [page]);
-  const title = pages.find(([url]) => url === `/${page}`)![1];
+  const title = pages.find(([url]) => url === routeOf(page))![1];
   return (
     <div class="app-shell">
       <header class="app-header">

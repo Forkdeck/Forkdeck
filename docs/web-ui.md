@@ -72,7 +72,7 @@ stale decisions return 409, including when another client wins Hub admission. Th
 same revision requirement applies when Reply or Send now implicitly answers a
 planning choice, so those message routes cannot bypass choice protection.
 
-Doctor shows the latest 200 audit entries, including admissions, outcomes, denied
+Configuration shows the latest 200 audit entries, including admissions, outcomes, denied
 requests and replays. Records identify the OIDC subject or `local`, action, target,
 revision, request ID and time, without raw prompt/message bodies. Audit history is
 append-only in SQLite. The live WebSocket carries actionable job/plan changes and intake events;
