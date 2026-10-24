@@ -27,8 +27,9 @@ plan = "auto"
 # same wire format works, including the hosted one.
 base_url = "http://127.0.0.1:8000"
 model = "jev-latest"
-# Name of the environment variable that holds the bearer key. Leave the variable
-# unset when the local server runs without auth.
+# Name of the environment variable that holds the bearer key. Unset, a server on
+# this machine gets the development key scripts/local-jev.sh starts it with
+# (forkdeck-local-dev); a remote one gets none.
 api_key_env = "FORKDECK_JEV_KEY"
 timeout_ms = 4000
 # These two descriptions are what the decision model picks between. Tune them to

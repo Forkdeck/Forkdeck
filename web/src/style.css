@@ -359,8 +359,9 @@ select:focus-visible {
   color: var(--muted);
 }
 .detail {
-  flex: 1 1 420px;
-  max-width: 520px;
+  /* Logs and plans are read here: scale with the window instead of the board taking it all. */
+  /* 850px: the sidebar and the board's minimum, padding included, so it stays beside them. */
+  flex: 0 0 clamp(420px, min(38vw, 100vw - 850px), 760px);
   border-left: 1px solid var(--border);
   background: var(--panel);
   display: flex;
@@ -981,6 +982,11 @@ select:focus-visible {
 .lane {
   max-height: calc(100dvh - 210px);
   overflow-y: auto;
+  /* Each lane still scrolls; six bars side by side are noise. */
+  scrollbar-width: none;
+}
+.lane::-webkit-scrollbar {
+  display: none;
 }
 .detail {
   height: 100%;

@@ -190,12 +190,11 @@ export function BoardWide({
             <label class="plan-toggle">
               <input
                 type="checkbox"
-                checked
                 onClick={(e) => e.preventDefault()}
                 tabIndex={-1}
                 class="plan-checkbox"
                 aria-disabled="true"
-                title="Coming in the next milestone"
+                title="Off by default: the router decides when a task needs a plan. Coming in the next milestone"
               />
               Plan first
             </label>
