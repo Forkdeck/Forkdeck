@@ -12,6 +12,8 @@ export interface JobDetail extends NativeJobDetail {
   choices: { label: string; detail: string }[];
   queued: string[];
   actions: { reply: boolean; stop: boolean; retry: boolean; resume: boolean };
+  /** Why this task takes no replies, when it does not. */
+  reply_reason: string;
 }
 export interface PlanView {
   id: number | string;
@@ -57,12 +59,15 @@ export const principal = signal<{
 const identityLoaded = signal(false);
 export const actionBusy = signal(false);
 export const actionError = signal("");
+/** Which control's action failed, so only that control shows the error. */
+export const actionSource = signal("");
 export const invalidation = signal(0);
 export const writeReason = computed(() => !identityLoaded.value ? "Checking permissions…" : principal.value?.role === "viewer" ? "Operator or admin role required" : "");
-export async function action<T = { id?: number }>(command: Record<string, unknown>): Promise<T | undefined> {
+export async function action<T = { id?: number }>(command: Record<string, unknown>, source = ""): Promise<T | undefined> {
   if (actionBusy.value || writeReason.value) return;
   actionBusy.value = true;
   actionError.value = "";
+  actionSource.value = source;
   const key = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join("");
   const options = { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": key }, body: JSON.stringify(command) };
   try {

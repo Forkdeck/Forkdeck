@@ -48,7 +48,13 @@ pub fn detail(hub: &Hub, feed: &Feed, id: u32) -> Option<Value> {
         v["revision"] = json!(super::write::revision(j));
         v["choices"] = json!(crate::choices::for_job(j).iter().map(|c| json!({"label":c.label,"detail":c.detail})).collect::<Vec<_>>());
         v["queued"] = json!(j.inbox);
-        v["actions"] = json!({"reply":j.source.is_manual(),"stop":!j.status.finished(),"resume":j.source.is_manual() && j.status == JobStatus::Interrupted,"retry":j.source.is_manual() && j.status.finished() && j.status != JobStatus::Interrupted});
+        // A finished typed task continues where it ran; once that directory is gone nothing can.
+        let gone = j.status.finished() && !j.workdir.is_dir();
+        let manual = j.source.is_manual() && !gone;
+        v["actions"] = json!({"reply":manual,"stop":!j.status.finished(),"resume":manual && j.status == JobStatus::Interrupted,"retry":manual && j.status.finished() && j.status != JobStatus::Interrupted});
+        v["reply_reason"] = json!(if !j.source.is_manual() { "Only typed tasks take replies".to_string() }
+            else if gone { format!("Its working directory {} no longer exists; start a new task instead", j.workdir.display()) }
+            else { String::new() });
     });
     Some(v)
 }
@@ -254,6 +260,24 @@ mod tests {
         let mut blank = crate::config::Config::default();
         blank.web.lanes.done = "  ".into();
         assert!(blank.web.check().unwrap_err().to_string().contains("web.lanes.done"));
+    }
+
+    #[test]
+    fn replies_are_offered_only_where_the_server_will_take_them() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut cfg = crate::config::Config { demo: true, ..Default::default() };
+        crate::server::seed::configure(&mut cfg);
+        let hub = Hub::new(cfg, rt.handle().clone());
+        crate::server::seed::seed_demo(&hub).unwrap();
+        let feed = Feed::new();
+        let typed = detail(&hub, &feed, 70).unwrap();
+        assert_eq!((typed["actions"]["reply"].as_bool(), typed["actions"]["retry"].as_bool()), (Some(true), Some(true)));
+        assert_eq!(typed["reply_reason"], "");
+        hub.job(70, |j| j.workdir = std::path::PathBuf::from("/nonexistent/forkdeck-workdir"));
+        let gone = detail(&hub, &feed, 70).unwrap();
+        assert_eq!((gone["actions"]["reply"].as_bool(), gone["actions"]["retry"].as_bool()), (Some(false), Some(false)));
+        assert!(gone["reply_reason"].as_str().unwrap().contains("/nonexistent/forkdeck-workdir no longer exists"));
+        assert_eq!(detail(&hub, &feed, 72).unwrap()["reply_reason"], "Only typed tasks take replies");
     }
 
     #[test]

@@ -221,6 +221,9 @@ path = "."
         if pr { j.pr_url = Some("https://github.com/o/semantic-context/pull/70".into()); }
         st.jobs.push(j);
     }
+    // Typed tasks ran where forkdeck was started; without that directory none of them takes a reply.
+    let here = std::env::current_dir()?;
+    for j in st.jobs.iter_mut().filter(|j| j.workdir.as_os_str().is_empty()) { j.workdir = here.clone(); }
     // The journal and attempt reports consume native records, just as normal operation does.
     st.next_id = st.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let records = st.jobs.iter().filter(|j| j.status.finished() && j.issue_plan.is_none()).map(|j| crate::journal::entry(j,j.status,&j.outcome,0)).collect::<Vec<_>>();

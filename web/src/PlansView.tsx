@@ -24,7 +24,7 @@ export function PlansView({
   useEffect(() => setFeedback(""), [plan.id]);
   const disabled = Boolean(writeReason.value) || actionBusy.value || !plan.revision;
   const apply = async (operation: string) => {
-    if (await action({ action: "plan", id: plan.id, operation, text: feedback, expected_revision: plan.revision })) setFeedback("");
+    if (await action({ action: "plan", id: plan.id, operation, text: feedback, expected_revision: plan.revision }, "plan")) setFeedback("");
   };
 
   const tabs = ["Tasks", "Plan", "Review"];
@@ -118,7 +118,7 @@ export function PlansView({
         </nav>
         <main class="plans-main">
           {newPlan && <Composer issuePlan />}
-          <ActionStatus />
+          <ActionStatus source="plan" page />
           <div class="plan-heading">
             <div class="plan-heading-copy">
               <div class="mono-muted">{`${plan.plan.repo}${plan.plan.issue ? "#" + plan.plan.issue.key : ""} · revision ${plan.plan.revision} · ${plan.status}`}</div>
