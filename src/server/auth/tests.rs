@@ -258,7 +258,7 @@ async fn viewer_cannot_write_but_operator_and_admin_can() {
 }
 
 #[tokio::test]
-async fn oidc_viewer_cannot_connect_a_forge() {
+async fn oidc_viewer_cannot_connect_or_add_a_repository() {
     let f = Fixture::new("userinfo").await;
     let cookie = f.session().await;
     let cfg = toml::from_str(r#"
@@ -278,5 +278,9 @@ redirect_url = "https://forkdeck.example/forges/github/callback"
     }
     let body: Value = f.client.get(format!("{base}/api/v1/forges")).header(header::COOKIE,&cookie).send().await.unwrap().json().await.unwrap();
     assert_eq!(body["can_add"],false);
+    let response = f.client.post(format!("{base}/api/v1/actions")).header(header::COOKIE,&cookie)
+        .header(header::ORIGIN,"https://forkdeck.example").header("idempotency-key","viewer-add")
+        .json(&json!({"action":"add_repo","picker":"missing","repo":"owner/repo"})).send().await.unwrap();
+    assert_eq!(response.status(),StatusCode::FORBIDDEN);
     task.abort();
 }

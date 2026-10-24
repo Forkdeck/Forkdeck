@@ -30,9 +30,7 @@ impl Forges {
     }
 }
 
-#[allow(dead_code)] // Task 3 consumes this server-side selection contract.
 pub(super) struct PickedRepo { pub provider: Provider, pub host: String, pub repo: String, pub default_branch: String }
-#[allow(dead_code)]
 pub(super) fn picked(app: &App, picker: &str, cookie: &str, repo: &str) -> Option<PickedRepo> {
     let mut store = app.forges.lock().unwrap();
     store.prune();
@@ -60,7 +58,7 @@ fn endpoint(cfg: &ForgeAppCfg, provider: Provider, step: &str) -> String {
         (Provider::Github,"authorize") => format!("{root}/login/oauth/authorize"),
         (Provider::Github,"exchange") => format!("{root}/login/oauth/access_token"),
         (Provider::Github,_) if !cfg.base_url.is_empty() => format!("{root}/user/repos"),
-        (Provider::Github,_) if cfg.host == "github.com" => "https://api.github.com/user/repos".into(),
+        (Provider::Github,_) if cfg.host.eq_ignore_ascii_case("github.com") => "https://api.github.com/user/repos".into(),
         (Provider::Github,_) => format!("{root}/api/v3/user/repos"),
         (Provider::Gitlab,"authorize") => format!("{root}/oauth/authorize"),
         (Provider::Gitlab,"exchange") => format!("{root}/oauth/token"),
@@ -158,7 +156,7 @@ pub(super) fn valid_repo(repo: &str) -> bool {
     repo.len() <= 512 && repo.split('/').count() >= 2 && repo.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && !part.starts_with('-') && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
 }
 pub(super) fn configured(app: &App, provider: Provider, host: &str, repo: &str) -> bool {
-    app.hub.cfg.repos.iter().any(|r| r.provider == provider && r.repo == repo && repo_host(r) == host)
+    app.hub.cfg.repos.iter().any(|r| r.provider == provider && r.repo == repo && repo_host(r).eq_ignore_ascii_case(host))
 }
 pub(super) fn repo_host(repo: &crate::config::RepoCfg) -> &str {
     if repo.host.is_empty() { match repo.provider { Provider::Github => "github.com", Provider::Gitlab => "gitlab.com" } } else { &repo.host }
@@ -178,6 +176,12 @@ pub(super) async fn picker(State(app): State<App>, Path(picker_id): Path<String>
         value
     }).collect();
     Json(json!({"provider":id(p.provider),"host":p.host,"expires_unix":p.expires,"repos":repos})).into_response()
+}
+
+#[cfg(test)]
+pub(super) fn test_picker(app: &App, id: &str, cookie: &str, provider: Provider, host: &str, repos: &[&str]) {
+    app.forges.lock().unwrap().pickers.push_back(Picker { id:id.into(),binding:hash(cookie),provider,host:host.into(),
+        repos:repos.iter().map(|repo|Repository { repo:(*repo).into(),private:false,default_branch:"main".into(),description:String::new() }).collect(),expires:now()+600 });
 }
 
 #[cfg(test)]

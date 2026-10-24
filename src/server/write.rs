@@ -6,7 +6,7 @@ use axum::{body::{to_bytes, Body}, extract::State, http::{header, Request, Statu
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::{collections::{HashMap, VecDeque}, path::{Path, PathBuf}, time::Duration};
 
 const LIMIT: usize = 32 * 1024;
 
@@ -57,6 +57,7 @@ enum Command {
     Plan { id: u32, operation: String, text: Option<String>, expected_revision: String },
     NewPlan { workspace: String, issue: String, text: String, agent: Option<AgentKind> },
     Automation { on: bool },
+    AddRepo { picker: String, repo: String },
 }
 
 fn text(value: String) -> Result<String, String> {
@@ -64,7 +65,8 @@ fn text(value: String) -> Result<String, String> {
     if value.is_empty() { Err("Enter a message".into()) } else { Ok(value) }
 }
 
-async fn apply(hub: &Hub, command: Command) -> Result<Value, (StatusCode, String)> {
+async fn apply(app: &App, cookie: &str, command: Command) -> Result<Value, (StatusCode, String)> {
+    let hub = &app.hub;
     let bad = |e: String| (if e == "stale revision" { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST }, e);
     let check = |id, expected: &str| -> Result<(), (StatusCode, String)> {
         match hub.job(id, |j| revision(j)) {
@@ -142,9 +144,92 @@ async fn apply(hub: &Hub, command: Command) -> Result<Value, (StatusCode, String
             }
             id
         }
+        Command::AddRepo { picker, repo } => return add_repo(app,&picker,cookie,&repo).await,
         Command::Automation { on } => { hub.automation(on); return Ok(json!({"automation":on})); }
     };
     Ok(json!({"id":id}))
+}
+
+fn repo_error(error: impl std::fmt::Display) -> (StatusCode,String) {
+    (StatusCode::CONFLICT,format!("Could not update repository configuration: {error}"))
+}
+fn disk_configured(path: &Path, entry: &crate::config::RepoEntry, host: &str) -> Result<bool,(StatusCode,String)> {
+    let cfg = crate::config::load(Some(path)).map_err(repo_error)?.0;
+    Ok(cfg.repos.iter().any(|r| r.provider == entry.provider && r.repo == entry.repo && super::forges::repo_host(r).eq_ignore_ascii_case(host)))
+}
+struct StagedClone(Option<PathBuf>);
+impl StagedClone {
+    fn path(&self) -> &Path { self.0.as_deref().unwrap() }
+    fn installed(&mut self, path: &Path) { self.0 = Some(path.to_path_buf()); }
+    fn keep(mut self) { self.0.take(); }
+}
+impl Drop for StagedClone {
+    fn drop(&mut self) { if let Some(path) = &self.0 { let _ = std::fs::remove_dir_all(path); } }
+}
+
+async fn add_repo(app: &App, picker: &str, cookie: &str, repo: &str) -> Result<Value,(StatusCode,String)> {
+    static ADDS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let missing = || (StatusCode::NOT_FOUND,"This repository is not in an active picker".into());
+    let picked = super::forges::picked(app,picker,cookie,repo).ok_or_else(missing)?;
+    let cfg = super::forges::config(app,picked.provider).ok_or_else(missing)?;
+    if !super::forges::valid_repo(&picked.repo) || !cfg.host.eq_ignore_ascii_case(&picked.host) { return Err(missing()); }
+    if app.hub.cfg.demo { return Err((StatusCode::CONFLICT,"Adding repositories is disabled in demo mode".into())); }
+    let config_path = app.hub.config_path.lock().unwrap().clone()
+        .ok_or_else(|| (StatusCode::CONFLICT,"Forkdeck was started without a config file".into()))?;
+    let clone_dir = cfg.clone_dir.clone();
+    let host = picked.host;
+    let target = clone_dir.join(&host).join(&picked.repo);
+    let entry = crate::config::RepoEntry { provider:picked.provider,repo:picked.repo,path:target,base:picked.default_branch };
+    let already = super::forges::configured(app,entry.provider,&host,&entry.repo);
+    let _serial = ADDS.lock().await;
+    let duplicate = || (StatusCode::CONFLICT,"Repository is already configured".into());
+    let exists = || (StatusCode::CONFLICT,"Clone path already exists".into());
+    let mut clone = tokio::task::spawn_blocking({
+        let entry = entry.clone();
+        let config_path = config_path.clone();
+        let host = host.clone();
+        move || {
+            if already || disk_configured(&config_path,&entry,&host)? { return Err(duplicate()); }
+            if std::fs::symlink_metadata(&entry.path).is_ok() { return Err(exists()); }
+            std::fs::create_dir_all(&clone_dir).map_err(repo_error)?;
+            let parent = entry.path.parent().unwrap();
+            let mut directory = clone_dir.clone();
+            for component in parent.strip_prefix(&clone_dir).unwrap().components() {
+                directory.push(component);
+                match std::fs::symlink_metadata(&directory) {
+                    Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => return Err((StatusCode::CONFLICT,"Clone parent must be a directory without symbolic links".into())),
+                    Ok(_) => {},
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&directory).map_err(repo_error)?,
+                    Err(e) => return Err(repo_error(e)),
+                }
+            }
+            let temporary = parent.join(format!(".forkdeck-{}",crate::metrics::id()));
+            std::fs::create_dir(&temporary).map_err(repo_error)?;
+            Ok(StagedClone(Some(temporary)))
+        }
+    }).await.map_err(|_| repo_error("Repository preparation interrupted"))??;
+    let github = entry.provider == crate::state::Provider::Github;
+    let mut command = crate::proc::command(if github { "gh" } else { "glab" });
+    command.args(["repo","clone"]).arg(&entry.repo).arg(clone.path())
+        .env(if github { "GH_HOST" } else { "GITLAB_HOST" },&host).env("GLAB_NO_PROMPT","1")
+        .current_dir(clone.path().parent().unwrap());
+    match crate::proc::output_code(command,Duration::from_secs(300)).await {
+        Ok((Some(0),_,_)) => {},
+        Ok((_,out,err)) => {
+            let message = if err.trim().is_empty() { out.trim() } else { err.trim() };
+            return Err((StatusCode::BAD_GATEWAY,if message.is_empty() { "Repository clone failed".into() } else { message.into() }));
+        }
+        Err(e) => return Err((StatusCode::BAD_GATEWAY,e)),
+    }
+    tokio::task::spawn_blocking(move || {
+        if std::fs::symlink_metadata(&entry.path).is_ok() { return Err(exists()); }
+        std::fs::rename(clone.path(),&entry.path).map_err(repo_error)?;
+        clone.installed(&entry.path);
+        if disk_configured(&config_path,&entry,&host)? { return Err(duplicate()); }
+        crate::config::append_repo(&config_path,&entry).map_err(repo_error)?;
+        clone.keep();
+        Ok(json!({"repo":entry.repo,"path":entry.path,"restart_required":true}))
+    }).await.map_err(|_| repo_error("Repository append interrupted"))?
 }
 
 fn response(status: u16, body: Value) -> Response {
@@ -178,6 +263,7 @@ impl App {
 pub(super) async fn action(State(app): State<App>, req: Request<Body>) -> Response {
     let actor = req.extensions().get::<Principal>().map(|p| p.subject.clone()).unwrap_or_else(|| "local".into());
     let headers = req.headers();
+    let forge_cookie = super::auth::cookie(headers,super::forges::COOKIE).unwrap_or_default();
     let origin = app.auth.as_ref().map(|auth| auth.origin())
         .or_else(|| headers.get(header::HOST).and_then(|h| h.to_str().ok()).map(|host| format!("http://{host}")));
     let denied = if !super::auth::can_write(req.extensions().get::<Principal>()) {
@@ -223,7 +309,7 @@ pub(super) async fn action(State(app): State<App>, req: Request<Body>) -> Respon
     }
     let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     let action = value["action"].as_str().filter(|action| matches!(*action,
-        "submit" | "reply" | "steer" | "cancel" | "resume" | "retry" | "choose" | "plan" | "new_plan" | "automation"
+        "submit" | "reply" | "steer" | "cancel" | "resume" | "retry" | "choose" | "plan" | "new_plan" | "automation" | "add_repo"
     )).unwrap_or("invalid");
     let audit = |status: &str| json!({"at":chrono::Utc::now(),"actor":actor,"action":action,"target":value["id"],"revision":value["expected_revision"],"request_id":key,"status":status});
     let mut op = Operation { fingerprint, status: 409, body: json!({"error":"Operation admitted; outcome uncertain after interruption. Inspect the task before taking another action."}) };
@@ -231,7 +317,7 @@ pub(super) async fn action(State(app): State<App>, req: Request<Body>) -> Respon
     writes.operations.insert(key.clone(), op.clone());
     writes.order.push_back(key.clone());
     let result = match serde_json::from_value(value.clone()) {
-        Ok(command) => apply(&app.hub, command).await,
+        Ok(command) => apply(&app, &forge_cookie, command).await,
         Err(_) => Err((StatusCode::BAD_REQUEST, "Invalid action fields".into())),
     };
     match result { Ok(body) => { op.status = 200; op.body = body; }, Err((status, error)) => { op.status = status.as_u16(); op.body = json!({"error":error}); } }
@@ -344,4 +430,139 @@ mod tests {
         assert!(matches!(event,forkdeck_remote_proto::Event::Automation { on:false }));
         task.abort();
     }
+    async fn add_server(app: App, viewer: bool) -> (String,tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}",listener.local_addr().unwrap());
+        let mut router = super::super::http::router(app);
+        if viewer { router = router.layer(axum::Extension(Principal { subject:"viewer".into(),name:"Viewer".into(),groups:vec![],role:"viewer".into() })); }
+        let task = tokio::spawn(async move { axum::serve(listener,router).await.unwrap(); });
+        (base,task)
+    }
+    async fn add_post(client: &reqwest::Client, base: &str, repo: &str, key: &str) -> (StatusCode,Value) {
+        let response = client.post(format!("{base}/api/v1/actions")).header("idempotency-key",key).header(header::COOKIE,"forkdeck_forge=browser")
+            .json(&json!({"action":"add_repo","picker":"picker","repo":repo})).send().await.unwrap();
+        (response.status(),response.json().await.unwrap())
+    }
+
+    #[test]
+    fn picked_repositories_clone_append_fail_cleanly_and_serialize() {
+        crate::subissues::tests::isolated("server::write::tests::picked_repositories_clone_append_fail_cleanly_and_serialize", |root| {
+            use std::os::unix::fs::PermissionsExt;
+            let script = r#"#!/bin/sh
+[ "$1" = repo ] && [ "$2" = clone ] || exit 9
+repo=$3
+dest=$4
+case "${0##*/}" in gh) host=$GH_HOST;; *) host=$GITLAB_HOST;; esac
+printf '%s %s\n' "$repo" "$host" >> "$FAKE_FORGE/clone-calls"
+mkdir -p "$dest"
+echo partial > "$dest/partial"
+case "$repo" in
+  */fail) echo 'Could not resolve to a Repository' >&2; exit 1;;
+  */edited) printf '\nmanual = [' >> "$FORKDECK_ADD_CONFIG";;
+esac
+git init -q "$dest"
+git -C "$dest" remote add origin "https://$host/$repo.git"
+"#;
+            std::fs::remove_file(root.join("bin/gh")).unwrap();
+            for name in ["gh","glab"] {
+                let path = root.join("bin").join(name);
+                std::fs::write(&path,script).unwrap();
+                std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::env::set_var("FORKDECK_ADD_SECRET","fixture-secret");
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+            rt.block_on(async {
+                for (i,provider,host) in [(0,"github","github.com"),(1,"github","github.example"),(2,"gitlab","gitlab.com"),(3,"gitlab","gitlab.example")] {
+                    let clone_dir = root.join(format!("clones-{i}"));
+                    let path = root.join(format!("config-{i}.toml"));
+                    let initial = format!("# Preserve these exact bytes.\n[web.forges.{provider}]\nhost = {host:?}\nclient_id = \"fixture\"\nclient_secret_env = \"FORKDECK_ADD_SECRET\"\nredirect_url = \"https://forkdeck.example/forges/{provider}/callback\"\nclone_dir = {:?}\n",clone_dir.to_str().unwrap());
+                    std::fs::write(&path,&initial).unwrap();
+                    std::env::set_var("FORKDECK_ADD_CONFIG",&path);
+                    let cfg = crate::config::load(Some(&path)).unwrap().0;
+                    let hub = Hub::new(cfg,rt.handle().clone());
+                    *hub.config_path.lock().unwrap() = Some(path.clone());
+                    let app = App { hub:hub.clone(),feed:Arc::new(Feed::new()),loopback:true,auth:None,writes:Default::default(),forges:Default::default() };
+                    let forge = if provider == "github" { crate::state::Provider::Github } else { crate::state::Provider::Gitlab };
+                    let repo = if provider == "github" { "owner/new" } else { "group/sub/project" };
+                    super::super::forges::test_picker(&app,"picker","browser",forge,host,&[repo,"owner/fail","owner/exists","owner/edited","owner/concurrent-a","owner/concurrent-b"]);
+                    let (base,server) = add_server(app.clone(),false).await;
+                    let client = reqwest::Client::new();
+                    let (status,result) = add_post(&client,&base,repo,"success").await;
+                    let clone = clone_dir.join(host).join(repo);
+                    assert_eq!(status,StatusCode::OK,"{result}");
+                    assert_eq!(result,json!({"repo":repo,"path":clone,"restart_required":true}));
+                    assert!(clone.join(".git").is_dir());
+                    let block = format!("\n[[repos]]\nprovider = {provider:?}\nrepo = {repo:?}\npath = {:?}\nbase = \"main\"\n",clone.to_str().unwrap());
+                    let saved = std::fs::read_to_string(&path).unwrap();
+                    assert_eq!(saved,format!("{initial}{block}"));
+                    assert_eq!(add_post(&client,&base,repo,"success").await.1,result,"idempotent replay");
+                    assert_eq!(add_post(&client,&base,repo,"duplicate").await.0,StatusCode::CONFLICT);
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(),saved);
+                    let existing = clone_dir.join(host).join("owner/exists");
+                    std::fs::create_dir_all(&existing).unwrap();
+                    std::fs::write(existing.join("keep"),"untouched").unwrap();
+                    assert_eq!(add_post(&client,&base,"owner/exists","exists").await.0,StatusCode::CONFLICT);
+                    assert_eq!(std::fs::read_to_string(existing.join("keep")).unwrap(),"untouched");
+                    let (status,result) = add_post(&client,&base,"owner/fail","failure").await;
+                    assert_eq!(status,StatusCode::BAD_GATEWAY);
+                    assert!(result["error"].as_str().unwrap().contains("Could not resolve to a Repository"));
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(),saved);
+                    assert!(!clone_dir.join(host).join("owner/fail").exists());
+                    assert!(std::fs::read_dir(clone_dir.join(host).join("owner")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains(".forkdeck-")));
+                    let mut other = app.clone();
+                    other.writes = Default::default();
+                    let (second,second_server) = add_server(other,false).await;
+                    let (a,b) = tokio::join!(add_post(&client,&base,"owner/concurrent-a","a"),add_post(&client,&second,"owner/concurrent-b","b"));
+                    assert_eq!(a.0,StatusCode::OK,"{}",a.1);
+                    assert_eq!(b.0,StatusCode::OK,"{}",b.1);
+                    let concurrent = std::fs::read_to_string(&path).unwrap();
+                    assert!(concurrent.starts_with(&saved));
+                    assert_eq!(concurrent.matches("[[repos]]").count(),3);
+                    assert_eq!(crate::config::load(Some(&path)).unwrap().0.repos.len(),3);
+                    let (status,_) = add_post(&client,&base,"owner/edited","edited").await;
+                    assert!(!status.is_success());
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(),format!("{concurrent}\nmanual = ["));
+                    assert!(!clone_dir.join(host).join("owner/edited").exists());
+                    let calls = std::fs::read_to_string(root.join("forge/clone-calls")).unwrap();
+                    assert_eq!(calls.lines().filter(|line| *line == format!("{repo} {host}")).count(),1);
+                    assert!(app.audit().await.unwrap().iter().any(|a|a["action"] == "add_repo" && a["status"] == "200"));
+                    server.abort();
+                    second_server.abort();
+                }
+            });
+        });
+    }
+
+    #[tokio::test]
+    async fn add_repository_keeps_cookie_role_origin_and_body_guards() {
+        let cfg = toml::from_str(r#"
+[web.forges.github]
+client_id = "fixture"
+client_secret_env = "UNUSED_SECRET"
+redirect_url = "https://forkdeck.example/forges/github/callback"
+"#).unwrap();
+        let hub = Hub::new(cfg,tokio::runtime::Handle::current());
+        let app = App { hub,feed:Arc::new(Feed::new()),loopback:true,auth:None,writes:Default::default(),forges:Default::default() };
+        super::super::forges::test_picker(&app,"picker","browser",crate::state::Provider::Github,"github.com",&["owner/repo"]);
+        let (base,server) = add_server(app.clone(),false).await;
+        let client = reqwest::Client::new();
+        assert_eq!(add_post(&client,&base,"owner/not-listed","absent").await.0,StatusCode::NOT_FOUND);
+        let (status,result) = add_post(&client,&base,"owner/repo","no-config").await;
+        assert_eq!(status,StatusCode::CONFLICT);
+        assert_eq!(result["error"],"Forkdeck was started without a config file");
+        let body = json!({"action":"add_repo","picker":"picker","repo":"owner/repo"});
+        let post = |key| client.post(format!("{base}/api/v1/actions")).header("idempotency-key",key).json(&body);
+        assert_eq!(post("cookie").header(header::COOKIE,"forkdeck_forge=another-browser").send().await.unwrap().status(),StatusCode::NOT_FOUND);
+        assert_eq!(post("origin").header(header::ORIGIN,"https://evil.example").send().await.unwrap().status(),StatusCode::FORBIDDEN);
+        for field in ["path","url"] {
+            let mut dangerous = body.clone();
+            dangerous[field] = json!("/untrusted");
+            assert_eq!(client.post(format!("{base}/api/v1/actions")).header("idempotency-key",field).json(&dangerous).send().await.unwrap().status(),StatusCode::BAD_REQUEST);
+        }
+        let (viewer,viewer_server) = add_server(app,true).await;
+        assert_eq!(add_post(&client,&viewer,"owner/repo","viewer").await.0,StatusCode::FORBIDDEN);
+        server.abort();
+        viewer_server.abort();
+    }
+
 }

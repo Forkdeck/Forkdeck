@@ -929,6 +929,39 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
     Ok((cfg, None))
 }
 
+#[derive(Clone, Serialize)]
+pub struct RepoEntry {
+    pub provider: Provider,
+    pub repo: String,
+    pub path: PathBuf,
+    pub base: String,
+}
+
+/// Append only; editors' existing bytes and ordering are never serialized back out.
+pub fn append_repo(path: &Path, entry: &RepoEntry) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    static APPENDS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = APPENDS.lock().unwrap();
+    let mut file = std::fs::OpenOptions::new().read(true).append(true).open(path)?;
+    let mut previous = Vec::new();
+    file.read_to_end(&mut previous)?;
+    let block = format!("\n[[repos]]\n{}",toml::to_string(entry)?);
+    let result = (|| -> anyhow::Result<()> {
+        file.write_all(block.as_bytes())?;
+        file.sync_all()?;
+        load(Some(path))?;
+        let current = std::fs::read(path)?;
+        anyhow::ensure!(current.starts_with(&previous) && current[previous.len()..].starts_with(block.as_bytes()), "configuration changed during repository append");
+        Ok(())
+    })();
+    if let Err(error) = result {
+        file.set_len(previous.len() as u64)?;
+        file.sync_all()?;
+        return Err(error);
+    }
+    Ok(())
+}
+
 impl RepoCfg {
     /// The repository as `gh -R` takes it: with its host when the clone names one, so `GH_HOST`
     /// cannot send the request to the same name on another server. Same rule as `host_args`.
@@ -1320,6 +1353,37 @@ impl Config {
 mod tests {
     use super::*;
 
+    #[test]
+    fn repository_appends_preserve_bytes_serialize_and_restore_on_invalid_edits() {
+        let root = std::env::temp_dir().join(format!("forkdeck-append-{}",crate::metrics::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let initial = "# Keep this comment and spacing.\n[web]\nport = 17435\n";
+        std::fs::write(&path,initial).unwrap();
+        let entry = |name: &str| RepoEntry { provider:Provider::Github,repo:format!("owner/{name}"),path:root.join(name),base:"main".into() };
+        append_repo(&path,&entry("one")).unwrap();
+        let block = format!("\n[[repos]]\nprovider = \"github\"\nrepo = \"owner/one\"\npath = {:?}\nbase = \"main\"\n",root.join("one").to_str().unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),format!("{initial}{block}"));
+        let a = entry("two");
+        let b = entry("three");
+        let paths = [path.clone(),path.clone()];
+        let threads: Vec<_> = [a,b].into_iter().zip(paths).map(|(entry,path)| std::thread::spawn(move || append_repo(&path,&entry).unwrap())).collect();
+        for thread in threads { thread.join().unwrap(); }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(&format!("{initial}{block}")));
+        assert_eq!(text.matches("[[repos]]").count(),3);
+        assert_eq!(load(Some(&path)).unwrap().0.repos.len(),3);
+        let mut invalid = entry("invalid");
+        invalid.base.clear();
+        assert!(append_repo(&path,&invalid).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),text);
+        let edited = format!("{text}\nmanual = [");
+        std::fs::write(&path,&edited).unwrap();
+        assert!(append_repo(&path,&entry("after-edit")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),edited);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn forge_config() -> Config {
         toml::from_str(r#"
 [web.forges.github]
@@ -1331,6 +1395,16 @@ client_id = "gitlab-app"
 client_secret_env = "FORKDECK_TEST_FORGE_SECRET"
 redirect_url = "https://forkdeck.example/forges/gitlab/callback"
 "#).unwrap()
+    }
+
+    #[test]
+    fn forge_loopback_ipv6_endpoints_are_allowed() {
+        std::env::set_var("FORKDECK_TEST_FORGE_SECRET", "test-secret");
+        let mut cfg = forge_config();
+        let app = cfg.web.forges.github.as_mut().unwrap();
+        app.redirect_url = "http://[::1]:17435/forges/github/callback".into();
+        app.base_url = "http://[::1]:9080".into();
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -1815,7 +1889,7 @@ impl ForgeAppCfg {
         for (name, value) in [("redirect_url", self.redirect_url.as_str()), ("base_url", self.base_url.as_str())] {
             if name == "base_url" && value.is_empty() { continue; }
             let u = reqwest::Url::parse(value).map_err(|_| anyhow::anyhow!("{key}.{name} must be a valid URL"))?;
-            let local = u.host_str().is_some_and(|h| h == "localhost" || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+            let local = u.host_str().is_some_and(|h| h == "localhost" || h.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
             anyhow::ensure!(u.host_str().is_some() && u.username().is_empty() && u.password().is_none() && u.query().is_none() && u.fragment().is_none() && (u.scheme() == "https" || (local && u.scheme() == "http")), "{key}.{name} must be HTTPS (HTTP allowed on loopback)");
             anyhow::ensure!(if name == "redirect_url" { u.path() == format!("/forges/{provider}/callback") } else { u.path() == "/" }, "{key}.{name} has an invalid path");
         }
