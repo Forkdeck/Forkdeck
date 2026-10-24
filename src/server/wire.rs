@@ -49,8 +49,6 @@ pub fn board(hub: &Hub, feed: &Feed) -> Vec<u8> {
     b.finished_data().to_vec()
 }
 
-// The live transport uses this encoder in the next task.
-#[allow(dead_code)]
 pub fn event(hub: &Hub, seq: u64, event: &Event) -> Vec<u8> {
     let mut b = flatbuffers::FlatBufferBuilder::new();
     let (body_type, body) = match event {
