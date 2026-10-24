@@ -1153,6 +1153,7 @@ fn quit_key(key: event::KeyEvent) -> bool {
 
 /// What Enter with nothing typed asks of a finished task.
 const CARRY_ON: &str = "Continue the previous task from where it stopped. Inspect the current working tree before making further changes.";
+const NO_REPOS_TO_POLL: &str = "no [[repos]] configured, nothing to poll";
 
 /// What the input line holds: the messages sent from it and an unsent draft. Kept per working
 /// directory in the history database, so they are there when the interface opens again.
@@ -1427,7 +1428,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                             let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
                             let none = st.repos.is_empty();
                             if on && none {
-                                st.log("issues", "no [[repos]] configured, nothing to poll");
+                                st.log("issues", NO_REPOS_TO_POLL);
                             }
                         }
                         KeyCode::Char('x') if ctrl => {

@@ -55,6 +55,7 @@ enum Command {
     Retry { id: u32 },
     Choose { id: u32, option: Option<usize>, text: Option<String>, expected_revision: String },
     Plan { id: u32, operation: String, text: Option<String>, expected_revision: String },
+    LinkPlan { id: u32, workspace: String, issue: Option<String>, text: String, expected_revision: String },
     NewPlan { workspace: String, issue: String, text: String, agent: Option<AgentKind> },
     Automation { on: bool },
     AddRepo { picker: String, repo: String },
@@ -98,8 +99,18 @@ async fn apply(app: &App, cookie: &str, command: Command) -> Result<Value, (Stat
             hub.submit_with_plan(crate::state::clip(&prompt, 80), prompt, Source::Manual, repo.path.clone(), agent.map(crate::state::AgentRef::Kind), Planning::Never, Some(plan)).await.map_err(bad)?
         }
         Command::Reply { id, text: message, expected_revision } => {
+            let status = hub.job(id, |j| j.status).ok_or_else(|| (StatusCode::NOT_FOUND, "No such task".into()))?;
+            let message = if message.trim().is_empty() {
+                if status == JobStatus::Interrupted {
+                    if let Some(expected) = &expected_revision { check(id, expected)?; }
+                    hub.resume(id).await.map_err(bad)?;
+                    return Ok(json!({"id":id}));
+                }
+                if !status.finished() { return Err(bad("Enter a message".into())); }
+                crate::CARRY_ON.into()
+            } else { text(message).map_err(bad)? };
             let revision = message_revision(id, expected_revision)?;
-            hub.reply_at(id, text(message).map_err(bad)?, Some(&revision)).await.map_err(bad)?; id
+            hub.reply_at(id, message, Some(&revision)).await.map_err(bad)?; id
         }
         Command::Steer { id, text: message, expected_revision } => {
             let revision = message_revision(id, expected_revision)?;
@@ -117,15 +128,31 @@ async fn apply(app: &App, cookie: &str, command: Command) -> Result<Value, (Stat
         Command::Choose { id, option, text: own, expected_revision } => {
             check(id, &expected_revision)?;
             let (waiting, options) = hub.job(id, |j| (j.status == JobStatus::Choosing, crate::choices::for_job(j))).unwrap();
-            let choice = match (option, own) {
-                (Some(i), None) if i < options.len() => {
-                    if waiting { Choice::Option(i) } else { Choice::Own(format!("For planning, I choose option {}.", options[i].label)) }
+            let own = own.map(|s| s.trim().to_owned());
+            let choice = match (option, &own) {
+                (Some(i), _) if i < options.len() => {
+                    if waiting { Choice::Option(i) } else { Choice::Own(format!("For planning, I choose option {}.{}", options[i].label, own.as_ref().filter(|s| !s.is_empty()).map(|s| format!("\n\n{s}")).unwrap_or_default())) }
                 }
-                (None, Some(s)) => Choice::Own(text(s).map_err(bad)?),
+                (None, Some(s)) => Choice::Own(text(s.clone()).map_err(bad)?),
                 _ => return Err(bad("Select an offered option or enter your own response".into())),
             };
-            if waiting { hub.choose_at(id, choice, Some(&expected_revision)).map_err(bad)?; }
-            else if let Choice::Own(message) = choice { hub.reply_at(id, message, Some(&expected_revision)).await.map_err(bad)?; }
+            if waiting {
+                if let Some(draft) = own.filter(|s| !s.is_empty() && matches!(&choice, Choice::Option(_))) {
+                    // As in the TUI, queue the draft before the choice wakes the worker. A reply
+                    // while still Choosing would be interpreted as another choice.
+                    let (at, queued_revision) = hub.job(id, |j| {
+                        j.check_revision(Some(&expected_revision))?;
+                        let at = j.inbox.len();
+                        j.inbox.push_back(draft.clone());
+                        j.worker.push(format!("› {} (queued)", crate::state::clip(&draft, 300)));
+                        Ok::<_, String>((at, revision(j)))
+                    }).unwrap().map_err(bad)?;
+                    if let Err(e) = hub.choose_at(id, choice, Some(&queued_revision)) {
+                        hub.job(id, |j| { if j.inbox.get(at) == Some(&draft) { j.inbox.remove(at); } });
+                        return Err(bad(e));
+                    }
+                } else { hub.choose_at(id, choice, Some(&expected_revision)).map_err(bad)?; }
+            } else if let Choice::Own(message) = choice { hub.reply_at(id, message, Some(&expected_revision)).await.map_err(bad)?; }
             id
         }
         Command::Plan { id, operation, text: feedback, expected_revision } => {
@@ -144,8 +171,23 @@ async fn apply(app: &App, cookie: &str, command: Command) -> Result<Value, (Stat
             }
             id
         }
+        Command::LinkPlan { id, workspace: key, issue, text: prompt, expected_revision } => {
+            check(id, &expected_revision)?;
+            if hub.cfg.demo { return Err(bad("Issue planning is disabled in demo mode".into())); }
+            let index = key.strip_prefix("repo-").and_then(|s| s.parse::<usize>().ok()).ok_or_else(|| bad("Select a configured repository".into()))?;
+            let repo = hub.cfg.repos.get(index).ok_or_else(|| bad("Select a configured repository".into()))?;
+            let prompt = text(prompt).map_err(bad)?;
+            let plan = crate::planning::Plan::new(repo, &issue.unwrap_or_default()).map_err(bad)?;
+            hub.link_plan(id, plan, prompt).await.map_err(bad)?;
+            id
+        }
         Command::AddRepo { picker, repo } => return add_repo(app,&picker,cookie,&repo).await,
-        Command::Automation { on } => { hub.automation(on); return Ok(json!({"automation":on})); }
+        Command::Automation { on } => {
+            hub.automation(on);
+            let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+            if on && st.repos.is_empty() { st.log("issues", crate::NO_REPOS_TO_POLL); }
+            return Ok(json!({"automation":on}));
+        }
     };
     Ok(json!({"id":id}))
 }
@@ -309,7 +351,7 @@ pub(super) async fn action(State(app): State<App>, req: Request<Body>) -> Respon
     }
     let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     let action = value["action"].as_str().filter(|action| matches!(*action,
-        "submit" | "reply" | "steer" | "cancel" | "resume" | "retry" | "choose" | "plan" | "new_plan" | "automation" | "add_repo"
+        "submit" | "reply" | "steer" | "cancel" | "resume" | "retry" | "choose" | "plan" | "link_plan" | "new_plan" | "automation" | "add_repo"
     )).unwrap_or("invalid");
     let audit = |status: &str| json!({"at":chrono::Utc::now(),"actor":actor,"action":action,"target":value["id"],"revision":value["expected_revision"],"request_id":key,"status":status});
     let mut op = Operation { fingerprint, status: 409, body: json!({"error":"Operation admitted; outcome uncertain after interruption. Inspect the task before taking another action."}) };
@@ -337,6 +379,105 @@ mod tests {
     use super::*;
     use crate::{history::{History, JobRecord}, remote::feed::Feed, state::{Plan, PlanOption, StageState}};
     use std::{sync::Arc, time::Duration};
+
+    fn parity_job(hub: &Hub, id: u32, status: JobStatus) {
+        let mut job = JobRecord { id, title:"native task".into(), workdir:std::env::current_dir().unwrap(), ..Default::default() }.job();
+        job.status = status;
+        if status == JobStatus::Choosing {
+            job.plan = Some(Plan { text:"Options".into(), options:vec![PlanOption { title:"Patch".into(),summary:"Small change".into(),recommended:true }], chosen:None });
+        }
+        hub.state.lock().unwrap().jobs.push(job);
+    }
+
+    #[tokio::test]
+    async fn parity_empty_replies_resume_carry_on_or_request_a_message() {
+        let hub = Hub::new(crate::config::Config { demo:true, ..Default::default() }, tokio::runtime::Handle::current());
+        let permit = hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel.max(1) as u32).await.unwrap();
+        for (id, status) in [(901, JobStatus::Working), (902, JobStatus::Choosing), (903, JobStatus::Interrupted), (904, JobStatus::Done)] { parity_job(&hub, id, status); }
+        for id in [901, 902] {
+            let (status, body) = super::super::http::test_post(hub.clone(), json!({"action":"reply","id":id,"text":"  "}), &format!("empty-{id}")).await;
+            assert_eq!((status, body["error"].as_str()), (StatusCode::BAD_REQUEST, Some("Enter a message")));
+        }
+        for id in [903, 904] {
+            let (status, body) = super::super::http::test_post(hub.clone(), json!({"action":"reply","id":id,"text":""}), &format!("empty-{id}")).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body, json!({"id":id}));
+            assert_eq!(hub.job(id, |j| j.status).unwrap(), JobStatus::Queued);
+        }
+        assert_eq!(hub.job(904, |j| j.turns.last().unwrap().ask.clone()).unwrap(), crate::CARRY_ON);
+        for id in [903, 904] { hub.cancel(id); }
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn parity_choices_keep_the_draft_and_the_revision_guard() {
+        let hub = Hub::new(crate::config::Config { demo:true, ..Default::default() }, tokio::runtime::Handle::current());
+        let permit = hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel.max(1) as u32).await.unwrap();
+        parity_job(&hub, 902, JobStatus::Choosing);
+        let body = json!({"action":"choose","id":902,"option":0,"text":"  additional guidance  ","expected_revision":"old"});
+        assert_eq!(super::super::http::test_post(hub.clone(), body.clone(), "stale-draft").await.0, StatusCode::CONFLICT);
+        assert!(hub.job(902, |j| j.inbox.is_empty()).unwrap());
+        let mut body = body;
+        body["expected_revision"] = json!(hub.job(902, |j| revision(j)).unwrap());
+        let (status, result) = super::super::http::test_post(hub.clone(), body, "choice-draft").await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(hub.job(902, |j| j.plan.as_ref().unwrap().chosen.clone()).unwrap(), Some(Choice::Option(0)));
+        assert_eq!(hub.job(902, |j| j.inbox.iter().cloned().collect::<Vec<_>>()).unwrap(), vec!["additional guidance"]);
+        parity_job(&hub, 905, JobStatus::Done);
+        hub.job(905, |j| j.turns = vec![crate::state::Turn { ask:"Plan it".into(), answer:"Choose an option:\n1. Patch it\n2. Rewrite it".into() }]);
+        let label = hub.job(905, |j| crate::choices::for_job(j)[0].label.clone()).unwrap();
+        let body = json!({"action":"choose","id":905,"option":0,"text":"extra context","expected_revision":hub.job(905, |j| revision(j)).unwrap()});
+        let (status, result) = super::super::http::test_post(hub.clone(), body, "finished-choice-draft").await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(hub.job(905, |j| j.turns.last().unwrap().ask.clone()).unwrap(), format!("For planning, I choose option {label}.\n\nextra context"));
+        hub.cancel(905);
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn parity_intake_explains_when_no_repositories_can_be_polled() {
+        let hub = Hub::new(crate::config::Config { demo:true, ..Default::default() }, tokio::runtime::Handle::current());
+        for on in [true, false] {
+            assert_eq!(super::super::http::test_post(hub.clone(), json!({"action":"automation","on":on}), if on { "intake-on" } else { "intake-off" }).await.0, StatusCode::OK);
+            assert_eq!(hub.state.lock().unwrap().log.iter().filter(|l| l.who == "issues" && l.msg == "no [[repos]] configured, nothing to poll").count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_link_plan_uses_native_linking_revisions_roles_and_replay() {
+        let cfg = toml::from_str("[[repos]]\nprovider = \"github\"\nrepo = \"owner/repo\"\npath = \".\"\nbase = \"main\"\n").unwrap();
+        let hub = Hub::new(cfg, tokio::runtime::Handle::current());
+        let permit = hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel.max(1) as u32).await.unwrap();
+        parity_job(&hub, 904, JobStatus::Done);
+        let app = App { hub:hub.clone(),feed:Arc::new(Feed::new()),loopback:true,auth:None,writes:Default::default(),forges:Default::default() };
+        let (base, server) = add_server(app.clone(), false).await;
+        let client = reqwest::Client::new();
+        let body = json!({"action":"link_plan","id":904,"workspace":"repo-0","issue":"42","text":"Refine the existing conversation","expected_revision":"old"});
+        let post = |base: String, body: Value, key: &'static str| {
+            let client = client.clone();
+            async move {
+                let response = client.post(format!("{base}/api/v1/actions")).header("idempotency-key",key).json(&body).send().await.unwrap();
+                (response.status(), response.json::<Value>().await.unwrap())
+            }
+        };
+        assert_eq!(post(base.clone(), body.clone(), "stale-link").await.0, StatusCode::CONFLICT);
+        assert!(hub.job(904, |j| j.issue_plan.is_none()).unwrap());
+        let mut body = body;
+        body["expected_revision"] = json!(hub.job(904, |j| revision(j)).unwrap());
+        let (viewer, viewer_server) = add_server(app, true).await;
+        assert_eq!(post(viewer, body.clone(), "viewer-link").await.0, StatusCode::FORBIDDEN);
+        let (status, result) = post(base.clone(), body.clone(), "link").await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result, json!({"id":904}));
+        assert_eq!(post(base, body, "link").await, (StatusCode::OK, result));
+        assert_eq!(hub.job(904, |j| j.issue_plan.as_ref().unwrap().issue.as_ref().unwrap().key.clone()).unwrap(), "42");
+        assert!(hub.job(904, |j| j.turns.last().unwrap().ask.starts_with("Refine the existing conversation\n\nRefine this into a complete issue implementation plan")).unwrap());
+        assert_eq!(hub.job(904, |j| j.status).unwrap(), JobStatus::Queued);
+        hub.cancel(904);
+        server.abort();
+        viewer_server.abort();
+        drop(permit);
+    }
 
     #[tokio::test]
     async fn every_task_action_uses_native_hub_state_and_durable_replay() {
