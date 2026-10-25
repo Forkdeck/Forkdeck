@@ -8,6 +8,7 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "check": "tsc --noEmit",
+    "e2e": "vite build && playwright test",
     "contracts": "cd .. && cargo run -q -p forkdeck-remote-proto --example web_contracts > web/src/contracts.ts",
     "schema": "../scripts/schema.sh",
     "schema:check": "../scripts/schema.sh --check"

@@ -91,3 +91,48 @@ jobs:
 
       - name: Check documentation links and anchors
         run: node scripts/check-doc-links.mjs
+
+  browser:
+    name: Browser tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "${RUST_VERSION}" --profile minimal
+          rustup default "${RUST_VERSION}"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          package_json_file: web/package.json
+
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install web dependencies and Chromium
+        run: |
+          pnpm install --frozen-lockfile --dir web
+          pnpm --dir web exec playwright install --with-deps chromium
+
+      - name: Type-check the web UI
+        run: pnpm --dir web run check
+
+      # The daemon embeds web/dist; the committed bundle must match the source.
+      - name: Rebuild the bundle
+        run: |
+          pnpm --dir web run build
+          git diff --exit-code -- web/dist
+
+      # Each test starts its own daemon, demo or normal, plus OIDC and forge stand-ins.
+      - name: End-to-end tests
+        run: pnpm --dir web exec playwright test
