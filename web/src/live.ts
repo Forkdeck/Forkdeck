@@ -114,9 +114,11 @@ export function connect(): () => void {
     url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
     url.searchParams.set("since", String(board.value!.seq));
     const ws = socket = new WebSocket(url);
+    let opened = false;
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
       if (stopped || socket !== ws) return;
+      opened = true;
       delay = 1000;
       connection.value = "Live";
       error.value = "";
@@ -153,6 +155,8 @@ export function connect(): () => void {
     ws.onclose = () => {
       if (stopped || socket !== ws) return;
       socket = undefined;
+      // A refused upgrade hides its status (401 after the session ended); the snapshot shows it.
+      if (!opened) needsSnapshot = true;
       connection.value = "Reconnecting";
       reconnect();
     };

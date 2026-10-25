@@ -328,7 +328,7 @@ impl Plan {
     /// The options, or with none (the agent asked something instead), what the agent said.
     pub fn show_options(&self, stage: &mut Stage) {
         if self.options.is_empty() {
-            let said = self.text.rfind("<options>").map(|i| &self.text[..i]).unwrap_or(&self.text);
+            let said = without_options(&self.text);
             for l in said.lines().map(str::trim).filter(|l| !l.is_empty()) {
                 stage.push(clip(l, 400));
             }
@@ -346,6 +346,11 @@ impl Plan {
             Choice::Own(t) => format!("own approach: {}", t),
         }
     }
+}
+
+/// What an agent said before its last `<options>` block; the block itself shows as choices.
+pub fn without_options(text: &str) -> &str {
+    text.rfind("<options>").map(|i| text[..i].trim_end()).unwrap_or(text)
 }
 
 /// The options in an agent's plan: the last `<options>{...}</options>` block. Earlier blocks (a

@@ -1247,8 +1247,15 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   display: none;
 }
 @media (min-width: 700px) {
+  :root {
+    --detail-width: clamp(min(440px, 100vw - 32px), 46vw, 760px);
+  }
   .app-body {
     flex-wrap: nowrap;
+  }
+  /* An open panel must not hide Start, Agent or Plan first: the composer stops short of it. */
+  .app-body:has(.detail.open) .board-main > div:first-child {
+    margin-right: calc(var(--detail-width) + 8px);
   }
   .board-main {
     flex: 1 1 0;
@@ -1259,7 +1266,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
     right: 16px;
     bottom: 16px;
     z-index: 20;
-    width: clamp(min(440px, 100vw - 32px), 46vw, 760px);
+    width: var(--detail-width);
     max-width: none;
     height: auto;
     border: 1px solid var(--border);

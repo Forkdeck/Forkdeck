@@ -122,6 +122,20 @@ function Status() {
     </div>
   );
 }
+/** An address no page owns; "Connecting…" there would never end. */
+function NotFound() {
+  return (
+    <div class="empty" role="status">
+      <header class="app-header">
+        <Navigation />
+        <span class="grow" />
+        <Account />
+      </header>
+      <h1>forkdeck</h1>
+      <p>Page not found.</p>
+    </div>
+  );
+}
 function App() {
   useEffect(() => {
     loadIdentity();
@@ -144,7 +158,7 @@ function App() {
         <Route path="/stats" component={() => <Operational page="stats" />} />
         <Route path="/configuration" component={() => <Operational page="doctor" />} />
         <Route path="/doctor" component={MovedToConfiguration} />
-        <Route default component={Status} />
+        <Route default component={NotFound} />
       </Router>
     </LocationProvider>
   );

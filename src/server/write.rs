@@ -68,7 +68,8 @@ fn text(value: String) -> Result<String, String> {
 
 async fn apply(app: &App, cookie: &str, command: Command) -> Result<Value, (StatusCode, String)> {
     let hub = &app.hub;
-    let bad = |e: String| (if e == "stale revision" { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST }, e);
+    // The Hub's stale-revision refusal reads like the check below, not as an internal word.
+    let bad = |e: String| if e == "stale revision" { (StatusCode::CONFLICT, "This task changed; review the current revision".into()) } else { (StatusCode::BAD_REQUEST, e) };
     let check = |id, expected: &str| -> Result<(), (StatusCode, String)> {
         match hub.job(id, |j| revision(j)) {
             Some(actual) if actual == expected => Ok(()),

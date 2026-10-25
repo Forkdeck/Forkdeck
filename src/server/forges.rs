@@ -156,7 +156,10 @@ pub(super) fn valid_repo(repo: &str) -> bool {
     repo.len() <= 512 && repo.split('/').count() >= 2 && repo.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && !part.starts_with('-') && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
 }
 pub(super) fn configured(app: &App, provider: Provider, host: &str, repo: &str) -> bool {
-    app.hub.cfg.repos.iter().any(|r| r.provider == provider && r.repo == repo && repo_host(r).eq_ignore_ascii_case(host))
+    listed(&app.hub.cfg.repos, provider, host, repo)
+}
+pub(super) fn listed(repos: &[crate::config::RepoCfg], provider: Provider, host: &str, repo: &str) -> bool {
+    repos.iter().any(|r| r.provider == provider && r.repo == repo && repo_host(r).eq_ignore_ascii_case(host))
 }
 pub(super) fn repo_host(repo: &crate::config::RepoCfg) -> &str {
     if repo.host.is_empty() { match repo.provider { Provider::Github => "github.com", Provider::Gitlab => "gitlab.com" } } else { &repo.host }
@@ -167,12 +170,15 @@ pub(super) async fn providers(State(app): State<App>, principal: Option<axum::Ex
     Json(json!({"providers":providers,"can_add":can_add(principal.as_ref().map(|p| &p.0))})).into_response()
 }
 pub(super) async fn picker(State(app): State<App>, Path(picker_id): Path<String>, headers: HeaderMap) -> Response {
+    // A repository added from a picker is in the config file, not the running config, until a restart.
+    let path = app.hub.config_path.lock().unwrap().clone();
+    let written = tokio::task::spawn_blocking(move || path.and_then(|p| crate::config::load(Some(&p)).ok()).map(|c| c.0.repos).unwrap_or_default()).await.unwrap_or_default();
     let mut store = app.forges.lock().unwrap();
     store.prune();
     let Some(p) = store.pickers.iter().find(|p| p.id == picker_id && p.binding == hash(&binding(&headers))) else { return StatusCode::NOT_FOUND.into_response() };
     let repos: Vec<_> = p.repos.iter().map(|r| {
         let mut value = serde_json::to_value(r).unwrap();
-        value["configured"] = json!(configured(&app,p.provider,&p.host,&r.repo));
+        value["configured"] = json!(configured(&app,p.provider,&p.host,&r.repo) || listed(&written,p.provider,&p.host,&r.repo));
         value
     }).collect();
     Json(json!({"provider":id(p.provider),"host":p.host,"expires_unix":p.expires,"repos":repos})).into_response()

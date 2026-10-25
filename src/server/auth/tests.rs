@@ -48,6 +48,7 @@ async fn token(State(p): State<Arc<Provider>>, Form(q): Form<HashMap<String,Stri
         "missing" => claims["groups"] = json!(["outsiders"]),
         "userinfo" | "userinfo-subject" | "userinfo-missing" => {},
         "malformed" => claims["groups"] = json!("readers"),
+        "capture-viewer" => claims["groups"] = json!(["readers"]),
         _ => claims["groups"] = json!(["readers", "admins"]),
     }
     let key = if p.mode == "rotation" { &p.rotated } else { &p.key };
@@ -89,14 +90,15 @@ impl Fixture {
         let routes = Router::new().route("/.well-known/openid-configuration", get(discovery)).route("/jwks", get(jwks)).route("/authorize", get(authorize)).route("/token", post(token)).route("/userinfo", get(userinfo)).with_state(provider.clone());
         let provider_task = tokio::spawn(async move { axum::serve(listener, routes).await.unwrap(); });
         let mut cfg: OidcCfg = serde_json::from_value(json!({"issuer":base,"client_id":"forkdeck-test","client_secret_env":"FORKDECK_TEST_SECRET","redirect_url":"https://forkdeck.example/auth/callback","groups_claim":if mode == "nested" {"realm_access.roles"} else {"groups"},"roles":{"viewer":["readers"],"operator":["operators"],"admin":["admins"]}})).unwrap();
-        if mode == "capture" { cfg.redirect_url = std::env::var("FORKDECK_CAPTURE_ORIGIN").unwrap() + "/auth/callback"; }
+        let capture = mode.starts_with("capture");
+        if capture { cfg.redirect_url = std::env::var("FORKDECK_CAPTURE_ORIGIN").unwrap() + "/auth/callback"; }
         cfg.validate().unwrap();
         let path = std::env::temp_dir().join(format!("forkdeck-oidc-{}",random()));
         let history = Arc::new(History::open(&path.join("history.db")).unwrap());
         let auth = Auth::connect(cfg, history, "test-secret".into()).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let router = crate::server::http::auth_test_router(auth.clone(), mode == "capture");
+        let router = crate::server::http::auth_test_router(auth.clone(), capture);
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
         Self { auth, provider, base, client: reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap(), tasks: vec![task,provider_task], path }
     }
@@ -175,6 +177,10 @@ async fn protects_all_pages_and_api_and_sessions_survive_restart() {
     for path in ["/api", "/api/v1/snapshot", "/api/v1/live", "/api/unknown"] {
         assert_eq!(f.client.get(format!("{}{path}",f.base)).send().await.unwrap().status(),StatusCode::UNAUTHORIZED);
     }
+    let favicon = f.client.get(format!("{}/favicon.svg",f.base)).header("sec-fetch-mode","no-cors").send().await.unwrap();
+    assert_eq!(favicon.status(),StatusCode::UNAUTHORIZED,"a subresource must not start a sign-in");
+    let page = f.client.get(format!("{}/plans",f.base)).header("sec-fetch-mode","navigate").send().await.unwrap();
+    assert_eq!(page.headers()[header::LOCATION],"/auth/login");
     let cookie = f.session().await;
     let mut headers = HeaderMap::new();
     headers.insert(header::COOKIE,cookie.parse().unwrap());
@@ -211,6 +217,8 @@ async fn logout_and_expiry_end_sessions_and_the_live_socket() {
             assert_eq!(f.client.post(format!("{}/auth/logout",f.base)).header(header::COOKIE,&cookie).header(header::ORIGIN,"https://evil.example").send().await.unwrap().status(),StatusCode::FORBIDDEN);
             let logout = f.client.post(format!("{}/auth/logout",f.base)).header(header::COOKIE,&cookie).header(header::ORIGIN,"https://forkdeck.example").send().await.unwrap();
             assert_eq!(logout.status(),StatusCode::OK);
+            // Browsers send the page's Origin on the sign-out form only when the policy allows it.
+            assert_eq!(logout.headers()["referrer-policy"],"same-origin");
             assert!(logout.headers()[header::SET_COOKIE].to_str().unwrap().contains("Max-Age=0"));
             assert!(logout.text().await.unwrap().contains("href=\"/auth/login\""));
         }
@@ -245,11 +253,13 @@ async fn a_new_signin_ends_the_previous_browser_session() {
     assert_eq!(f.client.get(format!("{}/api/v1/me",f.base)).header(header::COOKIE,cookie).send().await.unwrap().status(),StatusCode::UNAUTHORIZED);
 }
 
-// Opt-in browser fixture: the capture script supplies a loopback HTTPS proxy for Secure cookies.
+// Opt-in browser fixture: the capture script and browser tests supply a loopback HTTPS proxy for
+// Secure cookies. FORKDECK_CAPTURE_ROLE=viewer signs in a member who may only read.
 #[tokio::test]
-#[ignore = "started by web/scripts/screenshots.mjs"]
+#[ignore = "started by web/scripts/screenshots.mjs and web/e2e"]
 async fn screenshot_provider() {
-    let f = Fixture::new("capture").await;
+    let viewer = std::env::var("FORKDECK_CAPTURE_ROLE").as_deref() == Ok("viewer");
+    let f = Fixture::new(if viewer { "capture-viewer" } else { "capture" }).await;
     println!("Forkdeck capture fixture: {}", f.base);
     tokio::task::spawn_blocking(|| {
         let mut line = String::new();

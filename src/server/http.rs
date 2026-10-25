@@ -48,7 +48,10 @@ async fn authenticated(State(app): State<App>, mut req: Request<Body>, next: Nex
         match auth.session(req.headers()).await {
             Ok(Some(principal)) => { req.extensions_mut().insert(principal); }
             Ok(None) => {
-                return if req.uri().path() == "/api" || req.uri().path().starts_with("/api/") {
+                // Only a page load starts a sign-in. A browser's subresource request (the favicon on
+                // the signed-out page) would otherwise replace the flow the user is about to start.
+                let subresource = req.headers().get("sec-fetch-mode").is_some_and(|m| m != "navigate");
+                return if subresource || req.uri().path() == "/api" || req.uri().path().starts_with("/api/") {
                     StatusCode::UNAUTHORIZED.into_response()
                 } else { axum::response::Redirect::to("/auth/login").into_response() };
             }
@@ -170,7 +173,9 @@ async fn security(req: Request<Body>, next: Next) -> Response {
     let h = response.headers_mut();
     h.insert("x-content-type-options", "nosniff".parse().unwrap());
     h.insert("x-frame-options", "DENY".parse().unwrap());
-    h.insert("referrer-policy", "no-referrer".parse().unwrap());
+    // Not no-referrer: under it browsers send `Origin: null` on same-origin form posts, which the
+    // sign-out Origin check must refuse. same-origin still sends nothing to other sites.
+    h.insert("referrer-policy", "same-origin".parse().unwrap());
     h.insert("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'".parse().unwrap());
     response
 }

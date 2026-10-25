@@ -194,6 +194,8 @@ try {
     await page.keyboard.press('F6');
     await expect(page).toHaveURL(`${base}/plans`);
     await page.goto(base);
+    // The key handler mounts with the board; a key pressed before that goes to the browser.
+    await page.locator('.job-card').first().waitFor();
     await page.keyboard.press('?');
     await expect(page.getByRole('dialog')).toBeVisible();
     await expect(page.getByRole('heading', { name: 'Keyboard shortcuts', exact: true })).toBeInViewport();

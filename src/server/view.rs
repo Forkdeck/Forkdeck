@@ -60,7 +60,8 @@ pub fn detail(hub: &Hub, feed: &Feed, id: u32) -> Option<Value> {
     let board = snapshot(hub, feed);
     v["board"] = board["jobs"].as_array()?.iter().find(|j| j["id"] == id)?.clone();
     hub.job(id, |j| {
-        v["prompt_title"] = json!(crate::ui::prompt_title(j));
+        // The browser keeps Ctrl-T for a new tab; n (outside text fields) starts a new task.
+        v["prompt_title"] = json!(crate::ui::prompt_title(j).replace("Ctrl-T new task", "n new task"));
         let url = match &j.source { crate::state::Source::Issue { url, .. } | crate::state::Source::Pr { url, .. } => url.as_str(), _ => "" };
         v["source"] = json!({"url":url,"branch":j.branch.as_deref().unwrap_or(""),"workdir":j.workdir.display().to_string()});
         v["revision"] = json!(super::write::revision(j));
@@ -155,7 +156,8 @@ pub(super) fn board(j: &Job, st: &crate::state::State) -> forkdeck_remote_proto:
     }).map(|l| vec![l.time.clone(), l.who.clone(), l.msg.clone()]).collect();
     log.extend(j.worker.tail.iter().enumerate().map(|(i, s)| vec![j.worker.tail_times.get(i).cloned().unwrap_or_default(), "worker".into(), s.clone()]));
     log.extend(j.reviewer.tail.iter().enumerate().map(|(i, s)| vec![j.reviewer.tail_times.get(i).cloned().unwrap_or_default(), "review".into(), s.clone()]));
-    log.extend(j.turns.iter().flat_map(|t| [vec![String::new(), "you".into(), t.ask.clone()], vec![String::new(), "agent".into(), t.answer.clone()]]));
+    // A planning answer's options block shows as the choices, as in the terminal.
+    log.extend(j.turns.iter().flat_map(|t| [vec![String::new(), "you".into(), t.ask.clone()], vec![String::new(), "agent".into(), crate::state::without_options(&t.answer).to_string()]]));
     if !j.outcome.is_empty() { log.push(vec![String::new(), "queue".into(), j.outcome.clone()]); }
     let warn = if unverified {
         let refused = if j.worker.refused.is_empty() { String::new() } else { format!(" Worker was not allowed: {}.", j.worker.refused.join("; ")) };
@@ -210,15 +212,15 @@ mod tests {
     }
 
     #[test]
-    fn detail_prompt_titles_match_the_terminal() {
+    fn detail_prompt_titles_match_the_terminal_with_browser_keys() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let hub = seeded(&rt);
         let feed = Feed::new();
         for (status, title) in [
-            (JobStatus::Choosing, "Choose for #70 · a number, or your own approach · F5 options · Ctrl-T new task"),
-            (JobStatus::Interrupted, "Reply to #70 · Enter with nothing typed resumes it · Ctrl-T new task"),
-            (JobStatus::Working, "Message #70 · 1 queued · Enter to queue · Ctrl-S now · Ctrl-T new task"),
-            (JobStatus::Done, "Reply to #70 · 1 queued · Enter to send · Ctrl-T new task"),
+            (JobStatus::Choosing, "Choose for #70 · a number, or your own approach · F5 options · n new task"),
+            (JobStatus::Interrupted, "Reply to #70 · Enter with nothing typed resumes it · n new task"),
+            (JobStatus::Working, "Message #70 · 1 queued · Enter to queue · Ctrl-S now · n new task"),
+            (JobStatus::Done, "Reply to #70 · 1 queued · Enter to send · n new task"),
         ] {
             hub.job(70, |j| { j.status = status; j.inbox.clear(); j.inbox.push_back("follow-up".into()); });
             assert_eq!(detail(&hub, &feed, 70).unwrap()["prompt_title"], title);
