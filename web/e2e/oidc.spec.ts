@@ -42,15 +42,21 @@ test("an unauthenticated visit goes through the provider and comes back signed i
 test("signing out ends the session and closes the live socket", async ({ page, admin }) => {
   await page.goto(admin.url + "/");
   await expect(page.locator(".connection")).toContainText("Live");
-  let closed = false;
-  page.on("websocket", ws => ws.on("close", () => { closed = true; }));
-  await page.reload();
-  await expect(page.locator(".connection")).toContainText("Live");
+  // A socket of the same session in a tab that stays put: signing out must close it from the
+  // server. The signing-out page's own socket goes with its navigation, which proves nothing.
+  const watcher = await page.context().newPage();
+  await watcher.goto(admin.url + "/plans");
+  await watcher.evaluate(url => new Promise<void>((resolve, reject) => {
+    const socket = new WebSocket(url);
+    socket.onopen = () => resolve();
+    socket.onerror = () => reject(new Error("live socket refused"));
+    socket.onclose = () => { (window as any).liveClosed = true; };
+  }), admin.url.replace(/^https/, "wss") + "/api/v1/live");
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.getByRole("link", { name: "Sign in", exact: true })).toBeVisible();
   expect((await page.request.get(admin.url + "/api/v1/me")).status()).toBe(401);
   expect((await page.request.get(admin.url + "/api/v1/snapshot")).status()).toBe(401);
-  await expect.poll(() => closed).toBe(true);
+  await expect.poll(() => watcher.evaluate(() => (window as any).liveClosed === true)).toBe(true);
 });
 
 test.describe("a session ended elsewhere", () => {
