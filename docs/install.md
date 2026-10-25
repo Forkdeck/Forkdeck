@@ -12,8 +12,8 @@ with a `.sha256` checksum and a CycloneDX SBOM (`.cdx.json`, also inside the
 archive as `SBOM.cdx.json`) listing every crate built into the binary:
 
 ```
-sha256sum --check forkdeck-v0.2.0-linux-amd64.tar.gz.sha256
-tar -xzf forkdeck-v0.2.0-linux-amd64.tar.gz
+sha256sum --check forkdeck-v0.3.0-linux-amd64.tar.gz.sha256
+tar -xzf forkdeck-v0.3.0-linux-amd64.tar.gz
 ```
 
 You need at least one of `claude`, `codex` and `copilot` on your PATH. With

@@ -39,7 +39,7 @@ audit entries. Publication and decision controls retain their native eligibility
 | Repos | [View](repos-1440x900.png) | — |
 | Deploys | [View](deploys-1440x900.png) | — |
 | Stats | [View](stats-1440x900.png) | — |
-| Configuration | [View](doctor-1440x900.png) | — |
+| Configuration | [View](configuration-1440x900.png) | — |
 
 ![Selected working job](board-1440x900.png)
 
@@ -68,7 +68,7 @@ Stats use the copied native journal and attempt records. No demo content is adde
 | Repos | [View](real-repos-1440x900.png) | — |
 | Deploys | [View](real-deploys-1440x900.png) | — |
 | Stats | [View](real-stats-1440x900.png) | — |
-| Configuration | [View](real-doctor-1440x900.png) | — |
+| Configuration | [View](real-configuration-1440x900.png) | — |
 
 ## Optional OIDC
 

@@ -7,8 +7,11 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import https from "node:https";
 import http from "node:http";
+import net from "node:net";
 import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
+import { ByteBuffer } from "flatbuffers";
+import { Frame, Snapshot } from "../src/wire/forkdeck/web.ts";
 const root = path.resolve(import.meta.dirname, "../..");
 const outputDir = path.join(root, "docs/screenshots");
 const binary =
@@ -209,9 +212,13 @@ cmd = "/unavailable-for-history-capture"
     page.on("pageerror", (e) => errors.push(String(e)));
     await page.goto(base + "/");
     await page.waitForSelector(".job-card");
-    const snapshot = await page.evaluate(async () =>
-      (await fetch("/api/v1/snapshot")).json(),
-    );
+    // The snapshot is a FlatBuffers frame, decoded with the same generated code as the board.
+    const bytes = await (await page.request.get(base + "/api/v1/snapshot")).body();
+    const body = Frame.getRootAsFrame(new ByteBuffer(new Uint8Array(bytes))).body(new Snapshot());
+    const snapshot = {
+      automation: body.automation(),
+      jobs: Array.from({ length: body.jobsLength() }, (_, i) => body.jobs(i)).map((j) => ({ id: j.id(), title: j.title(), state: j.state(), kind: j.kind() })),
+    };
     const selected = real
       ? snapshot.jobs
           .filter((j) => j.state === "unverified")
@@ -219,7 +226,7 @@ cmd = "/unavailable-for-history-capture"
       : snapshot.jobs.find((j) => j.kind === "manual" && ["working", "planning", "reviewing"].includes(j.state));
     if (!selected) throw new Error("No job for detail capture");
     if (!real) {
-      // Exercise a native write before the Doctor capture; the audit is actual service data.
+      // Exercise a native write before the Configuration capture; the audit is actual service data.
       for (const on of [!snapshot.automation, snapshot.automation]) {
         const response = await page.request.post(base + "/api/v1/actions", {
           headers: { "Idempotency-Key": `capture-intake-${on}` },
@@ -240,13 +247,13 @@ cmd = "/unavailable-for-history-capture"
       for (const tab of ["Tasks", "Plan", "Review"])
         captures.push([`plans-${tab.toLowerCase()}`, planUrl, width, height, plan ? tab : null]);
     }
-    for (const name of ["repos", "deploys", "stats", "doctor"])
+    for (const name of ["repos", "deploys", "stats", "configuration"])
       captures.push([name, `/${name}`, 1440, 900]);
     for (const [name, url, width, height, tab] of captures) {
       const file = `${prefix}${name}-${width}x${height}.png`;
       await page.setViewportSize({ width, height });
       await page.goto(base + url);
-      if (["repos", "deploys", "stats", "doctor"].includes(name)) {
+      if (["repos", "deploys", "stats", "configuration"].includes(name)) {
         await page.waitForFunction(() => !document.querySelector('[role="status"]'));
         await page.locator("main h1").waitFor();
       } else if (name.startsWith("plans")) {
@@ -267,7 +274,7 @@ cmd = "/unavailable-for-history-capture"
       if (!real && name === "board" && width >= 700) {
         // Unsent drafts come from the selected native task; no response fixtures are introduced.
         await page.getByRole("textbox", { name: "New task", exact: true }).fill(selected.title);
-        await page.getByRole("textbox", { name: "Reply to this task", exact: true }).fill(selected.title);
+        await page.getByRole("complementary", { name: "Job detail" }).getByRole("textbox").first().fill(selected.title);
         if (!(await page.getByRole("button", { name: "Send now", exact: true }).isEnabled())) throw new Error("Writable controls disabled");
       }
       await save(page, file);
@@ -302,6 +309,8 @@ async function save(page, file) {
     const header = document.querySelector(".app-header");
     if (detail && detail.getBoundingClientRect().top < (header?.getBoundingClientRect().bottom ?? 0)) issues.push("detail heading clipped by header");
     for (const node of document.querySelectorAll(".reply-form input, .reply-form button")) {
+      // A closed floating detail panel waits off-screen.
+      if (node.closest(".detail:not(.open)")) continue;
       const r = node.getBoundingClientRect();
       if (r.x < 0 || r.y < 0 || r.right > innerWidth + 1 || r.bottom > innerHeight + 1)
         issues.push(`reply control outside viewport: ${node.textContent || "input"}`);
@@ -320,6 +329,7 @@ async function captureOidc() {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "forkdeck-oidc-capture-"));
   let fixture;
   let proxy;
+  const tunnels = new Set();
   try {
     execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", path.join(temp, "key.pem"), "-out", path.join(temp, "cert.pem"), "-days", "1", "-subj", "/CN=localhost"], { stdio: "ignore" });
     let upstream;
@@ -330,6 +340,19 @@ async function captureOidc() {
       });
       forwarded.on("error", (error) => res.destroy(error));
       req.pipe(forwarded);
+    });
+    // The live socket is an upgrade; pipe it through unchanged.
+    proxy.on("upgrade", (req, socket, head) => {
+      const target = new URL(upstream);
+      tunnels.add(socket);
+      socket.on("close", () => tunnels.delete(socket));
+      const backend = net.connect(Number(target.port), target.hostname, () => {
+        backend.write(`${req.method} ${req.url} HTTP/1.1\r\n${Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join("\r\n")}\r\n\r\n`);
+        backend.write(head);
+        socket.pipe(backend).pipe(socket);
+      });
+      backend.on("error", () => socket.destroy());
+      socket.on("error", () => backend.destroy());
     });
     proxy.listen(0, "127.0.0.1");
     await once(proxy, "listening");
@@ -356,7 +379,7 @@ async function captureOidc() {
       await save(page, "oidc-sign-in-1440x900.png");
       await page.getByRole("link", { name: "Sign in", exact: true }).click();
       await page.locator(".signed-in").getByText("Test member", { exact: true }).waitFor();
-      await page.locator(".job-card.selected").waitFor();
+      await page.locator(".job-card").first().waitFor();
       await save(page, "oidc-board-1440x900.png");
       await page.setViewportSize({ width: 390, height: 844 });
       await page.reload();
@@ -369,7 +392,8 @@ async function captureOidc() {
       fixture.stdin.end("\n");
       await ended;
     }
-    if (proxy) await new Promise((resolve) => proxy.close(resolve));
+    for (const tunnel of tunnels) tunnel.destroy();
+    if (proxy) { proxy.closeAllConnections(); await new Promise((resolve) => proxy.close(resolve)); }
     fs.rmSync(temp, { recursive: true, force: true });
   }
 }

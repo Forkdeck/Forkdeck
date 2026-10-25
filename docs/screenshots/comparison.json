@@ -4,23 +4,23 @@
     {
       "capture": "board-1440x900.png",
       "reference": "Main.dc.html",
-      "different_pixels": 217466,
+      "different_pixels": 757388,
       "total_pixels": 1296000,
-      "different_percent": 16.78
+      "different_percent": 58.44
     },
     {
       "capture": "plans-tasks-1440x900.png",
       "reference": "Plan.dc.html",
-      "different_pixels": 245941,
+      "different_pixels": 642931,
       "total_pixels": 1296000,
-      "different_percent": 18.977
+      "different_percent": 49.609
     },
     {
       "capture": "board-390x844.png",
       "reference": "Phone.dc.html",
-      "different_pixels": 147777,
+      "different_pixels": 198946,
       "total_pixels": 329160,
-      "different_percent": 44.895
+      "different_percent": 60.441
     }
   ],
   "captures": [
@@ -28,49 +28,49 @@
       "path": "board-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "e205b386a205e62f77618c06f4bdc8bcabf656759c2180c96c7d5bcfe9fa5d5d"
+      "sha256": "a25b0ea51fdcf4d6af428802c7f476aceb7c64b53a43608d606130bd0ca433d1"
     },
     {
       "path": "board-390x844.png",
       "width": 390,
       "height": 844,
-      "sha256": "1f113cc0f7428d48dd37e158ec3e1303ceec6aa060418f4c1bcd4e0c447b0eb1"
+      "sha256": "6c5fd7aca0a09f6e1fde8923af049314e73f85a4d5233158a5d7ddf872696e61"
+    },
+    {
+      "path": "configuration-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "93c6d0129b5a9d361336b94aef0bd5b99989a1be0c4235c8ed347d5d030c7685"
     },
     {
       "path": "deploys-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "f36734cdcd5c9c04f6889802fa2e4b581f5c530e05a3d2a425c27f023f65f63c"
+      "sha256": "fba296431ebe8a2b28d49e8649db2468ddd6bd516e866baee18afac15961c31a"
     },
     {
       "path": "detail-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "cbf5de608d6d8b7ee3ad7b7fe38d40d8cb21e7a1c1f18964e6da3e36cdf41f5d"
+      "sha256": "b31a47ff89942bf2b10c3a1625500d05692e766bd14d7065c8e852819565982a"
     },
     {
       "path": "detail-390x844.png",
       "width": 390,
       "height": 844,
-      "sha256": "20c4374d3b3aac0018ea9efbef0327d09c2a77eb3936ecc12d7399063257e2fd"
-    },
-    {
-      "path": "doctor-1440x900.png",
-      "width": 1440,
-      "height": 900,
-      "sha256": "78a0cd6f09da8b0b10837aad0cb6658ceae96556bf306ae56f8c6499f3506f90"
+      "sha256": "bd27028f9b16aa16b4eeee2b570ff6f6fb379fa9c5278e2debce965522704e20"
     },
     {
       "path": "oidc-board-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "96d7fadca4ae2c2907d0d8ce1022850bd3fcd61cac0c54126569a80d4ceeb12a"
+      "sha256": "89afb9d046b44c7cb255dfa3783e6e8f5b378992332ccd587d9d6562b3dbb8b2"
     },
     {
       "path": "oidc-board-390x844.png",
       "width": 390,
       "height": 844,
-      "sha256": "3400b8e628f283939edb653bbdea0061ea69dea002aec3218edde20784063214"
+      "sha256": "5804849515f4ba9fa3c9b51fe18e83aef644ae04758b161c4f4e8a8a6032b7be"
     },
     {
       "path": "oidc-sign-in-1440x900.png",
@@ -82,133 +82,133 @@
       "path": "plans-plan-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "833e04ffe1953a93434d7b342138549df1efb1fd3ecd29837f1ff2e9309a9263"
+      "sha256": "c7b56327f70fb34b337d22868cc9f174a761ad2932e63cf18f80b181d969b854"
     },
     {
       "path": "plans-plan-390x844.png",
       "width": 390,
       "height": 844,
-      "sha256": "df9870908ef5f236186d2bce10b0b4d699522d20deeea37c5b382f963af036ae"
+      "sha256": "99e34471120a3809c997cc44aab1b81b4a115778167b805e1f6daaa8598023f2"
     },
     {
       "path": "plans-review-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "92618d26e29d11b9a72b98e3847bea51f77a0079b6f3069d74b2c82665ceef1a"
+      "sha256": "be8c7f04e961e0283b9e8131dd8d85cbd63af1b237b4725d81de29488b838d4e"
     },
     {
       "path": "plans-review-390x844.png",
       "width": 390,
       "height": 844,
-      "sha256": "c0da5b08ca008d87762fdb0575348fdaf22b1350469b9897401f76a55d33b273"
+      "sha256": "98f099dd70507d000f9ccc471cdcb5b0545592137fa0186a81572e92b9ec43d6"
     },
     {
       "path": "plans-tasks-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "8d951347dfa9b13c1f62e6731c0c0a7419f0ec78df2a37523a407ea6ad39a0ca"
+      "sha256": "1138103675a555123e6301a93bbd220207dd66fbd728fcf7a9046563d00537e2"
     },
     {
       "path": "plans-tasks-390x844.png",
       "width": 390,
       "height": 844,
-      "sha256": "5cb0a227389ee02c0edcf11a7b1c10836f61752753f760e3cf53fc63dc3316d0"
+      "sha256": "f6e4370e7fca2b5e6185413dbe844a35dd95a89f15511323c0a64a2024298c5d"
     },
     {
       "path": "real-board-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "efe7f3bca58dead6c2a4f002d84fe9866490f46f7c04a47bc907c37149d3dc79"
+      "sha256": "1d588a7030a5ce6a8f563af80e5a1f2bcc68fa8f201c2a2a0637d036b7a8bbd7"
     },
     {
       "path": "real-board-390x844.png",
       "width": 390,
       "height": 844,
-      "sha256": "3f3ddce676508671447303cac449dc9243df70f098031fd4123700d5898f3790"
+      "sha256": "e04bf7c978b435709a5d460d8020f7d72d707c5f03c294339ba3dbb5b0f536be"
+    },
+    {
+      "path": "real-configuration-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "6a2f576030cd27373cf01d40deb7ccc0acd5e38a27f1eb3a9c31a3b39d646c4c"
     },
     {
       "path": "real-deploys-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "7ce6e41213091f72e87b9c6b132274f1235ff7f74b4b3f418ad5943b0e622dc1"
+      "sha256": "f898cef1b72db4fb329d59d14d0fa80756b0fbaf60d2e8a3c6f3295148e8c91b"
     },
     {
       "path": "real-detail-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "05b9ba009cdb08cdaeae1d580957c1a5de5a101069b1927ff5672679d76dbc15"
+      "sha256": "811ddaebba8fba5d3a86baa81d3ad4427b81db136368d01a1e64ef362d758659"
     },
     {
       "path": "real-detail-390x844.png",
       "width": 390,
       "height": 844,
-      "sha256": "4281cd95efcd6fb89f3c0caa6ac88c2695c8feea278ed3bf547f459c414e62f7"
-    },
-    {
-      "path": "real-doctor-1440x900.png",
-      "width": 1440,
-      "height": 900,
-      "sha256": "22a2545b3b80cc7f33b4e5ebbb9f236b33f7580087f8b49669baeafa5f9409e8"
+      "sha256": "daac8d78041005d7662128102d4010ea7e9eb93b7053da2953ef146573b74ed5"
     },
     {
       "path": "real-plans-plan-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "eb7328298e71be35620cb07b3b230993997cf8a95ff2c291a236f8e900752b63"
+      "sha256": "8ac438fa3151e1577fda37d04380dc00fb97c58901ce133c0f8df0007bdb8090"
     },
     {
       "path": "real-plans-plan-390x844.png",
       "width": 390,
       "height": 844,
-      "sha256": "f179ff1390fd5cdf9231f8608b9645873709eaf06d6728995dc82baf1183e8c8"
+      "sha256": "7f0af2762e664b201580425d43eb0ce3f8a3f210a9cc4248515c241a31afd283"
     },
     {
       "path": "real-plans-review-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "65e607285489f058eb2b7576a97fcd06fecc2f4c3a276b0a0c9342915443323f"
+      "sha256": "78a04895a68fa8c08c1d462019a6fadfeee2795e049e76cbb5707b0fe90ec7e1"
     },
     {
       "path": "real-plans-review-390x844.png",
       "width": 390,
       "height": 844,
-      "sha256": "08276f56c8cb5f87addaa14dab852575acfd96ac77b234209f4de16fe891a8c5"
+      "sha256": "f7de3270a8cfca7d12bbd3d8dddd4fc4d9ef6edf542fbf6d773598b4c4fa43b7"
     },
     {
       "path": "real-plans-tasks-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "135cb8ad44f312adffa15ca63d2155c46cdd05be6072a5d126a8b44e8bcfaae5"
+      "sha256": "702ecddc15ff9ef7f1433bfee43c23c331ec238900424b0af22eb919d17aeb80"
     },
     {
       "path": "real-plans-tasks-390x844.png",
       "width": 390,
       "height": 844,
-      "sha256": "6cec53f51db52bbd06934166d98b391fdf136fefd4cdb5a9b7845071d331074b"
+      "sha256": "102b84ad54cf8835ac6f12ec1698c4b9b0e28840503fcf8e69c71fead8cf5a9d"
     },
     {
       "path": "real-repos-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "2b7fd9be3bbdbe8e81f19cd46242d9a4df68b03792d3cbcc635b6f2068b22925"
+      "sha256": "70e60f94073185a64703139c07e5fc50a4a223bd5e42045a4ebcf0358dca424b"
     },
     {
       "path": "real-stats-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "44cdc7a330c6a90acbf69e061ef40c3cc5b0a34959143387c487d9d0547e5fcb"
+      "sha256": "7f672f058b7e12217b82e0ef997122cec1b4843c993a91b910cdfd352fdda0e1"
     },
     {
       "path": "repos-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "8be854b9d860f8f5ba3713691478f043fcba1c6f4ef1471287a8fff0ba1e8983"
+      "sha256": "b58e96e7e7cc1a7fc8862ad39342942e8bb3d887f463dcb6ba4fd5fc060f1e56"
     },
     {
       "path": "stats-1440x900.png",
       "width": 1440,
       "height": 900,
-      "sha256": "d5d0f46084c40731ba9d0e3fb3aeeabe62f7d29111c8a63193d8aac2cbe5e7c8"
+      "sha256": "858962f7ad306c11297fbe7fc9c8af3d7b6f0d9f820de41b66948dc3223f9fea"
     },
     {
       "path": "team.png",

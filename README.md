@@ -44,8 +44,10 @@ See [terminal controls](docs/terminal.md) and [how a job runs](docs/jobs.md).
 
 For the browser board, run `forkdeck serve` in the clone and open
 <http://127.0.0.1:7420/>. There is no login by default. The browser starts tasks, queues replies, steers
-running agents, and controls issue intake through the same Hub as the terminal. `forkdeck serve --demo` shows seeded native jobs.
-See [web UI and daemon](docs/web-ui.md) for server settings and optional OIDC.
+running agents, plans issues and controls issue intake through the same Hub as the terminal, with the
+terminal's keys. Repositories can be added from a GitHub or GitLab picker. `forkdeck serve --demo` shows seeded native jobs.
+See [web UI and daemon](docs/web-ui.md) for server settings and optional OIDC, and
+[forge pickers](docs/web-ui-forges.md) for the repository picker.
 
 Issue automation needs `gh` and/or `glab`, logged in, and a configured repository.
 Read [configuration](docs/configuration.md) and [issues and pull requests](docs/issues-and-prs.md)
