@@ -149,7 +149,11 @@ async fn apply(app: &App, cookie: &str, command: Command) -> Result<Value, (Stat
                         Ok::<_, String>((at, revision(j)))
                     }).ok_or_else(|| (StatusCode::NOT_FOUND, "No such task".to_string()))?.map_err(bad)?;
                     if let Err(e) = hub.choose_at(id, choice, Some(&queued_revision)) {
-                        hub.job(id, |j| { if j.inbox.get(at) == Some(&draft) { j.inbox.remove(at); } });
+                        // The tail only grows, so the dropped draft is marked rather than unprinted.
+                        hub.job(id, |j| {
+                            if j.inbox.get(at) == Some(&draft) { j.inbox.remove(at); }
+                            j.worker.push(format!("› {} (not sent)", crate::state::clip(&draft, 300)));
+                        });
                         return Err(bad(e));
                     }
                 } else { hub.choose_at(id, choice, Some(&expected_revision)).map_err(bad)?; }
@@ -179,7 +183,7 @@ async fn apply(app: &App, cookie: &str, command: Command) -> Result<Value, (Stat
             let repo = hub.cfg.repos.get(index).ok_or_else(|| bad("Select a configured repository".into()))?;
             let prompt = text(prompt).map_err(bad)?;
             let plan = crate::planning::Plan::new(repo, &issue.unwrap_or_default()).map_err(bad)?;
-            hub.link_plan(id, plan, prompt).await.map_err(bad)?;
+            hub.link_plan_at(id, plan, prompt, Some(&expected_revision)).await.map_err(bad)?;
             id
         }
         Command::AddRepo { picker, repo } => return add_repo(app,&picker,cookie,&repo).await,

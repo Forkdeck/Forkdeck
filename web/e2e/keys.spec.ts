@@ -70,6 +70,30 @@ test("Alt-↑/↓ step through jobs; Alt-←/→ jump lanes; F2 opens and closes
   await expect(detail(page)).not.toHaveClass(/open/);
 });
 
+test("text fields keep Shift-Tab and Escape; Escape that closes help keeps the panel", async ({ page }) => {
+  await live(page, "/jobs/73");
+  const panel = detail(page);
+  const reply = panel.getByRole("textbox");
+  await reply.fill("keep this draft");
+  await reply.press("Escape");
+  await expect(page).toHaveURL(/\/jobs\/73$/);
+  await expect(reply).toHaveValue("keep this draft");
+  await panel.locator(".detail-title").click();
+  await page.keyboard.press("?");
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page).toHaveURL(/\/jobs\/73$/);
+  await page.keyboard.press("Escape");
+  await expect(page).toHaveURL(/\/$/);
+  const plan = page.getByRole("checkbox", { name: "Plan first" });
+  const agent = page.getByRole("combobox", { name: "Agent" });
+  await agent.focus();
+  await page.keyboard.press("Shift+Tab");
+  await expect(plan).not.toBeChecked();
+  await expect(page.getByRole("combobox", { name: "Workspace" })).toBeFocused();
+});
+
 test("F4 opens Repositories and F6 issue plans", async ({ page }) => {
   await live(page);
   await page.locator("body").click();

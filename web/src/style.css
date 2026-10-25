@@ -1214,6 +1214,7 @@ a.decision-button:hover {
 .writable-composer select { max-width: 180px; }
 .action-notice { color: var(--accent); font-size: 12px; padding: 4px 12px; margin: 0; }
 .job-actions { flex-shrink: 0; max-height: 45%; overflow: auto; background: var(--background); }
+.job-actions > .secondary-button { margin: 0 20px 16px; }
 .choices, .queued-messages { padding: 8px 12px; font-size: 12px; }
 .choices h2 { font-size: 13px; }
 .choices button { display: block; width: 100%; text-align: left; padding: 8px; margin: 4px 0; }

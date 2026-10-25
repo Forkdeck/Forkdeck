@@ -5,7 +5,7 @@ const bindings = [
   ["Ctrl-S / Ctrl-Enter", "Send the reply now."],
   ["↑ / ↓", "Recall history at the first / last line of New task; restore the unfinished draft after the newest entry."],
   ["Ctrl-P / Shift-Tab", "Toggle Plan first while the task composer has focus."],
-  ["Esc / Ctrl-U", "Clear the task draft; Esc also resets Plan first. Outside the composer, Esc closes detail or help."],
+  ["Esc / Ctrl-U", "Clear the task draft; Esc also resets Plan first. Outside text fields, Esc closes detail or help."],
   ["Alt-↑ / Alt-↓", "Previous / next job, stopping at either end."],
   ["Alt-← / Alt-→", "Newest job in the previous / next occupied lane. Handled on the board; elsewhere the browser keeps history navigation."],
   ["F2", "Open / close job detail."],

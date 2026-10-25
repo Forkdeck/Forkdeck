@@ -641,11 +641,17 @@ impl Hub {
 
     /// Tie a finished typed task's conversation to an issue and refine it into an issue plan.
     pub async fn link_plan(&self, id: u32, plan: crate::planning::Plan, request: String) -> Result<(), String> {
+        self.link_plan_at(id, plan, request, None).await
+    }
+
+    /// `link_plan`, refused when the task changed since the caller saw revision `expected`.
+    pub async fn link_plan_at(&self, id: u32, plan: crate::planning::Plan, request: String, expected: Option<&str>) -> Result<(), String> {
         let workdir = crate::planning::repo(self, &plan)?.path;
         let eligible = |j: &mut Job| j.source.is_manual() && j.status.finished() && j.issue_plan.is_none();
         // Held from the check to the reply: nothing (a reply from the phone, say) may start the task
         // in between, or the takeover would replace a job that is running here.
         let _admission = self.admission.lock().await;
+        self.job(id, |j| j.check_revision(expected)).ok_or("no such job")??;
         if !self.job(id, eligible).unwrap_or(false) { return Err("finish the local planning turn before linking an issue".into()); }
         // Taken over first: a takeover reloads the saved job, which would drop a link made before it.
         if self.job(id, |j| j.in_history).unwrap_or(false) {
@@ -3154,6 +3160,9 @@ path = {dir:?}
             let id = hub.submit("look".into(), "look around".into(), Source::Manual, dir.clone(), None, Planning::Never).await.unwrap();
             until(id).await;
             let plan = crate::planning::Plan::new(&hub.cfg.repos[0], "").unwrap();
+            // A browser that saw an older revision is refused and nothing is linked.
+            assert_eq!(hub.link_plan_at(id, plan.clone(), "plan the build".into(), Some("old")).await, Err("stale revision".into()));
+            assert!(hub.job(id, |j| j.issue_plan.is_none()).unwrap());
             hub.link_plan(id, plan, "plan the build".into()).await.unwrap();
             until(id).await;
             let (outcome, p) = hub.job(id, |j| (j.outcome.clone(), j.issue_plan.clone().unwrap())).unwrap();

@@ -5,7 +5,7 @@ import { board } from "./live";
 import { action, actionBusy, details, writeReason } from "./state";
 import { Help, KeyHints } from "./Help";
 
-function textField(target: EventTarget | null): target is HTMLElement {
+export function textField(target: EventTarget | null): target is HTMLElement {
   if (!(target instanceof HTMLElement)) return false;
   const field = target.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]');
   if (field instanceof HTMLInputElement) return !["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"].includes(field.type);

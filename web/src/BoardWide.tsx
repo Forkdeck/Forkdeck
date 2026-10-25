@@ -4,6 +4,7 @@ import type { Agents, Lane, Snapshot, LogEntry, Router } from "./wire/forkdeck/w
 import { details, type JobDetail } from "./state";
 import type { StageView } from "./contracts";
 import { board as liveBoard } from "./live";
+import { textField } from "./keys";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { useLocation } from "preact-iso";
 import { pill, stageChip, tabClass, jobPath, type PresentedJob } from "./ui";
@@ -77,6 +78,8 @@ function FollowLog({ lines, active, reset }: { lines: Line[]; active: boolean; r
     if (!active) return;
     const key = (event: KeyboardEvent) => {
       if (event.defaultPrevented && event.key !== "End") return;
+      // As in the TUI these page the output from the reply box; the multi-line composer keeps them for editing.
+      if (event.target instanceof HTMLTextAreaElement) return;
       const el = pane.current;
       if (!el || !el.clientHeight || el.closest("details")?.open === false) return;
       if (event.key === "End") { event.preventDefault(); latest(); }
@@ -135,7 +138,10 @@ export function BoardWide({ data, picked, open, snapshot, live, busy, capacity, 
     board.current?.querySelector(".job-card.selected")?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [picked]);
   useEffect(() => {
-    const key = (e: KeyboardEvent) => { if (e.key === "Escape" && open) route("/"); };
+    // Escape that closed help, or that leaves a text field, keeps the panel and its draft.
+    const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && open && !e.defaultPrevented && !textField(e.target) && !document.querySelector("dialog[open]")) route("/");
+    };
     addEventListener("keydown", key);
     return () => removeEventListener("keydown", key);
   }, [open]);

@@ -87,7 +87,9 @@ export function Composer({ issuePlan = false }: { issuePlan?: boolean }) {
     if (result) { submitted(text); setPlan(false); if (result.id) route(issuePlan ? `/plans/${result.id}` : `/jobs/${result.id}`); }
   };
   return <div><form class="composer writable-composer" onKeyDown={e => {
-    if (!issuePlan && !e.isComposing && ((e.ctrlKey && !e.altKey && e.key.toLowerCase() === "p") || (e.shiftKey && e.key === "Tab"))) { e.preventDefault(); setPlan(!plan); }
+    // Shift-Tab toggles Plan first only from the task box; elsewhere it moves focus back.
+    const inTask = (e.target as HTMLElement).classList.contains("task-input");
+    if (!issuePlan && !e.isComposing && ((e.ctrlKey && !e.altKey && e.key.toLowerCase() === "p") || (inTask && e.shiftKey && e.key === "Tab"))) { e.preventDefault(); setPlan(!plan); }
   }} onSubmit={e => { e.preventDefault(); void submit(); }}>
     <textarea rows={1} aria-label={issuePlan ? "Planning request" : "New task"} placeholder={issuePlan ? "Planning request…" : "New task…"} class="task-input" value={text} onInput={e => setText(e.currentTarget.value)} onKeyDown={e => {
       keyDown(e);
