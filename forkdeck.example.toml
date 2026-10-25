@@ -8,10 +8,11 @@
 # examples to uncomment.
 
 [router]
+# "auto":  ask a Jev-compatible decision server at router.jev.base_url when one answers
+#          (scripts/local-jev.sh starts one on this machine), the keyword rules otherwise.
 # "rules": keyword rules, no network.
-# "jev":   a Jev-compatible decision endpoint (POST /v1/systemone). Falls back to
-#          the rules when the endpoint does not answer.
-kind = "rules"
+# "jev":   always ask the decision server; say so when falling back to the rules.
+kind = "auto"
 default_agent = "claude"
 # Answers under this confidence count as "split" and take the cautious branch:
 # the default agent, the next effort tier up, and a review. Between 0.5 and 1.
@@ -26,8 +27,9 @@ plan = "auto"
 # same wire format works, including the hosted one.
 base_url = "http://127.0.0.1:8000"
 model = "jev-latest"
-# Name of the environment variable that holds the bearer key. Leave the variable
-# unset when the local server runs without auth.
+# Name of the environment variable that holds the bearer key. Unset, a server on
+# this machine gets the development key scripts/local-jev.sh starts it with
+# (forkdeck-local-dev); a remote one gets none.
 api_key_env = "FORKDECK_JEV_KEY"
 timeout_ms = 4000
 # These two descriptions are what the decision model picks between. Tune them to
@@ -36,19 +38,50 @@ claude_is_for = "Open-ended or ambiguous work: multi-file refactors, design chan
 codex_is_for = "Well-specified work: a bug with a clear reproduction, a contained feature, tests, scripts"
 
 [router.rules]
-claude_keywords = ["refactor", "design", "architecture", "document", "docs", "readme", "explain", "plan", "restructure"]
-codex_keywords = ["bug", "fix", "test", "tests", "script", "failing", "crash", "regression", "implement", "endpoint"]
-heavy_keywords = ["architecture", "migrate", "migration", "concurrency", "race", "security", "rewrite", "redesign", "deadlock", "distributed"]
-light_keywords = ["typo", "rename", "comment", "bump", "format", "lint", "wording", "spelling"]
+# Used when no decision server answers. The built-in lists cover common phrasings;
+# a list set here replaces the built-in one. Keywords may be phrases, and word
+# forms match ("fix" also matches "fixes", "fixed" and "fixing").
+#~ claude_keywords = ["refactor", "clean up", "document", "explain", "design"]
+#~ codex_keywords = ["bug", "fix", "failing", "stack trace", "implement"]
+#~ heavy_keywords = ["migration", "race condition", "security", "rewrite"]
+#~ light_keywords = ["typo", "rename", "one line", "version bump"]
+# Typed tasks with these phrases propose approaches first (router.plan = "never" turns it off).
+#~ plan_keywords = ["how should", "which approach", "pros and cons"]
+
+[router.memory]
+# Route a task like earlier ones that went well the way they were, without asking.
+enabled = true
+similarity = 0.8       # shared words over all words, 0 to 1
+min_matches = 2        # earlier tasks that went well before memory answers
+step_down = true       # then try a tier lower to use fewer tokens...
+step_down_after = 3    # ...once this many went well at a tier
 
 [agents]
 timeout_mins = 45
+# Without your own plugins, hooks and MCP servers (the repository's settings still apply):
+# they add thousands of tokens to every call an agent makes. false loads them.
+lean = true
+# Claude workers run any build or test command inside Claude Code's sandbox (needs bubblewrap
+# and socat on Linux). Unset: whenever those are installed. false: only the build commands
+# found for each repository, by name.
+#~ sandbox = true
+
+# Hosts a sandboxed worker's commands may reach. The public package registries of the
+# languages a repository uses are open by default, and so are the mirrors your package managers
+# already use (found in your own .npmrc, pip.conf, settings.xml, GOPROXY, ...). List any others
+# here; public_registries = false leaves only the mirrors.
+[agents.network]
+public_registries = true
+detect_mirrors = true
+#~ mirrors = ["nexus.example.com", "artifactory.example.com"]
 
 [agents.claude]
 cmd = "claude"
 models = { light = "haiku", standard = "sonnet", heavy = "opus" }
 efforts = { light = "low", standard = "medium", heavy = "high" }
-# acceptEdits lets the agent edit files but not run shell commands unattended.
+# acceptEdits lets the agent edit files. A worker may also run the project's own build and
+# test commands (cargo, go, gradle, mvn, npm, pytest, make, dotnet, ... as its build files show)
+# and read-only git, so it can work test first; any other command is refused.
 # Loosen this only for repositories and issue authors you trust.
 write_args = ["--permission-mode", "acceptEdits"]
 review_args = ["--permission-mode", "plan"]
@@ -117,6 +150,19 @@ draft = true
 publish_on_failed_review = false
 # worktree_root = "~/.cache/forkdeck/worktrees"
 
+# How much of this machine forkdeck may take. Checks build and test; several at once starve
+# the machine and fail timing-sensitive tests. A job waiting for a build lends its agent slot
+# to other jobs meanwhile.
+[resources]
+builds = 1           # checks running at the same time
+nice = 10            # niceness of agents and what they start, 0..19; 0 leaves it alone
+check_nice = 0       # niceness of checks: the check decides the job, so it gets the CPU first
+check_retries = 1    # a failed check runs again once the machine is quiet; a later pass is flaky
+build_cache = true   # share build output and toolchain caches between worktrees (Cargo, Go, Gradle, Maven,
+                     # sbt, .NET, Swift, Stack/Cabal, dune, Zig, dub, Nim, Mix, rebar3, pub, Bazel, npm, pip;
+                     # ccache/sccache when installed) and let Codex's sandbox write to them
+max_load = 1.0       # hold a check back while load > this x CPUs (at most 10 min); 0: off
+
 # How much forkdeck may pick up by itself. Counted over the last 24 hours from its
 # journal (~/.local/state/forkdeck/journal.jsonl), so a restart resets nothing.
 # 0 switches a limit off. What a limit holds back stays labelled and untouched.
@@ -141,6 +187,7 @@ learn = false
 share = true
 max_learned = 30           # learned rules kept per repository; the oldest make room
 max_chars = 6000           # how much of the notes goes into a prompt
+brief_chars = 30000        # repository brief in front of an issue: layout, manifests, the files it names; 0: off
 
 # Sharing with teammates who run forkdeck on the same repositories. The shared
 # state is comments on GitHub or GitLab; only metadata goes into them (who, which
@@ -168,6 +215,9 @@ lan_only = true        # refuse connections from outside this machine's subnets,
 dir = "~/.config/forkdeck/remote"   # certificate authority, paired devices
 # workdir = "~/src/project"         # where tasks from the phone run; default: where forkdeck started
 
+# A repository can instead keep the keys below (except provider, repo, path and base) in its own
+# .forkdeck/config.toml, read from the base branch. Started inside such a clone, forkdeck adds it
+# without an entry here. For a repository listed here too, what you set here wins.
 #~ [[repos]]
 #~ provider = "github"    # uses the gh CLI and its login
 #~ repo = "your-name/your-project"
@@ -178,10 +228,14 @@ dir = "~/.config/forkdeck/remote"   # certificate authority, paired devices
 #~ jobs_per_day = 0        # limit for this repository alone; 0 leaves it to [limits]
 #~ done_label = "agent:pr-open"
 #~ failed_label = "agent:needs-human"
+#~ plan_label = "forkdeck:plan"     # marks the parent issue of a plan split into sub-issues
+#~ human_label = "needs-human"      # put on a task that needs a person before it can go on
 #~ # Only these accounts' issues and pull requests are picked up. Set this on public repositories.
 #~ allowed_authors = ["your-name"]
 #~ # Run in the issue's worktree before any review. These run as you, on code an agent just wrote.
 #~ checks = ["cargo test --quiet"]
+#~ # Hosts a sandboxed worker's commands may reach (a package registry, say). None by default.
+#~ agent_domains = ["crates.io", "static.crates.io"]
 #~ # Pull requests with this label are reviewed and commented on, never approved or merged.
 #~ pr_label = "review:ready"
 #~ pr_working_label = "review:running"
@@ -288,3 +342,58 @@ dir = "~/.config/forkdeck/remote"   # certificate authority, paired devices
 # url = "http://127.0.0.1:3000/mcp"
 # headers = { Authorization = "Bearer ${PIPELINES_TOKEN}" }
 # timeout_secs = 60
+
+# Optional worker-model trials: disabled unless explicitly configured.
+# See docs/adaptive-routing.md for evidence generation and all required gates.
+[adaptive]
+mode = "off"
+
+# Optional adaptive extensions (inside [adaptive]):
+# objective = "reported_cost_usd" # default: tokens; requires complete reported USD costs
+# invocation_max_usd = 1.0       # installed Claude flag when supported; not a token cap
+# cohorts = [{ definition = "prompt-proxy-v1", category = "fix", complexity = "standard", context = "prompt-small" }]
+
+# Browser UI served by forkdeck serve. No login unless web.oidc is configured.
+# Without OIDC, anyone who reaches the port sees every job, log and plan.
+[web]
+bind = "127.0.0.1"
+port = 7420
+
+# What the board calls its lanes. Only the names change; which jobs land in each lane does not.
+[web.lanes]
+queue = "Queue"
+build = "Build"
+review = "Review"
+delivery = "Delivery"
+done = "Done"
+attention = "Attention"
+
+# Optional group-based OIDC access; needs a public HTTPS reverse proxy.
+# See docs/web-ui-oidc.md for provider setup. Store the secret only in the environment.
+# [web.oidc]
+# issuer = "https://identity.example/realms/work"
+# client_id = "forkdeck"
+# client_secret_env = "FORKDECK_OIDC_SECRET"
+# redirect_url = "https://forkdeck.example/auth/callback"
+# scopes = ["openid", "email", "profile", "groups"]
+# groups_claim = "groups" # dotted paths supported, e.g. realm_access.roles
+# session_lifetime_secs = 43200
+# [web.oidc.roles]
+# viewer = ["forkdeck-readers"]
+# operator = ["forkdeck-operators"]
+# admin = ["forkdeck-admins"]
+
+# Optional repository picker (independent of OIDC sign-in). Restart after adding a repo.
+# [web.forges.github]
+# host = "github.com"                         # or GitHub Enterprise
+# client_id = "your-oauth-app-client-id"
+# client_secret_env = "FORKDECK_GITHUB_SECRET"
+# redirect_url = "https://forkdeck.example/forges/github/callback"
+# private = false                             # true requests GitHub's repo scope
+# clone_dir = "~/.local/share/forkdeck/repos"
+# [web.forges.gitlab]
+# host = "gitlab.com"                         # or a self-managed host
+# client_id = "your-oauth-app-client-id"
+# client_secret_env = "FORKDECK_GITLAB_SECRET"
+# redirect_url = "https://forkdeck.example/forges/gitlab/callback"
+# clone_dir = "~/.local/share/forkdeck/repos"

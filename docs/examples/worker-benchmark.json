@@ -1,0 +1,17 @@
+{
+  "version": "worker-comparison-1",
+  "repository": "/absolute/path/to/repository",
+  "cohort_repo": "",
+  "source": "task",
+  "tier": "standard",
+  "cli": "claude",
+  "candidate": {"model": "YOUR_CANDIDATE_MODEL", "effort": "high"},
+  "repeats": 3,
+  "max_invocations": 27,
+  "lifetime_secs": 604800,
+  "cache_state": "Describe provider cache conditions",
+  "fixture": false,
+  "tasks": [
+    {"id": "task-1", "revision": "0000000000000000000000000000000000000000", "prompt": "Document the behavior of the selected component"}
+  ]
+}

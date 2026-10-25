@@ -11,6 +11,8 @@ publish = false
 client = ["dep:tokio", "dep:tokio-rustls", "dep:rustls", "dep:rcgen", "dep:futures", "dep:tokio-util", "dep:tarpc", "dep:sha2"]
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+ts-rs = "12"
 fory = "0.17"
 fory-core = "0.17"
 tarpc-fory = "0.1"

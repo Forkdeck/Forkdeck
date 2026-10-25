@@ -1,0 +1,4 @@
+# No dependency runs install scripts. esbuild's only checks the platform binary it
+# already receives as an optional dependency.
+allowBuilds:
+  esbuild: false

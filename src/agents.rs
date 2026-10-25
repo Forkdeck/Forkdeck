@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::orchestrator::Hub;
 use crate::pick::Exec;
-use crate::state::{clip, AgentKind, Stage, StageState};
+use crate::state::{clip, AgentKind, Stage, StageState, Tier};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -17,6 +17,17 @@ pub enum Slot {
     Reviewer,
     /// A pull request reviewer past the second.
     Extra(usize),
+    /// Learning notes from a finished job; shown in the reviewer's box.
+    Knowledge,
+}
+
+/// The part a run plays, as attempt records name it.
+fn role(slot: Slot, read_only: bool) -> &'static str {
+    match slot {
+        Slot::Worker if !read_only => "worker",
+        Slot::Knowledge => "knowledge",
+        _ => "reviewer",
+    }
 }
 
 pub struct RunSpec<'a> {
@@ -26,6 +37,8 @@ pub struct RunSpec<'a> {
     pub read_only: bool,
     /// Continue this conversation of the same CLI instead of starting a new one.
     pub resume: Option<&'a str>,
+    /// The routed tier, recorded with each attempt.
+    pub tier: Tier,
 }
 
 #[derive(Default)]
@@ -124,6 +137,10 @@ pub(crate) fn record_event(s: &mut crate::state::Stage, p: &Parsed) {
                 s.push(clip(l, LINE));
             }
         }
+        Parsed::Refused(t) => {
+            s.refused.push(t.clone());
+            s.push(format!("⊘ not allowed: {}", clip(t, 300)));
+        }
         Parsed::Tool(t) => {
             s.tools += 1;
             s.push(format!("▸ {}", clip(t, LINE)));
@@ -159,7 +176,32 @@ pub enum Parsed {
     NoModels(String),
     /// The CLI named the conversation (codex does so in its first event).
     Session(String),
+    /// The agent asked to run something and was not allowed to.
+    Refused(String),
     Nothing,
+}
+
+/// Whether Claude workers run their shell commands in Claude Code's sandbox (config, else whether it can run here).
+pub fn claude_sandboxed(cfg: &Config) -> bool {
+    !cfg.demo && cfg.agents.sandbox.unwrap_or_else(crate::buildcache::sandbox_available)
+}
+
+/// The hosts a job's sandboxed commands may reach: its repository's `agent_domains`. A typed task
+/// takes them from the configured repository its directory is in.
+fn agent_domains(hub: &Hub, job: u32, dir: &Path) -> Vec<String> {
+    use crate::state::Source;
+    let idx = hub.job(job, |j| match &j.source {
+        Source::Issue { repo_idx, .. } | Source::Pr { repo_idx, .. } | Source::Deploy { repo_idx, .. } => Some(*repo_idx),
+        Source::Manual => None,
+    }).flatten();
+    let repo = match idx {
+        Some(i) => hub.cfg.repos.get(i),
+        None => {
+            let here = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+            hub.cfg.repos.iter().find(|r| r.path.canonicalize().is_ok_and(|p| here.starts_with(p)))
+        }
+    };
+    repo.map(|r| r.agent_domains.clone()).unwrap_or_default()
 }
 
 /// The prompt is not part of the command line: it is written to the agent's stdin, so its size
@@ -189,6 +231,15 @@ pub fn command_line(cfg: &Config, spec: &RunSpec) -> CmdLine {
             if !e.effort.is_empty() {
                 args.extend(["--effort".to_string(), e.effort.clone()]);
             }
+            // A worker can build and run the project's tests, so it can work test first; nothing else
+            // runs without asking. A reviewer only reads.
+            if !spec.read_only && !extra.iter().any(|a| a.starts_with("--allowedTools") || a.starts_with("--allowed-tools") || a == "bypassPermissions") {
+                args.extend(["--allowedTools".to_string(), crate::buildcache::claude_allowed(spec.dir)]);
+            }
+            // The user's plugins, hooks and MCP servers are theirs, not the job's.
+            if cfg.agents.lean() && !extra.iter().any(|a| a.starts_with("--setting-sources") || a.starts_with("--mcp-config")) {
+                args.extend(["--strict-mcp-config", "--setting-sources", "project,local"].map(String::from));
+            }
             args.extend(extra);
         }
         AgentKind::Codex => {
@@ -203,6 +254,9 @@ pub fn command_line(cfg: &Config, spec: &RunSpec) -> CmdLine {
             }
             if !e.effort.is_empty() {
                 args.extend(["-c".to_string(), format!("model_reasoning_effort=\"{}\"", e.effort)]);
+            }
+            if cfg.agents.lean() {
+                args.extend(["-c".to_string(), "mcp_servers={}".to_string()]);
             }
             match resume {
                 Some((id, x)) => {
@@ -323,6 +377,12 @@ pub fn parse_claude(line: &str) -> Vec<Parsed> {
             }
         }
         "result" => {
+            // What it was not allowed to do, said before the final answer so it is on record first.
+            for d in v.get("permission_denials").and_then(|d| d.as_array()).into_iter().flatten() {
+                let tool = d.get("tool_name").and_then(|t| t.as_str()).unwrap_or("a tool");
+                let what = d.pointer("/tool_input/command").or_else(|| d.pointer("/tool_input/file_path")).and_then(|c| c.as_str());
+                out.push(Parsed::Refused(match what { Some(w) => format!("{tool}: {}", first_line(w)), None => tool.to_string() }));
+            }
             let u = v.get("usage").cloned().unwrap_or(Value::Null);
             let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
             out.push(Parsed::Final {
@@ -413,7 +473,52 @@ pub fn parse_copilot(line: &str) -> Vec<Parsed> {
 }
 
 pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
-    let line = command_line(&hub.cfg, &spec);
+    let baseline = spec.exec;
+    // Adaptive routing changes only the worker's model and effort; the CLI and tier keep the review policy.
+    let adapted = (slot == Slot::Worker && !spec.read_only).then(|| crate::adaptive::execution(hub, job)).flatten()
+        .map(|choice| Exec { model: choice.model, effort: choice.effort, ..baseline.clone() });
+    let spec = RunSpec { exec: adapted.as_ref().unwrap_or(baseline), ..spec };
+    let mut line = command_line(&hub.cfg, &spec);
+    let limit_description = if hub.cfg.demo {
+        "demo".into()
+    } else {
+        match invocation_limit(&line.cmd, spec.exec.cli, &mut line.args, hub.cfg.adaptive.invocation_max_usd).await {
+            Ok(description) => description,
+            Err(error) => {
+                crate::adaptive::suspend(hub, job, &error);
+                return RunOut { error, ..Default::default() };
+            }
+        }
+    };
+    let role = role(slot, spec.read_only);
+    let cli_version = hub.state.lock().unwrap_or_else(|e| e.into_inner()).cli_versions[crate::journal::slot(spec.exec.cli)].clone();
+    let mut attempt = hub.job(job, |j| {
+        let mut a = crate::metrics::Attempt::new(j, role, spec.exec.cli, spec.tier.name(), spec.exec.model.clone(), spec.exec.effort.clone());
+        a.cli_version = cli_version;
+        a.invocation_limit = limit_description;
+        j.attempt_ids.push(a.id.clone());
+        a
+    });
+    let mut spec = spec;
+    if !hub.cfg.demo {
+        if let Some(a) = &mut attempt {
+            if let Err(err) = crate::metrics::write(a) {
+                // Without a record the trial cannot be judged: run the baseline instead.
+                hub.log("metrics", format!("attempt coverage missing: {}", err));
+                crate::adaptive::suspend(hub, job, "attempt write failed");
+                crate::adaptive::fallback(hub, job, "attempt write failed");
+                spec = RunSpec { exec: baseline, ..spec };
+                line = command_line(&hub.cfg, &spec);
+                a.configured_model = baseline.model.clone();
+                a.effort = baseline.effort.clone();
+                match invocation_limit(&line.cmd, baseline.cli, &mut line.args, hub.cfg.adaptive.invocation_max_usd).await {
+                    Ok(description) => a.invocation_limit = description,
+                    Err(error) => return RunOut { error, ..Default::default() },
+                }
+            }
+        }
+    }
+    let telemetry = std::sync::Mutex::new(crate::metrics::Stream::default());
     let start = Instant::now();
     let e = spec.exec;
     let stage = |f: &mut dyn FnMut(&mut Stage)| {
@@ -421,10 +526,12 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     };
     stage(&mut |s| {
         let keep = std::mem::take(&mut s.tail);
+        let times = std::mem::take(&mut s.tail_times);
         let unprinted = s.unprinted;
         let pushed = s.pushed;
         *s = Stage::default();
         s.tail = keep;
+        s.tail_times = times;
         s.unprinted = unprinted;
         s.pushed = pushed;
         s.agent = Some(e.family);
@@ -459,7 +566,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
         let limit = Duration::from_secs(hub.cfg.agents.timeout_mins.unwrap_or(45).clamp(1, 24 * 60) * 60);
         // Dropping the losing branch drops the process group guard, which kills the agent and its children.
         tokio::select! {
-            o = spawn_and_read(hub, job, slot, &line, &spec) => o,
+            o = spawn_and_read(hub, job, slot, &line, &spec, &telemetry, attempt.as_ref()) => o,
             _ = cancel.wait() => RunOut { error: "cancelled".into(), ..Default::default() },
             _ = steer.wait() => RunOut { error: "stopped to take a message".into(), interrupted: true, ..Default::default() },
             _ = tokio::time::sleep(limit) => RunOut { error: format!("timed out after {} min", limit.as_secs() / 60), ..Default::default() },
@@ -480,6 +587,31 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
         hub.state.lock().unwrap_or_else(|e| e.into_inner()).agent_cooldowns[crate::journal::slot(e.cli)] = Some(Instant::now() + Duration::from_secs(15 * 60));
         hub.log("agents", format!("{} reported a usage limit; passed over for 15 minutes: {}", e.cli.name(), clip(&out.error, 200)));
     }
+    if let Some(a) = &mut attempt {
+        let t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
+        a.first_output_ms = t.first_output_ms;
+        a.tokens = t.tokens.clone();
+        a.actual_model = t.model.clone();
+        a.terminal_usage = t.terminal;
+        a.ended = Some(crate::journal::now());
+        a.wall_ms = Some(start.elapsed().as_millis() as u64);
+        a.status = if out.ok {
+            "completed"
+        } else if out.error == "cancelled" || out.interrupted {
+            "cancelled"
+        } else if out.error.starts_with("timed out") {
+            "timeout"
+        } else {
+            "error"
+        }
+        .into();
+        if !hub.cfg.demo {
+            if let Err(err) = crate::metrics::write(a) {
+                hub.log("metrics", format!("attempt coverage missing: {}", err));
+                crate::adaptive::suspend(hub, job, "attempt write failed");
+            }
+        }
+    }
     // What this run used goes on the job's account, by the CLI that ran, whichever box it was shown in.
     hub.job(job, |j| {
         let s = j.stage(slot);
@@ -498,7 +630,15 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     out
 }
 
-async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &RunSpec<'_>) -> RunOut {
+async fn spawn_and_read(
+    hub: &Hub,
+    job: u32,
+    slot: Slot,
+    line: &CmdLine,
+    spec: &RunSpec<'_>,
+    telemetry: &std::sync::Mutex<crate::metrics::Stream>,
+    attempt: Option<&crate::metrics::Attempt>,
+) -> RunOut {
     let (kind, prompt, dir, read_only) = (spec.exec.cli, spec.prompt, spec.dir, spec.read_only);
     let (cmd, args) = (line.cmd.as_str(), &line.args);
     if let Some(f) = &line.usage_file {
@@ -533,8 +673,30 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
     };
     let run_dir = mirror.as_deref().or(scratch.as_ref().map(|s| s.0.as_path())).unwrap_or(dir);
     let cmd = program_for(cmd, read_only);
-    let mut child = match proc::command(&cmd)
-        .args(args)
+    let mut command = proc::command(&cmd);
+    // Agents build and test too; whatever they start must not starve the machine.
+    proc::lower_priority(&mut command, hub.cfg.resources.nice);
+    // Their builds share output and caches with every other job on the repository.
+    let cache = crate::buildcache::for_job(hub, job, dir);
+    command.envs(cache.env.iter().map(|(k, v)| (k, v)));
+    if kind == AgentKind::Claude {
+        // In -p mode nothing delivers a background task's result: a worker that backgrounds its
+        // test run ends its turn with the work unfinished. It waits for its commands instead.
+        command.env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
+    }
+    let mut args = args.clone();
+    if kind == AgentKind::Codex && !read_only {
+        if let Some(at) = args.iter().position(|a| a == "--json") {
+            args.splice(at..at, crate::buildcache::codex_args(&cache));
+        }
+    }
+    // Any language's tools run, inside the sandbox; without one, only the commands allowed by name.
+    if kind == AgentKind::Claude && !read_only && claude_sandboxed(&hub.cfg) {
+        let domains = crate::buildcache::domains(dir, &hub.cfg.agents.network, &agent_domains(hub, job, dir));
+        args.extend(crate::buildcache::claude_sandbox(&cache, &domains));
+    }
+    let mut child = match command
+        .args(&args)
         .current_dir(run_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -542,6 +704,8 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
         .spawn()
     {
         Ok(c) => c,
+        // A missing working directory fails the same way as a missing program; say which it was.
+        Err(_) if !run_dir.is_dir() => return fail(format!("working directory {} no longer exists", run_dir.display())),
         Err(e) => return fail(format!("cannot start {}: {}", cmd, e)),
     };
     let group = proc::Group::of(&child);
@@ -555,6 +719,7 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
     });
     let err_task = proc::Pipe::read(stderr);
 
+    let output_start = Instant::now();
     let mut reader = BufReader::new(stdout);
     let mut raw: Vec<u8> = Vec::new();
     let mut last_text = String::new();
@@ -595,12 +760,46 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
                 break;
             }
         }
-        if raw.len() > proc::OUTPUT_LIMIT { error = "agent event exceeded 1 MiB".into(); group.kill(); break; }
+        if raw.len() > proc::OUTPUT_LIMIT {
+            // One event this big is a tool's whole output (a build log, a file dump), not the
+            // answer: drop the rest of the line, say so, and carry on reading.
+            raw.clear();
+            let mut rest = Vec::new();
+            while !raw.ends_with(b"\n") {
+                rest.clear();
+                match (&mut reader).take((proc::OUTPUT_LIMIT + 1) as u64).read_until(b'\n', &mut rest).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => if rest.ends_with(b"\n") { raw.push(b'\n'); },
+                }
+            }
+            raw.clear();
+            hub.job(job, |j| j.stage(slot).push("▸ (an event over 1 MiB was left out)".to_string()));
+            continue;
+        }
         let owned = String::from_utf8_lossy(&raw).trim().to_string();
         raw.clear();
         let line = owned.as_str();
         if line.is_empty() {
             continue;
+        }
+        {
+            let mut t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
+            if t.first_output_ms.is_none() {
+                t.first_output_ms = Some(output_start.elapsed().as_millis() as u64);
+            }
+            if t.observe(kind, line) {
+                if let Some(a) = attempt {
+                    let mut snapshot = a.clone();
+                    snapshot.first_output_ms = t.first_output_ms;
+                    snapshot.tokens = t.tokens.clone();
+                    snapshot.actual_model = t.model.clone();
+                    snapshot.terminal_usage = t.terminal;
+                    if let Err(e) = crate::metrics::write(&snapshot) {
+                        hub.log("metrics", format!("attempt checkpoint failed: {}", e));
+                        crate::adaptive::suspend(hub, job, "attempt checkpoint failed");
+                    }
+                }
+            }
         }
         let parsed = match kind {
             AgentKind::Claude => parse_claude(line),
@@ -612,6 +811,7 @@ async fn spawn_and_read(hub: &Hub, job: u32, slot: Slot, line: &CmdLine, spec: &
             match p {
                 Parsed::Text(t) => last_text = t,
                 Parsed::Tool(_) => tools_seen += 1,
+                Parsed::Refused(t) => hub.log("agents", format!("#{} {} was not allowed: {}", job, kind.name(), clip(&t, 160))),
                 Parsed::Session(id) => {
                     hub.job(job, |j| {
                         j.stage(slot).session = Some(id.clone());
@@ -862,7 +1062,7 @@ fn mirror_checkout(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// A read-only run starts in an empty directory, where a relative `cmd` such as
-/// `./scripts/claude` is not. It is taken from forkdeck's own directory, as `on_path` finds it;
+/// `./scripts/claude` is not. It is taken from forkdeck's own directory, as `version` finds it;
 /// never from the checkout under review, whose copy the change may have rewritten.
 fn program_for(cmd: &str, read_only: bool) -> String {
     let p = Path::new(cmd);
@@ -872,18 +1072,81 @@ fn program_for(cmd: &str, read_only: bool) -> String {
     cmd.to_string()
 }
 
-pub async fn on_path(cmd: &str) -> bool {
+pub async fn version(cmd: &str) -> Option<String> {
     if cmd.trim().is_empty() {
-        return false;
+        return None;
     }
     let mut c = proc::command(cmd);
     c.arg("--version");
-    matches!(proc::output(c, Duration::from_secs(15)).await, Ok((true, _, _)))
+    match proc::output(c, Duration::from_secs(15)).await {
+        Ok((true, out, _)) => Some(first_line(&out)),
+        _ => None,
+    }
+}
+
+/// Probe the installed CLI, rather than assuming a flag exists in every version.
+/// This bounds reported invocation USD spend, never token usage or tool charges.
+pub async fn invocation_limit(cmd: &str, kind: AgentKind, args: &mut Vec<String>, usd: Option<f64>) -> Result<String, String> {
+    let Some(usd) = usd else {
+        return Ok("wall-time timeout; token budget is admission-only".into());
+    };
+    if !usd.is_finite() || usd <= 0.0 {
+        return Err("invocation_max_usd must be finite and positive".into());
+    }
+    if kind != AgentKind::Claude {
+        return Ok("wall-time timeout; installed adapter has no supported hard spend/token ceiling".into());
+    }
+    // Serialize first-use probes, including failures, so concurrent jobs probe once
+    // per configured executable in this process. Restart after upgrading the CLI.
+    type ProbeResults = std::collections::HashMap<String, Result<(String, bool), String>>;
+    static PROBES: std::sync::OnceLock<tokio::sync::Mutex<ProbeResults>> = std::sync::OnceLock::new();
+    let mut probes = PROBES.get_or_init(Default::default).lock().await;
+    if !probes.contains_key(cmd) {
+        let result = async {
+            let version = version(cmd).await.ok_or("cannot probe invocation limit: CLI version unavailable")?;
+            let mut c = proc::command(cmd);
+            c.arg("--help");
+            let (ok, help, _) = proc::output(c, Duration::from_secs(15)).await?;
+            Ok((version, ok && help.split_whitespace().any(|w| w == "--max-budget-usd")))
+        }.await;
+        probes.insert(cmd.to_string(), result);
+    }
+    let (version, supported) = probes.get(cmd).unwrap().clone()?;
+    drop(probes);
+    if !supported {
+        return Ok(format!("{version}: no advertised --max-budget-usd; token budget is admission-only"));
+    }
+    if args.iter().any(|s| s == "--max-budget-usd" || s.starts_with("--max-budget-usd=")) {
+        return Err("remove explicit --max-budget-usd from agent arguments before configuring invocation_max_usd".into());
+    }
+    args.extend(["--max-budget-usd".into(), usd.to_string()]);
+    Ok(format!("{version}: --max-budget-usd={usd}; CLI-reported invocation USD spend, not a token ceiling"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_says_what_it_was_not_allowed_to_run() {
+        let l = r#"{"type":"result","is_error":false,"result":"stuck","permission_denials":[{"tool_name":"Bash","tool_use_id":"t1","tool_input":{"command":"PATH=/opt/x:$PATH cargo test\nmore"}},{"tool_name":"Write","tool_input":{"file_path":"/etc/hosts"}},{"tool_name":"Monitor"}]}"#;
+        let p = parse_claude(l);
+        assert_eq!(&p[..3], &[Parsed::Refused("Bash: PATH=/opt/x:$PATH cargo test".into()), Parsed::Refused("Write: /etc/hosts".into()), Parsed::Refused("Monitor".into())]);
+        assert!(matches!(p[3], Parsed::Final { ok: true, .. }));
+        let mut s = crate::state::Stage::default();
+        record_event(&mut s, &p[0]);
+        assert_eq!(s.refused, ["Bash: PATH=/opt/x:$PATH cargo test"]);
+        assert!(s.tail.back().unwrap().starts_with("⊘ not allowed"));
+    }
+
+    #[test]
+    fn attempts_name_the_part_a_run_plays() {
+        assert_eq!(role(Slot::Worker, false), "worker");
+        assert_eq!(role(Slot::Worker, true), "reviewer", "planning only reads");
+        assert_eq!(role(Slot::Reviewer, true), "reviewer");
+        assert_eq!(role(Slot::Extra(0), true), "reviewer");
+        assert_eq!(role(Slot::Knowledge, true), "knowledge");
+    }
 
     #[test]
     fn a_reviewers_copy_moves_agent_configuration_aside_and_follows_no_links() {
@@ -1095,12 +1358,57 @@ mod tests {
     }
 
     #[test]
+    fn claude_writers_may_run_the_projects_own_build_and_test_commands() {
+        let dir = std::env::temp_dir().join(format!("forkdeck-allowed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("web")).unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap().status.success());
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+        std::fs::write(dir.join("web/package.json"), "{}").unwrap();
+        git(&["add", "."]);
+        let cfg: Config = toml::from_str("").unwrap();
+        let line = |cli, read_only| {
+            let e = exec_for(cli, "m");
+            command_line(&cfg, &RunSpec { exec: &e, prompt: "p", dir: &dir, read_only, resume: None, tier: Tier::Standard }).args
+        };
+        let w = line(AgentKind::Claude, false);
+        let at = w.iter().position(|a| a == "--allowedTools").expect("build commands are allowed");
+        let allowed = &w[at + 1];
+        for c in ["Bash(cargo:*)", "Bash(npm:*)", "Bash(git diff:*)"] {
+            assert!(allowed.contains(c), "{c}: {allowed}");
+        }
+        assert!(!allowed.contains("Bash(go:") && !allowed.contains("Bash(npx:") && !allowed.contains("Bash(curl"), "{allowed}");
+        assert!(!line(AgentKind::Claude, true).contains(&"--allowedTools".to_string()), "a reviewer only reads");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn agents_run_lean_unless_told_otherwise() {
+        let dir = Path::new("/tmp");
+        let line = |cfg: &Config, cli| {
+            let e = exec_for(cli, "m");
+            command_line(cfg, &RunSpec { exec: &e, prompt: "p", dir, read_only: false, resume: None, tier: Tier::Standard }).args
+        };
+        let lean: Config = toml::from_str("").unwrap();
+        let c = line(&lean, AgentKind::Claude);
+        assert!(c.contains(&"--strict-mcp-config".to_string()), "{c:?}");
+        let at = c.iter().position(|a| a == "--setting-sources").expect("user plugins and hooks left out");
+        assert_eq!(c[at + 1], "project,local");
+        let x = line(&lean, AgentKind::Codex);
+        assert!(x.windows(2).any(|w| w[0] == "-c" && w[1] == "mcp_servers={}"), "{x:?}");
+        let full: Config = toml::from_str("[agents]\nlean = false").unwrap();
+        assert!(!line(&full, AgentKind::Claude).contains(&"--strict-mcp-config".to_string()));
+        assert!(!line(&full, AgentKind::Codex).iter().any(|a| a == "mcp_servers={}"));
+    }
+
+    #[test]
     fn sessions_are_named_and_continued() {
         let cfg: Config = toml::from_str("").unwrap();
         let dir = Path::new("/tmp");
         let line = |cli, read_only, resume| {
             let e = exec_for(cli, "m");
-            command_line(&cfg, &RunSpec { exec: &e, prompt: "p", dir, read_only, resume })
+            command_line(&cfg, &RunSpec { exec: &e, prompt: "p", dir, read_only, resume, tier: Tier::Standard })
         };
         let after = |l: &CmdLine, flag: &str| l.args.iter().position(|a| a == flag).map(|i| l.args[i + 1].clone());
 

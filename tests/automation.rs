@@ -134,6 +134,11 @@ if [ "$1" = "api" ]; then
       printf '{"permission":"%s"}\n' "$permission" ;;
     GET\ repos/*/commits\?*) cat "$FAKE_GH/commits.json" 2>/dev/null || echo "[]" ;;
     GET\ *)
+      # The issue itself, as the claim check reads its task marker: a plain one, with no body.
+      case "${bare#repos/*/issues/}" in
+        "$bare"|*/*) ;;
+        [0-9]*) n=${bare##*/}; printf '{"number":%s,"id":%s,"title":"","body":"","state":"open","labels":[],"html_url":"https://github.com/o/r/issues/%s"}\n' "$n" "$n" "$n"; exit 0 ;;
+      esac
       d="$FAKE_GH/c/$key"; printf '['; sep=""
       for id in $(ls "$d" 2>/dev/null | sed -n 's/\.json$//p' | sort -n); do
         printf '%s{"id":%s,"user":{"login":"%s"},"author_association":"%s","updated_at":"%s",%s' "$sep" "$id" "$(cat "$d/$id.who")" "$(cat "$d/$id.assoc" 2>/dev/null || echo MEMBER)" "$(cat "$d/$id.at")" "$(sed 's/^{//' "$d/$id.json")"
@@ -261,7 +266,12 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
 "#;
 
 fn quota_rig(name: &str) -> Rig {
-    let rig = Rig::new(name, "[agents.codex]\ncmd=\"{root}/bin/codex\"\n[review]\nmode=\"always\"", "");
+    quota_rig_with(name, "")
+}
+
+/// As `quota_rig`, with more configuration.
+fn quota_rig_with(name: &str, extra: &str) -> Rig {
+    let rig = Rig::new(name, &format!("[agents.codex]\ncmd=\"{{root}}/bin/codex\"\n[review]\nmode=\"always\"\n{}", extra), "");
     for (name, body) in [("claude", QUOTA_CLAUDE), ("codex", FALLBACK_CODEX)] {
         let path = rig.root.join("bin").join(name);
         fs::write(&path, body).unwrap();
@@ -388,10 +398,17 @@ impl Rig {
         git(&clone, &["push", "-q", "origin", "HEAD:main"]);
         fs::write(root.join("gh/issues.json"), "[]").unwrap();
         fs::write(root.join("gh/prs.json"), "[]").unwrap();
+        // Never whatever decision server happens to run on this machine, and stand-in CLIs have
+        // no model catalog to ask.
+        let pinned = [
+            if extra_config.contains("[router") { "" } else { "[router]\nkind = \"rules\"\n" },
+            if extra_config.contains("[agents]") { "" } else { "[agents]\ndiscover_models = false\n" },
+        ].concat();
         fs::write(
             root.join("home/.config/forkdeck/config.toml"),
             format!(
-                "{}\n[automation]\nworktree_root = \"{}\"\n[[repos]]\nprovider = \"github\"\nrepo = \"o/r\"\npath = \"{}\"\n{}\n",
+                "{}{}\n[automation]\nworktree_root = \"{}\"\n[[repos]]\nprovider = \"github\"\nrepo = \"o/r\"\npath = \"{}\"\n{}\n",
+                pinned,
                 extra_config,
                 root.join("wt").display(),
                 clone.display(),
@@ -485,6 +502,8 @@ impl Rig {
             .env_clear()
             .env("PATH", format!("{}:/usr/local/bin:/usr/bin:/bin", self.root.join("bin").display()))
             .env("HOME", self.root.join("home"))
+            // The temporary directory the tests were given, which a sandbox may make the only one writable.
+            .env("TMPDIR", std::env::temp_dir())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("FAKE_GH", self.root.join("gh"));
         for (k, v) in env {
@@ -564,8 +583,10 @@ impl Rig {
         git(&c, &["rev-parse", "HEAD"])
     }
 
+    /// Every `gh` call, except the read-only look for plans to schedule that each poll starts with.
     fn calls(&self) -> String {
-        fs::read_to_string(self.root.join("gh/calls.log")).unwrap_or_default()
+        let log = fs::read_to_string(self.root.join("gh/calls.log")).unwrap_or_default();
+        log.lines().filter(|l| !l.starts_with("api GET repos/o/r/issues?labels=forkdeck%3Aplan")).map(|l| format!("{l}\n")).collect()
     }
 }
 
@@ -751,6 +772,34 @@ fn a_ci_failure_goes_back_to_the_worker_and_the_fix_is_pushed() {
     assert_eq!(calls.matches("pr create").count(), 1, "one pull request, not two:\n{}", calls);
     assert!(calls.contains("pr comment 12") && calls.contains("pushed a fix"), "{}", calls);
     assert!(!calls.contains("agent:needs-human"), "{}", calls);
+}
+
+#[test]
+fn local_review_repair_does_not_consume_the_ci_repair_allowance() {
+    let rig = Rig::new("ci-after-review", &format!("{MCP_SERVER}\n[review]\nmax_fix_rounds = 1"), CI_STAGE);
+    rig.issue();
+    let agent = CLAUDE.replace("prompt=$(cat)", "prompt=$(cat)\nat=$(printf '%s' \"$prompt\" | sed -n 's/^The checkout to inspect is \\(.*\\)\\. Use absolute.*/\\1/p' | head -1)\nf=${at:-.}/by_agent.txt\nif test -f $f && test $(wc -l < $f) -eq 1; then FAKE_VERDICT=FAIL; fi");
+    fs::write(rig.root.join("bin/claude"), agent).unwrap();
+    rig.mcp_answers("ci_status", &["state=FAILED run=4411", "state=PASSED"]);
+    rig.mcp_answers("ci_logs", &["error: repair the CI failure"]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok && out.contains("CI passed"), "{out}");
+    assert_eq!(git(&rig.origin(), &["rev-list", "--count", "main..forkdeck/issue-7"]), "2");
+    assert_eq!(git(&rig.origin(), &["show", "forkdeck/issue-7:by_agent.txt"]).lines().count(), 3);
+}
+
+#[test]
+fn review_after_ci_repair_gets_a_fresh_local_allowance() {
+    let rig = Rig::new("review-after-ci", &format!("{MCP_SERVER}\n[review]\nmax_fix_rounds = 1"), CI_STAGE);
+    rig.issue();
+    let agent = CLAUDE.replace("prompt=$(cat)", "prompt=$(cat)\nat=$(printf '%s' \"$prompt\" | sed -n 's/^The checkout to inspect is \\(.*\\)\\. Use absolute.*/\\1/p' | head -1)\nf=${at:-.}/by_agent.txt\nif test -f $f; then case $(wc -l < $f) in 1|3) FAKE_VERDICT=FAIL;; esac; fi");
+    fs::write(rig.root.join("bin/claude"), agent).unwrap();
+    rig.mcp_answers("ci_status", &["state=FAILED run=4411", "state=PASSED"]);
+    rig.mcp_answers("ci_logs", &["error: repair the CI failure"]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok && out.contains("CI passed"), "{out}");
+    assert_eq!(git(&rig.origin(), &["rev-list", "--count", "main..forkdeck/issue-7"]), "2");
+    assert_eq!(git(&rig.origin(), &["show", "forkdeck/issue-7:by_agent.txt"]).lines().count(), 4);
 }
 
 #[test]
@@ -1286,7 +1335,9 @@ fn sharing_is_off_unless_asked_for() {
     rig.issue();
     let (ok, out) = rig.once(&[]);
     assert!(ok, "{}", out);
-    assert!(!rig.calls().contains("api "), "nothing extra is said on the forge:\n{}", rig.calls());
+    // Reading the issue before the claim (to see whether it is a task of a plan) says nothing.
+    let said: Vec<String> = rig.calls().lines().filter(|l| l.starts_with("api ") && !l.starts_with("api GET repos/o/r/issues/7")).map(str::to_string).collect();
+    assert!(said.is_empty(), "nothing extra is said on the forge:\n{}", rig.calls());
     assert!(!rig.calls().contains("--add-assignee"));
 }
 
@@ -1964,6 +2015,9 @@ fn the_teams_notes_come_from_the_base_branch_and_lead_the_prompt() {
     let seen = fs::read_to_string(&prompts).unwrap();
     assert!(seen.contains("<notes>\n- Money is integer cents, never floats.\n\n- My own reminder.\n</notes>"), "{}", seen);
     assert!(seen.find("<notes>").unwrap() < seen.find("Resolve issue #7").unwrap(), "what every job shares comes first");
+    let brief = seen.find("Repository brief").expect("the worker is given the repository brief");
+    assert!(seen.find("</notes>").unwrap() < brief && brief < seen.find("Resolve issue #7").unwrap(), "{}", seen);
+    assert!(seen.contains(".forkdeck/notes.md") && seen.contains("do not search for them"), "{}", seen);
     let (ok, out) = rig.run(&["notes", "o/r"], &[]);
     assert!(ok && out.contains("the team's notes: .forkdeck/notes.md on main") && out.contains("Money is integer cents") && out.contains("My own reminder"), "{}", out);
 }
@@ -3156,4 +3210,47 @@ printf '%s\n' '\nVERDICT: PASS"}'
     let calls = rig.calls();
     assert!(calls.contains("--body-file -") && calls.contains("ü/CLAUDE.md"), "{}", out);
     assert!(calls.len() > 128 * 1024);
+}
+
+#[test]
+fn a_stop_while_an_issue_runs_hands_it_back_to_the_queue() {
+    let rig = Rig::new("stop-handback", "", "checks = [\"touch {root}/checking; sleep 60\"]");
+    rig.issue();
+    let checking = rig.root.join("checking");
+    rig.once_then_stop(|_| checking.exists(), |_| {});
+    let calls = rig.calls();
+    assert!(calls.contains("--remove-label agent:working --add-label agent:ready"), "{}", calls);
+    assert!(!calls.contains("agent:needs-human") && !calls.contains("could not finish"), "a stop is nobody's failure:\n{}", calls);
+}
+
+#[test]
+fn an_oversized_agent_event_is_skipped_not_fatal() {
+    // A command with a huge output arrives as one event line; it must not end the job.
+    let cli = "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\ncat >/dev/null\nhead -c 1200000 /dev/zero | tr '\\0' a; echo\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done after a big event\"}'\n";
+    let rig = Rig::with_agents("agent-big-event", "", "", &[("claude", cli)]);
+    let (ok, out) = rig.run(&["run", "--agent", "claude", "fix typo"], &[]);
+    assert!(ok, "{}", out);
+    assert!(!out.contains("exceeded 1 MiB"), "{}", out);
+}
+
+#[test]
+fn a_usage_limit_mid_issue_hands_it_back_instead_of_failing_it() {
+    // The rules send every task to Claude, so the limit is met halfway through its work.
+    let rig = quota_rig_with("quota-issue-partial", "[router.rules]\ncodex_keywords = []");
+    rig.issue();
+    let (_, out) = rig.once(&[("FAKE_PARTIAL", "1")]);
+    let calls = rig.calls();
+    assert!(calls.contains("--remove-label agent:working --add-label agent:ready"), "the next pick-up retries it:\n{}\n{}", calls, out);
+    assert!(!calls.contains("agent:needs-human") && !calls.contains("could not finish"), "a usage limit is nobody's failure:\n{}", calls);
+}
+
+#[test]
+fn claude_runs_without_background_tasks() {
+    // In -p mode nothing delivers a background task's result, so a worker that backgrounds its
+    // test run ends its turn with the work unfinished.
+    let cli = "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\ncat >/dev/null\necho \"$CLAUDE_CODE_DISABLE_BACKGROUND_TASKS\" > \"$FAKE_GH/bg\"\necho '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}'\n";
+    let rig = Rig::with_agents("claude-no-bg", "", "", &[("claude", cli)]);
+    let (ok, out) = rig.run(&["run", "--agent", "claude", "fix typo"], &[]);
+    assert!(ok, "{}", out);
+    assert_eq!(fs::read_to_string(rig.root.join("gh/bg")).unwrap().trim(), "1");
 }

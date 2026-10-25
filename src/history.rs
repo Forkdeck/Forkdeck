@@ -9,9 +9,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A job whose issue plan is still in progress: a publication pending, or not yet marked ready for build.
-/// Resolved is what `Plan::ready_for_intake` says: ready, nothing pending, and the current revision
+/// Resolved is what `Plan::resolved` says: all its sub-issues created, or what `Plan::ready_for_intake` says: ready, nothing pending, and the current revision
 /// reviewed, accepted and published.
-const UNRESOLVED_PLAN: &str = "(issue_plan IS NOT NULL AND NOT (json_extract(issue_plan, '$.ready') IS 1 \
+const UNRESOLVED_PLAN: &str = "(issue_plan IS NOT NULL AND json_extract(issue_plan, '$.creation.done') IS NOT 1 \
+    AND NOT (json_extract(issue_plan, '$.ready') IS 1 \
     AND json_extract(issue_plan, '$.pending') IS NULL \
     AND json_extract(issue_plan, '$.reviewed') IS json_extract(issue_plan, '$.revision') \
     AND json_extract(issue_plan, '$.accepted') IS json_extract(issue_plan, '$.revision') \
@@ -68,7 +69,40 @@ const MIGRATIONS: &[&str] = &["
 ", "
     ALTER TABLE jobs ADD COLUMN issue_plan TEXT;
     CREATE TABLE composer (workdir TEXT PRIMARY KEY, state TEXT NOT NULL);
+", "
+    ALTER TABLE jobs ADD COLUMN metrics TEXT;
+", "
+    CREATE TABLE routes (
+        id INTEGER PRIMARY KEY,
+        job INTEGER NOT NULL,
+        scope TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        words TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        tier TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        source TEXT NOT NULL,
+        trial_from TEXT,
+        accepted INTEGER NOT NULL,
+        tokens INTEGER,
+        finished INTEGER NOT NULL
+    );
+    CREATE INDEX routes_scope ON routes (scope, kind, finished);
+", "
+    CREATE TABLE web_sessions (
+        token_hash TEXT PRIMARY KEY,
+        scope TEXT NOT NULL,
+        principal TEXT NOT NULL,
+        expires INTEGER NOT NULL
+    );
+    CREATE INDEX web_sessions_expiry ON web_sessions (expires);
+", "
+    CREATE TABLE web_operations (key TEXT PRIMARY KEY, record TEXT NOT NULL, created INTEGER NOT NULL);
+    CREATE TABLE web_audit (id INTEGER PRIMARY KEY, record TEXT NOT NULL);
 "];
+
+/// Routes kept per repository and kind of job; older ones are dropped as new ones come.
+pub const KEEP_ROUTES: i64 = 2000;
 
 /// Who is running: this process, told apart from a later process that reuses its id by its start time.
 pub fn owner_token() -> String {
@@ -139,6 +173,8 @@ pub struct StageRecord {
     pub cost: f64,
     pub secs: u64,
     pub tail: Vec<String>,
+    #[serde(default)]
+    pub tail_times: Vec<String>,
 }
 
 impl StageRecord {
@@ -163,6 +199,7 @@ impl StageRecord {
             cost: s.cost,
             secs: s.secs(),
             tail: s.tail.iter().cloned().collect(),
+            tail_times: s.tail_times.iter().cloned().collect(),
         }
     }
     fn stage(self) -> Stage {
@@ -192,6 +229,8 @@ impl StageRecord {
             started: None,
             elapsed: (self.secs > 0).then(|| Duration::from_secs(self.secs)),
             tail: self.tail.into(),
+            tail_times: self.tail_times.into(),
+            refused: Vec::new(),
         }
     }
 }
@@ -230,6 +269,17 @@ pub struct JobRecord {
     /// The forkdeck process that runs the job, as `owner_token` wrote it.
     pub owner: Option<String>,
     pub issue_plan: Option<crate::planning::Plan>,
+    /// The job's metrics identity, its attempts this turn, and the adaptive decision (JSON).
+    pub metrics: Option<String>,
+}
+
+/// What links a job to its attempt records and adaptive decision, kept across restarts.
+#[derive(Serialize, Deserialize)]
+struct JobMetrics {
+    id: String,
+    attempt_ids: Vec<String>,
+    escalated: bool,
+    adaptive: Option<crate::adaptive::Decision>,
 }
 
 impl JobRecord {
@@ -264,6 +314,7 @@ impl JobRecord {
             inbox: j.inbox.iter().cloned().collect(),
             owner: Some(owner_token()),
             issue_plan: j.issue_plan.clone(),
+            metrics: serde_json::to_string(&JobMetrics { id: j.metrics_id.clone(), attempt_ids: j.attempt_ids.clone(), escalated: j.escalated, adaptive: j.adaptive.clone() }).ok(),
         }
     }
 
@@ -275,7 +326,17 @@ impl JobRecord {
         if status == JobStatus::Interrupted && outcome.is_empty() {
             outcome = "interrupted: forkdeck stopped while this ran".into();
         }
+        let m = self.metrics.as_deref().and_then(|m| serde_json::from_str::<JobMetrics>(m).ok());
+        let (metrics_id, attempt_ids, escalated, adaptive) = match m {
+            Some(m) => (m.id, m.attempt_ids, m.escalated, m.adaptive),
+            None => (crate::metrics::id(), Vec::new(), false, None),
+        };
         Job {
+            metrics_id,
+            queue: crate::metrics::QueueTiming::admitted(),
+            attempt_ids,
+            adaptive,
+            escalated,
             active_secs: self.active_secs,
             active_started: Instant::now(),
             restored: true,
@@ -298,6 +359,7 @@ impl JobRecord {
             checks: self.checks,
             outcome,
             pr_url: self.pr_url,
+            pr_open: None,
             rounds: self.rounds,
             created: instant_of(self.created),
             finished: Some(instant_of(self.finished.unwrap_or(self.created))),
@@ -379,6 +441,48 @@ impl History {
         Ok(History { db: Mutex::new(db) })
     }
 
+    /// Write admission is durable before a Hub action can start. Pending admissions survive a crash
+    /// and are never executed again automatically: the outcome may already exist on the forge.
+    pub fn web_operation(&self, key: &str) -> Result<Option<String>, String> {
+        self.db.lock().unwrap().query_row("SELECT record FROM web_operations WHERE key = ?1", [key], |r| r.get(0)).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn web_record(&self, key: Option<&str>, operation: &str, audit: &str) -> Result<(), String> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        if let Some(key) = key {
+            tx.execute("INSERT INTO web_operations VALUES (?1, ?2, ?3) ON CONFLICT(key) DO UPDATE SET record = excluded.record", params![key, operation, now_secs() as i64]).map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM web_operations WHERE created < ?1", [now_secs() as i64 - 7 * 86400]).map_err(|e| e.to_string())?;
+        }
+        tx.execute("INSERT INTO web_audit(record) VALUES (?1)", [audit]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn web_audit(&self) -> Result<Vec<serde_json::Value>, String> {
+        let db = self.db.lock().unwrap();
+        let mut query = db.prepare("SELECT record FROM web_audit ORDER BY id DESC LIMIT 200").map_err(|e| e.to_string())?;
+        let rows = query.query_map([], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?.map(|r| {
+            serde_json::from_str(&r.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        }).collect();
+        rows
+    }
+
+    pub fn web_session_save(&self, hash: &str, scope: &str, principal: &str, expires: i64) -> Result<(), String> {
+        let db = self.db.lock().unwrap();
+        db.execute("DELETE FROM web_sessions WHERE expires <= ?1", params![now_secs() as i64]).map_err(|e| e.to_string())?;
+        db.execute("INSERT INTO web_sessions VALUES (?1, ?2, ?3, ?4)", params![hash, scope, principal, expires]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn web_session(&self, hash: &str, scope: &str) -> Result<Option<String>, String> {
+        self.db.lock().unwrap().query_row("SELECT principal FROM web_sessions WHERE token_hash = ?1 AND scope = ?2 AND expires > ?3", params![hash, scope, now_secs() as i64], |r| r.get(0)).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn web_session_delete(&self, hash: &str) -> Result<(), String> {
+        self.db.lock().unwrap().execute("DELETE FROM web_sessions WHERE token_hash = ?1", params![hash]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     /// A new job id, reserved with an empty row so another forkdeck cannot take it.
     /// Ids only ever go up, also across `clear`: a forkdeck that is still open keeps jobs with the
     /// old ids, and a new job must never get one of them.
@@ -437,12 +541,86 @@ impl History {
             ],
         )
         .map_err(|e| e.to_string())?;
-        tx.execute("UPDATE jobs SET active_secs = ?1, used = ?2, issue_plan = ?3 WHERE id = ?4", params![r.active_secs, json(&r.used), r.issue_plan.as_ref().map(|p| json(p)), r.id]).map_err(|e| e.to_string())?;
+        tx.execute("UPDATE jobs SET active_secs = ?1, used = ?2, issue_plan = ?3, metrics = ?4 WHERE id = ?5", params![r.active_secs, json(&r.used), r.issue_plan.as_ref().map(|p| json(p)), r.metrics, r.id]).map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM turns WHERE job = ?1", params![r.id]).map_err(|e| e.to_string())?;
         for (n, t) in r.turns.iter().enumerate() {
             tx.execute("INSERT INTO turns (job, n, ask, answer) VALUES (?1, ?2, ?3, ?4)", params![r.id, n as i64, t.ask, t.answer]).map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Remember how a job was routed and how it went. Routes are not pruned with jobs.
+    pub fn record_route(&self, scope: &str, kind: &str, r: &crate::routemem::Route) -> Result<(), String> {
+        let e = |e: rusqlite::Error| e.to_string();
+        let text = |v: &dyn erased::Json| v.json();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(e)?;
+        tx.execute(
+            "INSERT INTO routes (job, scope, kind, words, agent, tier, decision, source, trial_from, accepted, tokens, finished)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                r.job,
+                scope,
+                kind,
+                text(&r.words),
+                r.agent.name(),
+                r.tier.name(),
+                text(&r.decision),
+                r.source,
+                r.trial_from.map(|t| t.name()),
+                r.accepted,
+                r.tokens.map(|t| t as i64),
+                r.finished as i64,
+            ],
+        )
+        .map_err(e)?;
+        tx.execute(
+            "DELETE FROM routes WHERE scope = ?1 AND kind = ?2 AND id NOT IN
+               (SELECT id FROM routes WHERE scope = ?1 AND kind = ?2 ORDER BY finished DESC, id DESC LIMIT ?3)",
+            params![scope, kind, KEEP_ROUTES],
+        )
+        .map_err(e)?;
+        tx.commit().map_err(e)
+    }
+
+    /// The remembered routes of one repository and kind of job, newest first. A row this
+    /// forkdeck cannot read (written by another version, say) is left out.
+    pub fn routes(&self, scope: &str, kind: &str) -> Result<Vec<crate::routemem::Route>, String> {
+        let e = |e: rusqlite::Error| e.to_string();
+        let db = self.db.lock().unwrap();
+        let mut q = db
+            .prepare("SELECT job, words, agent, tier, decision, source, trial_from, accepted, tokens, finished FROM routes WHERE scope = ?1 AND kind = ?2 ORDER BY finished DESC, id DESC LIMIT ?3")
+            .map_err(e)?;
+        // Stored by name, as their serde form is.
+        let tier = |s: &str| serde_json::from_value::<crate::state::Tier>(serde_json::Value::String(s.into())).ok();
+        let agent_of = |s: &str| serde_json::from_value::<AgentKind>(serde_json::Value::String(s.into())).ok();
+        let rows = q
+            .query_map(params![scope, kind, KEEP_ROUTES], |r| {
+                Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, bool>(7)?, r.get::<_, Option<i64>>(8)?, r.get::<_, i64>(9)?))
+            })
+            .map_err(e)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (job, words, agent, t, decision, source, trial_from, accepted, tokens, finished) = row.map_err(e)?;
+            let (Ok(words), Some(agent), Some(t), Ok(decision)) = (serde_json::from_str(&words), agent_of(&agent), tier(&t), serde_json::from_str::<Decision>(&decision))
+            else {
+                continue;
+            };
+            out.push(crate::routemem::Route {
+                job,
+                words,
+                agent,
+                tier: t,
+                decision,
+                source,
+                trial_from: trial_from.as_deref().and_then(tier),
+                accepted,
+                tokens: tokens.map(|t| t as u64),
+                finished: finished as u64,
+            });
+        }
+        Ok(out)
     }
 
     /// What the input line held in a working directory when the interface last closed (JSON).
@@ -474,7 +652,7 @@ impl History {
         let e = |e: rusqlite::Error| e.to_string();
         let mut q = db
             .prepare(&format!(
-                "SELECT id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan, inbox, owner, active_secs, used, issue_plan
+                "SELECT id, title, prompt, source, workdir, branch, base_sha, status, resume_from, outcome, decision, forced, session, pr_url, rounds, verdict, checks, created, finished, worker, reviewer, planning, plan, inbox, owner, active_secs, used, issue_plan, metrics
                  FROM jobs WHERE source != 'null' AND {} ORDER BY id DESC LIMIT ?2",
                 filter
             ))
@@ -512,6 +690,7 @@ impl History {
                     inbox: r.get::<_, Option<String>>(23)?.and_then(|p| serde_json::from_str(&p).ok()).unwrap_or_default(),
                     owner: r.get(24)?,
                     issue_plan: r.get::<_, Option<String>>(27)?.and_then(|p| serde_json::from_str(&p).ok()),
+                    metrics: r.get(28)?,
                 })
             })
             .map_err(e)?;
@@ -595,6 +774,11 @@ mod tests {
         worker.push("▸ Edit src/a.rs");
         worker.push("Done.");
         Job {
+            metrics_id: "m-1".into(),
+            queue: crate::metrics::QueueTiming::admitted(),
+            attempt_ids: vec!["a-1".into()],
+            adaptive: None,
+            escalated: true,
             active_secs: 0,
             active_started: Instant::now(),
             restored: false,
@@ -609,7 +793,7 @@ mod tests {
             staged_tree: None,
             status,
             forced: Some(AgentRef::Profile("second".into())),
-            decision: Some(Decision { agent: AgentKind::Codex, tier: Tier::Heavy, review: true, gates: vec![Gate { name: "effort".into(), answer: "heavy".into(), value: 0.9, sharp: true }], source: "rules".into(), ms: 3, note: String::new(), plan: true }),
+            decision: Some(Decision { agent: AgentKind::Codex, tier: Tier::Heavy, review: true, gates: vec![Gate { name: "effort".into(), answer: "heavy".into(), value: 0.9, sharp: true }], source: "rules".into(), ms: 3, note: String::new(), plan: true, trial_from: None }),
             worker,
             reviewer: Stage::default(),
             extra: Vec::new(),
@@ -617,6 +801,7 @@ mod tests {
             checks: None,
             outcome: "ok".into(),
             pr_url: None,
+            pr_open: None,
             rounds: 1,
             created: Instant::now(),
             finished: Some(Instant::now()),
@@ -690,6 +875,27 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_creation_resolves_a_plan_but_an_unfinished_one_is_kept() {
+        let h = History::in_memory();
+        let cfg: crate::config::Config = toml::from_str("[[repos]]\nprovider='github'\nrepo='a/b'\npath='/tmp'\n").unwrap();
+        let plan = crate::planning::Plan::new(&cfg.repos[0], "7").unwrap();
+        let (mut created, mut partial) = (plan.clone(), plan);
+        created.creation = Some(crate::planning::Creation { done: true, ..Default::default() });
+        partial.creation = Some(crate::planning::Creation::default());
+        assert!(created.resolved() && !partial.resolved());
+        for (plan, title) in [(Some(partial), "partial"), (Some(created), "created"), (None, "a"), (None, "b"), (None, "c")] {
+            let id = h.new_id().unwrap();
+            let mut j = job(id, Source::Manual, JobStatus::Done);
+            j.title = title.into();
+            j.issue_plan = plan;
+            h.save(&JobRecord::of(&j)).unwrap();
+        }
+        h.prune(2).unwrap();
+        let titles: Vec<String> = h.load(2).unwrap().into_iter().map(|r| r.title).collect();
+        assert_eq!(titles, ["partial", "b", "c"]);
+    }
+
+    #[test]
     fn queued_resumes_keep_the_stage_and_usage_without_downtime() {
         let mut j = job(1, Source::Manual, JobStatus::Queued);
         j.resume_from = Some(JobStatus::Reviewing);
@@ -759,8 +965,11 @@ mod tests {
         assert_eq!(h.load(10).unwrap().len(), 4);
         let j = back[0].clone().job();
         assert_eq!((j.turns.len(), j.worker.tail.len(), j.worker.via.as_str(), j.forced.map(|f| f.name())), (2, 2, "copilot", Some("copilot:second".to_string())));
+        assert_eq!(j.worker.tail_times, saved[0].worker.tail_times);
+        assert!(j.worker.tail_times.iter().all(|time| !time.is_empty()));
         assert_eq!(j.decision.unwrap().tier, Tier::Heavy);
         assert_eq!(j.inbox.iter().collect::<Vec<_>>(), ["and the docs too"], "a queued message survives a restart");
+        assert_eq!((j.metrics_id.as_str(), j.attempt_ids.as_slice(), j.escalated), ("m-1", ["a-1".to_string()].as_slice(), true), "attempts stay linked to the job");
     }
 
     #[test]
@@ -813,6 +1022,48 @@ mod tests {
         assert_eq!(h.new_id().unwrap(), 6, "clearing never hands an old id out again");
     }
 
+    fn route(job: u32, finished: u64) -> crate::routemem::Route {
+        let d = Decision { agent: AgentKind::Claude, tier: Tier::Standard, review: true, gates: vec![], source: "jev".into(), ms: 1, note: String::new(), plan: false, trial_from: Some(Tier::Heavy) };
+        crate::routemem::Route { job, words: vec![3, 1, 2], agent: AgentKind::Codex, tier: Tier::Light, decision: d, source: "memory".into(), trial_from: Some(Tier::Standard), accepted: true, tokens: Some(42), finished }
+    }
+
+    #[test]
+    fn routes_outlive_pruned_jobs_and_are_capped_per_repository() {
+        let h = History::in_memory();
+        h.record_route("o/r", "issue", &route(7, 100)).unwrap();
+        h.record_route("o/r", "task", &route(8, 100)).unwrap();
+        h.prune(0).unwrap();
+        let back = h.routes("o/r", "issue").unwrap();
+        assert_eq!(back.len(), 1, "one per scope and kind, and jobs pruning leaves them");
+        let r = &back[0];
+        assert_eq!((r.job, r.words.as_slice(), r.agent, r.tier, r.source.as_str()), (7, [3u64, 1, 2].as_slice(), AgentKind::Codex, Tier::Light, "memory"));
+        assert_eq!((r.trial_from, r.accepted, r.tokens, r.finished, r.decision.trial_from), (Some(Tier::Standard), true, Some(42), 100, Some(Tier::Heavy)));
+        for n in 0..KEEP_ROUTES as u64 + 5 {
+            h.record_route("o/r", "issue", &route(n as u32, 200 + n)).unwrap();
+        }
+        let back = h.routes("o/r", "issue").unwrap();
+        assert_eq!(back.len(), KEEP_ROUTES as usize);
+        assert_eq!(back[0].job, KEEP_ROUTES as u32 + 4, "newest first; the oldest went");
+        assert_eq!(h.routes("o/r", "task").unwrap().len(), 1, "another kind is not touched");
+    }
+
+    #[test]
+    fn a_database_from_before_route_memory_gains_it() {
+        let dir = std::env::temp_dir().join(format!("forkdeck-history-routes-{}", std::process::id()));
+        let p = dir.join("h.db");
+        {
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = Connection::open(&p).unwrap();
+            for (i, m) in MIGRATIONS[..MIGRATIONS.len() - 1].iter().enumerate() {
+                db.execute_batch(&format!("{} PRAGMA user_version = {};", m, i + 1)).unwrap();
+            }
+        }
+        let h = History::open(&p).unwrap();
+        h.record_route("o/r", "issue", &route(1, 1)).unwrap();
+        assert_eq!(h.routes("o/r", "issue").unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_file_database_is_reopened_and_a_newer_schema_is_refused() {
         let dir = std::env::temp_dir().join(format!("forkdeck-history-test-{}", std::process::id()));
@@ -827,4 +1078,15 @@ mod tests {
         assert!(History::open(&p).err().unwrap().contains("newer forkdeck"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[tokio::test]
+    async fn failed_submission_persistence_never_launches_a_job() {
+        let mut hub = crate::orchestrator::Hub::new(crate::config::Config { demo:true,..Default::default() },tokio::runtime::Handle::current());
+        let history = std::sync::Arc::new(History::in_memory());
+        history.db.lock().unwrap().execute_batch("DROP TABLE turns").unwrap();
+        hub.history = Some(history);
+        let (status, _) = crate::server::http::test_post(hub.clone(),serde_json::json!({"action":"submit","text":"must not execute","workspace":"workspace","plan_first":false}),"broken-storage").await;
+        assert_eq!(status,axum::http::StatusCode::BAD_REQUEST);
+        assert!(hub.state.lock().unwrap().jobs.is_empty());
+    }
+
 }

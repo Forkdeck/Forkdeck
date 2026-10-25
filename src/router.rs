@@ -21,7 +21,7 @@ pub async fn route(cfg: &Config, http: &reqwest::Client, task: &str, is_issue: b
         d.ms = start.elapsed().as_millis();
         return Routed { decision: d, fell_back: None, asked_jev: true };
     }
-    if cfg.router.kind == "jev" {
+    if cfg.router.kind == "jev" || cfg.router.kind == "auto" {
         match ask_jev(cfg, http, task).await {
             Ok(v) => match from_answers(cfg, &v) {
                 Ok(mut d) => {
@@ -37,6 +37,10 @@ pub async fn route(cfg: &Config, http: &reqwest::Client, task: &str, is_issue: b
             Err(e) => {
                 let mut d = rules(cfg, task, is_issue);
                 d.ms = start.elapsed().as_millis();
+                // "auto" asks a decision server only if one is running: none is not a failure.
+                if cfg.router.kind == "auto" && e.starts_with("cannot connect") {
+                    return Routed { decision: d, fell_back: None, asked_jev: false };
+                }
                 return Routed { decision: d, fell_back: Some(e), asked_jev: true };
             }
         }
@@ -86,6 +90,9 @@ pub fn request_body(cfg: &Config, task: &str) -> Value {
     body
 }
 
+/// The development key scripts/local-jev.sh serves with unless FORKDECK_JEV_KEY says otherwise.
+const LOCAL_DEV_KEY: &str = "forkdeck-local-dev";
+
 async fn ask_jev(cfg: &Config, http: &reqwest::Client, task: &str) -> Result<Value, String> {
     let j = &cfg.router.jev;
     let url = format!("{}/v1/systemone", j.base_url.trim_end_matches('/'));
@@ -93,12 +100,12 @@ async fn ask_jev(cfg: &Config, http: &reqwest::Client, task: &str) -> Result<Val
         .post(&url)
         .timeout(Duration::from_millis(j.timeout_ms))
         .json(&request_body(cfg, task));
-    if !j.api_key_env.is_empty() {
-        if let Ok(key) = std::env::var(&j.api_key_env) {
-            if !key.is_empty() {
-                req = req.bearer_auth(key);
-            }
-        }
+    let key = Some(&j.api_key_env).filter(|n| !n.is_empty()).and_then(|n| std::env::var(n).ok()).filter(|k| !k.is_empty());
+    // With no key set, a server on this machine gets the one scripts/local-jev.sh starts it with.
+    // A remote one never does: the key is for the local development server only.
+    let key = key.or_else(|| crate::orchestrator::is_loopback(&j.base_url).then(|| LOCAL_DEV_KEY.to_string()));
+    if let Some(key) = key {
+        req = req.bearer_auth(key);
     }
     let resp = req.send().await.map_err(|e| {
         if e.is_timeout() {
@@ -195,7 +202,7 @@ pub fn from_answers(cfg: &Config, v: &Value) -> Result<Decision, String> {
             gates.push(Gate { name: "plan first".into(), answer: if plan { "yes".into() } else { "no".into() }, value: pv, sharp });
         }
     }
-    Ok(Decision { agent, tier, review, gates, source: "jev".into(), ms: 0, note: note.join("; "), plan })
+    Ok(Decision { agent, tier, review, gates, source: "jev".into(), ms: 0, note: note.join("; "), plan, trial_from: None })
 }
 
 fn unit(v: f64, what: &str) -> Result<f64, String> {
@@ -206,12 +213,51 @@ fn unit(v: f64, what: &str) -> Result<f64, String> {
     }
 }
 
-fn hits(text: &str, words: &[String]) -> usize {
-    words
+/// A word reduced to a common form, so "fixes", "fixed" and "fixing" all meet "fix", and
+/// "renamed" meets "rename". Crude on purpose: both sides go through the same reduction.
+fn stem(w: &str) -> String {
+    let mut w = w.to_string();
+    let n = w.len();
+    let mut cut = false;
+    for suffix in ["ing", "ed"] {
+        if w.ends_with(suffix) && n - suffix.len() >= 3 {
+            w.truncate(n - suffix.len());
+            cut = true;
+            break;
+        }
+    }
+    if !cut {
+        if ["sses", "xes", "ches", "shes"].iter().any(|s| w.ends_with(s)) {
+            w.truncate(n - 2);
+        } else if w.ends_with('s') && !w.ends_with("ss") && n > 3 {
+            w.truncate(n - 1);
+        }
+    }
+    // "planning" -> "plann" -> "plan"; "called" keeps its double l.
+    let b = w.as_bytes();
+    if cut && b.len() >= 4 && b[b.len() - 1] == b[b.len() - 2] && !b"aeiouslz".contains(&b[b.len() - 1]) {
+        w.pop();
+    }
+    if w.len() > 3 && w.ends_with('e') {
+        w.pop();
+    }
+    w
+}
+
+/// Lowercase words, split on anything that is not a letter or digit ("one-line" is two words).
+fn tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).map(|t| stem(&t.to_lowercase())).collect()
+}
+
+/// How many of the keywords appear in the text. A keyword may be a phrase: its words must
+/// appear next to each other.
+fn hits(text: &str, keywords: &[String]) -> usize {
+    let words = tokens(text);
+    keywords
         .iter()
-        .filter(|w| {
-            let w = w.to_lowercase();
-            text.split(|c: char| !c.is_alphanumeric()).any(|t| t == w)
+        .filter(|k| {
+            let k = tokens(k);
+            !k.is_empty() && words.windows(k.len()).any(|w| w == k.as_slice())
         })
         .count()
 }
@@ -265,6 +311,8 @@ pub fn rules(cfg: &Config, task: &str, is_issue: bool) -> Decision {
     let review_sharp = (rv - 0.5).abs() >= (th - 0.5).max(0.05);
     // Same rule as the Jev path: any unsure answer buys a review.
     let review = rv >= 0.5 || !review_sharp || !agent_sharp || !effort_sharp;
+    // A task that asks how to go about something gets a choice of approaches first.
+    let plan = cfg.router.plan != "never" && !is_issue && hits(&text, &r.plan_keywords) > 0;
     Decision {
         agent,
         tier,
@@ -277,13 +325,77 @@ pub fn rules(cfg: &Config, task: &str, is_issue: bool) -> Decision {
         source: "rules".into(),
         ms: 0,
         note: note.join("; "),
-        plan: false,
+        plan,
+        trial_from: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A decision server on loopback that answers every request and records the auth header.
+    fn stand_in() -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let s = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 65536];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                *s.lock().unwrap() = req.lines().find(|l| l.to_ascii_lowercase().starts_with("authorization:")).unwrap_or("").to_string();
+                let body = r#"{"answers":{"agent":{"choice":"claude","confidence":0.9},"effort":{"score":1,"confidence":0.9},"review":{"noul":0.9}}}"#;
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            }
+        });
+        (url, seen)
+    }
+
+    fn auto(url: &str) -> Config {
+        let mut cfg = Config::default();
+        cfg.router.jev.base_url = url.into();
+        cfg.router.jev.api_key_env = "FORKDECK_TEST_KEY_THAT_IS_NEVER_SET".into();
+        cfg
+    }
+
+    #[tokio::test]
+    async fn auto_uses_a_local_decision_server_when_one_answers() {
+        let (url, seen) = stand_in();
+        let cfg = auto(&url);
+        assert_eq!(cfg.router.kind, "auto", "the default");
+        let r = route(&cfg, &reqwest::Client::new(), "rename a field", false).await;
+        assert!(r.asked_jev && r.fell_back.is_none(), "{:?}", r.fell_back);
+        assert_eq!(r.decision.agent, AgentKind::Claude);
+        assert!(seen.lock().unwrap().contains("Bearer forkdeck-local-dev"), "the local server's development key: {}", seen.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn auto_without_a_server_uses_the_rules_quietly() {
+        let r = route(&auto("http://127.0.0.1:1"), &reqwest::Client::new(), "fix the failing test", false).await;
+        assert!(!r.asked_jev && r.fell_back.is_none(), "{:?}", r.fell_back);
+    }
+
+    #[tokio::test]
+    async fn jev_without_a_key_set_uses_the_local_development_key() {
+        let (url, seen) = stand_in();
+        let mut cfg = auto(&url);
+        cfg.router.kind = "jev".into();
+        let r = route(&cfg, &reqwest::Client::new(), "rename a field", false).await;
+        assert!(r.asked_jev && r.fell_back.is_none(), "{:?}", r.fell_back);
+        assert!(seen.lock().unwrap().contains("Bearer forkdeck-local-dev"), "the local server's development key: {}", seen.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn jev_without_a_server_says_it_fell_back() {
+        let mut cfg = auto("http://127.0.0.1:1");
+        cfg.router.kind = "jev".into();
+        let r = route(&cfg, &reqwest::Client::new(), "fix the failing test", false).await;
+        assert!(r.fell_back.is_some_and(|e| e.contains("cannot connect")));
+    }
 
     #[test]
     fn rules_review_confidence_obeys_the_threshold() {
@@ -377,6 +489,44 @@ mod tests {
         let v = json!({"answers": {"agent": {"choice": "gemini", "confidence": 0.9},
             "effort": {"score": 1.0}, "review": {"noul": 0.5}}});
         assert!(from_answers(&cfg, &v).is_err());
+    }
+
+    #[test]
+    fn rules_match_phrases_and_word_forms() {
+        let kw = |k: &[&str]| k.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(hits("Renamed the field and fixed two failing tests", &kw(&["rename", "fix", "fail", "test"])), 4);
+        assert_eq!(hits("Planning the races", &kw(&["plan", "race"])), 2);
+        assert_eq!(hits("passed and called", &kw(&["pass", "call"])), 2);
+        // A phrase needs its words together and in order.
+        assert_eq!(hits("there is a race condition in the pool", &kw(&["race condition"])), 1);
+        assert_eq!(hits("the condition of the race", &kw(&["race condition"])), 0);
+        assert_eq!(hits("a one-line change", &kw(&["one line"])), 1);
+        // Words are whole: "fixture" is not "fix".
+        assert_eq!(hits("update the fixture", &kw(&["fix"])), 0);
+    }
+
+    #[test]
+    fn rules_cover_common_phrasings() {
+        let cfg = Config::default();
+        let d = rules(&cfg, "The importer crashes with a stack trace when the file is empty", false);
+        assert_eq!(d.agent, AgentKind::Codex);
+        let d = rules(&cfg, "Clean up and document the config module", false);
+        assert_eq!(d.agent, AgentKind::Claude);
+        let d = rules(&cfg, "There is a race condition in the job queue", false);
+        assert_eq!(d.tier, Tier::Heavy);
+        let d = rules(&cfg, "Fix the spelling in the log message", false);
+        assert_eq!(d.tier, Tier::Light);
+    }
+
+    #[test]
+    fn rules_ask_for_a_plan_only_when_the_task_asks_how() {
+        let mut cfg = Config::default();
+        assert!(rules(&cfg, "How should we split the storage layer?", false).plan);
+        assert!(!rules(&cfg, "Fix the failing parser test", false).plan);
+        // An issue's text is someone else's: it never stops for a choice by itself.
+        assert!(!rules(&cfg, "How should we split the storage layer?", true).plan);
+        cfg.router.plan = "never".into();
+        assert!(!rules(&cfg, "How should we split the storage layer?", false).plan);
     }
 
     #[test]

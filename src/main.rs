@@ -1,23 +1,34 @@
+mod adaptive;
 mod agents;
+mod buildcache;
+mod catalog;
 mod choices;
+mod benchmark;
 mod cicd;
 mod config;
 mod copilot;
 mod demo;
+mod diff;
 mod history;
 mod input;
 mod issues;
 mod journal;
 mod knowledge;
 mod mcp;
+mod metrics;
 mod orchestrator;
 mod pick;
 mod plan_ui;
 mod planning;
 mod proc;
 mod remote;
+mod routemem;
 mod router;
+mod schedule;
+mod server;
 mod state;
+mod subissues;
+mod taskgraph;
 mod team;
 mod tracker;
 mod ui;
@@ -55,6 +66,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Run the local web UI and orchestration daemon
+    Serve,
+    /// Run paired model benchmarks in disposable local clones (executes agents)
+    Benchmark {
+        manifest: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        preflight: bool,
+    },
+    /// Compare reviewers against labeled defects and clean changes (never enables routing)
+    ReviewerBenchmark {
+        manifest: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        preflight: bool,
+    },
+    /// Inspect adaptive decisions, suspensions and durable trial reservations
+    Adaptive {
+        /// Print full audit records as JSON
+        #[arg(long)]
+        json: bool,
+        /// Evaluate a paired benchmark evidence file against configured gates
+        #[arg(long)]
+        evaluate: Option<PathBuf>,
+        /// Disable new adaptive assignments immediately, across running instances
+        #[arg(long, conflicts_with_all=["enable", "evaluate"])]
+        disable: bool,
+        /// Re-enable assignments after evidence qualification (suspensions remain binding)
+        #[arg(long, conflicts_with_all=["disable", "evaluate"])]
+        enable: bool,
+    },
     /// Run one task without the interface and print progress. Lines typed on stdin while it runs
     /// are sent to the task; a line starting with "!" stops the agent to take it at once
     Run {
@@ -96,6 +140,13 @@ enum Cmd {
     },
     /// What forkdeck has done lately: jobs, pass rates, time to a pull request, tokens
     Stats {
+        /// Group invocation usage by actual model, effort, and role
+        #[arg(long)]
+        by_model: bool,
+        #[arg(long, requires = "by_model")]
+        role: Option<String>,
+        #[arg(long, requires = "by_model")]
+        repo: Option<String>,
         /// How many days back to look
         #[arg(long, default_value_t = 7)]
         days: u32,
@@ -235,7 +286,20 @@ fn main() -> anyhow::Result<()> {
         eprintln!("note: ./forkdeck.toml is not read. Move it to {} or pass --config.", config::user_path().display());
     }
     cfg.demo = cli.demo;
+    // Evidence is matched against the configuration as written, whatever is filled in below.
+    cfg.adaptive.written = Some(adaptive::fingerprint(&cfg));
     if !cfg.demo {
+        // Only where agents may run: asking the CLI takes a moment.
+        let agents_run = matches!(cli.cmd, None | Some(Cmd::Once) | Some(Cmd::Run { .. }) | Some(Cmd::Resume) | Some(Cmd::Doctor) | Some(Cmd::Serve) | Some(Cmd::Remote { cmd: RemoteCmd::Serve }));
+        let chosen = if agents_run && cfg.agents.discover_models.unwrap_or(true) { catalog::fill_codex(&mut cfg) } else { vec![] };
+        if !chosen.is_empty() && matches!(cli.cmd, Some(Cmd::Doctor)) {
+            println!("models    codex: {}", chosen.join(", "));
+        }
+        if let Some((r, automation)) = config::launch_repo(&std::env::current_dir()?, &cfg)? {
+            cfg.repos.push(r);
+            cfg.automation.enabled |= automation;
+            cfg.validate()?;
+        }
         // Files saved under a repository's name from before its host was part of it.
         knowledge::migrate_names(&cfg.repos);
         if let Err(e) = cicd::migrate_keys(&cfg.repos) {
@@ -246,6 +310,7 @@ fn main() -> anyhow::Result<()> {
         cfg.automation.enabled = true;
         if cfg.repos.is_empty() {
             cfg.repos.push(config::RepoCfg {
+                agent_domains: vec![],
                 provider: Provider::Github,
                 repo: "acme/payments".into(),
                 path: PathBuf::from("."),
@@ -254,6 +319,8 @@ fn main() -> anyhow::Result<()> {
                 working_label: "agent:working".into(),
                 done_label: "agent:review".into(),
                 failed_label: "agent:needs-human".into(),
+                plan_label: "forkdeck:plan".into(),
+                human_label: "needs-human".into(),
                 allowed_authors: vec![],
                 checks: vec!["cargo test --quiet".into()],
                 pr_label: "review:ready".into(),
@@ -268,14 +335,23 @@ fn main() -> anyhow::Result<()> {
             });
         }
     }
+    if cfg.demo && matches!(cli.cmd, Some(Cmd::Serve) | Some(Cmd::Remote { cmd: RemoteCmd::Serve })) { server::seed::configure(&mut cfg); }
     let rt = tokio::runtime::Runtime::new()?;
     let hub = Hub::new(cfg, rt.handle().clone()).with_history();
+    *hub.config_path.lock().unwrap() = cfg_path.clone();
     let cwd = std::env::current_dir()?;
 
     match cli.cmd {
         Some(Cmd::Route { task }) => {
             let task = task.join(" ");
             anyhow::ensure!(!task.trim().is_empty(), "give a task to route");
+            // As a task typed here would be routed: memory first, for this directory.
+            let here = std::env::current_dir()?;
+            let remembered = orchestrator::route_scope(&Source::Manual, &here).and_then(|(scope, kind)| orchestrator::recall(&hub, None, &scope, kind, &task));
+            if let Some(d) = remembered {
+                println!("{}", serde_json::to_string_pretty(&d)?);
+                return Ok(());
+            }
             let r = rt.block_on(router::route(&hub.cfg, &hub.http, &task, false));
             if let Some(e) = &r.fell_back {
                 eprintln!("jev unavailable, rules used instead: {}", e);
@@ -299,9 +375,93 @@ fn main() -> anyhow::Result<()> {
             let code = rt.block_on(team_cmd(&hub, all, json, cmd));
             std::process::exit(code);
         }
-        Some(Cmd::Stats { days, jobs, json }) => {
+        Some(Cmd::ReviewerBenchmark { manifest, output, preflight }) => {
+            rt.block_on(benchmark::reviewers(&hub, &manifest, &output, preflight)).map_err(anyhow::Error::msg)
+        }
+        Some(Cmd::Benchmark { manifest, output, preflight }) => {
+            rt.block_on(benchmark::run(&hub, &manifest, &output, preflight)).map_err(anyhow::Error::msg)
+        }
+        Some(Cmd::Adaptive { json, evaluate, disable, enable }) => {
+            if disable || enable {
+                adaptive::set_disabled(&hub.cfg, disable).map_err(anyhow::Error::msg)?;
+            }
+            if let Some(path) = evaluate {
+                let q = adaptive::evaluate(&hub.cfg, &path).map_err(anyhow::Error::msg)?;
+                println!("{}", serde_json::to_string_pretty(&q)?);
+            } else {
+                let s = adaptive::status().map_err(anyhow::Error::msg)?;
+                let production = adaptive::production_reports(&hub.cfg.adaptive, &s);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({"state":s,"production":production,"fingerprint":adaptive::fingerprint(&hub.cfg)})
+                        )?
+                    );
+                } else {
+                    println!("Mode: {:?}; configuration fingerprint: {}", hub.cfg.adaptive.mode, adaptive::fingerprint(&hub.cfg));
+                    println!("Operator disable switch: {}", s.disabled);
+                    println!(
+                        "Objective: {:?}; invocation USD ceiling: {:?} (capability probed per CLI; no hard token ceiling)",
+                        hub.cfg.adaptive.objective, hub.cfg.adaptive.invocation_max_usd
+                    );
+                    for p in production {
+                        println!("Observed trial {} / {}: {} candidates, {} baseline, {} pending; savings {:?}, 95% lower {:?}; reserved {} tokens; gate {:?}",p.policy,p.cohort,p.candidate_tasks,p.baseline_tasks,p.pending,p.observed_savings,p.observed_savings_lower,p.reserved_tokens,p.gate_failure);
+                    }
+                    for (cohort, reason) in s.suspended {
+                        println!("Suspended {cohort}: {reason}");
+                    }
+                    for d in s.decisions.iter().rev().take(30) {
+                        println!(
+                            "{} {:?} {} -> {} / {}: {}; probability {}; reserved {}; observed tokens {:?}; accepted {:?}",
+                            d.id,
+                            d.mode,
+                            d.baseline.model,
+                            d.executed.model,
+                            d.executed.effort,
+                            d.reason,
+                            d.probability,
+                            d.reserved,
+                            d.tokens,
+                            d.accepted
+                        );
+                        if let Some(q) = &d.qualification {
+                            println!("  Predicted savings {:.1}% (95% interval {:.1}–{:.1}%); {} paired tasks; quality difference lower {:.3}; p90 {} ms",100.0*q.predicted_savings,100.0*q.savings_lower,100.0*q.savings_upper,q.tasks,q.quality_difference_lower,q.candidate_p90_ms);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Some(Cmd::Stats { days, jobs, json, by_model, role, repo }) => {
             let days = days.clamp(1, 3650);
-            let entries = journal::read(journal::now() - days as i64 * journal::DAY).map_err(|e| anyhow::anyhow!("the journal cannot be read: {}", e))?;
+            let entries = journal::read(journal::now() - days as i64 * journal::DAY)
+                .map_err(|e| anyhow::anyhow!("the journal cannot be read: {}", e))?;
+            if by_model {
+                let report = metrics::report(journal::now() - days as i64 * journal::DAY, role.as_deref(), repo.as_deref(), &entries)
+                    .map_err(anyhow::Error::msg)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", report.note);
+                    println!(
+                        "Damaged records: {}; historical jobs without attempts: {}",
+                        report.damaged_records, report.historical_jobs_without_attempts
+                    );
+                    for t in &report.tasks {
+                        println!(
+                            "  Cohort {:?}; reported USD/accepted {:?}; cost coverage {}/{}",
+                            t.cohort, t.reported_usd_per_accepted_task, t.complete_cost_tasks, t.tasks
+                        );
+                        println!("Task cohort {} / {} / {}: {} evaluated, {} accepted, {} unknown; {} first pass; tokens/accepted {:?} (partial: {}); {} known excluded tokens",t.repo,t.source,t.initial_model,t.evaluated,t.accepted,t.unknown_quality,t.first_pass,t.tokens_per_accepted_task_lower_bound,t.partial_usage,t.known_excluded_tokens);
+                        println!("Queue wait p90 {:?} ms; measured {}/{} tasks (live admission to dispatch)", t.p90_queue_wait_ms, t.queue_coverage, t.tasks);
+                    }
+                    for g in report.groups {
+                        println!("{} / {} / {} / {}: {} attempts, {} complete usage, {} incomplete, {} cancelled, {} errors; input {} output {} cache-read {} cache-write {}; median {:?} p90 {:?} tokens; p90 {:?} ms", g.cli,g.model,g.effort,g.role,g.attempts,g.complete_usage,g.incomplete,g.cancelled,g.errors,g.known_input,g.known_output,g.known_cache_read,g.known_cache_write,g.median_tokens,g.p90_tokens,g.p90_wall_ms);
+                    }
+                }
+                return Ok(());
+            }
             let summary = journal::summarise(&entries, days);
             if json {
                 println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -367,31 +527,9 @@ fn main() -> anyhow::Result<()> {
             RemoteCmd::Pair { iface, ttl } => remote::pair_cmd(&hub.cfg, iface.as_deref(), ttl),
             RemoteCmd::Devices => remote::devices_cmd(&hub.cfg),
             RemoteCmd::Revoke { name } => remote::revoke_cmd(&hub.cfg, &name),
-            RemoteCmd::Serve => {
-                anyhow::ensure!(hub.cfg.remote.enabled, "[remote] enabled = false in the config");
-                rt.block_on(hub.detect_agents());
-                // As the interface does: earlier tasks come back for the phone to see and reply to,
-                // cut-off ones continue, and running ones are saved as they go.
-                hub.start_autosave();
-                for id in hub.restore() {
-                    if let Err(e) = rt.block_on(hub.resume(id)) {
-                        hub.log("queue", format!("#{} not resumed: {}", id, e));
-                    }
-                }
-                rt.spawn(issues::poll_loop(hub.clone()));
-                rt.spawn(team::watch_loop(hub.clone()));
-                let stopped = rt.block_on(async {
-                    tokio::select! {
-                        r = remote::serve(hub.clone()) => r,
-                        _ = stop_signal() => Ok(()),
-                    }
-                });
-                rt.block_on(hub.shutdown(Duration::from_secs(45)));
-                record_owed(&hub);
-                proc::kill_all();
-                stopped
-            }
+            RemoteCmd::Serve => server::run(&rt, hub),
         },
+        Some(Cmd::Serve) => server::run(&rt, hub),
         Some(Cmd::Doctor) => {
             let ok = rt.block_on(doctor(&hub, cfg_path));
             std::process::exit(if ok { 0 } else { 1 });
@@ -425,7 +563,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Cmd::Init { .. }) => unreachable!(),
         None => {
-            rt.block_on(hub.detect_agents());
+            rt.block_on(hub.detect_agents_in_background());
             if hub.cfg.remote.enabled {
                 let h = hub.clone();
                 rt.spawn(async move {
@@ -730,6 +868,21 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
         None => println!("config    none found, defaults in use"),
     }
     hub.detect_agents().await;
+    if agents::claude_sandboxed(&hub.cfg) {
+        println!("sandbox   on       claude workers run any command in Claude Code's sandbox");
+    } else if hub.cfg.agents.sandbox == Some(false) {
+        println!("sandbox   off      claude workers run only the build commands found for each repository (agents.sandbox = false)");
+    } else {
+        println!("sandbox   off      claude workers run only the build commands found for each repository; install bubblewrap and socat to sandbox them");
+    }
+    if agents::claude_sandboxed(&hub.cfg) {
+        let n = &hub.cfg.agents.network;
+        let found = if n.detect_mirrors { buildcache::machine_mirrors() } else { vec![] };
+        let mut open = vec![if n.public_registries { "the package registries of each repository's languages".to_string() } else { "no public registries".to_string() }];
+        if !found.is_empty() { open.push(format!("mirrors your package managers use: {}", found.join(", "))); }
+        if !n.mirrors.is_empty() { open.push(format!("configured mirrors: {}", n.mirrors.join(", "))); }
+        println!("network   {}", open.join("; "));
+    }
     for k in AgentKind::ALL {
         let cmd = hub.cfg.agents.get(k).cmd.unwrap_or_default();
         match issues::sh(&cmd, &["--version"], None).await {
@@ -917,6 +1070,41 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
     ok
 }
 
+/// A click on an edit line opens its diff full screen; while it is open, keys and the wheel move
+/// through it and Esc closes it. True when the event was used here.
+fn diff_event(hub: &Hub, u: &mut ui::Ui, e: &Event, page: u16) -> bool {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    if let Some(v) = &mut u.diff {
+        match e {
+            Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => u.diff = None,
+                KeyCode::Up => v.scroll_by(-1, page),
+                KeyCode::Down => v.scroll_by(1, page),
+                KeyCode::PageUp => v.scroll_by(-(page as i32), page),
+                KeyCode::PageDown | KeyCode::Char(' ') => v.scroll_by(page as i32, page),
+                KeyCode::Home => v.scroll = 0,
+                KeyCode::End => v.scroll_by(i32::MAX / 2, page),
+                _ => {}
+            },
+            Event::Mouse(m) if m.kind == MouseEventKind::ScrollUp => v.scroll_by(-3, page),
+            Event::Mouse(m) if m.kind == MouseEventKind::ScrollDown => v.scroll_by(3, page),
+            _ => {}
+        }
+        return true;
+    }
+    let Event::Mouse(m) = e else { return false };
+    if m.kind != MouseEventKind::Down(MouseButton::Left) {
+        return true;
+    }
+    let Some(spot) = crate::diff::spot_at(&u.spots.borrow(), m.column, m.row).cloned() else { return true };
+    let st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(j) = st.jobs.iter().find(|j| j.id == spot.job) {
+        let base = j.base_sha.clone().unwrap_or_else(|| "HEAD".into());
+        u.diff = Some(crate::diff::View::open(j.id, spot.files, j.workdir.clone(), base));
+    }
+    true
+}
+
 fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
     ui::Ui {
         input: String::new(),
@@ -935,6 +1123,23 @@ fn new_ui(hub: &Hub, cwd: PathBuf) -> ui::Ui {
         seen_choices: Default::default(),
         jobs_per_day: hub.cfg.limits.jobs_per_day,
         tokens_per_day: hub.cfg.limits.tokens_per_day,
+        spots: Default::default(),
+        diff: None,
+        output_back: Default::default(),
+        log_back: Default::default(),
+        output_view: Default::default(),
+        log_view: Default::default(),
+    }
+}
+
+/// Ctrl with Shift or Caps Lock arrives as an uppercase letter; it is the same shortcut.
+fn ctrl_lowercase(event: Event) -> Event {
+    match event {
+        Event::Key(mut k) if k.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let KeyCode::Char(c) = k.code { k.code = KeyCode::Char(c.to_ascii_lowercase()); }
+            Event::Key(k)
+        }
+        e => e,
     }
 }
 
@@ -948,6 +1153,7 @@ fn quit_key(key: event::KeyEvent) -> bool {
 
 /// What Enter with nothing typed asks of a finished task.
 const CARRY_ON: &str = "Continue the previous task from where it stopped. Inspect the current working tree before making further changes.";
+const NO_REPOS_TO_POLL: &str = "no [[repos]] configured, nothing to poll";
 
 /// What the input line holds: the messages sent from it and an unsent draft. Kept per working
 /// directory in the history database, so they are there when the interface opens again.
@@ -1162,7 +1368,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
         rt.spawn(async move {
             stop_signal().await;
             let already = stopping.swap(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
+            let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste, event::DisableMouseCapture);
             let _ = ratatui::try_restore();
             if already {
                 proc::kill_all();
@@ -1179,7 +1385,8 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
         });
     }
     let mut term = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste);
+    // Mouse capture: clicking an edit line opens its diff. Shift-drag still selects text.
+    let _ = crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste, event::EnableMouseCapture);
     let res = (|| -> anyhow::Result<()> {
         loop {
             if stopping.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1193,11 +1400,17 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
             }
             sync_selection(hub, &mut u);
             sync_choices(hub, &mut u);
+            if let Some(v) = &mut u.diff { v.refresh(); }
             term.draw(|f| ui::draw(f, &hub.state.lock().unwrap_or_else(|e| e.into_inner()), &u))?;
             if !event::poll(Duration::from_millis(100))? {
                 continue;
             }
-            match event::read()? {
+            let page = term.size().map(|s| s.height.saturating_sub(2)).unwrap_or(20);
+            let event = ctrl_lowercase(event::read()?);
+            if diff_event(hub, &mut u, &event, page) {
+                continue;
+            }
+            match event {
                 Event::Paste(s) => {
                     if let Some(panel) = &mut u.issue_panel { panel.paste(&s); }
                     else { u.input.push_str(&s.replace(['\n', '\r'], " ")); }
@@ -1210,13 +1423,12 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                     match k.code {
                         KeyCode::Char('a') if ctrl => {
+                            let on = !hub.state.lock().unwrap_or_else(|e| e.into_inner()).automation;
+                            hub.automation(on);
                             let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
-                            st.automation = !st.automation;
-                            let on = st.automation;
                             let none = st.repos.is_empty();
-                            st.log("issues", if on { "polling on" } else { "polling paused" });
                             if on && none {
-                                st.log("issues", "no [[repos]] configured, nothing to poll");
+                                st.log("issues", NO_REPOS_TO_POLL);
                             }
                         }
                         KeyCode::Char('x') if ctrl => {
@@ -1229,7 +1441,12 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                         KeyCode::F(5) => open_choices(hub, &mut u),
                         KeyCode::Char('t') | KeyCode::Char('n') if ctrl => { u.reply_to = None; u.new_task = true; }
                         // The next new task proposes approaches first.
+                        // Shift-Tab as in Claude Code's plan mode.
                         KeyCode::Char('p') if ctrl => {
+                            u.plan_next = !u.plan_next;
+                            if u.plan_next { u.reply_to = None; u.new_task = true; }
+                        }
+                        KeyCode::BackTab => {
                             u.plan_next = !u.plan_next;
                             if u.plan_next { u.reply_to = None; u.new_task = true; }
                         }
@@ -1267,6 +1484,19 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                             u.plan_next = false;
                             u.follow = true;
                         }
+                        // The session log with Shift, else the selected job's output panes.
+                        KeyCode::PageUp | KeyCode::PageDown if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                            u.log_back.set(ui::page(u.log_back.get(), u.log_view.get(), k.code == KeyCode::PageUp));
+                        }
+                        KeyCode::PageUp | KeyCode::PageDown => {
+                            if let Some(id) = u.selected {
+                                u.output_back.set(Some((id, ui::page(u.back_for(id), u.output_view.get(), k.code == KeyCode::PageUp))));
+                            }
+                        }
+                        KeyCode::End => {
+                            u.output_back.set(None);
+                            u.log_back.set(0);
+                        }
                         KeyCode::Tab => {
                             // Profiles are for --agent and the config; Tab steps through the CLIs.
                             u.forced = match u.forced.as_ref().map(|r| r.kind()) {
@@ -1288,6 +1518,15 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
                                 u.follow = false;
                             }
                         }
+                        KeyCode::Left | KeyCode::Right if k.modifiers.contains(KeyModifiers::ALT) => {
+                            let st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(next) = ui::lane_step(&st, u.selected, k.code == KeyCode::Right) {
+                                if u.input.is_empty() { u.reply_to = None; u.new_task = false; }
+                                else if u.reply_to.is_none() { u.reply_to = ui::reply_target(&st, &u); }
+                                u.selected = Some(next);
+                                u.follow = false;
+                            }
+                        }
                         KeyCode::Up => history.older(&mut u.input),
                         KeyCode::Down => history.newer(&mut u.input),
                         KeyCode::Enter => {
@@ -1301,7 +1540,7 @@ fn tui(rt: &tokio::runtime::Runtime, hub: &Hub, cwd: PathBuf) -> anyhow::Result<
             }
         }
     })();
-    let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
+    let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste, event::DisableMouseCapture);
     let _ = ratatui::try_restore();
     save_composer(hub, &u, &history, &mut composer_saved);
     // Stop any agent still running, and give claimed issues time to be handed back with a comment.
@@ -1334,5 +1573,16 @@ mod quit_tests {
         let mut release = event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         release.kind = KeyEventKind::Release;
         assert!(!quit_key(release));
+    }
+
+    #[test]
+    fn ctrl_shortcuts_work_with_shift_or_caps_lock() {
+        let shifted = Event::Key(event::KeyEvent::new(KeyCode::Char('T'), KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        let Event::Key(k) = ctrl_lowercase(shifted) else { panic!() };
+        assert_eq!(k.code, KeyCode::Char('t'));
+        // Typed text keeps its case.
+        let typed = Event::Key(event::KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT));
+        let Event::Key(k) = ctrl_lowercase(typed) else { panic!() };
+        assert_eq!(k.code, KeyCode::Char('T'));
     }
 }

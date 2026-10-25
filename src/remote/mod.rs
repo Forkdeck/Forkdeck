@@ -41,14 +41,18 @@ struct Ctx {
 
 /// Start listening. Runs until the process ends; errors before the listener is up are returned.
 pub async fn serve(hub: Hub) -> anyhow::Result<()> {
+    let feed = Arc::new(feed::Feed::new());
+    tokio::spawn(feed.clone().run(hub.clone(), Duration::from_millis(200)));
+    serve_with_feed(hub, feed).await
+}
+
+pub async fn serve_with_feed(hub: Hub, feed: Arc<feed::Feed>) -> anyhow::Result<()> {
     let cfg = hub.cfg.remote.clone();
     let ca = pki::Ca::load_or_create(&cfg.dir)?;
     let mut ips: Vec<IpAddr> = pair::interfaces().into_iter().map(|i| i.ip).collect();
     ips.sort();
     let (tls_tx, tls) = watch::channel(ca.server_config(&ips)?);
     let listener = TcpListener::bind(&cfg.listen).await?;
-    let feed = Arc::new(feed::Feed::new());
-    tokio::spawn(feed.clone().run(hub.clone(), Duration::from_millis(200)));
     let paired = devices::Registry::new(&cfg.dir).list().len();
     hub.log("remote", format!("listening on {} ({} phone(s) paired)", listener.local_addr()?, paired));
     let ctx = Arc::new(Ctx { hub: hub.clone(), feed, ca, devices: devices::Registry::new(&cfg.dir), dir: cfg.dir.clone(), tls });
@@ -295,12 +299,13 @@ async fn call(ctx: &Ctx, device: &str, c: Call) -> Reply {
             Reply::Ok
         }
         Call::SetAutomation { on } => {
-            let mut st = hub.state.lock().unwrap();
+            let st = hub.state.lock().unwrap();
             if on && st.stopping {
                 return Reply::Err { msg: "shutting down".into() };
             }
-            st.automation = on;
-            st.log("remote", format!("{}: polling {}", device, if on { "on" } else { "paused" }));
+            drop(st);
+            hub.automation(on);
+            hub.log("remote", format!("{}: polling {}", device, if on { "on" } else { "paused" }));
             Reply::Ok
         }
         Call::PollNow => {

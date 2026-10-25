@@ -27,7 +27,7 @@ pub const SUBSCRIBE: u32 = 1;
 pub type ServerCodec = StreamingServerCodec<Call, Reply>;
 pub type ClientCodec = StreamingClientCodec<Call, Reply>;
 
-#[derive(ForyObject, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {
     #[default]
     Auto,
@@ -35,7 +35,7 @@ pub enum Agent {
     Codex,
 }
 
-#[derive(ForyObject, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     #[default]
     Queued,
@@ -58,7 +58,7 @@ impl Status {
     }
 }
 
-#[derive(ForyObject, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum StageState {
     #[default]
     Idle,
@@ -69,15 +69,28 @@ pub enum StageState {
 }
 
 /// Which box of a job's tree a stage event is about.
-#[derive(ForyObject, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Which {
     #[default]
     Worker,
     Reviewer,
 }
 
+/// Board fields projected from a job, shared by every browser viewport.
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, Debug, Default, Clone, PartialEq)]
+pub struct BoardProjection {
+    pub lane: String,
+    pub state: String,
+    pub meta: String,
+    pub elapsed: String,
+    pub route: String,
+    pub stages: Vec<u8>,
+    pub log: Vec<Vec<String>>,
+    pub warn: String,
+}
+
 /// One row of the job list.
-#[derive(ForyObject, Debug, Default, Clone, PartialEq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 pub struct JobSummary {
     pub id: u32,
     pub title: String,
@@ -101,7 +114,7 @@ pub struct JobSummary {
     pub outcome: String,
 }
 
-#[derive(ForyObject, Debug, Default, Clone, PartialEq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 pub struct StageView {
     pub agent: String,
     pub label: String,
@@ -118,7 +131,7 @@ pub struct StageView {
     pub pushed: u64,
 }
 
-#[derive(ForyObject, Debug, Default, Clone, PartialEq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 pub struct GateView {
     pub name: String,
     pub answer: String,
@@ -126,7 +139,7 @@ pub struct GateView {
     pub sharp: bool,
 }
 
-#[derive(ForyObject, Debug, Default, Clone, PartialEq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 pub struct DecisionView {
     pub agent: String,
     pub tier: String,
@@ -137,13 +150,13 @@ pub struct DecisionView {
     pub note: String,
 }
 
-#[derive(ForyObject, Debug, Default, Clone, PartialEq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 pub struct TurnView {
     pub ask: String,
     pub answer: String,
 }
 
-#[derive(ForyObject, Debug, Default, Clone, PartialEq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 pub struct JobDetail {
     pub summary: JobSummary,
     pub prompt: String,
@@ -159,7 +172,7 @@ pub struct JobDetail {
     pub findings: Vec<String>,
 }
 
-#[derive(ForyObject, Debug, Default, Clone, PartialEq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 pub struct LogLine {
     /// Position in the session log, counting every line ever logged.
     pub seq: u64,
@@ -168,14 +181,14 @@ pub struct LogLine {
     pub msg: String,
 }
 
-#[derive(ForyObject, Debug, Default, Clone, PartialEq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 pub struct RepoView {
     pub name: String,
     pub label: String,
     pub last_error: String,
 }
 
-#[derive(ForyObject, Debug, Default, Clone, PartialEq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 pub struct Snapshot {
     /// Seq of the last event folded into this snapshot; subscribe from here.
     pub seq: u64,
@@ -188,7 +201,7 @@ pub struct Snapshot {
     pub repos: Vec<RepoView>,
 }
 
-#[derive(ForyObject, Debug, Default, Clone, PartialEq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 pub struct ServerInfo {
     pub proto: u32,
     pub version: String,
@@ -196,7 +209,7 @@ pub struct ServerInfo {
     pub device: String,
 }
 
-#[derive(ForyObject, Debug, Default, Clone, PartialEq)]
+#[derive(ts_rs::TS, serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 pub enum Event {
     /// The client missed events: fetch a [`Call::Snapshot`] and start over.
     #[default]
@@ -209,7 +222,7 @@ pub enum Event {
     Automation { on: bool },
 }
 
-#[derive(ForyObject, Debug, Default, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 pub enum Call {
     #[default]
     Nop,
@@ -227,7 +240,7 @@ pub enum Call {
     Pair { token: String, csr: Vec<u8>, device: String },
 }
 
-#[derive(ForyObject, Debug, Default, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, ForyObject, Debug, Default, Clone, PartialEq)]
 // A wire type: one large variant (a snapshot) is fine, and boxing it would change its API.
 #[allow(clippy::large_enum_variant)]
 pub enum Reply {
@@ -490,5 +503,24 @@ mod tests {
         assert!(in_subnet(ip("fe80::1"), ip("fe80::abcd"), 64));
         assert!(!in_subnet(ip("fe80::1"), ip("192.168.1.20"), 0));
         assert!(!in_subnet(ip("192.168.1.77"), ip("192.168.1.20"), 40));
+    }
+}
+
+/// JSON contracts use numbers for integers, matching serde_json's wire representation.
+pub fn web_contracts() -> String {
+    use ts_rs::TS;
+    let cfg = ts_rs::Config::default().with_large_int("number");
+    let mut out = String::from("// Generated from crates/remote-proto. Run pnpm run contracts to refresh.\n");
+    for declaration in [BoardProjection::decl(&cfg), Agent::decl(&cfg), Status::decl(&cfg), StageState::decl(&cfg), Which::decl(&cfg), JobSummary::decl(&cfg), StageView::decl(&cfg), GateView::decl(&cfg), DecisionView::decl(&cfg), TurnView::decl(&cfg), JobDetail::decl(&cfg), LogLine::decl(&cfg), RepoView::decl(&cfg), Snapshot::decl(&cfg), ServerInfo::decl(&cfg), Event::decl(&cfg)] {
+        out.push_str(&format!("export {declaration}\n"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod web_contract_tests {
+    #[test]
+    fn typescript_contracts_match_the_shared_dtos() {
+        assert_eq!(super::web_contracts(), include_str!("../../../web/src/contracts.ts"), "run pnpm run contracts in web/");
     }
 }

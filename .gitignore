@@ -3,3 +3,8 @@
 /dist
 *.cdx.json
 /.local/
+
+/web/node_modules/
+/.forkdeck-serve.lock
+/web/test-results/
+/web/playwright-report/

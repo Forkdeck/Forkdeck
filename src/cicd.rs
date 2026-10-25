@@ -490,7 +490,7 @@ fn deploy_lock() -> Result<(), String> {
 
 /// Read the state file. A file that exists but cannot be understood is an error, not "no state":
 /// treating it as empty would make the commit that is there now the rollback target.
-fn load_saved() -> Result<HashMap<String, Saved>, String> {
+pub(crate) fn load_saved() -> Result<HashMap<String, Saved>, String> {
     let path = state_path();
     match std::fs::read_to_string(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
@@ -519,7 +519,7 @@ fn update_saved(key: &str, change: impl FnOnce(&mut Saved)) -> Result<Saved, Str
     Ok(now)
 }
 
-fn saved_key(r: &RepoCfg, d: &DeployCfg) -> String {
+pub(crate) fn saved_key(r: &RepoCfg, d: &DeployCfg) -> String {
     format!("{:?}:{}:{}", r.provider, r.qualified(), d.environment).to_lowercase()
 }
 

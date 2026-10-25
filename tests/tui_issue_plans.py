@@ -317,12 +317,16 @@ with tempfile.TemporaryDirectory(prefix="forkdeck-plan-tests-") as directory:
         rig.start(); rig.begin()
         rig.wait(lambda: rig.job().get('status')=='Done' and rig.job().get('verdict') is False)
         rig.send(b'1\r')
-        rig.wait(lambda: b'passing plan review' in rig.output)
+        # The refusal replaces the outcome line. The terminal only redraws the cells that changed,
+        # so the message never arrives as one run of bytes; its distinct word does.
+        rig.wait(lambda: b'passing' in rig.output)
+        assert rig.plan()['accepted'] is None and rig.plan()['published'] is None
         assert rig.db()['creates']==0
         (rig.root/'reject').unlink()
-        rig.refine('Address the review findings'); rig.reviewed(2)
+        # Revision 2 was the planner's own answer to the failed review; the refinement is 3.
+        rig.refine('Address the review findings'); rig.reviewed(3)
         assert 'VERDICT: FAIL' in rig.records('agents.jsonl')[-2]['prompt']
-        rig.send(F6); rig.publish(2); rig.stop()
+        rig.send(F6); rig.publish(3); rig.stop()
         print('PASS failed plan review blocks publication; next revision includes reviewer feedback')
     finally: rig.cleanup()
 

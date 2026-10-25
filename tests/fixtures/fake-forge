@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""A stateful stand-in for `gh api`, for tests. State lives in $FAKE_FORGE/state.json:
+  issues      {"<number>": {title, body, state, state_reason, labels: [names]}}  (id is 1000 + number)
+  sub_issues  {"<parent>": [numbers]}
+  blocked_by  {"<number>": [numbers]}
+  pulls       [{number, state, merged_at, base: {ref}, head: {ref}}]
+`gh issue view` is answered too, for the claim check. Every call is appended to $FAKE_FORGE/calls.log as "METHOD path". If $FAKE_FORGE/timeout_once holds a
+"METHOD path" prefix (or "METHOD path #N" for the Nth identical call), the first matching call takes effect and then fails with "timed out" (an
+uncertain write)."""
+import json, os, re, sys
+from urllib.parse import parse_qs, unquote, urlsplit
+
+root = os.environ["FAKE_FORGE"]
+args = sys.argv[1:]
+if args[:2] == ["issue", "view"]:
+    # `gh issue view <n> --json state,labels`, as the claim check asks it.
+    with open(os.path.join(root, "calls.log"), "a") as f:
+        f.write(f"VIEW issue {args[2]}\n")
+    it = json.load(open(os.path.join(root, "state.json")))["issues"][args[2]]
+    print(json.dumps({"state": it.get("state", "open").upper(), "labels": [{"name": l} for l in it.get("labels", [])]}))
+    sys.exit(0)
+if not args or args[0] != "api":
+    sys.exit("fake-forge: only `api` is supported")
+args = args[1:]
+method, path, data = "GET", None, None
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "-X": method = args[i + 1]; i += 2
+    elif a in ("--hostname", "-H"): i += 2
+    elif a == "--input": data = json.loads(sys.stdin.read() or "null"); i += 2
+    elif a == "--paginate": i += 1
+    else: path = a; i += 1
+
+with open(os.path.join(root, "calls.log"), "a") as f:
+    f.write(f"{method} {path}\n")
+
+state_file = os.path.join(root, "state.json")
+try:
+    state = json.load(open(state_file))
+except FileNotFoundError:
+    state = {}
+for k, v in (("issues", {}), ("sub_issues", {}), ("blocked_by", {}), ("pulls", [])):
+    state.setdefault(k, v)
+
+def fail(code, text):
+    print(f"gh: {text} (HTTP {code})", file=sys.stderr)
+    sys.exit(1)
+
+def render(n):
+    it = state["issues"][str(n)]
+    return {"number": int(n), "id": 1000 + int(n), "title": it.get("title", ""), "body": it.get("body", ""),
+            "state": it.get("state", "open"), "state_reason": it.get("state_reason"),
+            "labels": [{"name": l} for l in it.get("labels", [])],
+            "html_url": f"https://github.com/o/r/issues/{n}"}
+
+def by_id(i):
+    n = i - 1000
+    if str(n) not in state["issues"]: fail(404, "Not Found")
+    return n
+
+def out(v):
+    print(json.dumps(v))
+
+def save():
+    json.dump(state, open(state_file, "w"))
+
+def finish(v):
+    save()
+    flag = os.path.join(root, "timeout_once")
+    if os.path.exists(flag):
+        prefix = open(flag).read().strip()
+        # "METHOD path #N" fires on the Nth identical call instead of the first match.
+        counted = re.fullmatch(r"(.*) #(\d+)", prefix)
+        if counted:
+            seen = sum(1 for l in open(os.path.join(root, "calls.log")) if l.strip() == counted[1])
+            hit = f"{method} {path}" == counted[1] and seen == int(counted[2])
+        else:
+            hit = f"{method} {path}".startswith(prefix)
+        if hit:
+            os.remove(flag)
+            print("gh api: timed out", file=sys.stderr)
+            sys.exit(1)
+    out(v)
+
+url = urlsplit(path)
+p, q = url.path, {k: v[0] for k, v in parse_qs(url.query).items()}
+m = None
+
+if (method, p) == ("GET", "user"):
+    finish({"login": "fake"})
+elif (method, p) == ("POST", "repos/o/r/issues"):
+    n = max([int(k) for k in state["issues"]] + [0]) + 1
+    state["issues"][str(n)] = {"title": data.get("title", ""), "body": data.get("body", ""), "state": "open", "labels": []}
+    finish(render(n))
+elif (method, p) == ("GET", "repos/o/r/issues"):
+    want = [l for l in q.get("labels", "").split(",") if l]
+    st = q.get("state", "open")
+    hits = [render(n) for n in sorted(map(int, state["issues"]))
+            if st in ("all", state["issues"][str(n)].get("state", "open"))
+            and all(l in state["issues"][str(n)].get("labels", []) for l in want)]
+    finish(hits)
+elif (m := re.fullmatch(r"repos/o/r/issues/(\d+)", p)):
+    n = m[1]
+    if n not in state["issues"]: fail(404, "Not Found")
+    if method == "GET": finish(render(n))
+    elif method == "PATCH":
+        it = state["issues"][n]
+        for k in ("title", "body", "state", "state_reason"):
+            if k in data: it[k] = data[k]
+        finish(render(n))
+    else: fail(404, "Not Found")
+elif (m := re.fullmatch(r"repos/o/r/issues/(\d+)/labels(?:/(.+))?", p)):
+    n = m[1]
+    if n not in state["issues"]: fail(404, "Not Found")
+    labels = state["issues"][n].setdefault("labels", [])
+    if method == "POST" and not m[2]:
+        labels.extend(l for l in data["labels"] if l not in labels)
+    elif method == "DELETE" and m[2]:
+        label = unquote(m[2])
+        if label not in labels: fail(404, "Label does not exist")
+        labels.remove(label)
+    else: fail(404, "Not Found")
+    finish([{"name": l} for l in labels])
+elif (m := re.fullmatch(r"repos/o/r/issues/(\d+)/sub_issues", p)):
+    n = m[1]
+    if n not in state["issues"]: fail(404, "Not Found")
+    kids = state["sub_issues"].setdefault(n, [])
+    if method == "GET": finish([render(k) for k in kids])
+    elif method == "POST":
+        child = by_id(data["sub_issue_id"])
+        if child in kids: fail(422, "Sub-issue already exists")
+        kids.append(child)
+        finish(render(n))
+    else: fail(404, "Not Found")
+elif (m := re.fullmatch(r"repos/o/r/issues/(\d+)/dependencies/blocked_by", p)):
+    n = m[1]
+    if n not in state["issues"]: fail(404, "Not Found")
+    blockers = state["blocked_by"].setdefault(n, [])
+    if method == "GET": finish([render(b) for b in blockers])
+    elif method == "POST":
+        blocker = by_id(data["issue_id"])
+        if blocker in blockers: fail(422, "Dependency already exists")
+        blockers.append(blocker)
+        finish(render(n))
+    else: fail(404, "Not Found")
+elif (method, p) == ("GET", "repos/o/r/pulls"):
+    head = q.get("head", "").split(":", 1)[-1]
+    finish([pr for pr in state["pulls"] if not head or pr.get("head", {}).get("ref") == head])
+elif (m := re.fullmatch(r"repos/o/r/issues/(\d+)/comments", p)):
+    if method == "GET": finish([])
+    elif method == "POST": finish({"id": 1, "body": data.get("body", "")})
+    else: fail(404, "Not Found")
+else:
+    fail(404, "Not Found")

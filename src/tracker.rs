@@ -21,20 +21,28 @@ pub struct RemoteIssue {
     pub body: String,
     pub labels: Vec<String>,
     pub open: bool,
+    pub id: u64,
+    pub completed: bool,
 }
 
-pub fn section(body: &str) -> Result<Option<String>, String> {
-    let starts: Vec<_> = body.match_indices(OPEN).collect();
-    let ends: Vec<_> = body.match_indices(CLOSE).collect();
+pub fn section(body: &str) -> Result<Option<String>, String> { section_between(body, OPEN, CLOSE) }
+
+pub fn section_between(body: &str, open: &str, close: &str) -> Result<Option<String>, String> {
+    let starts: Vec<_> = body.match_indices(open).collect();
+    let ends: Vec<_> = body.match_indices(close).collect();
     match (starts.as_slice(), ends.as_slice()) {
         ([], []) => Ok(None),
-        ([(a, _)], [(b, _)]) if a < b => Ok(Some(body[*a..*b + CLOSE.len()].into())),
+        ([(a, _)], [(b, _)]) if a < b => Ok(Some(body[*a..*b + close.len()].into())),
         _ => Err("The issue has ambiguous plan markers; repair them on the forge before publishing.".into()),
     }
 }
 
 pub fn replace(body: &str, expected: &Option<String>, replacement: &str) -> Result<String, String> {
-    let current = section(body)?;
+    replace_between(body, OPEN, CLOSE, expected, replacement)
+}
+
+pub fn replace_between(body: &str, open: &str, close: &str, expected: &Option<String>, replacement: &str) -> Result<String, String> {
+    let current = section_between(body, open, close)?;
     if &current != expected { return Err("The issue plan changed remotely. Refine against the latest issue before accepting again.".into()); }
     Ok(match current {
         Some(old) => body.replacen(&old, replacement, 1),
@@ -114,6 +122,8 @@ fn parse(r: &RepoCfg, v: &Value) -> Result<RemoteIssue, String> {
         body: v[if github { "body" } else { "description" }].as_str().unwrap_or("").into(),
         labels: v["labels"].as_array().into_iter().flatten().filter_map(|l| l.as_str().or_else(|| l["name"].as_str())).map(str::to_string).collect(),
         open: matches!(v["state"].as_str(), Some("open" | "opened")),
+        id: v["id"].as_u64().unwrap_or(0),
+        completed: v["state_reason"].as_str() == Some("completed"),
     })
 }
 
@@ -183,21 +193,115 @@ pub async fn comment(r: &RepoCfg, key: &str, body: &str) -> Result<(), String> {
     api(r, "POST", &path, Some(json!({"body":body}))).await.map(|_| ())
 }
 pub async fn readiness(r: &RepoCfg, key: &str, ready: bool) -> Result<(), String> {
-    // Label-only edits preserve unrelated labels on both forges.
+    // Label-only edits preserve unrelated labels on both forges. GitLab keeps the readiness label it always had.
+    if r.provider == Provider::Github { return set_label(r, key, &r.label, ready).await; }
+    let data = if ready { json!({"add_labels":r.label}) } else { json!({"remove_labels":r.label}) };
+    api(r, "PUT", &format!("{}/{}", root(r), number(key)?), Some(data)).await.map(|_| ())
+}
+
+pub async fn set_label(r: &RepoCfg, key: &str, label: &str, on: bool) -> Result<(), String> {
+    github_only(r)?;
     let path = format!("{}/{}", root(r), number(key)?);
-    if r.provider == Provider::Github {
-        if ready { api(r, "POST", &format!("{path}/labels"), Some(json!({"labels":[r.label]}))).await?; }
-        else { api(r, "DELETE", &format!("{path}/labels/{}", encode(&r.label)), Some(json!({}))).await?; }
-    } else {
-        let data = if ready { json!({"add_labels":r.label}) } else { json!({"remove_labels":r.label}) };
-        api(r, "PUT", &path, Some(data)).await?;
+    if on { api(r, "POST", &format!("{path}/labels"), Some(json!({"labels":[label]}))).await.map(|_| ()) }
+    else { api(r, "DELETE", &format!("{path}/labels/{}", encode(label)), Some(json!({}))).await.map(|_| ()) }
+}
+
+fn github_only(r: &RepoCfg) -> Result<(), String> {
+    if r.provider == Provider::Github { Ok(()) } else { Err("Sub-issues are GitHub-only for now.".into()) }
+}
+
+/// Every page of a list endpoint, as one list of entries.
+async fn pages(r: &RepoCfg, path: &str) -> Result<Vec<Value>, String> {
+    let dir = if r.path.is_dir() { Some(r.path.as_path()) } else { None };
+    let host = r.host_args();
+    let mut args: Vec<&str> = vec!["api"];
+    args.extend(host.iter().map(String::as_str));
+    args.extend(["--paginate", path]);
+    let out = issues::sh(tool(r), &args, dir).await?;
+    let mut all = Vec::new();
+    for page in serde_json::Deserializer::from_str(&out).into_iter::<Value>() {
+        all.extend(page.map_err(|e| e.to_string())?.as_array().ok_or("Invalid paginated response")?.iter().cloned());
     }
-    Ok(())
+    Ok(all)
+}
+
+/// What became of the pull request for a branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrState { None, Open(u64), Merged(u64), Closed(u64) }
+
+/// Merged into the base branch beats open, which beats whatever closed last.
+pub fn pr_state(r: &RepoCfg, json: &str) -> Result<PrState, String> {
+    let list: Value = serde_json::from_str(json).map_err(|e| format!("Invalid pull request list: {e}"))?;
+    let (mut merged, mut open, mut closed) = (None, None, None);
+    for pr in list.as_array().ok_or("Invalid pull request list")? {
+        let n = pr["number"].as_u64().ok_or("Pull request has no number")?;
+        if pr["state"].as_str() == Some("open") { open = open.max(Some(n)); }
+        else if pr["merged_at"].is_string() && pr["base"]["ref"].as_str() == Some(r.base.as_str()) { merged = merged.max(Some(n)); }
+        else { closed = closed.max(Some(n)); }
+    }
+    Ok(match (merged, open, closed) {
+        (Some(n), ..) => PrState::Merged(n),
+        (_, Some(n), _) => PrState::Open(n),
+        (.., Some(n)) => PrState::Closed(n),
+        _ => PrState::None,
+    })
+}
+
+pub async fn pr_for_branch(r: &RepoCfg, branch: &str) -> Result<PrState, String> {
+    github_only(r)?;
+    let owner = r.repo.split('/').next().unwrap_or("");
+    let all = pages(r, &format!("repos/{}/pulls?head={}&state=all&per_page=100", r.repo, encode(&format!("{owner}:{branch}")))).await?;
+    pr_state(r, &Value::Array(all).to_string())
+}
+
+pub async fn sub_issues(r: &RepoCfg, key: &str) -> Result<Vec<RemoteIssue>, String> {
+    github_only(r)?;
+    pages(r, &format!("{}/{}/sub_issues?per_page=100", root(r), number(key)?)).await?.iter().map(|v| parse(r, v)).collect()
+}
+
+pub async fn add_sub_issue(r: &RepoCfg, parent: &str, child_id: u64) -> Result<(), String> {
+    github_only(r)?;
+    api(r, "POST", &format!("{}/{}/sub_issues", root(r), number(parent)?), Some(json!({"sub_issue_id":child_id}))).await.map(|_| ())
+}
+
+pub async fn blocked_by(r: &RepoCfg, key: &str) -> Result<Vec<u64>, String> {
+    github_only(r)?;
+    pages(r, &format!("{}/{}/dependencies/blocked_by?per_page=100", root(r), number(key)?)).await?
+        .iter().map(|v| v["number"].as_u64().ok_or_else(|| "Blocker has no issue number".to_string())).collect()
+}
+
+pub async fn add_blocked_by(r: &RepoCfg, key: &str, blocker_id: u64) -> Result<(), String> {
+    github_only(r)?;
+    api(r, "POST", &format!("{}/{}/dependencies/blocked_by", root(r), number(key)?), Some(json!({"issue_id":blocker_id}))).await.map(|_| ())
+}
+
+/// Open issues carrying `label`; pull requests are skipped.
+pub async fn labelled(r: &RepoCfg, label: &str) -> Result<Vec<RemoteIssue>, String> {
+    github_only(r)?;
+    let all = pages(r, &format!("{}?labels={}&state=open&per_page=100", root(r), encode(label))).await?;
+    all.iter().filter(|v| v.get("pull_request").is_none()).map(|v| parse(r, v)).collect()
+}
+
+pub async fn close(r: &RepoCfg, key: &str) -> Result<(), String> {
+    github_only(r)?;
+    api(r, "PATCH", &format!("{}/{}", root(r), number(key)?), Some(json!({"state":"closed","state_reason":"completed"}))).await.map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_a_merge_into_the_base_branch_counts() {
+        let cfg: crate::config::Config = toml::from_str("[[repos]]\nprovider='github'\nrepo='o/r'\npath='/tmp'\nbase='main'\n").unwrap();
+        let r = &cfg.repos[0];
+        let pr = |n: u64, state: &str, merged: bool, base: &str| format!(r#"{{"number":{n},"state":"{state}","merged_at":{},"base":{{"ref":"{base}"}}}}"#, if merged { "\"2026-10-01T00:00:00Z\"" } else { "null" });
+        assert_eq!(pr_state(r, "[]").unwrap(), PrState::None);
+        assert_eq!(pr_state(r, &format!("[{}]", pr(5, "open", false, "main"))).unwrap(), PrState::Open(5));
+        assert_eq!(pr_state(r, &format!("[{}]", pr(5, "closed", false, "main"))).unwrap(), PrState::Closed(5));
+        assert_eq!(pr_state(r, &format!("[{},{}]", pr(5, "closed", false, "main"), pr(6, "closed", true, "main"))).unwrap(), PrState::Merged(6));
+        assert_eq!(pr_state(r, &format!("[{}]", pr(7, "closed", true, "release"))).unwrap(), PrState::Closed(7), "merged elsewhere");
+    }
+
     #[test]
     fn only_a_definite_refusal_counts_as_nothing_written() {
         assert!(refused("gh api: Resource not accessible by integration (HTTP 403)"));
@@ -235,6 +339,21 @@ mod tests {
         assert!(replace(&body, &None, &new).is_err());
         assert!(section(&format!("{old}\n{old}")).is_err());
         assert!(section(CLOSE).is_err());
+    }
+
+    #[tokio::test]
+    async fn gitlab_is_refused_before_anything_is_sent() {
+        let cfg: crate::config::Config = toml::from_str("[[repos]]\nprovider='gitlab'\nrepo='a/b'\npath='/tmp'\n").unwrap();
+        let r = &cfg.repos[0];
+        let want = Err("Sub-issues are GitHub-only for now.".to_string());
+        assert_eq!(set_label(r, "1", "x", true).await, want);
+        assert_eq!(close(r, "1").await, want);
+        assert_eq!(add_sub_issue(r, "1", 2).await, want);
+        assert_eq!(add_blocked_by(r, "1", 2).await, want);
+        assert_eq!(pr_for_branch(r, "b").await, Err("Sub-issues are GitHub-only for now.".to_string()));
+        assert_eq!(blocked_by(r, "1").await, Err("Sub-issues are GitHub-only for now.".to_string()));
+        assert_eq!(sub_issues(r, "1").await.err(), want.err());
+        assert_eq!(labelled(r, "x").await.err(), Some("Sub-issues are GitHub-only for now.".to_string()));
     }
 
     #[test]

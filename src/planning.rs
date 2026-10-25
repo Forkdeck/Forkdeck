@@ -1,6 +1,7 @@
 //! Durable issue-plan lifecycle. Remote writes run only after the job is saved to the history.
-use crate::{config::RepoCfg, orchestrator::Hub, state::*, tracker};
+use crate::{config::RepoCfg, orchestrator::Hub, state::*, taskgraph, tracker};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum Action { #[default] Draft, Publish, Ready }
@@ -14,6 +15,26 @@ pub struct Publication {
     pub create_attempted: bool,
     pub comment_attempted: bool,
     pub summary: String,
+}
+
+/// Progress of turning an accepted task list into issues; each step is saved before its forge write.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Creation {
+    pub token: String,
+    pub attempted: BTreeSet<String>,
+    pub ids: BTreeMap<String, u64>,
+    pub linked: bool,
+    /// The task section about to be written to the root issue, and what the issue held before it.
+    /// Saved before the write, so a retry can tell its own write from a person's edit.
+    #[serde(default)]
+    pub section: Option<String>,
+    #[serde(default)]
+    pub before: Option<String>,
+    /// The write of that section may have taken effect; the baseline no longer allows writing it.
+    #[serde(default)]
+    pub writing: bool,
+    pub listed: bool,
+    pub done: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -37,6 +58,10 @@ pub struct Plan {
     pub action: Action,
     pub ready: bool,
     pub build_job: Option<u32>,
+    #[serde(default)]
+    pub graph: Option<taskgraph::Graph>,
+    #[serde(default)]
+    pub creation: Option<Creation>,
 }
 
 impl Plan {
@@ -45,7 +70,7 @@ impl Plan {
             Some(tracker::IssueRef { provider: r.provider, repo: r.repo.clone(), key: tracker::key(r, link)?, url: if link.contains("://") { link.trim().into() } else { String::new() } })
         };
         let identity = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos());
-        Ok(Self { provider: r.provider, repo: r.repo.clone(), host: r.host.clone(), issue, identity, revision: 0, draft: String::new(), review: String::new(), reviewed: None, accepted: None, published: None, base: None, remote_context: String::new(), pending: None, action: Action::Draft, ready: false, build_job: None })
+        Ok(Self { provider: r.provider, repo: r.repo.clone(), host: r.host.clone(), issue, identity, revision: 0, draft: String::new(), review: String::new(), reviewed: None, accepted: None, published: None, base: None, remote_context: String::new(), pending: None, action: Action::Draft, ready: false, build_job: None, graph: None, creation: None })
     }
 
     /// Feedback arrived: this revision is no longer reviewed, nor ready for build.
@@ -64,19 +89,41 @@ impl Plan {
     pub fn ready_for_intake(&self) -> bool {
         self.ready && self.pending.is_none() && self.reviewed == Some(self.revision) && self.accepted == Some(self.revision) && self.published == Some(self.revision)
     }
+    /// Nothing more to do for this plan: ready for build, or split into sub-issues that are all created.
+    #[allow(dead_code)] // history.rs asks the same question in SQL; the tests hold the two together
+    pub fn resolved(&self) -> bool {
+        self.ready_for_intake() || self.creation.as_ref().is_some_and(|c| c.done)
+    }
+    /// Published, but its sub-issues are not all created: only finishing that is allowed, since a new
+    /// revision would drop the issues already numbered and create them again.
+    pub fn creating(&self) -> bool {
+        self.graph.is_some() && self.pending.is_none() && self.published == Some(self.revision) && !self.creation.as_ref().is_some_and(|c| c.done)
+    }
     pub fn accept(&mut self, queued: bool) -> Result<(), String> {
-        if self.pending.is_some() { self.action = Action::Publish; return Ok(()); }
+        if self.pending.is_some() || self.creating() { self.action = Action::Publish; return Ok(()); }
         if queued { return Err("Send queued feedback through review before accepting.".into()); }
         if self.reviewed != Some(self.revision) || self.draft.trim().is_empty() { return Err("This revision needs a passing plan review before acceptance.".into()); }
-        if self.published == Some(self.revision) { return Err("This revision is already published. Choose Ready for build or Refine.".into()); }
+        if self.published == Some(self.revision) {
+            return Err("This revision is already published. Choose Ready for build or Refine.".into());
+        }
+        let graph = taskgraph::extract(&self.draft)?;
+        if let Some(g) = &graph {
+            if self.provider != Provider::Github { return Err("Sub-issues are GitHub-only for now.".into()); }
+            taskgraph::validate_new(g)?;
+        }
+        self.graph = graph;
+        self.creation = None;
         self.accepted = Some(self.revision);
         let token = format!("{}-{}", self.identity, self.revision);
         let plan = self.draft.trim_end().strip_suffix("PLAN: READY").unwrap_or(&self.draft).trim_end();
+        let plan = &taskgraph::strip(plan);
+        let plan = plan.trim_end();
         self.pending = Some(Publication { revision: self.revision, section: tracker::managed(plan, &token, self.revision), token, expected: self.base.clone(), create_attempted: false, comment_attempted: false, summary: clip(plan.lines().find(|line| !line.trim().is_empty()).unwrap_or("Updated implementation plan"), 240) });
         self.action = Action::Publish;
         Ok(())
     }
     pub fn request_ready(&mut self, queued: bool) -> Result<(), String> {
+        if self.graph.is_some() { return Err("This plan is split into sub-issues; they start by themselves once created.".into()); }
         if queued || self.pending.is_some() || self.published != Some(self.revision) || self.accepted != Some(self.revision) || self.reviewed != Some(self.revision) {
             return Err("Ready requires the current reviewed, accepted and published revision, with no queued feedback.".into());
         }
@@ -87,6 +134,8 @@ impl Plan {
         let target = self.issue.as_ref().map(|i| if i.url.is_empty() { format!("{}#{}", i.repo, i.key) } else { i.url.clone() }).unwrap_or_else(|| format!("{} · new issue (local draft)", self.repo));
         let state = if let Some(id) = self.build_job { format!("Build task #{id}") }
             else if self.pending.is_some() { "Publication pending — retry to reconcile".into() }
+            else if self.creation.as_ref().is_some_and(|c| c.done) { "Split into sub-issues — they start by themselves".into() }
+            else if self.graph.is_some() && self.published == Some(self.revision) { "Published — accept to finish creating the sub-issues".into() }
             else if self.ready { if intake { "Ready for build".into() } else { "Ready — intake paused".into() } }
             else if self.published == Some(self.revision) && self.reviewed == Some(self.revision) { "Published — choose Ready for build".into() }
             else if self.reviewed == Some(self.revision) { "Reviewed — accept and publish or refine".into() }
@@ -98,10 +147,10 @@ impl Plan {
 pub fn repo(hub: &Hub, p: &Plan) -> Result<RepoCfg, String> {
     hub.cfg.repos.iter().find(|r| p.is_for(r)).cloned().ok_or_else(|| "The plan's repository is no longer configured.".into())
 }
-fn plan(hub: &Hub, id: u32) -> Result<Plan, String> { hub.job(id, |j| j.issue_plan.clone()).flatten().ok_or_else(|| "Issue plan missing".into()) }
-fn edit(hub: &Hub, id: u32, f: impl FnOnce(&mut Plan)) { hub.job(id, |j| { if let Some(p) = &mut j.issue_plan { f(p); } }); }
+pub fn plan(hub: &Hub, id: u32) -> Result<Plan, String> { hub.job(id, |j| j.issue_plan.clone()).flatten().ok_or_else(|| "Issue plan missing".into()) }
+pub fn edit(hub: &Hub, id: u32, f: impl FnOnce(&mut Plan)) { hub.job(id, |j| { if let Some(p) = &mut j.issue_plan { f(p); } }); }
 
-fn durable(hub: &Hub, id: u32) -> Result<(), String> {
+pub fn durable(hub: &Hub, id: u32) -> Result<(), String> {
     let stopping = hub.state.lock().unwrap().stopping;
     if stopping || hub.job(id, |j| j.cancel.is_set()).unwrap_or(true) { return Err("Issue operation interrupted; retry from F6 to reconcile.".into()); }
     hub.persist(id)
@@ -124,6 +173,7 @@ async fn guard(hub: &Hub, r: &RepoCfg, remote: &tracker::RemoteIssue) -> Result<
 pub async fn prepare(hub: &Hub, id: u32) -> Result<(), String> {
     let p = plan(hub, id)?;
     if p.pending.is_some() { return Err("Reconcile the pending publication with Accept / retry before refining.".into()); }
+    if p.creating() { return Err("Finish creating the sub-issues with Accept / retry before refining.".into()); }
     let r = repo(hub, &p)?;
     if let Some(i) = &p.issue {
         let remote = tracker::read_ref(&r, i).await?;
@@ -266,6 +316,47 @@ mod tests {
         assert!(p.request_ready(false).is_err());
         p.revision += 1;
         assert!(p.accept(false).is_err());
+    }
+
+    #[test]
+    fn a_task_list_plan_is_created_not_marked_ready() {
+        let cfg: crate::config::Config = toml::from_str("[[repos]]\nprovider='github'\nrepo='a/b'\npath='/tmp'\n").unwrap();
+        let mut p = Plan::new(&cfg.repos[0], "").unwrap();
+        p.revision = 1; p.reviewed = Some(1);
+        p.draft = "Split.\n```forkdeck-tasks\n{\"version\":1,\"tasks\":[{\"id\":\"a\",\"title\":\"A\",\"kind\":\"work\"}]}\n```\nPLAN: READY".into();
+        p.accept(false).unwrap();
+        assert!(p.graph.is_some());
+        assert!(!p.pending.as_ref().unwrap().section.contains("forkdeck-tasks"));
+        p.pending = None; p.published = Some(1);
+        assert!(p.request_ready(false).unwrap_err().contains("sub-issues"));
+        assert!(!p.resolved());
+        p.accept(false).unwrap();
+        assert_eq!(p.action, Action::Publish, "an unfinished creation is retried, not refused");
+        p.creation = Some(Creation { done: true, ..Default::default() });
+        assert!(p.resolved());
+    }
+
+    #[test]
+    fn an_unfinished_creation_is_finished_not_refined_and_gitlab_is_refused_up_front() {
+        let list = "Split.\n```forkdeck-tasks\n{\"version\":1,\"tasks\":[{\"id\":\"a\",\"title\":\"A\",\"kind\":\"work\"}]}\n```\nPLAN: READY";
+        let cfg: crate::config::Config = toml::from_str("[[repos]]\nprovider='github'\nrepo='a/b'\npath='/tmp'\n").unwrap();
+        let mut p = Plan::new(&cfg.repos[0], "").unwrap();
+        p.revision = 1; p.reviewed = Some(1); p.draft = list.into();
+        p.accept(false).unwrap();
+        p.pending = None; p.published = Some(1);
+        assert!(p.creating());
+        // Feedback arrived meanwhile: finishing the creation still comes first.
+        p.invalidate(); p.action = Action::Draft;
+        p.accept(true).unwrap();
+        assert_eq!(p.action, Action::Publish);
+        assert!(p.graph.is_some(), "the numbered task list is kept");
+        p.creation = Some(Creation { done: true, ..Default::default() });
+        assert!(!p.creating());
+        let gl: crate::config::Config = toml::from_str("[[repos]]\nprovider='gitlab'\nrepo='a/b'\npath='/tmp'\n").unwrap();
+        let mut g = Plan::new(&gl.repos[0], "").unwrap();
+        g.revision = 1; g.reviewed = Some(1); g.draft = list.into();
+        assert_eq!(g.accept(false).unwrap_err(), "Sub-issues are GitHub-only for now.");
+        assert!(g.pending.is_none());
     }
 
     #[test]

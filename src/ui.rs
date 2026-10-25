@@ -56,6 +56,55 @@ pub struct Ui {
     /// The daily limits, to show next to what has been used. 0: none.
     pub jobs_per_day: u32,
     pub tokens_per_day: u64,
+    /// Edit lines on screen, as last drawn, for a click to open their diff.
+    pub spots: std::cell::RefCell<Vec<crate::diff::Spot>>,
+    /// The full-screen diff opened by clicking an edit line.
+    pub diff: Option<crate::diff::View>,
+    /// How far the selected job's output panes are scrolled back (PageUp), and for which job;
+    /// none, or another job, follows the end.
+    /// Drawing moves it back further as output arrives, so what is on screen holds still.
+    pub output_back: std::cell::Cell<Option<(u32, usize)>>,
+    /// How far the session log is scrolled back (Shift-PageUp); 0 follows the end.
+    pub log_back: std::cell::Cell<usize>,
+    /// Rows of an output pane and how far it can scroll back, as last drawn.
+    pub output_view: std::cell::Cell<Scroll>,
+    /// The same for the session log.
+    pub log_view: std::cell::Cell<Scroll>,
+}
+
+/// What a scrolled pane last showed: its height in rows, and the furthest it can go back.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Scroll {
+    pub rows: usize,
+    pub max_back: usize,
+}
+
+/// One page further back (`up`) or forward from `back` lines before the end, keeping a couple of
+/// lines of context, never past the start and never below 0 (which follows the end again).
+pub fn page(back: usize, view: Scroll, up: bool) -> usize {
+    let step = view.rows.saturating_sub(2).max(1);
+    if up { (back + step).min(view.max_back) } else { back.min(view.max_back).saturating_sub(step) }
+}
+
+impl Ui {
+    /// Lines back from the end for the selected job's output panes.
+    pub fn back_for(&self, job: u32) -> usize {
+        self.output_back.get().filter(|(j, _)| *j == job).map(|(_, b)| b).unwrap_or(0)
+    }
+
+    /// The job's output panes as just drawn. While scrolled back, what arrived since the last
+    /// draw adds to how far back, so the lines being read stay where they are.
+    fn output_drawn(&self, job: u32, view: Scroll) {
+        let before = self.output_view.replace(view);
+        if let Some((j, back)) = self.output_back.get().filter(|(j, b)| *j == job && *b > 0) {
+            self.output_back.set(Some((j, held(back, before, view))));
+        }
+    }
+}
+
+/// `back` for a pane that had `before` and now has `now` rows hidden at the top: held still while scrolled.
+fn held(back: usize, before: Scroll, now: Scroll) -> usize {
+    if back == 0 { 0 } else { (back + now.max_back.saturating_sub(before.max_back)).min(now.max_back) }
 }
 
 /// The typed task Enter sends to: the one pinned with Ctrl-R, else the selected one. The input
@@ -123,6 +172,11 @@ fn mmss(secs: u64) -> String {
 }
 
 pub fn draw(f: &mut Frame, st: &State, ui: &Ui) {
+    ui.spots.borrow_mut().clear();
+    if let Some(v) = &ui.diff {
+        crate::diff::draw(f, f.area(), v);
+        return;
+    }
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(BG).fg(TEXT)), area);
     let rows = Layout::vertical([
@@ -145,11 +199,11 @@ pub fn draw(f: &mut Frame, st: &State, ui: &Ui) {
     let job = ui.selected.and_then(|id| st.jobs.iter().find(|j| j.id == id));
     match job {
         _ if ui.team => team_panel(f, cols[1], st),
-        Some(j) => tree(f, cols[1], j),
+        Some(j) => tree(f, cols[1], j, ui),
         None => empty_tree(f, cols[1]),
     }
     }
-    log_panel(f, rows[3], st);
+    log_panel(f, rows[3], st, ui);
     prompt(f, rows[4], ui, reply_target(st, ui).and_then(|id| st.jobs.iter().find(|j| j.id == id)));
     status(f, rows[5], st);
     if let Some(picker) = &ui.choices { choice_panel(f, area, picker); }
@@ -194,20 +248,39 @@ fn lane(status: JobStatus) -> usize {
     }
 }
 
+/// The board lane a job's card is in.
+pub(crate) fn job_lane(j: &Job) -> usize {
+    if j.status == JobStatus::Done && j.checks.is_none() && j.issue_plan.is_none() { return 5; }
+    // A pull request still open is work a person has to review, not work that is done.
+    if j.status == JobStatus::Done && j.pr_url.is_some() && j.pr_open != Some(false) {
+        return 3;
+    }
+    let status = if j.status == JobStatus::Done && j.issue_plan.as_ref().is_some_and(|p| p.build_job.is_none()) { JobStatus::Planning } else { j.status };
+    lane(status)
+}
+
+/// Alt+Right (`forward`) or Alt+Left: the newest job in the next lane that has any, from the
+/// selected job's lane. At either end the selection stays where it is.
+pub fn lane_step(st: &State, selected: Option<u32>, forward: bool) -> Option<u32> {
+    let newest = |l: usize| st.jobs.iter().rev().find(|j| job_lane(j) == l).map(|j| j.id);
+    let Some(from) = selected.and_then(|id| st.jobs.iter().find(|j| j.id == id)).map(job_lane) else {
+        return (0..6).find_map(newest);
+    };
+    let next = if forward { (from + 1..6).find_map(newest) } else { (0..from).rev().find_map(newest) };
+    next.or(selected)
+}
+
 fn factory(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
     let narrow = area.width < 120;
     let rows = Layout::vertical([Constraint::Length(if narrow { 14 } else { 9 }), Constraint::Min(4)]).split(area);
     let board_rows = Layout::vertical(vec![Constraint::Ratio(1, if narrow { 2 } else { 1 }); if narrow { 2 } else { 1 }]).split(rows[0]);
-    let names = ["QUEUE", "BUILD", "REVIEW", "DELIVERY", "DONE", "ATTENTION"];
+    let names = ["QUEUE", "BUILD", "REVIEW", "PR REVIEW", "DONE", "ATTENTION"];
     let colors = [PURPLE, ORANGE, PURPLE, ORANGE, GREEN, RED];
     for (index, name) in names.iter().enumerate() {
         let count = if narrow { 3 } else { 6 };
         let columns = Layout::horizontal(vec![Constraint::Ratio(1, count as u32); count]).split(board_rows[index / count]);
         let cell = columns[index % count];
-        let jobs: Vec<_> = st.jobs.iter().filter(|j| {
-            let status = if j.status == JobStatus::Done && j.issue_plan.as_ref().is_some_and(|p| p.build_job.is_none()) { JobStatus::Planning } else { j.status };
-            lane(status) == index
-        }).collect();
+        let jobs: Vec<_> = st.jobs.iter().filter(|j| job_lane(j) == index).collect();
         // Keep the selected card visible, even when browsing older completed jobs.
         let room = cell.height.saturating_sub(3) as usize / 2;
         let room = room.max(1);
@@ -239,55 +312,70 @@ fn factory(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
             ];
             f.render_widget(Paragraph::new(lines).block(boxed(&format!("#{} {} · {}", job.id, job.title, job.status.name()), status_color(job.status))), detail[0]);
             let outputs = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(detail[1]);
+            let mut view = Scroll::default();
             for (rect, role, stage) in [(outputs[0], "worker", &job.worker), (outputs[1], "reviewer", &job.reviewer)] {
                 let agent = stage.agent.map(|a| a.name()).unwrap_or("waiting");
-                output_panel(f, rect, &format!("{} · {} · {} tools", role, agent, stage.tools), stage, stage.agent.map(agent_color).unwrap_or(DIM));
+                let (spots, v) = scrolled_panel(f, rect, &format!("{} · {} · {} tools", role, agent, stage.tools), stage, stage.agent.map(agent_color).unwrap_or(DIM), ui.back_for(job.id));
+                view = Scroll { rows: v.rows, max_back: view.max_back.max(v.max_back) };
+                ui.spots.borrow_mut().extend(spots.into_iter().map(|s| crate::diff::Spot { job: job.id, ..s }));
             }
+            ui.output_drawn(job.id, view);
         }
         None => {
             let lines = vec![
                 Line::from(Span::styled("Ready for work", bold(BRIGHT))),
                 Line::from("Type a task and press Enter. Jobs move through the board as they run."),
                 Line::from(format!("{} repositories configured · issue intake {} (Ctrl-A)", st.repos.len(), if st.automation { "on" } else { "paused" })),
-                Line::from("Alt↑↓ selects a job · F2 opens the agent tree · F4 shows the team"),
+                Line::from("Alt↑↓ selects a job · Alt←→ a lane · F2 opens the agent tree · F4 shows the team"),
             ];
             f.render_widget(Paragraph::new(lines).alignment(Alignment::Center).block(boxed("dispatch", PURPLE)), rows[1]);
         }
     }
 }
 
+/// What follows "forkdeck" in the title; the browser shows the same note.
+pub(crate) fn title_note(demo: bool) -> &'static str {
+    if demo { "(demo)" } else { "" }
+}
+
 fn title_bar(f: &mut Frame, area: Rect, ui: &Ui) {
-    let dots = Line::from(vec![
-        Span::styled(" ●", fg(RED)),
-        Span::styled(" ●", fg(Color::Rgb(230, 190, 60))),
-        Span::styled(" ●", fg(GREEN)),
-    ]);
-    f.render_widget(Paragraph::new(dots), area);
     let dir = ui.cwd.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let t = format!("~/{} — forkdeck{} — {}x{}", dir, if ui.demo { " (demo)" } else { "" }, area.width, f.area().height);
+    let note = title_note(ui.demo);
+    let t = format!("~/{} — forkdeck{}{} — {}x{}", dir, if note.is_empty() { "" } else { " " }, note, area.width, f.area().height);
     f.render_widget(Paragraph::new(Span::styled(t, fg(DIM))).alignment(Alignment::Center), area);
+}
+
+pub(crate) fn agent_word(st: &State, k: AgentKind) -> &'static str {
+    if k == AgentKind::Copilot && st.copilot_checking {
+        "CHECKING"
+    } else if st.has(k) && !st.agent_ready(k) {
+        "LIMITED"
+    } else if st.has(k) && (k != AgentKind::Copilot || st.copilot_usable()) {
+        "ON CALL"
+    } else if k == AgentKind::Copilot && st.has(k) {
+        "NO ACCESS"
+    } else if k != AgentKind::Copilot && st.stand_in && st.copilot_usable() {
+        "VIA COPILOT"
+    } else {
+        "MISSING"
+    }
+}
+
+pub(crate) fn router_word(st: &State) -> String {
+    match (st.router.kind.as_str(), st.router.healthy) {
+        ("rules", _) => "RULES ROUTER".to_string(),
+        (_, Some(false)) => "JEV DOWN · RULES".to_string(),
+        (k, _) => k.to_uppercase(),
+    }
 }
 
 fn header(f: &mut Frame, area: Rect, st: &State) {
     let chip = |k: AgentKind, own: Color| -> Span {
-        let (word, color) = if st.has(k) && !st.agent_ready(k) {
-            ("LIMITED", DIM)
-        } else if st.has(k) && (k != AgentKind::Copilot || st.copilot_usable()) {
-            ("ON CALL", own)
-        } else if k == AgentKind::Copilot && st.has(k) {
-            ("NO ACCESS", RED)
-        } else if k != AgentKind::Copilot && st.stand_in && st.copilot_usable() {
-            ("VIA COPILOT", BLUE)
-        } else {
-            ("MISSING", DIM)
-        };
+        let word = agent_word(st, k);
+        let color = match word { "ON CALL" => own, "NO ACCESS" => RED, "VIA COPILOT" => BLUE, _ => DIM };
         Span::styled(format!("{} {}", k.name().to_uppercase(), word), bold(color))
     };
-    let jev = match (st.router.kind.as_str(), st.router.healthy) {
-        ("rules", _) => "RULES ROUTER".to_string(),
-        (_, Some(false)) => "JEV DOWN · RULES".to_string(),
-        (k, _) => k.to_uppercase(),
-    };
+    let jev = router_word(st);
     let top = Line::from(vec![
         Span::styled("  FORKDECK SOFTWARE FACTORY", bold(BRIGHT)),
         Span::styled("   ·   ", fg(DIM)),
@@ -457,7 +545,7 @@ fn connector(f: &mut Frame, area: Rect, color: Color) {
     f.render_widget(Paragraph::new(Span::styled("┊", fg(color))).alignment(Alignment::Center), area);
 }
 
-fn tree(f: &mut Frame, area: Rect, j: &Job) {
+fn tree(f: &mut Frame, area: Rect, j: &Job, ui: &Ui) {
     let rows = Layout::vertical([
         Constraint::Length(5),
         Constraint::Length(1),
@@ -588,24 +676,50 @@ fn tree(f: &mut Frame, area: Rect, j: &Job) {
             ("worker".to_string(), &j.worker)
         };
         let who = s.agent.map(|a| if s.via.is_empty() { a.name().to_string() } else { format!("{} via {}", a.name(), s.via) }).unwrap_or_else(|| "idle".into());
-        output_panel(f, rows[7], &format!("{} output · {}", name, who), s, DIM);
+        let (spots, view) = scrolled_panel(f, rows[7], &format!("{} output · {}", name, who), s, DIM, ui.back_for(j.id));
+        ui.output_drawn(j.id, view);
+        ui.spots.borrow_mut().extend(spots.into_iter().map(|s| crate::diff::Spot { job: j.id, ..s }));
     }
 }
 
-/// Follow the last screenful of rendered rows, including wrapped continuations.
-fn output_panel(f: &mut Frame, area: Rect, title: &str, stage: &Stage, color: Color) {
-    let block = boxed(title, color);
+/// Follow the last screenful of rendered rows, including wrapped continuations. Returns where the
+/// visible edit lines were drawn, for a click to open their diff (the job is filled in by the caller).
+#[cfg(test)]
+fn output_panel(f: &mut Frame, area: Rect, title: &str, stage: &Stage, color: Color) -> Vec<crate::diff::Spot> {
+    scrolled_panel(f, area, title, stage, color, 0).0
+}
+
+/// `output_panel`, `back` rendered rows before the end (0 follows the end). Also says how tall the
+/// pane is and how far back it can go.
+fn scrolled_panel(f: &mut Frame, area: Rect, title: &str, stage: &Stage, color: Color, back: usize) -> (Vec<crate::diff::Spot>, Scroll) {
+    let probe = boxed(title, color).inner(area);
+    let raw: Vec<&str> = stage.tail.iter().flat_map(|entry| entry.split('\n')).collect();
+    let total = Paragraph::new(raw.iter().map(|l| Line::from(*l)).collect::<Vec<_>>()).wrap(Wrap { trim: false }).line_count(probe.width);
+    let max_back = total.saturating_sub(probe.height as usize);
+    let back = back.min(max_back);
+    let title = if back > 0 { format!("{title} · ↑ {back} lines back · PgDn/End") } else { title.to_string() };
+    let block = boxed(&title, color);
     let inner = block.inner(area);
-    let lines: Vec<Line> = stage.tail.iter().flat_map(|entry| {
-        entry.split('\n').map(|line| {
-            let color = if line.starts_with('▸') { DIM } else if line.starts_with("error") { RED } else { TEXT };
-            Line::from(Span::styled(line, fg(color)))
-        })
+    let raw: Vec<&str> = stage.tail.iter().flat_map(|entry| entry.split('\n')).collect();
+    let lines: Vec<Line> = raw.iter().map(|line| {
+        let color = if line.starts_with('▸') { DIM } else if line.starts_with("error") { RED } else { TEXT };
+        Line::from(Span::styled(*line, fg(color)))
     }).collect();
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
     // Use the widget's own wrapping calculation so Unicode and word boundaries agree.
-    let scroll = paragraph.line_count(inner.width).saturating_sub(inner.height as usize).min(u16::MAX as usize) as u16;
+    let scroll = paragraph.line_count(inner.width).saturating_sub(inner.height as usize).saturating_sub(back).min(u16::MAX as usize) as u16;
     f.render_widget(paragraph.scroll((scroll, 0)).block(block), area);
+    let (mut spots, mut top) = (Vec::new(), 0usize);
+    for (raw, line) in raw.iter().zip(lines) {
+        let rows = Paragraph::new(line).wrap(Wrap { trim: false }).line_count(inner.width);
+        let (start, end) = (top.max(scroll as usize), (top + rows).min(scroll as usize + inner.height as usize));
+        if let (Some(files), true) = (crate::diff::edited_files(raw), start < end) {
+            let area = Rect::new(inner.x, inner.y + (start - scroll as usize) as u16, inner.width, (end - start) as u16);
+            spots.push(crate::diff::Spot { area, job: 0, files });
+        }
+        top += rows;
+    }
+    (spots, Scroll { rows: inner.height as usize, max_back })
 }
 
 fn stage_box(f: &mut Frame, area: Rect, role: &str, s: &Stage) {
@@ -655,11 +769,17 @@ fn stage_box(f: &mut Frame, area: Rect, role: &str, s: &Stage) {
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Center).block(boxed("", color)), area);
 }
 
-fn log_panel(f: &mut Frame, area: Rect, st: &State) {
+fn log_panel(f: &mut Frame, area: Rect, st: &State, ui: &Ui) {
     let h = area.height.saturating_sub(1) as usize;
     let w = area.width as usize;
-    let mut lines = vec![Line::from(Span::styled(format!("──── session log {}", "─".repeat(w.saturating_sub(17))), fg(Color::Rgb(40, 46, 56))))];
-    for l in st.log.iter().skip(st.log.len().saturating_sub(h)) {
+    let max_back = st.log.len().saturating_sub(h);
+    let view = Scroll { rows: h, max_back };
+    let back = held(ui.log_back.get(), ui.log_view.replace(view), view);
+    ui.log_back.set(back);
+    let head = if back > 0 { format!("──── session log · ↑ {back} back · Shift-PgDn ") } else { "──── session log ".to_string() };
+    let rule = w.saturating_sub(head.chars().count());
+    let mut lines = vec![Line::from(Span::styled(format!("{head}{}", "─".repeat(rule)), fg(Color::Rgb(40, 46, 56))))];
+    for l in st.log.iter().skip(max_back - back).take(h) {
         let c = match l.who.as_str() {
             "router" => PURPLE,
             "review" => GREEN,
@@ -675,12 +795,18 @@ fn log_panel(f: &mut Frame, area: Rect, st: &State) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+pub(crate) fn prompt_title(j: &Job) -> String {
+    match j.status {
+        JobStatus::Choosing => format!("Choose for #{} · a number, or your own approach · F5 options · Ctrl-T new task", j.id),
+        JobStatus::Interrupted => format!("Reply to #{} · Enter with nothing typed resumes it · Ctrl-T new task", j.id),
+        s if !s.finished() => format!("Message #{} · {} queued · Enter to queue · Ctrl-S now · Ctrl-T new task", j.id, j.inbox.len()),
+        _ => format!("Reply to #{} · {} queued · Enter to send · Ctrl-T new task", j.id, j.inbox.len()),
+    }
+}
+
 fn prompt(f: &mut Frame, area: Rect, ui: &Ui, target: Option<&Job>) {
     let title = match target {
-        Some(j) if j.status == JobStatus::Choosing => format!("Choose for #{} · a number, or your own approach · F5 options · Ctrl-T new task", j.id),
-        Some(j) if j.status == JobStatus::Interrupted => format!("Reply to #{} · Enter with nothing typed resumes it · Ctrl-T new task", j.id),
-        Some(j) if !j.status.finished() => format!("Message #{} · {} queued · Enter to queue · Ctrl-S now · Ctrl-T new task", j.id, j.inbox.len()),
-        Some(j) => format!("Reply to #{} · {} queued · Enter to send · Ctrl-T new task", j.id, j.inbox.len()),
+        Some(j) => prompt_title(j),
         None => format!("{} · {} · Enter to start", if ui.plan_next { "New task, planned first" } else { "Quick task" }, ui.forced.as_ref().map(|a| a.name()).unwrap_or_else(|| "auto".into())),
     };
     let room = area.width.saturating_sub(5) as usize;
@@ -710,7 +836,7 @@ fn status(f: &mut Frame, area: Rect, st: &State) {
     let keys = if area.width < 110 {
         "⏎ send · ↑↓ history · ^T new · F5 choices · F6 issue plan · ^C quit"
     } else {
-        "⏎ send · ↑↓ history · Alt↑↓ job · F2 view · F5 choices · F6 issue plan · Tab agent · ^T new · ^P plan · ^R reply · ^S now · ^X stop · ^C quit "
+        "⏎ send · ↑↓ history · Alt↑↓ job · Alt←→ lane · PgUp/Dn output · F2 view · F5 choices · F6 issue plan · Tab agent · ^T new · ^P plan · ^R reply · ^S now · ^X stop · ^C quit "
     };
     f.render_widget(Paragraph::new(Span::styled(keys, fg(DIM))).alignment(Alignment::Right), area);
 }
@@ -796,11 +922,72 @@ mod tests {
     }
 
     #[test]
+    fn edit_lines_are_clickable_where_they_are_drawn() {
+        let mut stage = Stage::default();
+        stage.push("first second third fourth fifth sixth seventh eighth");
+        stage.push("▸ edit /w/crates/a/src/a_long_file_name.rs");
+        stage.push("▸ shell cargo test");
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(22, 12)).unwrap();
+        let mut spots = Vec::new();
+        term.draw(|f| spots = output_panel(f, f.area(), "worker", &stage, GREEN)).unwrap();
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        let buf = term.backend().buffer();
+        let row = |y: u16| (0..22).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        let s = &spots[0];
+        assert!(row(s.area.y).contains("▸ edit"), "{}", row(s.area.y));
+        assert!(s.area.height >= 2, "the wrapped path is part of it: {s:?}");
+        assert!(!row(s.area.y + s.area.height).contains("a_long"), "and nothing below it");
+        assert_eq!(s.files, ["/w/crates/a/src/a_long_file_name.rs"]);
+    }
+
+    #[test]
+    fn paging_keeps_context_and_stops_at_both_ends() {
+        let view = Scroll { rows: 10, max_back: 25 };
+        assert_eq!(page(0, view, true), 8, "a page less two lines of context");
+        assert_eq!(page(8, view, true), 16);
+        assert_eq!(page(24, view, true), 25, "never past the start");
+        assert_eq!(page(25, view, false), 17);
+        assert_eq!(page(5, view, false), 0, "back to following the end");
+        assert_eq!(page(90, view, false), 17, "scrolled further than the text is now: from the start");
+        assert_eq!(page(0, Scroll { rows: 1, max_back: 3 }, true), 1, "a tiny pane still moves");
+    }
+
+    #[test]
+    fn a_scrolled_pane_holds_still_as_lines_arrive() {
+        let (before, now) = (Scroll { rows: 6, max_back: 24 }, Scroll { rows: 6, max_back: 27 });
+        assert_eq!(held(10, before, now), 13, "three lines arrived: three further back");
+        assert_eq!(held(0, before, now), 0, "following the end keeps following");
+        assert_eq!(held(26, before, Scroll { rows: 6, max_back: 20 }), 20, "never past the start");
+    }
+
+    #[test]
+    fn an_output_pane_scrolls_back_and_says_so() {
+        let mut stage = Stage::default();
+        for n in 1..=30 {
+            stage.push(format!("line {n}"));
+        }
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+        let mut view = Scroll::default();
+        term.draw(|f| { view = scrolled_panel(f, f.area(), "worker", &stage, GREEN, 0).1; }).unwrap();
+        let text = to_text(term.backend().buffer());
+        assert!(text.contains("line 30") && !text.contains("line 24") && !text.contains("back"), "{text}");
+        assert_eq!(view, Scroll { rows: 6, max_back: 24 });
+        term.draw(|f| { scrolled_panel(f, f.area(), "worker", &stage, GREEN, 10); }).unwrap();
+        let text = to_text(term.backend().buffer());
+        assert!(text.contains("line 15") && text.contains("line 20") && !text.contains("line 21"), "{text}");
+        assert!(text.contains("10 lines back"), "{text}");
+        // Further back than there is: the start.
+        term.draw(|f| { scrolled_panel(f, f.area(), "worker", &stage, GREEN, 500); }).unwrap();
+        let text = to_text(term.backend().buffer());
+        assert!(text.contains("line 1 ") && text.contains("24 lines back"), "{text}");
+    }
+
+    #[test]
     fn output_wraps_and_follows_newest_rendered_rows_on_resize() {
         let mut stage = Stage::default();
         stage.push("first second third fourth fifth sixth seventh eighth");
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(22, 8)).unwrap();
-        term.draw(|f| output_panel(f, f.area(), "worker", &stage, GREEN)).unwrap();
+        term.draw(|f| { output_panel(f, f.area(), "worker", &stage, GREEN); }).unwrap();
         let text = to_text(term.backend().buffer());
         assert!(text.contains("first second third"), "{text}");
         assert!(text.contains("fourth fifth sixth"), "{text}");
@@ -809,7 +996,7 @@ mod tests {
         for width in [18, 30, 60] {
             term.backend_mut().resize(width, 5);
             term.resize(Rect::new(0, 0, width, 5)).unwrap();
-            term.draw(|f| output_panel(f, f.area(), "reviewer", &stage, GREEN)).unwrap();
+            term.draw(|f| { output_panel(f, f.area(), "reviewer", &stage, GREEN); }).unwrap();
             let text = to_text(term.backend().buffer());
             assert!(text.contains("FINAL"), "{text}");
             assert!(!text.contains("first second"), "{text}");
@@ -833,7 +1020,7 @@ mod tests {
                 assert_eq!(stage.tail.back(), Some(&expected));
                 for width in [22, 40, 80] {
                     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 6)).unwrap();
-                    term.draw(|f| output_panel(f, f.area(), role, &stage, GREEN)).unwrap();
+                    term.draw(|f| { output_panel(f, f.area(), role, &stage, GREEN); }).unwrap();
                     let visible = to_text(term.backend().buffer());
                     assert!(visible.contains("END_SENTINEL"), "{visible}");
                     assert!(!visible.contains('…'), "{visible}");
@@ -850,7 +1037,7 @@ mod tests {
         let _slots = rt.block_on(hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel as u32)).unwrap();
         for index in 0..15 {
             let id = rt.block_on(hub.submit(format!("TASK-{}", index), "task".into(), Source::Manual, PathBuf::from("."), None, Planning::Never)).unwrap();
-            hub.job(id, |j| j.status = JobStatus::Done);
+            hub.job(id, |j| { j.status = JobStatus::Done; j.checks = Some(true); });
             if index == 0 { ui.selected = Some(id); }
         }
         for (width, height) in [(180, 50), (120, 40), (80, 30), (40, 12)] {
@@ -862,5 +1049,51 @@ mod tests {
                 assert!(text.contains("DONE 15"), "{text}");
             }
         }
+    }
+
+    #[test]
+    fn a_finished_job_waits_in_pr_review_until_its_pull_request_closes() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = crate::orchestrator::Hub::new(crate::config::Config::default(), rt.handle().clone());
+        let _slots = rt.block_on(hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel as u32)).unwrap();
+        let id = rt.block_on(hub.submit("t".into(), "t".into(), Source::Manual, PathBuf::from("."), None, Planning::Never)).unwrap();
+        let lane_now = || hub.job(id, |j| job_lane(j)).unwrap();
+        hub.job(id, |j| { j.status = JobStatus::Done; j.checks = Some(true); });
+        assert_eq!(lane_now(), 4, "verified work without a pull request is done");
+        hub.job(id, |j| j.checks = None);
+        assert_eq!(lane_now(), 5, "finished work without checks needs attention");
+        hub.job(id, |j| j.checks = Some(true));
+        hub.job(id, |j| j.pr_url = Some("https://github.com/o/r/pull/9".into()));
+        assert_eq!(lane_now(), 3, "a person still has to review it");
+        hub.job(id, |j| j.pr_open = Some(true));
+        assert_eq!(lane_now(), 3);
+        hub.job(id, |j| j.pr_open = Some(false));
+        assert_eq!(lane_now(), 4, "merged or closed");
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40)).unwrap();
+        hub.job(id, |j| j.pr_open = None);
+        let ui = crate::new_ui(&hub, PathBuf::from("."));
+        term.draw(|f| draw(f, &hub.state.lock().unwrap(), &ui)).unwrap();
+        assert!(to_text(term.backend().buffer()).contains("PR REVIEW 1"));
+    }
+
+    #[test]
+    fn alt_left_and_right_move_between_lanes_that_have_jobs() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = crate::orchestrator::Hub::new(crate::config::Config::default(), rt.handle().clone());
+        let _slots = rt.block_on(hub.sem.clone().acquire_many_owned(hub.cfg.automation.max_parallel as u32)).unwrap();
+        let mut ids = Vec::new();
+        for status in [JobStatus::Queued, JobStatus::Done, JobStatus::Done, JobStatus::Failed] {
+            let id = rt.block_on(hub.submit("t".into(), "t".into(), Source::Manual, PathBuf::from("."), None, Planning::Never)).unwrap();
+            hub.job(id, |j| { j.status = status; j.checks = Some(true); });
+            ids.push(id);
+        }
+        let st = hub.state.lock().unwrap();
+        let (queued, done_old, done_new, failed) = (ids[0], ids[1], ids[2], ids[3]);
+        assert_eq!(lane_step(&st, Some(queued), true), Some(done_new), "empty lanes are skipped; the newest job is taken");
+        assert_eq!(lane_step(&st, Some(done_old), true), Some(failed));
+        assert_eq!(lane_step(&st, Some(failed), true), Some(failed), "stays at the last lane");
+        assert_eq!(lane_step(&st, Some(failed), false), Some(done_new));
+        assert_eq!(lane_step(&st, Some(queued), false), Some(queued), "stays at the first lane");
+        assert_eq!(lane_step(&st, None, true), Some(queued), "nothing selected: the first lane with jobs");
     }
 }

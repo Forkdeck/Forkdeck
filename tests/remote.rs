@@ -46,7 +46,7 @@ fn start(name: &str) -> Server {
     std::fs::write(
         &config,
         format!(
-            "[remote]\nenabled = true\nlisten = \"127.0.0.1:{}\"\ndir = \"{}\"\nworkdir = \"{}\"\n",
+            "[web]\nport = 0\n[remote]\nenabled = true\nlisten = \"127.0.0.1:{}\"\ndir = \"{}\"\nworkdir = \"{}\"\n",
             port,
             dir.join("remote").display(),
             dir.join("work").display()

@@ -3,7 +3,7 @@
 
 use crate::config::RepoCfg;
 use crate::orchestrator::{strip_verdict, Hub};
-use crate::state::{clip, Planning, Provider, Source};
+use crate::state::{clip, JobStatus, Planning, Provider, Source};
 use crate::team::{self, Claimed, Target};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -454,14 +454,44 @@ fn hold_for(hub: &Hub, b: &Budget, r: &RepoCfg, taken_here: u32) -> Option<Strin
         .map(|until| format!("paused until {} after {} failed jobs in a row", clock(until), lim.pause_after_failures))
 }
 
+/// Whether a pull request is still open, from `gh pr view --json state`: None when unreadable.
+pub fn still_open(state: &str) -> Option<bool> {
+    match state.trim() {
+        "OPEN" => Some(true),
+        "MERGED" | "CLOSED" => Some(false),
+        _ => None,
+    }
+}
+
+/// Ask the forge about the pull requests of finished jobs that a person has not merged or
+/// closed yet, so the board moves them from PR REVIEW to DONE.
+async fn refresh_prs(hub: &Hub) {
+    let waiting: Vec<(u32, String)> = {
+        let st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.jobs.iter().filter(|j| j.status == JobStatus::Done && j.pr_open != Some(false))
+            .filter_map(|j| Some((j.id, j.pr_url.clone()?))).filter(|(_, u)| u.contains("github")).collect()
+    };
+    for (id, url) in waiting {
+        if let Ok(out) = sh("gh", &["pr", "view", &url, "--json", "state", "-q", ".state"], None).await {
+            if let Some(open) = still_open(&out) {
+                hub.job(id, |j| j.pr_open = Some(open));
+            }
+        }
+    }
+}
+
 pub async fn poll_once(hub: &Hub) {
     crate::cicd::deploy_poll(hub).await;
+    if !hub.cfg.demo {
+        refresh_prs(hub).await;
+    }
     let mut budget = budget(hub);
     {
         {
             for (idx, r) in hub.cfg.repos.iter().enumerate() {
                 if polled_before(&hub.cfg.repos[..idx], r) { continue; }
                 crate::knowledge::retry_pending(hub, idx).await;
+                if !hub.cfg.demo { crate::schedule::pass(hub, idx).await; }
                 // What a limit held back in this repository on this poll: the reason, and how many items.
                 let mut repo_hold: Option<(String, u32)> = None;
                 for pr in [false, true] {
@@ -741,6 +771,7 @@ pub async fn prepare(hub: &Hub, id: u32) -> Result<(), String> {
     }
     lock_worktree(hub, id, &dir)?;
     still_requested(&r, false, n).await?;
+    crate::schedule::gate(hub, &r, n).await?;
     write_guard(hub, id).await?;
     let held = claim_first(hub, &r, Target::Issue(n), "issue").await?;
     if let Err(e) = relabel(&r, false, n, &r.label, &r.working_label).await {
@@ -1307,6 +1338,24 @@ pub async fn pr_post(hub: &Hub, id: u32, rep: &Report<'_>) -> Result<(), String>
 }
 
 /// Tell the issue or pull request what happened and hand it back to a person.
+/// forkdeck stopped while this ran. That is nobody's failure: the item goes back to the queue
+/// without a comment, for the next start to pick up. What the attempt left stays on its local
+/// branch, and the next pick-up moves it aside as it does for any earlier attempt.
+pub async fn hand_back(hub: &Hub, id: u32) {
+    if hub.cfg.demo || !hub.job(id, |j| j.branch.is_some()).unwrap_or(false) || !team::may_report(hub, id).await {
+        return;
+    }
+    if let Some((r, n, _)) = issue_of(hub, id) {
+        if let Err(e) = relabel(&r, false, n, &r.working_label, &r.label).await {
+            hub.log("issues", e);
+        }
+    } else if let Some((r, n, _, _)) = pr_of(hub, id) {
+        if let Err(e) = review_labels(&r, n, &r.pr_label).await {
+            hub.log("issues", e);
+        }
+    }
+}
+
 pub async fn report_failure(hub: &Hub, id: u32, why: &str) {
     if hub.cfg.demo {
         return;
@@ -1361,6 +1410,15 @@ fn demo_items(hub: &Hub, idx: usize, pr: bool) -> Vec<Issue> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_pull_request_is_open_until_merged_or_closed() {
+        assert_eq!(still_open("OPEN\n"), Some(true));
+        assert_eq!(still_open("MERGED"), Some(false));
+        assert_eq!(still_open("CLOSED"), Some(false));
+        assert_eq!(still_open(""), None, "no answer leaves it as it was");
+    }
+
     use super::*;
 
     #[test]

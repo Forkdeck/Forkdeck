@@ -80,7 +80,8 @@ impl Serialize for AgentRef {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+/// Ordered from cheapest to most capable.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Light,
@@ -100,6 +101,12 @@ impl Tier {
         match self {
             Tier::Light => Tier::Standard,
             _ => Tier::Heavy,
+        }
+    }
+    pub fn down(self) -> Tier {
+        match self {
+            Tier::Heavy => Tier::Standard,
+            _ => Tier::Light,
         }
     }
 }
@@ -184,8 +191,12 @@ pub struct Stage {
     pub started: Option<Instant>,
     pub elapsed: Option<Duration>,
     pub tail: VecDeque<String>,
+    /// Clock time of each retained tail line; empty for older history without timestamps.
+    pub tail_times: VecDeque<String>,
     /// Lines ever pushed, so a remote viewer can ask for the ones it has not seen.
     pub pushed: u64,
+    /// What the agent asked to run and was not allowed to, in its last run.
+    pub refused: Vec<String>,
 }
 
 impl Default for Stage {
@@ -206,14 +217,21 @@ impl Default for Stage {
             started: None,
             elapsed: None,
             tail: VecDeque::new(),
+            tail_times: VecDeque::new(),
             unprinted: 0,
             pushed: 0,
+            refused: Vec::new(),
         }
     }
 }
 
 impl Stage {
     pub fn push(&mut self, line: impl Into<String>) {
+        self.push_at(chrono::Local::now().format("%H:%M:%S").to_string(), line);
+    }
+    pub fn push_at(&mut self, time: impl Into<String>, line: impl Into<String>) {
+        self.tail_times.resize(self.tail.len(), String::new());
+        self.tail_times.push_back(time.into());
         let line = line.into();
         self.last = line.clone();
         self.tail.push_back(line);
@@ -221,6 +239,7 @@ impl Stage {
         self.pushed += 1;
         while self.tail.len() > 200 {
             self.tail.pop_front();
+            self.tail_times.pop_front();
         }
     }
     pub fn secs(&self) -> u64 {
@@ -253,6 +272,9 @@ pub struct Decision {
     /// The fork layer thinks the user should choose an approach before work starts.
     #[serde(default)]
     pub plan: bool,
+    /// Route memory tried a tier lower than its group's: the tier it stepped down from.
+    #[serde(default)]
+    pub trial_from: Option<Tier>,
 }
 
 /// Whether a job proposes approaches before it works.
@@ -303,7 +325,15 @@ impl Choice {
 }
 
 impl Plan {
+    /// The options, or with none (the agent asked something instead), what the agent said.
     pub fn show_options(&self, stage: &mut Stage) {
+        if self.options.is_empty() {
+            let said = without_options(&self.text);
+            for l in said.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                stage.push(clip(l, 400));
+            }
+            return;
+        }
         for (i, o) in self.options.iter().enumerate() { stage.push(format!("{}) {}{} — {}", i + 1, o.title, if o.recommended { " (recommended)" } else { "" }, o.summary)); }
     }
     /// The recommended option, else the first.
@@ -316,6 +346,11 @@ impl Plan {
             Choice::Own(t) => format!("own approach: {}", t),
         }
     }
+}
+
+/// What an agent said before its last `<options>` block; the block itself shows as choices.
+pub fn without_options(text: &str) -> &str {
+    text.rfind("<options>").map(|i| text[..i].trim_end()).unwrap_or(text)
 }
 
 /// The options in an agent's plan: the last `<options>{...}</options>` block. Earlier blocks (a
@@ -423,6 +458,12 @@ pub struct Job {
     pub active_secs: u64,
     pub active_started: Instant,
     pub worktree_lock: Option<Arc<crate::proc::FileLock>>,
+    pub metrics_id: String,
+    pub queue: crate::metrics::QueueTiming,
+    pub attempt_ids: Vec<String>,
+    pub adaptive: Option<crate::adaptive::Decision>,
+    /// Once a candidate is sent back, all later worker invocations use the baseline.
+    pub escalated: bool,
     pub id: u32,
     pub title: String,
     pub prompt: String,
@@ -445,6 +486,9 @@ pub struct Job {
     pub checks: Option<bool>,
     pub outcome: String,
     pub pr_url: Option<String>,
+    /// Whether that pull request is still open, as last asked: None until forkdeck has looked.
+    /// A finished job waits for a person while it is open.
+    pub pr_open: Option<bool>,
     pub rounds: u32,
     pub created: Instant,
     pub finished: Option<Instant>,
@@ -494,11 +538,21 @@ pub struct Job {
 }
 
 impl Job {
+    /// Optimistic concurrency token for user decisions; output and elapsed clocks do not change it.
+    pub fn action_revision(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let value = serde_json::json!([self.status, self.turns, self.plan, self.issue_plan, self.inbox]);
+        format!("{:x}", Sha256::digest(serde_json::to_vec(&value).unwrap()))
+    }
+    pub fn check_revision(&self, expected: Option<&str>) -> Result<(), String> {
+        if expected.is_some_and(|r| r != self.action_revision()) { Err("stale revision".into()) } else { Ok(()) }
+    }
+
     pub fn stage(&mut self, slot: crate::agents::Slot) -> &mut Stage {
         use crate::agents::Slot;
         match slot {
             Slot::Worker => &mut self.worker,
-            Slot::Reviewer => &mut self.reviewer,
+            Slot::Reviewer | Slot::Knowledge => &mut self.reviewer,
             Slot::Extra(i) => {
                 if self.extra.len() <= i {
                     self.extra.resize_with(i + 1, Stage::default);
@@ -520,6 +574,8 @@ pub struct RouterStats {
     pub kind: String,
     pub endpoint: String,
     pub calls: u32,
+    /// Tasks route memory answered for, without asking the decision server.
+    pub remembered: u32,
     pub fallbacks: u32,
     pub last_ms: u128,
     pub healthy: Option<bool>,
@@ -583,6 +639,10 @@ pub struct State {
     pub rejected_models: HashSet<String>,
     /// Copilot may play claude or codex when that CLI is missing (agents.copilot.stand_in).
     pub stand_in: bool,
+    /// Copilot is installed and its account is still being asked what it may use.
+    pub copilot_checking: bool,
+    /// First line of each CLI's `--version`: claude, codex, copilot.
+    pub cli_versions: [Option<String>; 3],
     pub next_id: u32,
     pub team: TeamView,
     /// Finished jobs the journal would not take. They are written as soon as it works again, and
@@ -726,6 +786,20 @@ pub fn clip(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plan_without_options_shows_what_the_agent_said() {
+        let plan = Plan { options: vec![], text: "The task came through only as `+`.\nPlease send the intended change.\n\n<options>{\"options\": []}</options>".into(), chosen: None };
+        let mut s = Stage::default();
+        plan.show_options(&mut s);
+        let shown: Vec<&str> = s.tail.iter().map(String::as_str).collect();
+        assert_eq!(shown, ["The task came through only as `+`.", "Please send the intended change."]);
+        // With options, the options are what is shown.
+        let plan = Plan { options: vec![PlanOption { title: "Patch it".into(), summary: "small".into(), recommended: true }], ..plan };
+        let mut s = Stage::default();
+        plan.show_options(&mut s);
+        assert_eq!(s.tail.iter().map(String::as_str).collect::<Vec<_>>(), ["1) Patch it (recommended) — small"]);
+    }
 
     #[test]
     fn the_first_cancellation_reason_survives_shutdown() {

@@ -1,0 +1,32 @@
+{
+  "name": "forkdeck-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@11.20.0",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "check": "tsc --noEmit",
+    "e2e": "vite build && playwright test",
+    "contracts": "cd .. && cargo run -q -p forkdeck-remote-proto --example web_contracts > web/src/contracts.ts",
+    "schema": "../scripts/schema.sh",
+    "schema:check": "../scripts/schema.sh --check"
+  },
+  "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.2.0",
+    "@fontsource/ibm-plex-sans": "^5.2.0",
+    "@preact/signals": "^2.0.0",
+    "markdown-it": "^15.0.3",
+    "preact": "^10.26.0",
+    "preact-iso": "^2.9.0",
+    "flatbuffers": "25.9.23"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "@preact/preset-vite": "^2.10.0",
+    "@types/markdown-it": "^14.2.0",
+    "typescript": "^5.8.0",
+    "vite": "^7.0.0"
+  }
+}

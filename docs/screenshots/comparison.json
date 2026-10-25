@@ -1,0 +1,226 @@
+{
+  "note": "Content is derived from native Hub state. Differences include honest live metadata and filters; see README.md.",
+  "reference_comparisons": [
+    {
+      "capture": "board-1440x900.png",
+      "reference": "Main.dc.html",
+      "different_pixels": 757388,
+      "total_pixels": 1296000,
+      "different_percent": 58.44
+    },
+    {
+      "capture": "plans-tasks-1440x900.png",
+      "reference": "Plan.dc.html",
+      "different_pixels": 642931,
+      "total_pixels": 1296000,
+      "different_percent": 49.609
+    },
+    {
+      "capture": "board-390x844.png",
+      "reference": "Phone.dc.html",
+      "different_pixels": 198946,
+      "total_pixels": 329160,
+      "different_percent": 60.441
+    }
+  ],
+  "captures": [
+    {
+      "path": "board-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "a25b0ea51fdcf4d6af428802c7f476aceb7c64b53a43608d606130bd0ca433d1"
+    },
+    {
+      "path": "board-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "6c5fd7aca0a09f6e1fde8923af049314e73f85a4d5233158a5d7ddf872696e61"
+    },
+    {
+      "path": "configuration-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "93c6d0129b5a9d361336b94aef0bd5b99989a1be0c4235c8ed347d5d030c7685"
+    },
+    {
+      "path": "deploys-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "fba296431ebe8a2b28d49e8649db2468ddd6bd516e866baee18afac15961c31a"
+    },
+    {
+      "path": "detail-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "b31a47ff89942bf2b10c3a1625500d05692e766bd14d7065c8e852819565982a"
+    },
+    {
+      "path": "detail-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "bd27028f9b16aa16b4eeee2b570ff6f6fb379fa9c5278e2debce965522704e20"
+    },
+    {
+      "path": "oidc-board-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "89afb9d046b44c7cb255dfa3783e6e8f5b378992332ccd587d9d6562b3dbb8b2"
+    },
+    {
+      "path": "oidc-board-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "5804849515f4ba9fa3c9b51fe18e83aef644ae04758b161c4f4e8a8a6032b7be"
+    },
+    {
+      "path": "oidc-sign-in-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "d7dbf21f6a9ec293340340bea22332e6c6e876fa36fc077651229c281d978603"
+    },
+    {
+      "path": "plans-plan-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "c7b56327f70fb34b337d22868cc9f174a761ad2932e63cf18f80b181d969b854"
+    },
+    {
+      "path": "plans-plan-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "99e34471120a3809c997cc44aab1b81b4a115778167b805e1f6daaa8598023f2"
+    },
+    {
+      "path": "plans-review-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "be8c7f04e961e0283b9e8131dd8d85cbd63af1b237b4725d81de29488b838d4e"
+    },
+    {
+      "path": "plans-review-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "98f099dd70507d000f9ccc471cdcb5b0545592137fa0186a81572e92b9ec43d6"
+    },
+    {
+      "path": "plans-tasks-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "1138103675a555123e6301a93bbd220207dd66fbd728fcf7a9046563d00537e2"
+    },
+    {
+      "path": "plans-tasks-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "f6e4370e7fca2b5e6185413dbe844a35dd95a89f15511323c0a64a2024298c5d"
+    },
+    {
+      "path": "real-board-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "1d588a7030a5ce6a8f563af80e5a1f2bcc68fa8f201c2a2a0637d036b7a8bbd7"
+    },
+    {
+      "path": "real-board-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "e04bf7c978b435709a5d460d8020f7d72d707c5f03c294339ba3dbb5b0f536be"
+    },
+    {
+      "path": "real-configuration-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "6a2f576030cd27373cf01d40deb7ccc0acd5e38a27f1eb3a9c31a3b39d646c4c"
+    },
+    {
+      "path": "real-deploys-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "f898cef1b72db4fb329d59d14d0fa80756b0fbaf60d2e8a3c6f3295148e8c91b"
+    },
+    {
+      "path": "real-detail-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "811ddaebba8fba5d3a86baa81d3ad4427b81db136368d01a1e64ef362d758659"
+    },
+    {
+      "path": "real-detail-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "daac8d78041005d7662128102d4010ea7e9eb93b7053da2953ef146573b74ed5"
+    },
+    {
+      "path": "real-plans-plan-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "8ac438fa3151e1577fda37d04380dc00fb97c58901ce133c0f8df0007bdb8090"
+    },
+    {
+      "path": "real-plans-plan-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "7f0af2762e664b201580425d43eb0ce3f8a3f210a9cc4248515c241a31afd283"
+    },
+    {
+      "path": "real-plans-review-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "78a04895a68fa8c08c1d462019a6fadfeee2795e049e76cbb5707b0fe90ec7e1"
+    },
+    {
+      "path": "real-plans-review-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "f7de3270a8cfca7d12bbd3d8dddd4fc4d9ef6edf542fbf6d773598b4c4fa43b7"
+    },
+    {
+      "path": "real-plans-tasks-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "702ecddc15ff9ef7f1433bfee43c23c331ec238900424b0af22eb919d17aeb80"
+    },
+    {
+      "path": "real-plans-tasks-390x844.png",
+      "width": 390,
+      "height": 844,
+      "sha256": "102b84ad54cf8835ac6f12ec1698c4b9b0e28840503fcf8e69c71fead8cf5a9d"
+    },
+    {
+      "path": "real-repos-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "70e60f94073185a64703139c07e5fc50a4a223bd5e42045a4ebcf0358dca424b"
+    },
+    {
+      "path": "real-stats-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "7f672f058b7e12217b82e0ef997122cec1b4843c993a91b910cdfd352fdda0e1"
+    },
+    {
+      "path": "repos-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "b58e96e7e7cc1a7fc8862ad39342942e8bb3d887f463dcb6ba4fd5fc060f1e56"
+    },
+    {
+      "path": "stats-1440x900.png",
+      "width": 1440,
+      "height": 900,
+      "sha256": "858962f7ad306c11297fbe7fc9c8af3d7b6f0d9f820de41b66948dc3223f9fea"
+    },
+    {
+      "path": "team.png",
+      "width": 1966,
+      "height": 1002,
+      "sha256": "9fced0f38e573e6edf5aaed9ec016e7661c431f92abc971275156b06cc40dfb1"
+    },
+    {
+      "path": "terminal.png",
+      "width": 1966,
+      "height": 1666,
+      "sha256": "6bcd4409a7ecf586178c770695ade55ce5b6a7d6d6331f033011b032276192c8"
+    }
+  ]
+}

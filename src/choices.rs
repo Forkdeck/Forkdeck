@@ -34,7 +34,7 @@ pub fn for_job(job: &Job) -> Vec<Choice> {
 }
 
 pub fn parse(text: &str) -> Vec<Choice> {
-    static CUE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(options|choices|alternatives|choose|prefer)\b").unwrap());
+    static CUE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(options|choices|alternatives|choose|prefer|select|pick|decide)\b").unwrap());
     static NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?:[-*]\s+)?(?:\*\*)?([1-9][0-9]?|[A-Z])[.)]\s+(.+)$").unwrap());
     let mut options: Vec<Choice> = Vec::new();
     let mut fenced = false;
@@ -44,7 +44,12 @@ pub fn parse(text: &str) -> Vec<Choice> {
         let line = raw.trim();
         if line.starts_with("```") || line.starts_with("~~~") { fenced = !fenced; continue; }
         if fenced { continue; }
-        cue |= CUE.is_match(line);
+        // A new lead-in starts a new list: the last question asked is the one on offer, not a plan's
+        // earlier numbered steps. A list item that mentions options stays part of its list.
+        if CUE.is_match(line) && !NUMBER.is_match(line) {
+            cue = true;
+            options.clear();
+        }
         if line.starts_with('|') {
             let cells: Vec<_> = line.trim_matches('|').split('|').map(str::trim).collect();
             if cells.first().is_some_and(|s| matches!(s.trim_matches('*').to_lowercase().as_str(), "option" | "choice" | "approach")) {
@@ -74,6 +79,23 @@ pub fn parse(text: &str) -> Vec<Choice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plan_that_asks_at_the_end_offers_only_that_question() {
+        let text = "Steps, with the options weighed:\n1. Baseline the tree.\n2. Integrate the pull requests.\n3. Add the evidence guard.\n\nYour latest instruction needs a separate choice. Please select:\n\n1. **Approve build readiness:** provision and start.\n2. **Defer build readiness:** keep it paused.\n\nPLAN: WAITING";
+        let c = parse(text);
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert!(c[0].label.starts_with("1. **Approve build readiness"), "{c:?}");
+        assert!(c[1].label.starts_with("2. **Defer"), "{c:?}");
+    }
+
+    #[test]
+    fn pick_and_decide_introduce_choices_too() {
+        assert_eq!(parse("Pick one:\n1. Keep it\n2. Drop it").len(), 2);
+        assert_eq!(parse("You need to decide:\nA) now\nB) later").len(), 2);
+        // An option that mentions options is still an option, not a new list.
+        assert_eq!(parse("Choose:\n1. Keep both options\n2. Drop one").len(), 2);
+    }
 
     #[test]
     fn numbered_and_table_choices_keep_descriptions() {

