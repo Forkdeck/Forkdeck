@@ -199,7 +199,7 @@ Serve hashed assets with immutable caching, index HTML with revalidation, and no
 Two workflow distinctions must remain visible:
 
 - A single-issue plan requires Ready for build after publication; a task-list plan materializes sub-issues and schedules eligible tasks automatically. ([src/planning.rs:125](../src/planning.rs#L125), [src/subissues.rs:163](../src/subissues.rs#L163))
-- Adoption, graph-changing re-plans, and comment-driven decision workflows belong to later sub-issue plans; do not present them as complete capabilities. ([docs/superpowers/plans/2026-10-21-plans-to-sub-issues-core.md:15](../docs/superpowers/plans/2026-10-21-plans-to-sub-issues-core.md))
+- Adoption, graph-changing re-plans, and comment-driven decision workflows belong to later sub-issue plans; do not present them as complete capabilities.
 
 **Mobile:** use a compact list instead of six horizontal lanes, tabbed worker/reviewer output, sticky composer/actions, large touch targets, and an explicit auto-follow toggle. Show connection freshness and reconnect state. Support keyboard navigation and screen readers. Exclude offline mutations from the first release.
 
@@ -216,7 +216,7 @@ Each milestone ships independently; proposed paths below do not exist yet unless
 | **5. TUI client and team self-hosting** | Proposed client/read-model modules; `attach`; in-process service adapter; memberships, roles and per-user drafts. Refactor `main.rs`, `ui.rs`, `plan_ui.rs`, `diff.rs`, protocol client and history. | Existing PTY tests plus attached variants; two clients see consistent state; client exit leaves daemon jobs running; role matrix; concurrent approvals; revoked sessions/streams; backup/restore drill. |
 | **6. Hosted tenant pilot** | Proposed storage/execution/forge adapters and runner protocol; PostgreSQL/outbox/leases; OIDC/GitHub identity; isolated runners/secrets; tenant quotas and retention. Touch execution paths in agents/proc/checks, forge/team/tracker, caches, persistence and deployment adapters. | Two tenants with identical repo/job names cannot read or affect each other; credential/cache/mount/network isolation; stale runner fenced; crash/redelivery recovery; quota fairness; tenant export/delete and restore tests. Security review before unrelated tenants execute. |
 
-Use the existing automation, remote, metrics, and PTY suites as regression foundations. Run Clippy and Rust tests at implementation gates, plus frontend contract/component/browser tests as introduced. The repository’s implementation guidance explicitly requires hand formatting rather than `cargo fmt`. ([Testing](testing.md), [docs/superpowers/plans/2026-10-21-plans-to-sub-issues-core.md:19](../docs/superpowers/plans/2026-10-21-plans-to-sub-issues-core.md))
+Use the existing automation, remote, metrics, and PTY suites as regression foundations. Run Clippy and Rust tests at implementation gates, plus frontend contract/component/browser tests as introduced. The repository’s implementation guidance explicitly requires hand formatting rather than `cargo fmt`. ([Testing](testing.md))
 
 ## 6. Risks and explicit decisions
 
