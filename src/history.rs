@@ -381,6 +381,7 @@ impl JobRecord {
             used: self.used,
             findings: Vec::new(),
             over_time: false,
+            running: Default::default(),
             admitted: false,
             issue_plan: self.issue_plan.map(|mut p| { p.build_job = None; p }),
         }
@@ -817,6 +818,7 @@ mod tests {
             used: Default::default(),
             findings: Vec::new(),
             over_time: false,
+            running: Default::default(),
             admitted: false,
             issue_plan: None,
             planning: Planning::Always,

@@ -503,6 +503,9 @@ pub struct Job {
     pub peer: Option<String>,
     /// What each CLI was used for in this job so far: claude, codex, copilot (`journal::slot`).
     pub used: [crate::journal::Usage; 3],
+    /// What each run under way has used so far, by run, until it ends and goes into `used`.
+    /// Not saved: a restored job starts over.
+    pub running: std::collections::BTreeMap<u64, (AgentKind, crate::journal::Usage)>,
     /// What checks and reviewers objected to, for the repository's notes.
     pub findings: Vec<String>,
     /// Stopped by `limits.job_mins`.
@@ -538,6 +541,20 @@ pub struct Job {
 }
 
 impl Job {
+    /// The run `key` has ended: what it used goes on the job's account, once.
+    pub fn close_run(&mut self, key: u64) {
+        if let Some((cli, u)) = self.running.remove(&key) {
+            self.used[crate::journal::slot(cli)].add(&crate::journal::Usage { runs: 1, ..u });
+        }
+    }
+    /// The job is over: every run still under way goes on the account now, before its journal
+    /// line is written. A run dropped later finds nothing left to add.
+    pub fn settle(&mut self) {
+        let keys: Vec<u64> = self.running.keys().copied().collect();
+        for k in keys {
+            self.close_run(k);
+        }
+    }
     /// Optimistic concurrency token for user decisions; output and elapsed clocks do not change it.
     pub fn action_revision(&self) -> String {
         use sha2::{Digest, Sha256};

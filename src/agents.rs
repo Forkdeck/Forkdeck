@@ -489,7 +489,72 @@ pub fn parse_copilot(line: &str) -> Vec<Parsed> {
     vec![one]
 }
 
+/// What a run has used so far. Claude reports per message as it goes and Codex at the end of its
+/// turn, both through the telemetry stream; the stage's own totals, from the final event, take
+/// over once they are in. Copilot's come from its usage file, through `Meter::set`.
+pub(crate) fn live_usage(kind: AgentKind, t: &crate::metrics::Tokens, s: &Stage) -> crate::journal::Usage {
+    let mut u = crate::journal::Usage { cost: s.cost, ..Default::default() };
+    if kind == AgentKind::Copilot || s.tokens_in + s.tokens_out > 0 {
+        (u.tokens_in, u.tokens_out) = (s.tokens_in, s.tokens_out);
+    } else {
+        (u.tokens_in, u.tokens_out) = (t.input.unwrap_or(0), t.output.unwrap_or(0));
+    }
+    if kind != AgentKind::Copilot {
+        u.cache_read = t.cache_read.unwrap_or(0);
+        u.cache_write = t.cache_write.unwrap_or(0);
+        if t.cache_read.is_some() {
+            u.cache_known_in = u.tokens_in;
+        }
+    }
+    u
+}
+
+static RUN_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One run's place in `Job.running`. However the run ends, finishing or dropped by a cancel, what
+/// it used goes on the job's account once, when this is dropped.
+pub(crate) struct Meter {
+    hub: Hub,
+    job: u32,
+    slot: Slot,
+    key: u64,
+}
+
+impl Meter {
+    pub(crate) fn start(hub: &Hub, job: u32, slot: Slot, cli: AgentKind) -> Meter {
+        let key = RUN_KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        hub.job(job, |j| j.running.insert(key, (cli, crate::journal::Usage::default())));
+        Meter { hub: hub.clone(), job, slot, key }
+    }
+    /// The run's figures as the telemetry and its stage have them now.
+    pub(crate) fn observe(&self, kind: AgentKind, t: &crate::metrics::Tokens) {
+        let slot = self.slot;
+        self.store(|j| live_usage(kind, t, j.stage(slot)));
+    }
+    pub(crate) fn set(&self, u: crate::journal::Usage) {
+        self.store(|_| u);
+    }
+    fn store(&self, f: impl FnOnce(&mut crate::state::Job) -> crate::journal::Usage) {
+        self.hub.job(self.job, |j| {
+            let u = f(j);
+            if let Some(e) = j.running.get_mut(&self.key) {
+                e.1 = u;
+            }
+        });
+    }
+}
+
+impl Drop for Meter {
+    fn drop(&mut self) {
+        self.hub.job(self.job, |j| j.close_run(self.key));
+    }
+}
+
 pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
+    // A stopped job starts nothing more, not even for the moment it takes the run to notice.
+    if hub.job(job, |j| j.cancel.is_set()).unwrap_or(false) {
+        return RunOut { error: "cancelled".into(), ..Default::default() };
+    }
     let baseline = spec.exec;
     // Adaptive routing changes only the worker's model and effort; the CLI and tier keep the review policy.
     let adapted = (slot == Slot::Worker && !spec.read_only).then(|| crate::adaptive::execution(hub, job)).flatten()
@@ -572,6 +637,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     }) else {
         return RunOut { error: "job vanished".into(), ..Default::default() };
     };
+    let meter = Meter::start(hub, job, slot, e.cli);
 
     let out = if hub.cfg.demo {
         tokio::select! {
@@ -583,12 +649,15 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
         let limit = Duration::from_secs(hub.cfg.agents.timeout_mins.unwrap_or(45).clamp(1, 24 * 60) * 60);
         // Dropping the losing branch drops the process group guard, which kills the agent and its children.
         tokio::select! {
-            o = spawn_and_read(hub, job, slot, &line, &spec, &telemetry, attempt.as_ref()) => o,
+            o = spawn_and_read(hub, job, slot, &line, &spec, &telemetry, attempt.as_ref(), &meter) => o,
             _ = cancel.wait() => RunOut { error: "cancelled".into(), ..Default::default() },
             _ = steer.wait() => RunOut { error: "stopped to take a message".into(), interrupted: true, ..Default::default() },
             _ = tokio::time::sleep(limit) => RunOut { error: format!("timed out after {} min", limit.as_secs() / 60), ..Default::default() },
         }
     };
+    if hub.cfg.demo {
+        meter.observe(e.cli, &Default::default());
+    }
     if let Some(f) = &line.usage_file { let _ = std::fs::remove_file(f); }
     // A run that was cancelled or timed out still had a conversation, and it can be continued.
     let mut out = out;
@@ -630,11 +699,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
         }
     }
     // What this run used goes on the job's account, by the CLI that ran, whichever box it was shown in.
-    hub.job(job, |j| {
-        let s = j.stage(slot);
-        let add = crate::journal::Usage { runs: 1, tokens_in: s.tokens_in, tokens_out: s.tokens_out, cost: s.cost, ..Default::default() };
-        j.used[crate::journal::slot(e.cli)].add(&add);
-    });
+    drop(meter);
     stage(&mut |s| {
         s.elapsed = Some(start.elapsed());
         s.state = if out.ok || out.interrupted { StageState::Ok } else { StageState::Failed };
@@ -647,6 +712,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_and_read(
     hub: &Hub,
     job: u32,
@@ -655,6 +721,7 @@ async fn spawn_and_read(
     spec: &RunSpec<'_>,
     telemetry: &std::sync::Mutex<crate::metrics::Stream>,
     attempt: Option<&crate::metrics::Attempt>,
+    meter: &Meter,
 ) -> RunOut {
     let (kind, prompt, dir, read_only) = (spec.exec.cli, spec.prompt, spec.dir, spec.read_only);
     let (cmd, args) = (line.cmd.as_str(), &line.args);
@@ -862,6 +929,7 @@ async fn spawn_and_read(
                 _ => {}
             }
         }
+        meter.observe(kind, &telemetry.lock().unwrap_or_else(|e| e.into_inner()).tokens);
         if finished && drain_until.is_none() { drain_until = Some(tokio::time::Instant::now() + proc::DRAIN_GRACE); }
     }
     let had_final = finished;
@@ -891,6 +959,8 @@ async fn spawn_and_read(
                 s.tokens_in = u.input;
                 s.tokens_out = u.output;
             });
+            let cache_known_in = if u.cache_known { u.input } else { 0 };
+            meter.set(crate::journal::Usage { tokens_in: u.input, tokens_out: u.output, cache_read: u.cache_read, cache_write: u.cache_write, cache_known_in, ..Default::default() });
         }
         models_used = u.models;
     }
@@ -1143,6 +1213,70 @@ pub async fn invocation_limit(cmd: &str, kind: AgentKind, args: &mut Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::Usage;
+
+    fn hub_with_job() -> (tokio::runtime::Runtime, Hub, u32) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = Hub::new(Config::default(), rt.handle().clone());
+        let id = rt.block_on(hub.submit("t".into(), "t".into(), crate::state::Source::Manual, PathBuf::from("."), None, crate::state::Planning::IfRouted)).unwrap();
+        (rt, hub, id)
+    }
+
+    #[test]
+    fn a_running_agent_has_a_live_count() {
+        let mut t = crate::metrics::Stream::default();
+        let line = |id: &str, out: u64| format!(r#"{{"type":"assistant","message":{{"id":"{id}","model":"m","usage":{{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":0,"output_tokens":{out}}}}}}}"#);
+        t.observe(AgentKind::Claude, &line("a", 5));
+        t.observe(AgentKind::Claude, &line("a", 7)); // the same message again, streamed further
+        t.observe(AgentKind::Claude, &line("b", 3));
+        let u = live_usage(AgentKind::Claude, &t.tokens, &Stage::default());
+        assert_eq!((u.tokens_in, u.tokens_out, u.cache_read, u.cache_known_in, u.runs), (200, 10, 180, 200, 0));
+        let done = Stage { tokens_in: 210, tokens_out: 12, cost: 0.5, ..Stage::default() };
+        let u = live_usage(AgentKind::Claude, &t.tokens, &done);
+        assert_eq!((u.tokens_in, u.tokens_out, u.cache_read, u.cost), (210, 12, 180, 0.5), "the final total wins, the cache split stays");
+        let s = Stage { tokens_in: 40, tokens_out: 4, ..Stage::default() };
+        let c = live_usage(AgentKind::Copilot, &crate::metrics::Tokens::default(), &s);
+        assert_eq!((c.tokens_in, c.tokens_out, c.cache_known_in), (40, 4, 0));
+    }
+
+    #[test]
+    fn a_run_is_on_the_account_once_whether_it_ends_or_is_dropped() {
+        let (_rt, hub, id) = hub_with_job();
+        let a = Meter::start(&hub, id, Slot::Worker, AgentKind::Claude);
+        let b = Meter::start(&hub, id, Slot::Reviewer, AgentKind::Codex);
+        a.set(Usage { tokens_in: 100, cache_read: 60, cache_known_in: 100, ..Usage::default() });
+        b.set(Usage { tokens_in: 7, ..Usage::default() });
+        assert_eq!(hub.job(id, |j| (j.running.len(), j.used[0].runs)).unwrap(), (2, 0));
+        drop(a);
+        drop(b);
+        let (running, claude, codex) = hub.job(id, |j| (j.running.len(), j.used[0], j.used[1])).unwrap();
+        assert_eq!(running, 0);
+        assert_eq!((claude.runs, claude.tokens_in, claude.cache_read), (1, 100, 60));
+        assert_eq!((codex.runs, codex.tokens_in), (1, 7));
+    }
+
+    #[test]
+    fn a_dropped_run_future_is_on_the_account() {
+        let (rt, hub, id) = hub_with_job();
+        // A future holding a meter is dropped while it waits, as select! drops a run.
+        let fut = async {
+            let m = Meter::start(&hub, id, Slot::Worker, AgentKind::Claude);
+            m.set(Usage { tokens_in: 42, ..Usage::default() });
+            std::future::pending::<()>().await;
+        };
+        rt.block_on(async { let _ = tokio::time::timeout(Duration::from_millis(10), fut).await; });
+        assert_eq!(hub.job(id, |j| (j.running.len(), j.used[0].runs, j.used[0].tokens_in)).unwrap(), (0, 1, 42));
+    }
+
+    #[test]
+    fn settle_counts_runs_still_going_once() {
+        let (_rt, hub, id) = hub_with_job();
+        let m = Meter::start(&hub, id, Slot::Reviewer, AgentKind::Copilot);
+        m.set(Usage { tokens_in: 9, ..Usage::default() });
+        hub.job(id, |j| j.settle());
+        drop(m); // an aborted reviewer task, dropped after the job has been settled
+        assert_eq!(hub.job(id, |j| (j.running.len(), j.used[2].runs, j.used[2].tokens_in)).unwrap(), (0, 1, 9));
+    }
 
     #[test]
     fn claude_says_what_it_was_not_allowed_to_run() {

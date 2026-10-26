@@ -463,6 +463,7 @@ impl Hub {
                 used: Default::default(),
                 findings: Vec::new(),
                 over_time: false,
+                running: Default::default(),
                 admitted: false,
                 issue_plan,
             });
@@ -984,6 +985,8 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
     };
     drop(hub.unpark_slot(id));
     drop(hub.unpark_lane(id));
+    // Reviewers aborted with their JoinSet may be dropped after this; what they used counts now.
+    hub.job(id, |j| j.settle());
     // A cancel that arrives late still makes the job "cancelled", but what was already written up stays written up.
     // What was already written up keeps its own account of what happened (a rollback that could not be
     // confirmed must not be reduced to the word "cancelled").
