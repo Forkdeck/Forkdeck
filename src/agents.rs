@@ -509,6 +509,12 @@ pub(crate) fn live_usage(kind: AgentKind, t: &crate::metrics::Tokens, s: &Stage)
     u
 }
 
+/// Whether `limits.tokens_per_job` watches this run. Like `job_mins`, it is for the issues and
+/// reviews forkdeck took by itself; the knowledge run comes after the outcome is settled.
+pub(crate) fn cap_applies(j: &crate::state::Job, slot: Slot, cfg: &Config) -> bool {
+    cfg.limits.tokens_per_job > 0 && !cfg.demo && !j.source.is_manual() && !matches!(j.source, crate::state::Source::Deploy { .. }) && slot != Slot::Knowledge
+}
+
 static RUN_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One run's place in `Job.running`. However the run ends, finishing or dropped by a cancel, what
@@ -534,13 +540,24 @@ impl Meter {
     pub(crate) fn set(&self, u: crate::journal::Usage) {
         self.store(|_| u);
     }
+    /// Records the run's figures, then holds the job to `limits.tokens_per_job`: its finished
+    /// runs and every one under way, reviewers running side by side included.
     fn store(&self, f: impl FnOnce(&mut crate::state::Job) -> crate::journal::Usage) {
-        self.hub.job(self.job, |j| {
+        let cfg = &self.hub.cfg;
+        let stopped = self.hub.job(self.job, |j| {
             let u = f(j);
             if let Some(e) = j.running.get_mut(&self.key) {
                 e.1 = u;
             }
-        });
+            if !cap_applies(j, self.slot, cfg) {
+                return None;
+            }
+            let spent = crate::journal::job_spend(&j.used, j.running.values().map(|(_, u)| u), cfg.limits.cache_read_weight);
+            (spent >= cfg.limits.tokens_per_job && j.stop(crate::state::Limit::Tokens(spent))).then_some(spent)
+        }).flatten();
+        if let Some(spent) = stopped {
+            self.hub.log("limits", format!("#{} stopped: it has used {} tokens (limits.tokens_per_job)", self.job, crate::journal::kilo(spent)));
+        }
     }
 }
 
@@ -1216,10 +1233,55 @@ mod tests {
     use crate::journal::Usage;
 
     fn hub_with_job() -> (tokio::runtime::Runtime, Hub, u32) {
+        hub_with(Config::default())
+    }
+
+    fn hub_with(cfg: Config) -> (tokio::runtime::Runtime, Hub, u32) {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let hub = Hub::new(Config::default(), rt.handle().clone());
+        let hub = Hub::new(cfg, rt.handle().clone());
         let id = rt.block_on(hub.submit("t".into(), "t".into(), crate::state::Source::Manual, PathBuf::from("."), None, crate::state::Planning::IfRouted)).unwrap();
         (rt, hub, id)
+    }
+
+    fn issue() -> crate::state::Source {
+        crate::state::Source::Issue { repo_idx: 0, repo: "o/r".into(), number: 7, url: String::new() }
+    }
+
+    #[test]
+    fn the_cap_leaves_typed_tasks_deployments_knowledge_and_demo_alone() {
+        let mut cfg = Config::default();
+        cfg.limits.tokens_per_job = 1000;
+        let (_rt, hub, id) = hub_with_job();
+        hub.job(id, |j| {
+            j.source = issue();
+            assert!(cap_applies(j, Slot::Worker, &cfg));
+            assert!(cap_applies(j, Slot::Reviewer, &cfg));
+            assert!(!cap_applies(j, Slot::Knowledge, &cfg), "the closing knowledge run");
+            let demo = Config { demo: true, ..cfg.clone() };
+            assert!(!cap_applies(j, Slot::Worker, &demo), "demo mode");
+            let mut off = cfg.clone();
+            off.limits.tokens_per_job = 0;
+            assert!(!cap_applies(j, Slot::Worker, &off), "no cap set");
+            j.source = crate::state::Source::Manual;
+            assert!(!cap_applies(j, Slot::Worker, &cfg), "a typed task");
+            j.source = crate::state::Source::Deploy { repo_idx: 0, repo: "o/r".into(), sha: "a".into() };
+            assert!(!cap_applies(j, Slot::Worker, &cfg), "a deployment");
+        });
+    }
+
+    #[test]
+    fn two_live_meters_are_summed_against_the_cap() {
+        let mut cfg = Config::default();
+        cfg.limits.tokens_per_job = 1000;
+        let (_rt, hub, id) = hub_with(cfg);
+        hub.job(id, |j| j.source = issue());
+        let a = Meter::start(&hub, id, Slot::Worker, AgentKind::Claude);
+        let b = Meter::start(&hub, id, Slot::Reviewer, AgentKind::Copilot);
+        a.set(Usage { tokens_in: 600, ..Usage::default() });
+        assert_eq!(hub.job(id, |j| j.stopped).unwrap(), None);
+        b.set(Usage { tokens_in: 600, ..Usage::default() });
+        assert_eq!(hub.job(id, |j| (j.stopped, j.cancel.is_set())).unwrap(), (Some(crate::state::Limit::Tokens(1200)), true));
+        drop((a, b));
     }
 
     #[test]

@@ -11,6 +11,7 @@ resets nothing.
 jobs_per_day = 20          # issues and reviews picked up, all repositories together
 tokens_per_day = 5000000   # in and out, both CLIs, typed tasks included
 job_mins = 90              # one issue or review may run this long
+tokens_per_job = 400000    # and use this many tokens
 pause_after_failures = 5   # default
 pause_mins = 60            # default
 cache_read_weight = 1.0    # default; what a token read from the prompt cache counts for
@@ -30,6 +31,13 @@ cache_read_weight = 1.0    # default; what a token read from the prompt cache co
   resumed session reads most of its input from the cache. `0.1` keeps the
   daily count close to what was billed; `1.0` counts them in full, as before.
   Cache writes always count in full.
+- **`tokens_per_job`** stops an issue or review once it has used this many
+  tokens (counted as `tokens_per_day` counts them, all its agents together,
+  reviewers running side by side included), kills its agents and hands the
+  item to a person with the failure label, like `job_mins`. Typed tasks,
+  deployments and the closing knowledge run are exempt. Claude is checked as
+  it works; Codex reports when its turn ends and Copilot when it exits, so one
+  such run can go past the limit before the job is stopped.
 - **`pause_after_failures`** is on by default: after five issues or reviews in
   a row fail on a repository within a day, nothing more is picked up from it for an hour.
   Then one is tried; if that fails too, the pause starts again. Cancelled jobs

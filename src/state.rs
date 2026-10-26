@@ -402,6 +402,13 @@ impl Source {
     }
 }
 
+/// Which limit stopped a job.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Limit {
+    Time,
+    Tokens(u64),
+}
+
 pub struct Cancel {
     flag: std::sync::atomic::AtomicU8,
     notify: tokio::sync::Notify,
@@ -412,8 +419,13 @@ impl Cancel {
         Arc::new(Cancel { flag: std::sync::atomic::AtomicU8::new(0), notify: tokio::sync::Notify::new() })
     }
     pub fn fire(&self) {
-        let _ = self.flag.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
+        self.claim();
+    }
+    /// Fire, and say whether this call was the one that did: a cancel or shutdown already under way wins.
+    pub fn claim(&self) -> bool {
+        let first = self.flag.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok();
         self.notify.notify_waiters();
+        first
     }
     pub fn shutdown(&self) {
         let _ = self.flag.compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst);
@@ -508,8 +520,8 @@ pub struct Job {
     pub running: std::collections::BTreeMap<u64, (AgentKind, crate::journal::Usage)>,
     /// What checks and reviewers objected to, for the repository's notes.
     pub findings: Vec<String>,
-    /// Stopped by `limits.job_mins`.
-    pub over_time: bool,
+    /// Stopped by a limit: limits.job_mins, or limits.tokens_per_job having spent this many (weighted) tokens.
+    pub stopped: Option<Limit>,
     /// Has its run slot and is under way, though its status may still read Queued while the item
     /// is claimed and prepared. Not saved: a restored job starts over.
     pub admitted: bool,
@@ -541,6 +553,15 @@ pub struct Job {
 }
 
 impl Job {
+    /// Stop the job for `why`, unless it is over or something else stopped it first. The reason
+    /// is claimed with the cancel token itself, so a person's cancel and a limit cannot both win.
+    pub fn stop(&mut self, why: Limit) -> bool {
+        if self.status.finished() || self.stopped.is_some() || !self.cancel.claim() {
+            return false;
+        }
+        self.stopped = Some(why);
+        true
+    }
     /// The run `key` has ended: what it used goes on the job's account, once.
     pub fn close_run(&mut self, key: u64) {
         if let Some((cli, u)) = self.running.remove(&key) {

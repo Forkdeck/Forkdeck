@@ -555,11 +555,13 @@ pub struct LimitsCfg {
     /// What a token read from the prompt cache counts for in the limits, from 0 to 1. Providers
     /// bill cache reads at a fraction of new input; 1 counts them in full.
     pub cache_read_weight: f64,
+    /// Tokens (weighted as above) one issue or review may use before it is stopped and handed to a person.
+    pub tokens_per_job: u64,
 }
 
 impl Default for LimitsCfg {
     fn default() -> Self {
-        LimitsCfg { jobs_per_day: 0, tokens_per_day: 0, job_mins: 0, pause_after_failures: 5, pause_mins: 60, cache_read_weight: 1.0 }
+        LimitsCfg { jobs_per_day: 0, tokens_per_day: 0, job_mins: 0, pause_after_failures: 5, pause_mins: 60, cache_read_weight: 1.0, tokens_per_job: 0 }
     }
 }
 

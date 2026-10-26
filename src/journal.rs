@@ -268,6 +268,11 @@ pub fn spent(entries: &[Entry], repo: Option<&str>, now: i64, cache_read_weight:
     s
 }
 
+/// What one job has used, weighted: its finished runs and those still under way.
+pub fn job_spend<'a>(used: &[Usage; 3], running: impl IntoIterator<Item = &'a Usage>, cache_read_weight: f64) -> u64 {
+    used.iter().map(|u| u.weighted(cache_read_weight)).sum::<u64>() + running.into_iter().map(|u| u.weighted(cache_read_weight)).sum::<u64>()
+}
+
 /// If the last `after` automated jobs on this repository all failed, and the latest of them less
 /// than `pause_secs` ago: when the pause ends. A cancelled job says nothing either way.
 pub fn paused_until(entries: &[Entry], repo: &str, after: u32, pause_secs: i64, now: i64) -> Option<i64> {
@@ -482,6 +487,15 @@ mod tests {
 
     fn e(ts: i64, kind: &str, repo: &str, status: &str) -> Entry {
         Entry { ts, kind: kind.into(), repo: repo.into(), status: status.into(), ..Entry::default() }
+    }
+
+    #[test]
+    fn job_spend_counts_finished_and_running_runs() {
+        let used = [Usage { runs: 1, tokens_in: 1000, tokens_out: 100, ..Usage::default() }, Usage::default(), Usage { runs: 1, tokens_in: 50, ..Usage::default() }];
+        let a = Usage { tokens_in: 500, cache_read: 400, cache_known_in: 500, ..Usage::default() };
+        let b = Usage { tokens_in: 30, ..Usage::default() };
+        assert_eq!(job_spend(&used, [&a, &b], 1.0), 1100 + 50 + 500 + 30);
+        assert_eq!(job_spend(&used, [&a, &b], 0.1), 1100 + 50 + 100 + 40 + 30);
     }
 
     #[test]

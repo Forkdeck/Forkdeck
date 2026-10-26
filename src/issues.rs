@@ -1380,7 +1380,7 @@ pub async fn report_failure(hub: &Hub, id: u32, why: &str) {
             hub.log("issues", e);
         }
         // Put the request label back so a later session can retry.
-        let to = if hub.job(id, |j| j.over_time).unwrap_or(false) { &r.pr_fail_label } else { &r.pr_label };
+        let to = if hub.job(id, |j| j.stopped.is_some()).unwrap_or(false) { &r.pr_fail_label } else { &r.pr_label };
         if let Err(e) = review_labels(&r, n, to).await {
             hub.log("issues", e);
         }

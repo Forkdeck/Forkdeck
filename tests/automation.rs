@@ -84,7 +84,7 @@ for m in $FAKE_COPILOT_REJECT; do
     exit 1
   fi
 done
-[ -n "$usage" ] && printf '{"modelMetrics":{"%s":{"usage":{"inputTokens":10,"outputTokens":2}}}}' "$model" > "$usage"
+[ -n "$usage" ] && printf '{"modelMetrics":{"%s":{"usage":{"inputTokens":%s,"outputTokens":2}}}}' "$model" "${FAKE_COPILOT_TOKENS:-10}" > "$usage"
 case "$prompt" in
   *"Write at most three short rules"*)
     [ -n "$FAKE_LESSONS_SEEN" ] && printf '%s' "$prompt" > "$FAKE_LESSONS_SEEN"
@@ -272,7 +272,7 @@ case "$prompt" in
   *) echo done > by_codex.txt
      echo '{"type":"item.completed","item":{"type":"agent_message","text":"Did the work."}}' ;;
 esac
-echo '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+echo "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":${FAKE_CODEX_TOKENS:-10},\"output_tokens\":5}}"
 "#;
 
 fn quota_rig(name: &str) -> Rig {
@@ -1958,6 +1958,69 @@ fn a_job_over_its_time_limit_is_stopped_and_handed_to_a_person() {
     assert!(rig.calls().contains("--add-label agent:needs-human"), "{}", rig.calls());
     assert_eq!(rig.journal()[0]["status"], "failed");
     assert_eq!(rig.journal()[0]["claude"]["tokens_in"], 5000, "what it used before the stop is on record");
+}
+
+#[test]
+fn a_job_over_its_token_limit_is_stopped_and_handed_to_a_person() {
+    let rig = Rig::new("limit-job-tokens", "[limits]\ntokens_per_job = 1000", "");
+    rig.issue();
+    let started = std::time::Instant::now();
+    let (ok, out) = rig.once(&[("FAKE_ASSISTANT_TOKENS", "5000")]);
+    assert!(!ok, "{}", out);
+    assert!(started.elapsed().as_secs() < 60, "it was stopped, not waited for");
+    assert!(out.contains("failed: stopped after 5.0k tokens, the limit for one job (limits.tokens_per_job)"), "{}", out);
+    assert!(rig.calls().contains("--add-label agent:needs-human"), "{}", rig.calls());
+    assert_eq!(rig.journal()[0]["status"], "failed");
+    assert_eq!(rig.journal()[0]["claude"]["tokens_in"], 5000);
+    let before = rig.calls();
+    rig.once(&[]);
+    assert_eq!(rig.calls(), before, "it is not retried");
+}
+
+#[test]
+fn concurrent_reviewers_are_stopped_by_their_combined_spend() {
+    // Each reviewer stays under the cap; together they pass it. Claude's reviewer is still running.
+    // Which one reports last varies; two_live_meters_are_summed_against_the_cap pins the sum itself.
+    let extra = "[agents.codex]\ncmd = \"absent-codex\"\n[agents.copilot.profiles.second]\nvendor = \"xai\"\nmodels = { light = \"grok-4.7\", standard = \"grok-4.7\", heavy = \"grok-4.7\" }\n[review]\npr_reviewers = [\"claude\", \"copilot:second\"]\n[limits]\ntokens_per_job = 1000";
+    let rig = Rig::with_agents("limit-job-reviewers", extra, "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let started = std::time::Instant::now();
+    let (ok, out) = rig.once(&[("FAKE_REVIEW_ASSISTANT_TOKENS", "600"), ("FAKE_COPILOT_TOKENS", "600")]);
+    assert!(!ok && out.contains("limits.tokens_per_job"), "{}", out);
+    assert!(started.elapsed().as_secs() < 60, "it was stopped, not waited for");
+    assert!(rig.calls().contains("--add-label review:changes"), "{}", rig.calls());
+    let e = &rig.journal()[0];
+    assert_eq!((e["claude"]["tokens_in"].as_u64(), e["copilot"]["tokens_in"].as_u64()), (Some(600), Some(600)), "both reviewers are on record");
+    let before = rig.calls();
+    rig.once(&[]);
+    assert_eq!(rig.calls(), before, "the review is not asked for again");
+}
+
+#[test]
+fn a_copilot_run_over_the_cap_stops_the_job_before_the_review() {
+    let extra = format!("{}[limits]\ntokens_per_job = 1000", NO_REAL_CLIS);
+    let rig = Rig::with_agents("limit-job-copilot", &extra, "", &[("copilot", COPILOT)]);
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_COPILOT_TOKENS", "5000")]);
+    assert!(!ok && out.contains("limits.tokens_per_job"), "{}", out);
+    assert_eq!(copilot_runs(&rig).len(), 1, "the review never started");
+}
+
+#[test]
+fn a_codex_run_over_the_cap_stops_the_job_after_it_reports() {
+    let rig = quota_rig_with("limit-job-codex", "[router]\nkind = \"rules\"\ndefault_agent = \"codex\"\n[limits]\ntokens_per_job = 1000");
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_CODEX_TOKENS", "5000")]);
+    assert!(!ok && out.contains("limits.tokens_per_job"), "{}", out);
+    assert_eq!(fs::read_to_string(rig.root.join("gh/attempts")).unwrap(), "codex\n", "only the worker ran");
+}
+
+#[test]
+fn a_typed_task_is_not_stopped_by_the_job_cap() {
+    let rig = Rig::new("limit-job-typed", "[limits]\ntokens_per_job = 1000", "");
+    let (ok, out) = rig.run(&["run", "add a change file"], &[("FAKE_TOKENS", "5000")]);
+    assert!(ok && !out.contains("limits.tokens_per_job"), "{}", out);
 }
 
 #[test]
