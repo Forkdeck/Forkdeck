@@ -275,7 +275,10 @@ impl Hub {
     }
 
     /// Bring back the saved jobs. Returns the typed tasks that were interrupted and can continue.
-    pub fn restore(&self) -> Vec<u32> {
+    /// Started in a folder, only the jobs of that folder (or another worktree of its repository)
+    /// and of the configured repositories come back, and only that folder's typed tasks continue.
+    /// The rest stay saved for a forkdeck started where they belong. None brings back every job.
+    pub fn restore(&self, here: Option<&Path>) -> Vec<u32> {
         let Some(h) = &self.history else { return vec![] };
         let records = match h.load(crate::history::KEEP) {
             Ok(r) => r,
@@ -287,6 +290,12 @@ impl Hub {
         let mut resumable = Vec::new();
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let me = crate::history::owner_token();
+        let here = here.map(Folders::of);
+        let repos = Folders::new(self.cfg.repos.iter().map(|r| r.path.clone()).collect());
+        let configured = |s: &Source| match s {
+            Source::Manual => false,
+            Source::Issue { repo, .. } | Source::Deploy { repo, .. } | Source::Pr { repo, .. } => self.cfg.repos.iter().any(|r| r.repo == *repo),
+        };
         for r in records {
             if st.jobs.iter().any(|j| j.id == r.id) {
                 continue;
@@ -296,9 +305,13 @@ impl Hub {
                 continue;
             }
             let j = r.job();
+            let mine = here.as_ref().is_none_or(|f| f.hold(&j.workdir));
+            if !mine && !configured(&j.source) && !repos.hold(&j.workdir) {
+                continue;
+            }
             // Planning against an issue is not resumed: a write to the forge happens only when the user
             // asks for it again in F6.
-            if j.status == JobStatus::Interrupted && j.source.is_manual() && j.resume_from.is_some() && j.issue_plan.is_none() {
+            if mine && j.status == JobStatus::Interrupted && j.source.is_manual() && j.resume_from.is_some() && j.issue_plan.is_none() {
                 resumable.push(j.id);
             }
             st.next_id = st.next_id.max(j.id + 1);
@@ -1211,6 +1224,36 @@ fn same_vendor(worker: &Exec, reviewer: &Exec, used: &[String]) -> bool {
 
 /// Which remembered routes a job is compared with: those of its repository and kind of job.
 /// A typed task's repository is the directory it runs in.
+/// Folders known by identity (device and inode), so a link to one, or the same path in another
+/// case on a case-insensitive drive, is still that folder.
+struct Folders(HashSet<(u64, u64)>);
+
+impl Folders {
+    fn new(dirs: Vec<PathBuf>) -> Folders {
+        Folders(dirs.iter().filter_map(|d| identity(d)).collect())
+    }
+
+    /// The folder and, in a git repository, every worktree of that repository.
+    fn of(dir: &Path) -> Folders {
+        let mut dirs = vec![dir.to_path_buf()];
+        let listed = std::process::Command::new("git").arg("-C").arg(dir).args(["worktree", "list", "--porcelain"]).stderr(std::process::Stdio::null()).output();
+        if let Some(o) = listed.ok().filter(|o| o.status.success()) {
+            dirs.extend(String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.strip_prefix("worktree ")).map(PathBuf::from));
+        }
+        Folders::new(dirs)
+    }
+
+    /// The folder is one of these or inside one. A folder since removed is judged by where it was.
+    fn hold(&self, dir: &Path) -> bool {
+        dir.ancestors().any(|a| identity(a).is_some_and(|i| self.0.contains(&i)))
+    }
+}
+
+fn identity(dir: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir).ok().map(|m| (m.dev(), m.ino()))
+}
+
 pub fn route_scope(source: &Source, workdir: &Path) -> Option<(String, &'static str)> {
     match source {
         Source::Manual => Some((std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf()).display().to_string(), "task")),

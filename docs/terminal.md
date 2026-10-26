@@ -73,12 +73,15 @@ nothing is sent twice. When a CLI no longer has the conversation, the agent
 starts a new one with the exchanges so far.
 
 Jobs are kept in `~/.local/state/forkdeck/forkdeck.db` (SQLite, the newest 200).
-The directory is private (0700), and the database is owner-readable and writable only (0600). They come back when forkdeck starts. A typed task that was cut off by quitting,
-Ctrl-C or SIGTERM is marked interrupted and continues by itself from the stage it
-had reached; `Ctrl-R` retries one by hand. Issue and pull request jobs come back
-for reference only: their labels already put them back in the queue. Several
-forkdecks can share the file. `forkdeck history` lists the saved jobs,
-`forkdeck history clear` removes them, and `forkdeck resume` continues
-interrupted typed tasks without the interface.
+The directory is private (0700), and the database is owner-readable and writable only (0600). They come back when forkdeck starts: the jobs of the folder it starts in
+(or of another worktree of that repository) and of the configured repositories.
+Jobs of other folders stay saved and come back when forkdeck starts there. A typed
+task of this folder that was cut off by quitting, Ctrl-C or SIGTERM is marked
+interrupted and continues by itself from the stage it had reached; `Ctrl-R`
+retries one by hand. Issue and pull request jobs come back for reference only:
+their labels already put them back in the queue. Several forkdecks can share the
+file. `forkdeck history` lists the saved jobs, `forkdeck history clear` removes
+them, and `forkdeck resume` continues every interrupted typed task, whatever its
+folder, without the interface.
 
 See [planning](planning.md) for F5/F6 and planning before work starts.

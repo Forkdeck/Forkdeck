@@ -42,7 +42,8 @@ impl Hub {
 
 /// One daemon owns this workspace, including its native and browser transports.
 pub fn run(rt: &tokio::runtime::Runtime, hub: Hub) -> anyhow::Result<()> {
-    let path = std::env::current_dir()?.join(".forkdeck-serve.lock");
+    let here = std::env::current_dir()?;
+    let path = here.join(".forkdeck-serve.lock");
     let _lease = crate::proc::FileLock::take(&path).map_err(anyhow::Error::msg)?;
     anyhow::ensure!(hub.cfg.demo || hub.history.is_some(), "server needs working history storage");
     rt.block_on(hub.detect_agents());
@@ -50,7 +51,7 @@ pub fn run(rt: &tokio::runtime::Runtime, hub: Hub) -> anyhow::Result<()> {
         seed::seed_demo(&hub)?;
     } else {
         hub.start_autosave();
-        for id in hub.restore() {
+        for id in hub.restore(Some(&here)) {
             if let Err(e) = rt.block_on(hub.resume(id)) { hub.log("queue", format!("#{id} not resumed: {e}")); }
         }
         rt.spawn(crate::issues::poll_loop(hub.clone()));
