@@ -47,6 +47,3 @@ that the feature is implemented; start with the guides above for current behavio
 - [Copilot implementation plan](copilot-plan.md)
 - [Model metrics plan](model-metrics-plan.md)
 - [Web UI and server mode plan](web-ui-server-mode-plan.md)
-- [Copilot CLI plan (2026-10-12)](superpowers/plans/2026-10-12-copilot-cli.md)
-- [Plans-to-sub-issues design (2026-10-21)](superpowers/specs/2026-10-21-plans-to-sub-issues-design.md)
-- [Plans-to-sub-issues core plan (2026-10-21)](superpowers/plans/2026-10-21-plans-to-sub-issues-core.md)

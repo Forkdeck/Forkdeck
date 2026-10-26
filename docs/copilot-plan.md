@@ -1,8 +1,7 @@
 # Plan: GitHub Copilot CLI as a third agent
 
-Status: implemented on branch `copilot-cli` (2026-10-12); step-by-step plan in
-`docs/superpowers/plans/2026-10-12-copilot-cli.md`. Where this proposal and the code differ, the
-"Decisions made while building" section at the end wins.
+Status: implemented on branch `copilot-cli` (2026-10-12). Where this proposal and the code
+differ, the "Decisions made while building" section at the end wins.
 
 ## Goal
 
