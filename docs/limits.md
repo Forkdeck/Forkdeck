@@ -13,6 +13,7 @@ tokens_per_day = 5000000   # in and out, both CLIs, typed tasks included
 job_mins = 90              # one issue or review may run this long
 pause_after_failures = 5   # default
 pause_mins = 60            # default
+cache_read_weight = 1.0    # default; what a token read from the prompt cache counts for
 ```
 
 - **`jobs_per_day`** and a repository's own `jobs_per_day` cap how many issues
@@ -23,6 +24,12 @@ pause_mins = 60            # default
 - **`job_mins`** stops an issue or review that runs too long, kills its agent,
   and hands the item to a person with the failure label. Deployments are
   exempt; they have their own timeouts and stopping one halfway is worse.
+- **`cache_read_weight`** is what a token read from the provider's prompt cache
+  counts for in `tokens_per_day`, from 0 to 1. Cache reads are cheap for the
+  provider (Anthropic bills them at a tenth of new input), and a long or
+  resumed session reads most of its input from the cache. `0.1` keeps the
+  daily count close to what was billed; `1.0` counts them in full, as before.
+  Cache writes always count in full.
 - **`pause_after_failures`** is on by default: after five issues or reviews in
   a row fail on a repository within a day, nothing more is picked up from it for an hour.
   Then one is tried; if that fails too, the pause starts again. Cancelled jobs

@@ -398,12 +398,12 @@ fn budget(hub: &Hub) -> Budget {
     if let Some(e) = broken.filter(|_| counted) {
         return Budget { stop: Some(format!("the journal cannot be used, so nothing is picked up: {}", clip(&e, 160))), jobs_left: None, entries, now };
     }
-    let mut spent = journal::spent(&entries, None, now);
+    let mut spent = journal::spent(&entries, None, now, lim.cache_read_weight);
     {
         // Jobs still running are not in the journal yet.
         let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
         for j in st.jobs.iter().filter(|j| !j.status.finished()) {
-            spent.tokens += j.used.iter().map(|u| u.tokens()).sum::<u64>();
+            spent.tokens += j.used.iter().map(|u| u.weighted(lim.cache_read_weight)).sum::<u64>();
             spent.jobs += matches!(j.source, Source::Issue { .. } | Source::Pr { .. }) as u32;
         }
         // Typed tasks cut off by a stop are in neither: their usage is in the saved history until
@@ -416,7 +416,7 @@ fn budget(hub: &Hub) -> Budget {
                 let cut_off = |r: &crate::history::JobRecord| r.status == crate::state::JobStatus::Interrupted
                     || (!r.status.finished() && r.owner.as_deref().is_none_or(|o| !crate::history::owner_alive(o)));
                 for r in saved.iter().filter(|r| cut_off(r) && !running.contains(&r.id) && r.finished.unwrap_or(r.created) as i64 >= now - window) {
-                    spent.tokens += r.used.iter().map(|u| u.tokens()).sum::<u64>();
+                    spent.tokens += r.used.iter().map(|u| u.weighted(lim.cache_read_weight)).sum::<u64>();
                 }
             }
             st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -442,7 +442,7 @@ fn hold_for(hub: &Hub, b: &Budget, r: &RepoCfg, taken_here: u32) -> Option<Strin
     if r.jobs_per_day > 0 {
         let running = hub.state.lock().unwrap_or_else(|e| e.into_inner()).jobs.iter().filter(|j| !j.status.finished() && matches!(&j.source, Source::Issue { repo, .. } | Source::Pr { repo, .. } if repo == &r.repo)).count() as u32;
         // `taken_here`: picked in this pass and not yet among the running jobs.
-        if journal::spent(&b.entries, Some(&r.repo), b.now).jobs + running + taken_here >= r.jobs_per_day {
+        if journal::spent(&b.entries, Some(&r.repo), b.now, hub.cfg.limits.cache_read_weight).jobs + running + taken_here >= r.jobs_per_day {
             return Some(format!("job limit for this repository reached: {} in the last 24 h", r.jobs_per_day));
         }
     }

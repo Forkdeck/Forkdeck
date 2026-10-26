@@ -35,8 +35,10 @@ the review runs anyway and the log says it is a same-vendor review.
 
 `forkdeck doctor` shows the login, whether the account can use Copilot from the
 CLI at all, and the model each part would run. Copilot's JSON output carries no
-token counts, so they are read from the usage file it writes when it exits; the
-cost column stays empty, as Copilot bills per request.
+token counts, so they are read from the usage file it writes when it exits.
+Its `inputTokens` already include cached input, which earlier versions of
+forkdeck counted a second time. The cost column stays empty, as Copilot bills
+per request.
 
 See [how a job runs](jobs.md) for worker/reviewer selection and effort tiers,
 and [sandbox and network](sandbox-and-network.md) for agent arguments and permissions.

@@ -20,9 +20,12 @@ reviews     19   done   18   failed    1   cancelled   0
 deploys      8   done    7   failed    1   cancelled   0
           1 rolled back
 
-claude      71 run(s) · 9.8M tokens in · 412.0k out · $31.40 as reported by the CLI
-codex       48 run(s) · 6.1M tokens in · 220.5k out
+claude      71 run(s) · 9.8M tokens in, 83% from cache · 412.0k out · $31.40 as reported by the CLI
+codex       48 run(s) · 6.1M tokens in, 61% from cache · 220.5k out
 ```
+
+The share from the cache is over the runs that reported it; older journal
+lines did not, and a CLI line without any shows none.
 
 `--jobs 20` adds the latest jobs one per line, and `--json` prints the summary
 for a dashboard or a script. The journal is also the audit trail: it is

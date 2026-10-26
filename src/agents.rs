@@ -319,19 +319,36 @@ pub fn copilot_args(cfg: &Config, exec: &Exec, read_only: bool, usage: &Path) ->
     args
 }
 
-/// Tokens in (cache reads and writes included) and out, and the models that ran, from copilot's usage file.
-pub fn read_usage(path: &Path) -> (u64, u64, Vec<String>) {
+/// What copilot's usage file says a run used.
+#[derive(Debug, Default, PartialEq)]
+pub struct CopilotUsage {
+    /// Every input token: copilot's `inputTokens` already counts cache reads and writes.
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// Some model said how much it read from the cache.
+    pub cache_known: bool,
+    pub models: Vec<String>,
+}
+
+/// Tokens in and out, the cached part, and the models that ran, from copilot's usage file.
+pub fn read_usage(path: &Path) -> CopilotUsage {
     let Some(v) = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()) else {
-        return (0, 0, vec![]);
+        return CopilotUsage::default();
     };
-    let (mut i, mut o, mut models) = (0, 0, vec![]);
+    let mut u = CopilotUsage::default();
     for (name, m) in v.get("modelMetrics").and_then(|m| m.as_object()).into_iter().flatten() {
-        let n = |k: &str| m.pointer(&format!("/usage/{}", k)).and_then(|n| n.as_u64()).unwrap_or(0);
-        i += n("inputTokens") + n("cacheReadTokens") + n("cacheWriteTokens");
-        o += n("outputTokens");
-        models.push(name.clone());
+        let get = |k: &str| m.pointer(&format!("/usage/{}", k)).and_then(|n| n.as_u64());
+        let n = |k: &str| get(k).unwrap_or(0);
+        u.input += n("inputTokens");
+        u.output += n("outputTokens");
+        u.cache_read += n("cacheReadTokens");
+        u.cache_write += n("cacheWriteTokens");
+        u.cache_known |= get("cacheReadTokens").is_some();
+        u.models.push(name.clone());
     }
-    (i, o, models)
+    u
 }
 
 fn first_line(s: &str) -> String {
@@ -615,7 +632,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     // What this run used goes on the job's account, by the CLI that ran, whichever box it was shown in.
     hub.job(job, |j| {
         let s = j.stage(slot);
-        let add = crate::journal::Usage { runs: 1, tokens_in: s.tokens_in, tokens_out: s.tokens_out, cost: s.cost };
+        let add = crate::journal::Usage { runs: 1, tokens_in: s.tokens_in, tokens_out: s.tokens_out, cost: s.cost, ..Default::default() };
         j.used[crate::journal::slot(e.cli)].add(&add);
     });
     stage(&mut |s| {
@@ -866,16 +883,16 @@ async fn spawn_and_read(
     }
     let mut models_used = Vec::new();
     if let Some(f) = &line.usage_file {
-        let (tokens_in, tokens_out, models) = read_usage(f);
+        let u = read_usage(f);
         let _ = std::fs::remove_file(f);
-        if tokens_in + tokens_out > 0 {
+        if u.input + u.output > 0 {
             hub.job(job, |j| {
                 let s = j.stage(slot);
-                s.tokens_in = tokens_in;
-                s.tokens_out = tokens_out;
+                s.tokens_in = u.input;
+                s.tokens_out = u.output;
             });
         }
-        models_used = models;
+        models_used = u.models;
     }
     let exit_ok = status.as_ref().map(|s| s.success()).unwrap_or(false) || ended_after_final;
     // A clean exit is not enough: the stream has to have reached its closing event.
@@ -1346,10 +1363,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("u.json");
         std::fs::write(&p, r#"{"modelMetrics":{"claude-sonnet-4.5":{"usage":{"inputTokens":200,"outputTokens":14,"cacheReadTokens":50}},"gpt-5.4":{"usage":{"inputTokens":1,"outputTokens":1}}}}"#).unwrap();
-        let (i, o, mut m) = read_usage(&p);
-        m.sort();
-        assert_eq!((i, o, m), (251, 15, vec!["claude-sonnet-4.5".to_string(), "gpt-5.4".to_string()]));
-        assert_eq!(read_usage(&dir.join("missing.json")), (0, 0, vec![]));
+        let mut u = read_usage(&p);
+        u.models.sort();
+        // inputTokens already holds the cached input: copilot sums uncached, cache reads and cache writes into it.
+        assert_eq!(u, CopilotUsage { input: 201, output: 15, cache_read: 50, cache_write: 0, cache_known: true, models: vec!["claude-sonnet-4.5".to_string(), "gpt-5.4".to_string()] });
+        assert_eq!(read_usage(&dir.join("missing.json")), CopilotUsage::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
