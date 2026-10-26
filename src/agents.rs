@@ -665,10 +665,12 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     } else {
         let limit = Duration::from_secs(hub.cfg.agents.timeout_mins.unwrap_or(45).clamp(1, 24 * 60) * 60);
         // Dropping the losing branch drops the process group guard, which kills the agent and its children.
+        // A stop is looked at first: one that came while the CLI was being probed starts nothing.
         tokio::select! {
-            o = spawn_and_read(hub, job, slot, &line, &spec, &telemetry, attempt.as_ref(), &meter) => o,
+            biased;
             _ = cancel.wait() => RunOut { error: "cancelled".into(), ..Default::default() },
             _ = steer.wait() => RunOut { error: "stopped to take a message".into(), interrupted: true, ..Default::default() },
+            o = spawn_and_read(hub, job, slot, &line, &spec, &telemetry, attempt.as_ref(), &meter) => o,
             _ = tokio::time::sleep(limit) => RunOut { error: format!("timed out after {} min", limit.as_secs() / 60), ..Default::default() },
         }
     };
