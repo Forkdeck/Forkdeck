@@ -579,7 +579,7 @@ fn main() -> anyhow::Result<()> {
             }
             // Earlier jobs come back; typed tasks that were cut off continue by themselves.
             hub.start_autosave();
-            for id in hub.restore() {
+            for id in hub.restore(Some(&cwd)) {
                 if let Err(e) = rt.block_on(hub.resume(id)) {
                     hub.log("queue", format!("#{} not resumed: {} (select it and press Enter to try again)", id, e));
                 }
@@ -660,7 +660,7 @@ fn read_messages(hub: &Hub, ids: Vec<u32>) {
 
 async fn resume_cmd(hub: &Hub) -> i32 {
     let mut ids = Vec::new();
-    for id in hub.restore() {
+    for id in hub.restore(None) {
         match hub.resume(id).await {
             Ok(()) => ids.push(id),
             Err(e) => hub.log("queue", format!("#{} not resumed: {}", id, e)),

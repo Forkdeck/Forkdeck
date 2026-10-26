@@ -984,6 +984,49 @@ mod tests {
         assert!(back.outcome.contains("ok") || back.outcome.contains("interrupted"));
     }
 
+    #[tokio::test]
+    async fn a_restart_brings_back_the_jobs_of_its_folder_and_of_the_configured_repositories() {
+        let base = std::env::temp_dir().join(format!("forkdeck-restore-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (here, tree, other, link) = (base.join("here"), base.join("tree"), base.join("other"), base.join("link"));
+        std::fs::create_dir_all(here.join("src")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&here).args(args).output().unwrap().status.success(), "git {:?}", args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "c"]);
+        git(&["worktree", "add", "-q", "-b", "side", tree.to_str().unwrap()]);
+        std::os::unix::fs::symlink(&here, &link).unwrap();
+        let h = std::sync::Arc::new(History::in_memory());
+        let issue = |repo: &str| Source::Issue { repo_idx: 0, repo: repo.into(), number: 1, url: String::new() };
+        let saved = [
+            (Source::Manual, here.join("src")),
+            (Source::Manual, tree.clone()),
+            (Source::Manual, link.clone()),
+            (Source::Manual, other.clone()),
+            (issue("a/b"), base.join("automation")),
+            (issue("c/d"), base.join("automation")),
+        ];
+        for (source, dir) in saved {
+            let id = h.new_id().unwrap();
+            let mut j = job(id, source, JobStatus::Interrupted);
+            (j.workdir, j.resume_from, j.plan) = (dir, Some(JobStatus::Working), None);
+            h.save(&JobRecord::of(&j)).unwrap();
+        }
+        let cfg: crate::config::Config = toml::from_str("[[repos]]\nprovider='github'\nrepo='a/b'\npath='/nonexistent'\n").unwrap();
+        let ids = |hub: &crate::orchestrator::Hub| hub.state.lock().unwrap().jobs.iter().map(|j| j.id).collect::<Vec<_>>();
+
+        let mut hub = crate::orchestrator::Hub::new(cfg.clone(), tokio::runtime::Handle::current());
+        hub.history = Some(h.clone());
+        assert_eq!(hub.restore(Some(&here)), [1, 2, 3], "typed tasks of this folder, its worktrees and a link to it continue");
+        assert_eq!(ids(&hub), [1, 2, 3, 5], "another folder's task and an unconfigured repository's issue stay saved, out of sight");
+
+        let mut everything = crate::orchestrator::Hub::new(cfg, tokio::runtime::Handle::current());
+        everything.history = Some(h);
+        assert_eq!(everything.restore(None), [1, 2, 3, 4]);
+        assert_eq!(ids(&everything), [1, 2, 3, 4, 5, 6]);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     #[test]
     fn a_job_is_claimed_only_from_an_owner_that_is_gone() {
         let h = History::in_memory();
