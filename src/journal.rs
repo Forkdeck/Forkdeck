@@ -18,9 +18,17 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct Usage {
     pub runs: u32,
+    /// Every input token, cached ones included.
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cost: f64,
+    /// Of `tokens_in`, read from the provider's prompt cache.
+    pub cache_read: u64,
+    /// Of `tokens_in`, written to the prompt cache.
+    pub cache_write: u64,
+    /// The `tokens_in` of the runs that said how much came from the cache: older lines and CLIs
+    /// that do not report it leave this short of `tokens_in`.
+    pub cache_known_in: u64,
 }
 
 impl Usage {
@@ -32,6 +40,17 @@ impl Usage {
         self.tokens_in += o.tokens_in;
         self.tokens_out += o.tokens_out;
         self.cost += o.cost;
+        self.cache_read += o.cache_read;
+        self.cache_write += o.cache_write;
+        self.cache_known_in += o.cache_known_in;
+    }
+    /// Tokens as the limits count them: cache reads at `cache_read_weight`, everything else in full.
+    pub fn weighted(&self, cache_read_weight: f64) -> u64 {
+        self.tokens_in.saturating_sub(self.cache_read) + (self.cache_read as f64 * cache_read_weight).round() as u64 + self.tokens_out
+    }
+    /// The percentage of input read from the cache, over the runs that reported it.
+    pub fn cache_share(&self) -> Option<u32> {
+        (self.cache_known_in > 0).then(|| (self.cache_read * 100 / self.cache_known_in) as u32)
     }
 }
 
@@ -234,18 +253,24 @@ pub struct Spent {
 
 pub const DAY: i64 = 24 * 3600;
 
-/// Jobs forkdeck picked up by itself and tokens of every kind, since a day ago.
-pub fn spent(entries: &[Entry], repo: Option<&str>, now: i64) -> Spent {
+/// Jobs forkdeck picked up by itself and tokens of every kind, since a day ago, cache reads at
+/// `cache_read_weight`.
+pub fn spent(entries: &[Entry], repo: Option<&str>, now: i64, cache_read_weight: f64) -> Spent {
     let mut s = Spent::default();
     for e in entries.iter().filter(|e| e.ts > now - DAY) {
         if repo.is_none_or(|r| e.repo == r) && e.automated() {
             s.jobs += 1;
         }
         if repo.is_none() {
-            s.tokens += e.tokens();
+            s.tokens += [&e.claude, &e.codex, &e.copilot].iter().map(|u| u.weighted(cache_read_weight)).sum::<u64>();
         }
     }
     s
+}
+
+/// What one job has used, weighted: its finished runs and those still under way.
+pub fn job_spend<'a>(used: &[Usage; 3], running: impl IntoIterator<Item = &'a Usage>, cache_read_weight: f64) -> u64 {
+    used.iter().map(|u| u.weighted(cache_read_weight)).sum::<u64>() + running.into_iter().map(|u| u.weighted(cache_read_weight)).sum::<u64>()
 }
 
 /// If the last `after` automated jobs on this repository all failed, and the latest of them less
@@ -426,7 +451,8 @@ pub fn text(s: &Summary) -> Vec<String> {
     for (name, u) in [("claude", &s.claude), ("codex", &s.codex), ("copilot", &s.copilot)] {
         if u.runs > 0 {
             let cost = if u.cost > 0.0 { format!(" · ${:.2} as reported by the CLI", u.cost) } else { String::new() };
-            out.push(format!("{:<9} {:>4} run(s) · {} tokens in · {} out{}", name, u.runs, kilo(u.tokens_in), kilo(u.tokens_out), cost));
+            let cached = u.cache_share().map(|p| format!(", {}% from cache", p)).unwrap_or_default();
+            out.push(format!("{:<9} {:>4} run(s) · {} tokens in{} · {} out{}", name, u.runs, kilo(u.tokens_in), cached, kilo(u.tokens_out), cost));
         }
     }
     if s.learned > 0 {
@@ -461,6 +487,41 @@ mod tests {
 
     fn e(ts: i64, kind: &str, repo: &str, status: &str) -> Entry {
         Entry { ts, kind: kind.into(), repo: repo.into(), status: status.into(), ..Entry::default() }
+    }
+
+    #[test]
+    fn job_spend_counts_finished_and_running_runs() {
+        let used = [Usage { runs: 1, tokens_in: 1000, tokens_out: 100, ..Usage::default() }, Usage::default(), Usage { runs: 1, tokens_in: 50, ..Usage::default() }];
+        let a = Usage { tokens_in: 500, cache_read: 400, cache_known_in: 500, ..Usage::default() };
+        let b = Usage { tokens_in: 30, ..Usage::default() };
+        assert_eq!(job_spend(&used, [&a, &b], 1.0), 1100 + 50 + 500 + 30);
+        assert_eq!(job_spend(&used, [&a, &b], 0.1), 1100 + 50 + 100 + 40 + 30);
+    }
+
+    #[test]
+    fn cache_reads_count_at_their_weight() {
+        let u = Usage { runs: 1, tokens_in: 1000, tokens_out: 100, cache_read: 800, cache_known_in: 1000, ..Usage::default() };
+        assert_eq!(u.weighted(1.0), 1100);
+        assert_eq!(u.weighted(0.1), 200 + 80 + 100);
+        assert_eq!(u.weighted(0.0), 300);
+        assert_eq!(u.cache_share(), Some(80));
+    }
+
+    #[test]
+    fn an_old_line_has_no_cache_share() {
+        let e: Entry = serde_json::from_str(r#"{"kind":"issue","claude":{"runs":1,"tokens_in":500,"tokens_out":5,"cost":0.0}}"#).unwrap();
+        assert_eq!((e.claude.cache_read, e.claude.cache_known_in), (0, 0));
+        assert_eq!(e.claude.cache_share(), None);
+        assert_eq!(e.claude.weighted(0.1), 505, "unknown cache use counts in full");
+    }
+
+    #[test]
+    fn the_daily_count_weights_cache_reads() {
+        let now = 10 * DAY;
+        let mut e = Entry { ts: now - 60, kind: "issue".into(), ..Entry::default() };
+        e.claude = Usage { runs: 1, tokens_in: 1000, cache_read: 900, cache_known_in: 1000, ..Usage::default() };
+        assert_eq!(spent(&[e.clone()], None, now, 1.0).tokens, 1000);
+        assert_eq!(spent(&[e], None, now, 0.1).tokens, 100 + 90);
     }
 
     #[test]
@@ -558,7 +619,7 @@ mod tests {
         let got = read_file(&p, now - DAY).unwrap();
         assert_eq!(got.len() as i64, n, "every job of the day is there");
         assert!(got.windows(2).all(|w| w[0].ts <= w[1].ts), "oldest first");
-        assert_eq!(spent(&got, None, now), Spent { jobs: n as u32, tokens: 10 * n as u64 });
+        assert_eq!(spent(&got, None, now, 1.0), Spent { jobs: n as u32, tokens: 10 * n as u64 });
         // And nothing more than was asked for.
         assert_eq!(read_file(&p, now - 100).unwrap().len(), 0);
         assert_eq!(read_file(&p, 0).unwrap().len() as i64, n + 2000);
@@ -569,12 +630,12 @@ mod tests {
     fn spending_counts_a_rolling_day() {
         let now = 1_000_000;
         let mut all = vec![e(now - DAY - 5, "issue", "o/r", "done"), e(now - 100, "issue", "o/r", "failed"), e(now - 50, "review", "x/y", "done"), e(now - 10, "task", "", "done"), e(now - 5, "deploy", "o/r", "done")];
-        all[3].claude = Usage { runs: 1, tokens_in: 900, tokens_out: 100, cost: 0.0 };
-        all[1].codex = Usage { runs: 2, tokens_in: 400, tokens_out: 100, cost: 0.0 };
-        all[0].claude = Usage { runs: 1, tokens_in: 5_000_000, tokens_out: 0, cost: 0.0 };
+        all[3].claude = Usage { runs: 1, tokens_in: 900, tokens_out: 100, cost: 0.0, ..Usage::default() };
+        all[1].codex = Usage { runs: 2, tokens_in: 400, tokens_out: 100, cost: 0.0, ..Usage::default() };
+        all[0].claude = Usage { runs: 1, tokens_in: 5_000_000, tokens_out: 0, cost: 0.0, ..Usage::default() };
         // Typed tasks and deployments are not jobs forkdeck took by itself, but their tokens were spent all the same.
-        assert_eq!(spent(&all, None, now), Spent { jobs: 2, tokens: 1500 });
-        assert_eq!(spent(&all, Some("o/r"), now).jobs, 1);
+        assert_eq!(spent(&all, None, now, 1.0), Spent { jobs: 2, tokens: 1500 });
+        assert_eq!(spent(&all, Some("o/r"), now, 1.0).jobs, 1);
     }
 
     #[test]
@@ -598,7 +659,8 @@ mod tests {
         all[3].verdict = Some(true);
         all[4].verdict = Some(false);
         all[5].rolled_back = true;
-        all[0].claude = Usage { runs: 1, tokens_in: 1000, tokens_out: 500, cost: 0.25 };
+        all[0].claude = Usage { runs: 1, tokens_in: 1000, tokens_out: 500, cost: 0.25, ..Usage::default() };
+        all[1].codex = Usage { runs: 1, tokens_in: 900, tokens_out: 10, cache_read: 720, cache_known_in: 900, ..Usage::default() };
         let s = summarise(&all, 7);
         assert_eq!((s.issues.jobs, s.issues.done, s.issues.failed, s.issues_first_pass, s.issue_rounds), (3, 2, 1, 1, 2));
         assert_eq!((s.issue_median_secs, s.issue_p90_secs), (300, 300));
@@ -607,6 +669,7 @@ mod tests {
         let t = text(&s).join("\n");
         assert!(t.contains("67% ended with a pull request · 50% of those without being sent back · 2 fix round(s)"), "{}", t);
         assert!(t.contains("claude       1 run(s) · 1.0k tokens in · 500 out · $0.25"), "{}", t);
+        assert!(t.contains("codex        1 run(s) · 900 tokens in, 80% from cache · 10 out"), "{}", t);
         assert!(text(&summarise(&[], 7))[1].contains("nothing on record"));
         assert_eq!(percentile(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 90), 10);
         assert_eq!(percentile(&[5], 50), 5);

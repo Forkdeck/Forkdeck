@@ -319,19 +319,36 @@ pub fn copilot_args(cfg: &Config, exec: &Exec, read_only: bool, usage: &Path) ->
     args
 }
 
-/// Tokens in (cache reads and writes included) and out, and the models that ran, from copilot's usage file.
-pub fn read_usage(path: &Path) -> (u64, u64, Vec<String>) {
+/// What copilot's usage file says a run used.
+#[derive(Debug, Default, PartialEq)]
+pub struct CopilotUsage {
+    /// Every input token: copilot's `inputTokens` already counts cache reads and writes.
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// Some model said how much it read from the cache.
+    pub cache_known: bool,
+    pub models: Vec<String>,
+}
+
+/// Tokens in and out, the cached part, and the models that ran, from copilot's usage file.
+pub fn read_usage(path: &Path) -> CopilotUsage {
     let Some(v) = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()) else {
-        return (0, 0, vec![]);
+        return CopilotUsage::default();
     };
-    let (mut i, mut o, mut models) = (0, 0, vec![]);
+    let mut u = CopilotUsage::default();
     for (name, m) in v.get("modelMetrics").and_then(|m| m.as_object()).into_iter().flatten() {
-        let n = |k: &str| m.pointer(&format!("/usage/{}", k)).and_then(|n| n.as_u64()).unwrap_or(0);
-        i += n("inputTokens") + n("cacheReadTokens") + n("cacheWriteTokens");
-        o += n("outputTokens");
-        models.push(name.clone());
+        let get = |k: &str| m.pointer(&format!("/usage/{}", k)).and_then(|n| n.as_u64());
+        let n = |k: &str| get(k).unwrap_or(0);
+        u.input += n("inputTokens");
+        u.output += n("outputTokens");
+        u.cache_read += n("cacheReadTokens");
+        u.cache_write += n("cacheWriteTokens");
+        u.cache_known |= get("cacheReadTokens").is_some();
+        u.models.push(name.clone());
     }
-    (i, o, models)
+    u
 }
 
 fn first_line(s: &str) -> String {
@@ -472,7 +489,89 @@ pub fn parse_copilot(line: &str) -> Vec<Parsed> {
     vec![one]
 }
 
+/// What a run has used so far. Claude reports per message as it goes and Codex at the end of its
+/// turn, both through the telemetry stream; the stage's own totals, from the final event, take
+/// over once they are in. Copilot's come from its usage file, through `Meter::set`.
+pub(crate) fn live_usage(kind: AgentKind, t: &crate::metrics::Tokens, s: &Stage) -> crate::journal::Usage {
+    let mut u = crate::journal::Usage { cost: s.cost, ..Default::default() };
+    if kind == AgentKind::Copilot || s.tokens_in + s.tokens_out > 0 {
+        (u.tokens_in, u.tokens_out) = (s.tokens_in, s.tokens_out);
+    } else {
+        (u.tokens_in, u.tokens_out) = (t.input.unwrap_or(0), t.output.unwrap_or(0));
+    }
+    if kind != AgentKind::Copilot {
+        u.cache_read = t.cache_read.unwrap_or(0);
+        u.cache_write = t.cache_write.unwrap_or(0);
+        if t.cache_read.is_some() {
+            u.cache_known_in = u.tokens_in;
+        }
+    }
+    u
+}
+
+/// Whether `limits.tokens_per_job` watches this run. Like `job_mins`, it is for the issues and
+/// reviews forkdeck took by itself; the knowledge run comes after the outcome is settled.
+pub(crate) fn cap_applies(j: &crate::state::Job, slot: Slot, cfg: &Config) -> bool {
+    cfg.limits.tokens_per_job > 0 && !cfg.demo && !j.source.is_manual() && !matches!(j.source, crate::state::Source::Deploy { .. }) && slot != Slot::Knowledge
+}
+
+static RUN_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One run's place in `Job.running`. However the run ends, finishing or dropped by a cancel, what
+/// it used goes on the job's account once, when this is dropped.
+pub(crate) struct Meter {
+    hub: Hub,
+    job: u32,
+    slot: Slot,
+    key: u64,
+}
+
+impl Meter {
+    pub(crate) fn start(hub: &Hub, job: u32, slot: Slot, cli: AgentKind) -> Meter {
+        let key = RUN_KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        hub.job(job, |j| j.running.insert(key, (cli, crate::journal::Usage::default())));
+        Meter { hub: hub.clone(), job, slot, key }
+    }
+    /// The run's figures as the telemetry and its stage have them now.
+    pub(crate) fn observe(&self, kind: AgentKind, t: &crate::metrics::Tokens) {
+        let slot = self.slot;
+        self.store(|j| live_usage(kind, t, j.stage(slot)));
+    }
+    pub(crate) fn set(&self, u: crate::journal::Usage) {
+        self.store(|_| u);
+    }
+    /// Records the run's figures, then holds the job to `limits.tokens_per_job`: its finished
+    /// runs and every one under way, reviewers running side by side included.
+    fn store(&self, f: impl FnOnce(&mut crate::state::Job) -> crate::journal::Usage) {
+        let cfg = &self.hub.cfg;
+        let stopped = self.hub.job(self.job, |j| {
+            let u = f(j);
+            if let Some(e) = j.running.get_mut(&self.key) {
+                e.1 = u;
+            }
+            if !cap_applies(j, self.slot, cfg) {
+                return None;
+            }
+            let spent = crate::journal::job_spend(&j.used, j.running.values().map(|(_, u)| u), cfg.limits.cache_read_weight);
+            (spent >= cfg.limits.tokens_per_job && j.stop(crate::state::Limit::Tokens(spent))).then_some(spent)
+        }).flatten();
+        if let Some(spent) = stopped {
+            self.hub.log("limits", format!("#{} stopped: it has used {} tokens (limits.tokens_per_job)", self.job, crate::journal::kilo(spent)));
+        }
+    }
+}
+
+impl Drop for Meter {
+    fn drop(&mut self) {
+        self.hub.job(self.job, |j| j.close_run(self.key));
+    }
+}
+
 pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
+    // A stopped job starts nothing more, not even for the moment it takes the run to notice.
+    if hub.job(job, |j| j.cancel.is_set()).unwrap_or(false) {
+        return RunOut { error: "cancelled".into(), ..Default::default() };
+    }
     let baseline = spec.exec;
     // Adaptive routing changes only the worker's model and effort; the CLI and tier keep the review policy.
     let adapted = (slot == Slot::Worker && !spec.read_only).then(|| crate::adaptive::execution(hub, job)).flatten()
@@ -555,6 +654,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     }) else {
         return RunOut { error: "job vanished".into(), ..Default::default() };
     };
+    let meter = Meter::start(hub, job, slot, e.cli);
 
     let out = if hub.cfg.demo {
         tokio::select! {
@@ -565,13 +665,18 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     } else {
         let limit = Duration::from_secs(hub.cfg.agents.timeout_mins.unwrap_or(45).clamp(1, 24 * 60) * 60);
         // Dropping the losing branch drops the process group guard, which kills the agent and its children.
+        // A stop is looked at first: one that came while the CLI was being probed starts nothing.
         tokio::select! {
-            o = spawn_and_read(hub, job, slot, &line, &spec, &telemetry, attempt.as_ref()) => o,
+            biased;
             _ = cancel.wait() => RunOut { error: "cancelled".into(), ..Default::default() },
             _ = steer.wait() => RunOut { error: "stopped to take a message".into(), interrupted: true, ..Default::default() },
+            o = spawn_and_read(hub, job, slot, &line, &spec, &telemetry, attempt.as_ref(), &meter) => o,
             _ = tokio::time::sleep(limit) => RunOut { error: format!("timed out after {} min", limit.as_secs() / 60), ..Default::default() },
         }
     };
+    if hub.cfg.demo {
+        meter.observe(e.cli, &Default::default());
+    }
     if let Some(f) = &line.usage_file { let _ = std::fs::remove_file(f); }
     // A run that was cancelled or timed out still had a conversation, and it can be continued.
     let mut out = out;
@@ -613,11 +718,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
         }
     }
     // What this run used goes on the job's account, by the CLI that ran, whichever box it was shown in.
-    hub.job(job, |j| {
-        let s = j.stage(slot);
-        let add = crate::journal::Usage { runs: 1, tokens_in: s.tokens_in, tokens_out: s.tokens_out, cost: s.cost };
-        j.used[crate::journal::slot(e.cli)].add(&add);
-    });
+    drop(meter);
     stage(&mut |s| {
         s.elapsed = Some(start.elapsed());
         s.state = if out.ok || out.interrupted { StageState::Ok } else { StageState::Failed };
@@ -630,6 +731,7 @@ pub async fn run(hub: &Hub, job: u32, slot: Slot, spec: RunSpec<'_>) -> RunOut {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_and_read(
     hub: &Hub,
     job: u32,
@@ -638,6 +740,7 @@ async fn spawn_and_read(
     spec: &RunSpec<'_>,
     telemetry: &std::sync::Mutex<crate::metrics::Stream>,
     attempt: Option<&crate::metrics::Attempt>,
+    meter: &Meter,
 ) -> RunOut {
     let (kind, prompt, dir, read_only) = (spec.exec.cli, spec.prompt, spec.dir, spec.read_only);
     let (cmd, args) = (line.cmd.as_str(), &line.args);
@@ -845,6 +948,7 @@ async fn spawn_and_read(
                 _ => {}
             }
         }
+        meter.observe(kind, &telemetry.lock().unwrap_or_else(|e| e.into_inner()).tokens);
         if finished && drain_until.is_none() { drain_until = Some(tokio::time::Instant::now() + proc::DRAIN_GRACE); }
     }
     let had_final = finished;
@@ -866,16 +970,18 @@ async fn spawn_and_read(
     }
     let mut models_used = Vec::new();
     if let Some(f) = &line.usage_file {
-        let (tokens_in, tokens_out, models) = read_usage(f);
+        let u = read_usage(f);
         let _ = std::fs::remove_file(f);
-        if tokens_in + tokens_out > 0 {
+        if u.input + u.output > 0 {
             hub.job(job, |j| {
                 let s = j.stage(slot);
-                s.tokens_in = tokens_in;
-                s.tokens_out = tokens_out;
+                s.tokens_in = u.input;
+                s.tokens_out = u.output;
             });
+            let cache_known_in = if u.cache_known { u.input } else { 0 };
+            meter.set(crate::journal::Usage { tokens_in: u.input, tokens_out: u.output, cache_read: u.cache_read, cache_write: u.cache_write, cache_known_in, ..Default::default() });
         }
-        models_used = models;
+        models_used = u.models;
     }
     let exit_ok = status.as_ref().map(|s| s.success()).unwrap_or(false) || ended_after_final;
     // A clean exit is not enough: the stream has to have reached its closing event.
@@ -1126,6 +1232,115 @@ pub async fn invocation_limit(cmd: &str, kind: AgentKind, args: &mut Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::Usage;
+
+    fn hub_with_job() -> (tokio::runtime::Runtime, Hub, u32) {
+        hub_with(Config::default())
+    }
+
+    fn hub_with(cfg: Config) -> (tokio::runtime::Runtime, Hub, u32) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = Hub::new(cfg, rt.handle().clone());
+        let id = rt.block_on(hub.submit("t".into(), "t".into(), crate::state::Source::Manual, PathBuf::from("."), None, crate::state::Planning::IfRouted)).unwrap();
+        (rt, hub, id)
+    }
+
+    fn issue() -> crate::state::Source {
+        crate::state::Source::Issue { repo_idx: 0, repo: "o/r".into(), number: 7, url: String::new() }
+    }
+
+    #[test]
+    fn the_cap_leaves_typed_tasks_deployments_knowledge_and_demo_alone() {
+        let mut cfg = Config::default();
+        cfg.limits.tokens_per_job = 1000;
+        let (_rt, hub, id) = hub_with_job();
+        hub.job(id, |j| {
+            j.source = issue();
+            assert!(cap_applies(j, Slot::Worker, &cfg));
+            assert!(cap_applies(j, Slot::Reviewer, &cfg));
+            assert!(!cap_applies(j, Slot::Knowledge, &cfg), "the closing knowledge run");
+            let demo = Config { demo: true, ..cfg.clone() };
+            assert!(!cap_applies(j, Slot::Worker, &demo), "demo mode");
+            let mut off = cfg.clone();
+            off.limits.tokens_per_job = 0;
+            assert!(!cap_applies(j, Slot::Worker, &off), "no cap set");
+            j.source = crate::state::Source::Manual;
+            assert!(!cap_applies(j, Slot::Worker, &cfg), "a typed task");
+            j.source = crate::state::Source::Deploy { repo_idx: 0, repo: "o/r".into(), sha: "a".into() };
+            assert!(!cap_applies(j, Slot::Worker, &cfg), "a deployment");
+        });
+    }
+
+    #[test]
+    fn two_live_meters_are_summed_against_the_cap() {
+        let mut cfg = Config::default();
+        cfg.limits.tokens_per_job = 1000;
+        let (_rt, hub, id) = hub_with(cfg);
+        hub.job(id, |j| j.source = issue());
+        let a = Meter::start(&hub, id, Slot::Worker, AgentKind::Claude);
+        let b = Meter::start(&hub, id, Slot::Reviewer, AgentKind::Copilot);
+        a.set(Usage { tokens_in: 600, ..Usage::default() });
+        assert_eq!(hub.job(id, |j| j.stopped).unwrap(), None);
+        b.set(Usage { tokens_in: 600, ..Usage::default() });
+        assert_eq!(hub.job(id, |j| (j.stopped, j.cancel.is_set())).unwrap(), (Some(crate::state::Limit::Tokens(1200)), true));
+        drop((a, b));
+    }
+
+    #[test]
+    fn a_running_agent_has_a_live_count() {
+        let mut t = crate::metrics::Stream::default();
+        let line = |id: &str, out: u64| format!(r#"{{"type":"assistant","message":{{"id":"{id}","model":"m","usage":{{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":0,"output_tokens":{out}}}}}}}"#);
+        t.observe(AgentKind::Claude, &line("a", 5));
+        t.observe(AgentKind::Claude, &line("a", 7)); // the same message again, streamed further
+        t.observe(AgentKind::Claude, &line("b", 3));
+        let u = live_usage(AgentKind::Claude, &t.tokens, &Stage::default());
+        assert_eq!((u.tokens_in, u.tokens_out, u.cache_read, u.cache_known_in, u.runs), (200, 10, 180, 200, 0));
+        let done = Stage { tokens_in: 210, tokens_out: 12, cost: 0.5, ..Stage::default() };
+        let u = live_usage(AgentKind::Claude, &t.tokens, &done);
+        assert_eq!((u.tokens_in, u.tokens_out, u.cache_read, u.cost), (210, 12, 180, 0.5), "the final total wins, the cache split stays");
+        let s = Stage { tokens_in: 40, tokens_out: 4, ..Stage::default() };
+        let c = live_usage(AgentKind::Copilot, &crate::metrics::Tokens::default(), &s);
+        assert_eq!((c.tokens_in, c.tokens_out, c.cache_known_in), (40, 4, 0));
+    }
+
+    #[test]
+    fn a_run_is_on_the_account_once_whether_it_ends_or_is_dropped() {
+        let (_rt, hub, id) = hub_with_job();
+        let a = Meter::start(&hub, id, Slot::Worker, AgentKind::Claude);
+        let b = Meter::start(&hub, id, Slot::Reviewer, AgentKind::Codex);
+        a.set(Usage { tokens_in: 100, cache_read: 60, cache_known_in: 100, ..Usage::default() });
+        b.set(Usage { tokens_in: 7, ..Usage::default() });
+        assert_eq!(hub.job(id, |j| (j.running.len(), j.used[0].runs)).unwrap(), (2, 0));
+        drop(a);
+        drop(b);
+        let (running, claude, codex) = hub.job(id, |j| (j.running.len(), j.used[0], j.used[1])).unwrap();
+        assert_eq!(running, 0);
+        assert_eq!((claude.runs, claude.tokens_in, claude.cache_read), (1, 100, 60));
+        assert_eq!((codex.runs, codex.tokens_in), (1, 7));
+    }
+
+    #[test]
+    fn a_dropped_run_future_is_on_the_account() {
+        let (rt, hub, id) = hub_with_job();
+        // A future holding a meter is dropped while it waits, as select! drops a run.
+        let fut = async {
+            let m = Meter::start(&hub, id, Slot::Worker, AgentKind::Claude);
+            m.set(Usage { tokens_in: 42, ..Usage::default() });
+            std::future::pending::<()>().await;
+        };
+        rt.block_on(async { let _ = tokio::time::timeout(Duration::from_millis(10), fut).await; });
+        assert_eq!(hub.job(id, |j| (j.running.len(), j.used[0].runs, j.used[0].tokens_in)).unwrap(), (0, 1, 42));
+    }
+
+    #[test]
+    fn settle_counts_runs_still_going_once() {
+        let (_rt, hub, id) = hub_with_job();
+        let m = Meter::start(&hub, id, Slot::Reviewer, AgentKind::Copilot);
+        m.set(Usage { tokens_in: 9, ..Usage::default() });
+        hub.job(id, |j| j.settle());
+        drop(m); // an aborted reviewer task, dropped after the job has been settled
+        assert_eq!(hub.job(id, |j| (j.running.len(), j.used[2].runs, j.used[2].tokens_in)).unwrap(), (0, 1, 9));
+    }
 
     #[test]
     fn claude_says_what_it_was_not_allowed_to_run() {
@@ -1346,10 +1561,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("u.json");
         std::fs::write(&p, r#"{"modelMetrics":{"claude-sonnet-4.5":{"usage":{"inputTokens":200,"outputTokens":14,"cacheReadTokens":50}},"gpt-5.4":{"usage":{"inputTokens":1,"outputTokens":1}}}}"#).unwrap();
-        let (i, o, mut m) = read_usage(&p);
-        m.sort();
-        assert_eq!((i, o, m), (251, 15, vec!["claude-sonnet-4.5".to_string(), "gpt-5.4".to_string()]));
-        assert_eq!(read_usage(&dir.join("missing.json")), (0, 0, vec![]));
+        let mut u = read_usage(&p);
+        u.models.sort();
+        // inputTokens already holds the cached input: copilot sums uncached, cache reads and cache writes into it.
+        assert_eq!(u, CopilotUsage { input: 201, output: 15, cache_read: 50, cache_write: 0, cache_known: true, models: vec!["claude-sonnet-4.5".to_string(), "gpt-5.4".to_string()] });
+        assert_eq!(read_usage(&dir.join("missing.json")), CopilotUsage::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

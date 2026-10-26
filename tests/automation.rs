@@ -30,6 +30,11 @@ case "$prompt" in
     # list), FAKE_REVIEW_CRASH=1 crashes the first review (=always: every one), and
     # FAKE_REVIEW_NOVERDICT=1 leaves the verdict out of the first.
     n=$(cat "$FAKE_GH/reviews" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_GH/reviews"
+    # FAKE_REVIEW_ASSISTANT_TOKENS: the review reports this much input as it works, then never finishes.
+    if [ -n "$FAKE_REVIEW_ASSISTANT_TOKENS" ]; then
+      printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"id\":\"r1\",\"model\":\"m\",\"content\":[],\"usage\":{\"input_tokens\":$FAKE_REVIEW_ASSISTANT_TOKENS,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}"
+      sleep 300
+    fi
     # FAKE_REVIEW_RESUME_FAILS: a review that tries to continue an earlier one finds it gone.
     if [ -n "$FAKE_REVIEW_RESUME_FAILS" ]; then case "$*" in *--resume*) echo "No conversation found with session ID" >&2; exit 1 ;; esac; fi
     [ "$FAKE_REVIEW_CRASH" = always ] && { echo "reviewer crashed" >&2; exit 1; }
@@ -43,8 +48,13 @@ case "$prompt" in
     printf '%s\n' "{\"type\":\"result\",\"is_error\":false,\"result\":\"Looked at it.\\nVERDICT: $v\"}"
     ;;
   *)
+    # FAKE_ASSISTANT_TOKENS: the worker reports this much input as it works, then never finishes.
+    if [ -n "$FAKE_ASSISTANT_TOKENS" ]; then
+      printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"model\":\"m\",\"content\":[],\"usage\":{\"input_tokens\":$FAKE_ASSISTANT_TOKENS,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}"
+      sleep 300
+    fi
     sh -c "${FAKE_WORK:-echo change >> by_agent.txt}" >/dev/null 2>&1
-    printf '%s\n' "{\"type\":\"result\",\"is_error\":false,\"result\":\"Did the work.\",\"usage\":{\"input_tokens\":${FAKE_TOKENS:-0},\"output_tokens\":0}}"
+    printf '%s\n' "{\"type\":\"result\",\"is_error\":false,\"result\":\"Did the work.\",\"usage\":{\"input_tokens\":${FAKE_TOKENS:-0},\"cache_read_input_tokens\":${FAKE_CACHE_READ:-0},\"output_tokens\":0}}"
     ;;
 esac
 "#;
@@ -74,7 +84,7 @@ for m in $FAKE_COPILOT_REJECT; do
     exit 1
   fi
 done
-[ -n "$usage" ] && printf '{"modelMetrics":{"%s":{"usage":{"inputTokens":10,"outputTokens":2}}}}' "$model" > "$usage"
+[ -n "$usage" ] && printf '{"modelMetrics":{"%s":{"usage":{"inputTokens":%s,"outputTokens":2}}}}' "$model" "${FAKE_COPILOT_TOKENS:-10}" > "$usage"
 case "$prompt" in
   *"Write at most three short rules"*)
     [ -n "$FAKE_LESSONS_SEEN" ] && printf '%s' "$prompt" > "$FAKE_LESSONS_SEEN"
@@ -262,7 +272,7 @@ case "$prompt" in
   *) echo done > by_codex.txt
      echo '{"type":"item.completed","item":{"type":"agent_message","text":"Did the work."}}' ;;
 esac
-echo '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+echo "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":${FAKE_CODEX_TOKENS:-10},\"output_tokens\":5}}"
 "#;
 
 fn quota_rig(name: &str) -> Rig {
@@ -1941,12 +1951,98 @@ fn a_job_over_its_time_limit_is_stopped_and_handed_to_a_person() {
     let rig = Rig::new("limit-time", "[limits]\njob_mins = 1", "");
     rig.issue();
     let started = std::time::Instant::now();
-    let (ok, out) = rig.once(&[("FAKE_WORK", "sleep 300")]);
+    let (ok, out) = rig.once(&[("FAKE_ASSISTANT_TOKENS", "5000")]);
     assert!(!ok, "{}", out);
     assert!(started.elapsed().as_secs() < 120, "it was stopped, not waited for");
     assert!(out.contains("failed: stopped after 1 min, the limit for one job"), "{}", out);
     assert!(rig.calls().contains("--add-label agent:needs-human"), "{}", rig.calls());
     assert_eq!(rig.journal()[0]["status"], "failed");
+    assert_eq!(rig.journal()[0]["claude"]["tokens_in"], 5000, "what it used before the stop is on record");
+}
+
+#[test]
+fn a_job_over_its_token_limit_is_stopped_and_handed_to_a_person() {
+    let rig = Rig::new("limit-job-tokens", "[limits]\ntokens_per_job = 1000", "");
+    rig.issue();
+    let started = std::time::Instant::now();
+    let (ok, out) = rig.once(&[("FAKE_ASSISTANT_TOKENS", "5000")]);
+    assert!(!ok, "{}", out);
+    assert!(started.elapsed().as_secs() < 60, "it was stopped, not waited for");
+    assert!(out.contains("failed: stopped after 5.0k tokens, the limit for one job (limits.tokens_per_job)"), "{}", out);
+    assert!(rig.calls().contains("--add-label agent:needs-human"), "{}", rig.calls());
+    assert_eq!(rig.journal()[0]["status"], "failed");
+    assert_eq!(rig.journal()[0]["claude"]["tokens_in"], 5000);
+    let before = rig.calls();
+    rig.once(&[]);
+    assert_eq!(rig.calls(), before, "it is not retried");
+}
+
+#[test]
+fn concurrent_reviewers_are_stopped_by_their_combined_spend() {
+    // Each reviewer stays under the cap; together they pass it. Claude's reviewer is still running.
+    // Which one reports last varies; two_live_meters_are_summed_against_the_cap pins the sum itself.
+    let extra = "[agents.codex]\ncmd = \"absent-codex\"\n[agents.copilot.profiles.second]\nvendor = \"xai\"\nmodels = { light = \"grok-4.7\", standard = \"grok-4.7\", heavy = \"grok-4.7\" }\n[review]\npr_reviewers = [\"claude\", \"copilot:second\"]\n[limits]\ntokens_per_job = 1000";
+    let rig = Rig::with_agents("limit-job-reviewers", extra, "", &[("claude", CLAUDE), ("copilot", COPILOT)]);
+    rig.pull_request(5, "feat");
+    rig.list_pull_request(5, "feat");
+    let started = std::time::Instant::now();
+    let (ok, out) = rig.once(&[("FAKE_REVIEW_ASSISTANT_TOKENS", "600"), ("FAKE_COPILOT_TOKENS", "600")]);
+    assert!(!ok && out.contains("limits.tokens_per_job"), "{}", out);
+    assert!(started.elapsed().as_secs() < 60, "it was stopped, not waited for");
+    assert!(rig.calls().contains("--add-label review:changes"), "{}", rig.calls());
+    let e = &rig.journal()[0];
+    assert_eq!((e["claude"]["tokens_in"].as_u64(), e["copilot"]["tokens_in"].as_u64()), (Some(600), Some(600)), "both reviewers are on record");
+    let before = rig.calls();
+    rig.once(&[]);
+    assert_eq!(rig.calls(), before, "the review is not asked for again");
+}
+
+#[test]
+fn a_copilot_run_over_the_cap_stops_the_job_before_the_review() {
+    let extra = format!("{}[limits]\ntokens_per_job = 1000", NO_REAL_CLIS);
+    let rig = Rig::with_agents("limit-job-copilot", &extra, "", &[("copilot", COPILOT)]);
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_COPILOT_TOKENS", "5000")]);
+    assert!(!ok && out.contains("limits.tokens_per_job"), "{}", out);
+    assert_eq!(copilot_runs(&rig).len(), 1, "the review never started");
+}
+
+#[test]
+fn a_codex_run_over_the_cap_stops_the_job_after_it_reports() {
+    let rig = quota_rig_with("limit-job-codex", "[router]\nkind = \"rules\"\ndefault_agent = \"codex\"\n[limits]\ntokens_per_job = 1000");
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_CODEX_TOKENS", "5000")]);
+    assert!(!ok && out.contains("limits.tokens_per_job"), "{}", out);
+    assert_eq!(fs::read_to_string(rig.root.join("gh/attempts")).unwrap(), "codex\n", "only the worker ran");
+}
+
+#[test]
+fn a_typed_task_is_not_stopped_by_the_job_cap() {
+    let rig = Rig::new("limit-job-typed", "[limits]\ntokens_per_job = 1000", "");
+    let (ok, out) = rig.run(&["run", "add a change file"], &[("FAKE_TOKENS", "5000")]);
+    assert!(ok && !out.contains("limits.tokens_per_job"), "{}", out);
+}
+
+#[test]
+fn cache_reads_are_on_record_and_stats_show_their_share() {
+    let rig = Rig::new("cache", "", "");
+    rig.issue();
+    let (ok, out) = rig.once(&[("FAKE_TOKENS", "200"), ("FAKE_CACHE_READ", "800")]);
+    assert!(ok, "{}", out);
+    let e = &rig.journal()[0];
+    assert_eq!((e["claude"]["tokens_in"].as_u64(), e["claude"]["cache_read"].as_u64(), e["claude"]["cache_known_in"].as_u64()), (Some(1000), Some(800), Some(1000)));
+    let (ok, out) = rig.run(&["stats"], &[]);
+    assert!(ok && out.contains("1.0k tokens in, 80% from cache"), "{}", out);
+}
+
+#[test]
+fn the_daily_limit_can_count_cache_reads_lightly() {
+    let rig = Rig::new("cache-limit", "[limits]\ntokens_per_day = 1000\ncache_read_weight = 0.1", "");
+    rig.issue();
+    rig.once(&[("FAKE_TOKENS", "100"), ("FAKE_CACHE_READ", "4900")]);
+    rig.issues(&[8]);
+    let (ok, out) = rig.once(&[]);
+    assert!(ok && !out.contains("token limit reached"), "5.0k in, 4.9k of it cached, counts as 590: {}", out);
 }
 
 #[test]

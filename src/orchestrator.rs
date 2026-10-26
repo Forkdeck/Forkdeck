@@ -462,7 +462,8 @@ impl Hub {
                 peer: None,
                 used: Default::default(),
                 findings: Vec::new(),
-                over_time: false,
+                stopped: None,
+                running: Default::default(),
                 admitted: false,
                 issue_plan,
             });
@@ -572,7 +573,7 @@ impl Hub {
                 j.escalated = false;
             }
             j.findings.clear();
-            j.over_time = false;
+            j.stopped = None;
             j.active_started = Instant::now();
             j.queue = crate::metrics::QueueTiming::admitted();
             j.cancel = Cancel::new();
@@ -952,9 +953,8 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
                             _ = tokio::time::sleep(Duration::from_secs(limit * 60)) => {}
                             _ = c.wait() => return,
                         }
-                        if h.job(id, |j| if j.status.finished() { false } else { j.over_time = true; true }).unwrap_or(false) {
+                        if h.job(id, |j| j.stop(Limit::Time)).unwrap_or(false) {
                             h.log("limits", format!("#{} stopped: it has run for {} min (limits.job_mins)", id, limit));
-                            c.fire();
                         }
                     });
                 }
@@ -984,15 +984,22 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
     };
     drop(hub.unpark_slot(id));
     drop(hub.unpark_lane(id));
+    // Reviewers aborted with their JoinSet may be dropped after this; what they used counts now.
+    hub.job(id, |j| j.settle());
     // A cancel that arrives late still makes the job "cancelled", but what was already written up stays written up.
     // What was already written up keeps its own account of what happened (a rollback that could not be
     // confirmed must not be reduced to the word "cancelled").
-    let over_time = hub.job(id, |j| j.over_time).unwrap_or(false);
-    let fin = if over_time && fin.status != JobStatus::Done {
-        // Not a person's cancel: the job hit its time limit, and somebody should look at why.
+    let stopped = hub.job(id, |j| j.stopped).flatten();
+    let fin = if let Some(why) = stopped.filter(|_| fin.status != JobStatus::Done) {
+        // Not a person's cancel: the job hit a limit, and somebody should look at why.
+        let state = if fin.reported { fin.outcome.clone() } else { "still working".to_string() };
+        let limit = match why {
+            Limit::Time => format!("{} min, the limit for one job (limits.job_mins)", hub.cfg.limits.job_mins),
+            Limit::Tokens(n) => format!("{} tokens, the limit for one job (limits.tokens_per_job)", journal::kilo(n)),
+        };
         Finish {
             status: JobStatus::Failed,
-            outcome: format!("stopped after {} min, the limit for one job (limits.job_mins). It was {} at the time", hub.cfg.limits.job_mins, if fin.reported { fin.outcome.clone() } else { "still working".to_string() }),
+            outcome: format!("stopped after {}. It was {} at the time", limit, state),
             reported: fin.reported,
             retry: None,
             wait: None,
@@ -1092,7 +1099,7 @@ async fn run_job_inner(hub: Hub, id: u32) -> bool {
                     st.schedule_retry(key, max, base, immediate, now);
                 }
                 // A pull request review that could not run has its request label put back as well.
-                (JobStatus::Failed, None, true, _) if !over_time => {
+                (JobStatus::Failed, None, true, _) if stopped.is_none() => {
                     st.schedule_retry(key, max, base, false, now);
                 }
                 // An issue we never managed to claim still carries its label.
@@ -2995,6 +3002,25 @@ mod tests {
     }
 
     #[test]
+    fn only_the_first_stop_names_the_reason() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = Hub::new(Config::default(), rt.handle().clone());
+        let submit = || rt.block_on(hub.submit("t".into(), "t".into(), Source::Manual, PathBuf::from("."), None, Planning::IfRouted)).unwrap();
+        let (id, other) = (submit(), submit());
+        hub.job(id, |j| {
+            assert!(j.stop(Limit::Tokens(5)));
+            assert!(!j.stop(Limit::Time));
+            assert_eq!(j.stopped, Some(Limit::Tokens(5)));
+            assert!(j.cancel.is_set());
+        });
+        hub.job(other, |j| {
+            j.cancel.fire(); // a person's cancel
+            assert!(!j.stop(Limit::Tokens(9)));
+            assert_eq!(j.stopped, None);
+        });
+    }
+
+    #[test]
     fn replies_keep_conversation_without_recounting_journal_usage() {
         // Keep spawned jobs queued: this test exercises reply admission without running agents.
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -3006,7 +3032,7 @@ mod tests {
             j.used[0].runs = 1;
             j.used[0].tokens_in = 123;
             j.findings.push("previous finding".into());
-            j.over_time = true;
+            j.stopped = Some(Limit::Time);
             j.created = Instant::now() - Duration::from_secs(3600);
         });
         let first = hub.job(id, |j| journal::entry(j, JobStatus::Done, "done", 0)).unwrap();
@@ -3016,7 +3042,7 @@ mod tests {
             assert_eq!(j.turns[0].answer, "first answer");
             assert_eq!(j.turns[1].ask, "follow up");
             assert!(j.findings.is_empty());
-            assert!(!j.over_time);
+            assert_eq!(j.stopped, None);
             journal::entry(j, JobStatus::Done, "done", 0)
         }).unwrap();
         assert_eq!(first.claude.tokens_in, 123);

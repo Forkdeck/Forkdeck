@@ -371,6 +371,11 @@ fn clock(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0).map(|d| d.with_timezone(&chrono::Local).format("%H:%M").to_string()).unwrap_or_default()
 }
 
+/// What a job not yet in the journal has used, weighted: its finished runs and those still under way.
+fn job_tokens(j: &crate::state::Job, cache_read_weight: f64) -> u64 {
+    crate::journal::job_spend(&j.used, j.running.values().map(|(_, u)| u), cache_read_weight)
+}
+
 fn budget(hub: &Hub) -> Budget {
     use crate::journal;
     let lim = &hub.cfg.limits;
@@ -398,12 +403,12 @@ fn budget(hub: &Hub) -> Budget {
     if let Some(e) = broken.filter(|_| counted) {
         return Budget { stop: Some(format!("the journal cannot be used, so nothing is picked up: {}", clip(&e, 160))), jobs_left: None, entries, now };
     }
-    let mut spent = journal::spent(&entries, None, now);
+    let mut spent = journal::spent(&entries, None, now, lim.cache_read_weight);
     {
         // Jobs still running are not in the journal yet.
         let mut st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
         for j in st.jobs.iter().filter(|j| !j.status.finished()) {
-            spent.tokens += j.used.iter().map(|u| u.tokens()).sum::<u64>();
+            spent.tokens += job_tokens(j, lim.cache_read_weight);
             spent.jobs += matches!(j.source, Source::Issue { .. } | Source::Pr { .. }) as u32;
         }
         // Typed tasks cut off by a stop are in neither: their usage is in the saved history until
@@ -416,7 +421,7 @@ fn budget(hub: &Hub) -> Budget {
                 let cut_off = |r: &crate::history::JobRecord| r.status == crate::state::JobStatus::Interrupted
                     || (!r.status.finished() && r.owner.as_deref().is_none_or(|o| !crate::history::owner_alive(o)));
                 for r in saved.iter().filter(|r| cut_off(r) && !running.contains(&r.id) && r.finished.unwrap_or(r.created) as i64 >= now - window) {
-                    spent.tokens += r.used.iter().map(|u| u.tokens()).sum::<u64>();
+                    spent.tokens += r.used.iter().map(|u| u.weighted(lim.cache_read_weight)).sum::<u64>();
                 }
             }
             st = hub.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -442,7 +447,7 @@ fn hold_for(hub: &Hub, b: &Budget, r: &RepoCfg, taken_here: u32) -> Option<Strin
     if r.jobs_per_day > 0 {
         let running = hub.state.lock().unwrap_or_else(|e| e.into_inner()).jobs.iter().filter(|j| !j.status.finished() && matches!(&j.source, Source::Issue { repo, .. } | Source::Pr { repo, .. } if repo == &r.repo)).count() as u32;
         // `taken_here`: picked in this pass and not yet among the running jobs.
-        if journal::spent(&b.entries, Some(&r.repo), b.now).jobs + running + taken_here >= r.jobs_per_day {
+        if journal::spent(&b.entries, Some(&r.repo), b.now, hub.cfg.limits.cache_read_weight).jobs + running + taken_here >= r.jobs_per_day {
             return Some(format!("job limit for this repository reached: {} in the last 24 h", r.jobs_per_day));
         }
     }
@@ -1380,7 +1385,7 @@ pub async fn report_failure(hub: &Hub, id: u32, why: &str) {
             hub.log("issues", e);
         }
         // Put the request label back so a later session can retry.
-        let to = if hub.job(id, |j| j.over_time).unwrap_or(false) { &r.pr_fail_label } else { &r.pr_label };
+        let to = if hub.job(id, |j| j.stopped.is_some()).unwrap_or(false) { &r.pr_fail_label } else { &r.pr_label };
         if let Err(e) = review_labels(&r, n, to).await {
             hub.log("issues", e);
         }
@@ -1441,6 +1446,19 @@ mod tests {
         assert!(!hub.state.lock().unwrap().should_take(key, now), "seen, and nothing is running for it");
         submission_failed(&hub, key, "database is locked");
         assert!(hub.state.lock().unwrap().should_take(key, now), "the next poll takes it");
+    }
+
+    #[test]
+    fn a_running_job_counts_its_runs_under_way_toward_the_day() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let hub = Hub::new(crate::config::Config::default(), rt.handle().clone());
+        let id = rt.block_on(hub.submit("t".into(), "t".into(), Source::Manual, std::path::PathBuf::from("."), None, crate::state::Planning::IfRouted)).unwrap();
+        hub.job(id, |j| {
+            j.used[0] = crate::journal::Usage { runs: 1, tokens_in: 100, ..Default::default() };
+            j.running.insert(1, (crate::state::AgentKind::Codex, crate::journal::Usage { tokens_in: 1000, cache_read: 800, cache_known_in: 1000, ..Default::default() }));
+            assert_eq!(job_tokens(j, 1.0), 1100);
+            assert_eq!(job_tokens(j, 0.1), 100 + 200 + 80);
+        });
     }
 
     #[test]

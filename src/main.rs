@@ -1005,12 +1005,14 @@ async fn doctor(hub: &Hub, cfg_path: Option<PathBuf>) -> bool {
         let l = &hub.cfg.limits;
         let part = |n: u64, what: &str| if n == 0 { format!("no limit on {}", what) } else { format!("{} {}", n, what) };
         println!(
-            "limits    {:<8} {} · {} · {} · {}",
-            if l.jobs_per_day == 0 && l.tokens_per_day == 0 { "open" } else { "set" },
+            "limits    {:<8} {} · {} · {} · {} · {}{}",
+            if l.jobs_per_day == 0 && l.tokens_per_day == 0 && l.tokens_per_job == 0 { "open" } else { "set" },
             part(l.jobs_per_day as u64, "jobs a day"),
             part(l.tokens_per_day, "tokens a day"),
+            part(l.tokens_per_job, "tokens per job"),
             if l.job_mins == 0 { "no time limit per job".to_string() } else { format!("{} min per job", l.job_mins) },
-            if l.pause_after_failures == 0 { "no pause on failures".to_string() } else { format!("pause {} min after {} failures in a row", l.pause_mins, l.pause_after_failures) }
+            if l.pause_after_failures == 0 { "no pause on failures".to_string() } else { format!("pause {} min after {} failures in a row", l.pause_mins, l.pause_after_failures) },
+            if l.cache_read_weight == 1.0 { String::new() } else { format!(" · cache reads count {}", l.cache_read_weight) }
         );
         let k = &hub.cfg.knowledge;
         println!("notes     {:<8} {}", if k.enabled { "on" } else { "off" }, if k.learn { "rules are learned from review and check failures" } else { "nothing is learned automatically ([knowledge] learn = true)" });

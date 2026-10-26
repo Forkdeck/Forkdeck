@@ -236,7 +236,7 @@ path = "."
         let mut a: crate::metrics::Attempt = serde_json::from_value(json!({"schema":2,"id":id,"job":e.job_id,"turn":e.turn,"parent":null,"role":"worker","retry":e.rounds,"repo":e.repo,"source":e.kind,"tier":"standard","cli":"claude","configured_model":"sonnet","actual_model":"sonnet","effort":"medium","adapter":"demo","started":now-1200,"ended":now-60,"wall_ms":1140000,"status":"done","tokens":{"input":120000,"output":3400,"cost_usd":null},"terminal_usage":true,"decision":null}))?;
         a.queue = Some(crate::metrics::QueueTiming {admitted_ms:(now-1201)*1000,dispatched_ms:Some((now-1200)*1000),wait_ms:Some(1000),provenance:"process-monotonic-admission-v1".into()});
         a.cohort = crate::metrics::Cohort {definition:"prompt-proxy-v1".into(),category:"fix".into(),complexity:"standard".into(),context:"prompt-medium".into()};
-        e.claude = crate::journal::Usage {runs:1,tokens_in:120000,tokens_out:3400,cost:0.0};
+        e.claude = crate::journal::Usage {runs:1,tokens_in:120000,tokens_out:3400,cost:0.0,..Default::default()};
         read_records.attempts.push(a);
     }
     *hub.read_records.lock().unwrap() = Some(read_records);

@@ -552,11 +552,16 @@ pub struct LimitsCfg {
     /// After this many issues or reviews in a row failed on a repository, stop picking up from it for a while.
     pub pause_after_failures: u32,
     pub pause_mins: u64,
+    /// What a token read from the prompt cache counts for in the limits, from 0 to 1. Providers
+    /// bill cache reads at a fraction of new input; 1 counts them in full.
+    pub cache_read_weight: f64,
+    /// Tokens (weighted as above) one issue or review may use before it is stopped and handed to a person.
+    pub tokens_per_job: u64,
 }
 
 impl Default for LimitsCfg {
     fn default() -> Self {
-        LimitsCfg { jobs_per_day: 0, tokens_per_day: 0, job_mins: 0, pause_after_failures: 5, pause_mins: 60 }
+        LimitsCfg { jobs_per_day: 0, tokens_per_day: 0, job_mins: 0, pause_after_failures: 5, pause_mins: 60, cache_read_weight: 1.0, tokens_per_job: 0 }
     }
 }
 
@@ -1158,6 +1163,7 @@ impl Config {
         if self.limits.job_mins > 7 * 24 * 60 {
             anyhow::bail!("limits.job_mins must be at most a week");
         }
+        anyhow::ensure!((0.0..=1.0).contains(&self.limits.cache_read_weight), "limits.cache_read_weight must be between 0 and 1");
         if self.knowledge.max_learned == 0 || self.knowledge.max_learned > 200 || !(200..=50_000).contains(&self.knowledge.max_chars) {
             anyhow::bail!("knowledge.max_learned must be 1 to 200 and knowledge.max_chars 200 to 50000");
         }
@@ -1591,6 +1597,17 @@ redirect_url = "https://forkdeck.example/forges/gitlab/callback"
             let cfg: Config = toml::from_str(&format!("[agents.network]\nmirrors = [{bad:?}]")).unwrap();
             assert!(cfg.validate().unwrap_err().to_string().contains("host names"), "{bad}");
         }
+    }
+
+    #[test]
+    fn cache_read_weight_must_be_a_fraction() {
+        for bad in ["1.5", "-0.1", "nan"] {
+            let cfg: Config = toml::from_str(&format!("[limits]\ncache_read_weight = {bad}")).unwrap();
+            assert!(cfg.validate().unwrap_err().to_string().contains("limits.cache_read_weight must be between 0 and 1"), "{bad}");
+        }
+        let cfg: Config = toml::from_str("[limits]\ncache_read_weight = 0.1").unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(toml::from_str::<Config>("").unwrap().limits.cache_read_weight, 1.0);
     }
 
     #[test]
