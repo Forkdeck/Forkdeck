@@ -21,5 +21,9 @@
 Work that starts from an issue is always reviewed, whatever the fork layer
 answers, unless `review.mode = "never"`.
 
+Output tokens cost more than input, so the worker is asked for a short report
+(what changed, what it could not verify) and the reviewer for one or two lines
+per problem. The worker's report becomes the pull request description.
+
 Effort tiers map to models and reasoning effort per CLI in the config, so
 "light" can be a small model for a typo and "heavy" the largest one.
